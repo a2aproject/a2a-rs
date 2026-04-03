@@ -1,5 +1,11 @@
 # a2a-rs
 
+[![CI](https://github.com/agntcy/a2a-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/agntcy/a2a-rs/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/agntcy/a2a-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/agntcy/a2a-rs)
+[![crates.io](https://img.shields.io/crates/v/agntcy-a2a.svg)](https://crates.io/crates/agntcy-a2a)
+[![docs.rs](https://docs.rs/agntcy-a2a/badge.svg)](https://docs.rs/agntcy-a2a)
+[![License](https://img.shields.io/crates/l/agntcy-a2a.svg)](https://github.com/agntcy/a2a-rs/blob/main/LICENSE.md)
+
 `a2a-rs` is a Rust workspace for the A2A v1 protocol. It includes core protocol
 types, async client and server libraries, protobuf definitions, and gRPC
 bindings for building interoperable A2A agents and clients.
