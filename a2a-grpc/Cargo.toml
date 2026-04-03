@@ -1,0 +1,21 @@
+[package]
+name = "a2a-grpc"
+version = "0.1.0"
+description = "A2A v1 gRPC protocol binding for client and server"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+a2a = { workspace = true }
+a2a-client = { workspace = true }
+a2a-server = { workspace = true }
+a2a-pb = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,57 @@
+[workspace]
+members = [
+    "a2a",
+    "a2a-client",
+    "a2a-server",
+    "a2a-pb",
+    "a2a-grpc",
+    "examples/helloworld",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/a2a-rs/a2a-rs"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates
+a2a = { path = "a2a" }
+a2a-client = { path = "a2a-client" }
+a2a-server = { path = "a2a-server" }
+a2a-pb = { path = "a2a-pb" }
+a2a-grpc = { path = "a2a-grpc" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+pin-project-lite = "0.2"
+
+# HTTP
+axum = { version = "0.8", features = ["macros"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors"] }
+hyper = "1"
+
+# gRPC + protobuf
+tonic = "0.13"
+tonic-build = "0.13"
+prost = "0.13"
+prost-types = "0.13"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+thiserror = "2"
+uuid = { version = "1", features = ["v7"] }
+semver = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

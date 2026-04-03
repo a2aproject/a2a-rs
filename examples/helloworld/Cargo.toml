@@ -1,0 +1,16 @@
+[package]
+name = "helloworld"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+a2a = { workspace = true }
+a2a-server = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }

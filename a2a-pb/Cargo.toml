@@ -1,0 +1,19 @@
+[package]
+name = "a2a-pb"
+version = "0.1.0"
+description = "A2A v1 protobuf-generated types and conversion layer"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+a2a = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

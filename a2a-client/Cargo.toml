@@ -1,0 +1,27 @@
+[package]
+name = "a2a-client"
+version = "0.1.0"
+description = "A2A v1 async client with protocol binding factory"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+a2a = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+bytes = "1"
+tracing = { workspace = true }
+uuid = { workspace = true }
+semver = { workspace = true }
+pin-project-lite = { workspace = true }
+
+[dev-dependencies]
+a2a-server = { workspace = true }
+axum = { workspace = true }
