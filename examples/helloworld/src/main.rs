@@ -87,7 +87,7 @@ fn build_agent_card() -> AgentCard {
         version: a2a::VERSION.to_string(),
         provider: Some(AgentProvider {
             organization: "A2A Rust SDK".to_string(),
-            url: "https://github.com/a2a-rs/a2a-rs".to_string(),
+            url: "https://github.com/agntcy/a2a-rs".to_string(),
         }),
         capabilities: AgentCapabilities {
             streaming: Some(true),

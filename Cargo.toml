@@ -12,16 +12,16 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/a2a-rs/a2a-rs"
+repository = "https://github.com/agntcy/a2a-rs"
 rust-version = "1.85"
 
 [workspace.dependencies]
 # Internal crates
-a2a = { path = "a2a" }
-a2a-client = { path = "a2a-client" }
-a2a-server = { path = "a2a-server" }
-a2a-pb = { path = "a2a-pb" }
-a2a-grpc = { path = "a2a-grpc" }
+a2a = { path = "a2a", version = "0.1.0" }
+a2a-client = { path = "a2a-client", version = "0.1.0" }
+a2a-server = { path = "a2a-server", version = "0.1.0" }
+a2a-pb = { path = "a2a-pb", version = "0.1.0" }
+a2a-grpc = { path = "a2a-grpc", version = "0.1.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
