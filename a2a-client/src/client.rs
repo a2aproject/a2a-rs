@@ -119,6 +119,32 @@ impl A2AClient {
     }
 }
 
+/// Convenience trait to extract client results.
+#[async_trait]
+pub trait SendMessageExt {
+    async fn send_text(
+        &self,
+        text: impl Into<String> + Send,
+    ) -> Result<SendMessageResponse, A2AError>;
+}
+
+#[async_trait]
+impl SendMessageExt for A2AClient {
+    async fn send_text(
+        &self,
+        text: impl Into<String> + Send,
+    ) -> Result<SendMessageResponse, A2AError> {
+        let msg = Message::new(Role::User, vec![Part::text(text)]);
+        let req = SendMessageRequest {
+            message: msg,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        self.send_message(&req).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,31 +492,5 @@ mod tests {
     async fn test_destroy() {
         let client = make_client();
         client.destroy().await.unwrap();
-    }
-}
-
-/// Convenience trait to extract client results.
-#[async_trait]
-pub trait SendMessageExt {
-    async fn send_text(
-        &self,
-        text: impl Into<String> + Send,
-    ) -> Result<SendMessageResponse, A2AError>;
-}
-
-#[async_trait]
-impl SendMessageExt for A2AClient {
-    async fn send_text(
-        &self,
-        text: impl Into<String> + Send,
-    ) -> Result<SendMessageResponse, A2AError> {
-        let msg = Message::new(Role::User, vec![Part::text(text)]);
-        let req = SendMessageRequest {
-            message: msg,
-            configuration: None,
-            metadata: None,
-            tenant: None,
-        };
-        self.send_message(&req).await
     }
 }

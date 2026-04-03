@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "a2a"
+name = "agntcy-a2a"
 version = "0.2.0"
 dependencies = [
  "base64",
@@ -15,13 +15,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "a2a-client"
+name = "agntcy-a2a-client"
 version = "0.1.2"
 dependencies = [
- "a2a",
- "a2a-server",
+ "agntcy-a2a",
  "async-trait",
- "axum",
  "bytes",
  "futures",
  "pin-project-lite",
@@ -36,13 +34,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "a2a-grpc"
+name = "agntcy-a2a-grpc"
 version = "0.1.0"
 dependencies = [
- "a2a",
- "a2a-client",
- "a2a-pb",
- "a2a-server",
+ "agntcy-a2a",
+ "agntcy-a2a-client",
+ "agntcy-a2a-pb",
+ "agntcy-a2a-server",
  "async-trait",
  "futures",
  "prost",
@@ -53,10 +51,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "a2a-pb"
+name = "agntcy-a2a-pb"
 version = "0.1.0"
 dependencies = [
- "a2a",
+ "agntcy-a2a",
  "chrono",
  "prost",
  "prost-types",
@@ -66,10 +64,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "a2a-server"
+name = "agntcy-a2a-server"
 version = "0.1.0"
 dependencies = [
- "a2a",
+ "agntcy-a2a",
  "async-trait",
  "axum",
  "chrono",
@@ -530,11 +528,14 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "helloworld"
 version = "0.1.0"
 dependencies = [
- "a2a",
- "a2a-server",
+ "agntcy-a2a",
+ "agntcy-a2a-client",
+ "agntcy-a2a-server",
+ "async-trait",
  "axum",
  "chrono",
  "futures",
+ "reqwest",
  "tokio",
  "tokio-stream",
  "tracing",

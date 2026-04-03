@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use a2a::event::{StreamResponse, TaskStatusUpdateEvent};
 use a2a::*;
+use a2a_client::Transport;
 use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::jsonrpc::JsonRpcTransport;
 use a2a_client::rest::RestTransport;
-use a2a_client::Transport;
 use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::rest::rest_router;
 use a2a_server::{RequestHandler, ServiceParams, WELL_KNOWN_AGENT_CARD_PATH};
@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
-use futures::stream::{self, BoxStream};
 use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 use reqwest::Client;
 use tokio::net::TcpListener;
 
@@ -119,7 +119,10 @@ impl RequestHandler for TestHandler {
                 },
                 metadata: None,
             })),
-            Ok(StreamResponse::Task(sample_task("task-1", TaskState::Completed))),
+            Ok(StreamResponse::Task(sample_task(
+                "task-1",
+                TaskState::Completed,
+            ))),
         ])))
     }
 
@@ -291,7 +294,9 @@ async fn rest_transport_end_to_end() {
     let (base_url, handle) = spawn_http_server().await;
     let transport = RestTransport::new(Client::new(), format!("{base_url}/rest"));
 
-    let send_resp = transport.send_message(&ServiceParams::new(), &send_message_request()).await;
+    let send_resp = transport
+        .send_message(&ServiceParams::new(), &send_message_request())
+        .await;
     assert!(matches!(send_resp.unwrap(), SendMessageResponse::Task(_)));
 
     let task = transport
@@ -313,8 +318,8 @@ async fn rest_transport_end_to_end() {
             &ListTasksRequest {
                 context_id: Some("ctx-1".to_string()),
                 status: Some(TaskState::Completed),
-                page_size: Some(1),
-                page_token: Some("token-1".to_string()),
+                page_size: Some(10),
+                page_token: Some("page-1".to_string()),
                 history_length: Some(1),
                 status_timestamp_after: None,
                 include_artifacts: Some(true),
@@ -338,6 +343,19 @@ async fn rest_transport_end_to_end() {
         .unwrap();
     assert_eq!(canceled.status.state, TaskState::Canceled);
 
+    let subscribed = transport
+        .subscribe_to_task(
+            &ServiceParams::new(),
+            &SubscribeToTaskRequest {
+                id: "task-1".to_string(),
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    let events: Vec<_> = subscribed.collect().await;
+    assert_eq!(events.len(), 1);
+
     let created = transport
         .create_push_config(
             &ServiceParams::new(),
@@ -349,7 +367,7 @@ async fn rest_transport_end_to_end() {
         )
         .await
         .unwrap();
-    assert_eq!(created.config.id.as_deref(), Some("cfg-1"));
+    assert_eq!(created.task_id, "task-1");
 
     let fetched = transport
         .get_push_config(
@@ -369,8 +387,8 @@ async fn rest_transport_end_to_end() {
             &ServiceParams::new(),
             &ListTaskPushNotificationConfigsRequest {
                 task_id: "task-1".to_string(),
-                page_size: Some(10),
-                page_token: Some("token-1".to_string()),
+                page_size: Some(5),
+                page_token: Some("page-1".to_string()),
                 tenant: None,
             },
         )
@@ -390,67 +408,21 @@ async fn rest_transport_end_to_end() {
         .await
         .unwrap();
 
-    let card = transport
-        .get_extended_agent_card(
-            &ServiceParams::new(),
-            &GetExtendedAgentCardRequest { tenant: None },
-        )
+    let resolver = AgentCardResolver::new(Client::new());
+    let card = resolver
+        .resolve(format!("{base_url}{WELL_KNOWN_AGENT_CARD_PATH}"))
         .await
         .unwrap();
     assert_eq!(card.name, "Test Agent");
 
-    transport.destroy().await.unwrap();
-    handle.abort();
-}
-
-#[tokio::test]
-async fn rest_transport_streaming_and_error_paths() {
-    let (base_url, handle) = spawn_http_server().await;
-    let transport = RestTransport::new(Client::new(), format!("{base_url}/rest"));
-
-    let stream = transport
-        .send_streaming_message(&ServiceParams::new(), &send_message_request())
-        .await
-        .unwrap();
-    let events: Vec<_> = stream.collect().await;
-    assert_eq!(events.len(), 2);
-    assert!(matches!(events[0].as_ref().unwrap(), StreamResponse::StatusUpdate(_)));
-
-    let subscribe_stream = transport
-        .subscribe_to_task(
-            &ServiceParams::new(),
-            &SubscribeToTaskRequest {
-                id: "task-1".to_string(),
-                tenant: None,
-            },
-        )
-        .await
-        .unwrap();
-    let subscribe_events: Vec<_> = subscribe_stream.collect().await;
-    assert_eq!(subscribe_events.len(), 1);
-
-    let err = transport
-        .get_task(
-            &ServiceParams::new(),
-            &GetTaskRequest {
-                id: "missing".to_string(),
-                history_length: None,
-                tenant: None,
-            },
-        )
+    let err = resolver
+        .resolve(format!("{base_url}/bad/.well-known/agent-card.json"))
         .await
         .unwrap_err();
     assert_eq!(err.code, error_code::INTERNAL_ERROR);
 
-    let err = transport
-        .delete_push_config(
-            &ServiceParams::new(),
-            &DeleteTaskPushNotificationConfigRequest {
-                task_id: "task-1".to_string(),
-                id: "missing".to_string(),
-                tenant: None,
-            },
-        )
+    let err = resolver
+        .resolve(format!("{base_url}/missing/.well-known/agent-card.json"))
         .await
         .unwrap_err();
     assert_eq!(err.code, error_code::INTERNAL_ERROR);
@@ -463,15 +435,24 @@ async fn jsonrpc_transport_end_to_end() {
     let (base_url, handle) = spawn_http_server().await;
     let transport = JsonRpcTransport::new(Client::new(), format!("{base_url}/rpc"));
 
-    let send_resp = transport.send_message(&ServiceParams::new(), &send_message_request()).await;
+    let send_resp = transport
+        .send_message(&ServiceParams::new(), &send_message_request())
+        .await;
     assert!(matches!(send_resp.unwrap(), SendMessageResponse::Task(_)));
+
+    let stream = transport
+        .send_streaming_message(&ServiceParams::new(), &send_message_request())
+        .await
+        .unwrap();
+    let items: Vec<_> = stream.collect().await;
+    assert_eq!(items.len(), 2);
 
     let task = transport
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
                 id: "task-1".to_string(),
-                history_length: None,
+                history_length: Some(2),
                 tenant: None,
             },
         )
@@ -479,17 +460,30 @@ async fn jsonrpc_transport_end_to_end() {
         .unwrap();
     assert_eq!(task.id, "task-1");
 
+    let not_found = transport
+        .get_task(
+            &ServiceParams::new(),
+            &GetTaskRequest {
+                id: "missing".to_string(),
+                history_length: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(not_found.code, error_code::TASK_NOT_FOUND);
+
     let list = transport
         .list_tasks(
             &ServiceParams::new(),
             &ListTasksRequest {
-                context_id: None,
-                status: None,
-                page_size: None,
-                page_token: None,
-                history_length: None,
+                context_id: Some("ctx-1".to_string()),
+                status: Some(TaskState::Completed),
+                page_size: Some(10),
+                page_token: Some("page-1".to_string()),
+                history_length: Some(1),
                 status_timestamp_after: None,
-                include_artifacts: None,
+                include_artifacts: Some(true),
                 tenant: None,
             },
         )
@@ -510,6 +504,44 @@ async fn jsonrpc_transport_end_to_end() {
         .unwrap();
     assert_eq!(canceled.status.state, TaskState::Canceled);
 
+    let cancel_missing = transport
+        .cancel_task(
+            &ServiceParams::new(),
+            &CancelTaskRequest {
+                id: "missing".to_string(),
+                metadata: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(cancel_missing.code, error_code::TASK_NOT_FOUND);
+
+    let subscribed = transport
+        .subscribe_to_task(
+            &ServiceParams::new(),
+            &SubscribeToTaskRequest {
+                id: "task-1".to_string(),
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    let events: Vec<_> = subscribed.collect().await;
+    assert_eq!(events.len(), 1);
+
+    let subscribe_missing = transport
+        .subscribe_to_task(
+            &ServiceParams::new(),
+            &SubscribeToTaskRequest {
+                id: "missing".to_string(),
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(subscribe_missing.code, error_code::TASK_NOT_FOUND);
+
     let created = transport
         .create_push_config(
             &ServiceParams::new(),
@@ -521,7 +553,20 @@ async fn jsonrpc_transport_end_to_end() {
         )
         .await
         .unwrap();
-    assert_eq!(created.config.id.as_deref(), Some("cfg-1"));
+    assert_eq!(created.task_id, "task-1");
+
+    let created_missing = transport
+        .create_push_config(
+            &ServiceParams::new(),
+            &CreateTaskPushNotificationConfigRequest {
+                task_id: "missing".to_string(),
+                config: sample_push_config("cfg-1").config,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(created_missing.code, error_code::TASK_NOT_FOUND);
 
     let fetched = transport
         .get_push_config(
@@ -536,19 +581,32 @@ async fn jsonrpc_transport_end_to_end() {
         .unwrap();
     assert_eq!(fetched.config.id.as_deref(), Some("cfg-1"));
 
-    let configs = transport
+    let fetched_missing = transport
+        .get_push_config(
+            &ServiceParams::new(),
+            &GetTaskPushNotificationConfigRequest {
+                task_id: "task-1".to_string(),
+                id: "missing".to_string(),
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(fetched_missing.code, error_code::TASK_NOT_FOUND);
+
+    let listed = transport
         .list_push_configs(
             &ServiceParams::new(),
             &ListTaskPushNotificationConfigsRequest {
                 task_id: "task-1".to_string(),
-                page_size: None,
-                page_token: None,
+                page_size: Some(5),
+                page_token: Some("page-1".to_string()),
                 tenant: None,
             },
         )
         .await
         .unwrap();
-    assert_eq!(configs.configs.len(), 1);
+    assert_eq!(listed.configs.len(), 1);
 
     transport
         .delete_push_config(
@@ -562,59 +620,7 @@ async fn jsonrpc_transport_end_to_end() {
         .await
         .unwrap();
 
-    let card = transport
-        .get_extended_agent_card(
-            &ServiceParams::new(),
-            &GetExtendedAgentCardRequest { tenant: None },
-        )
-        .await
-        .unwrap();
-    assert_eq!(card.name, "Test Agent");
-
-    transport.destroy().await.unwrap();
-    handle.abort();
-}
-
-#[tokio::test]
-async fn jsonrpc_transport_streaming_and_error_paths() {
-    let (base_url, handle) = spawn_http_server().await;
-    let transport = JsonRpcTransport::new(Client::new(), format!("{base_url}/rpc"));
-
-    let stream = transport
-        .send_streaming_message(&ServiceParams::new(), &send_message_request())
-        .await
-        .unwrap();
-    let events: Vec<_> = stream.collect().await;
-    assert_eq!(events.len(), 2);
-    assert!(matches!(events[0].as_ref().unwrap(), StreamResponse::StatusUpdate(_)));
-
-    let subscribe_stream = transport
-        .subscribe_to_task(
-            &ServiceParams::new(),
-            &SubscribeToTaskRequest {
-                id: "task-1".to_string(),
-                tenant: None,
-            },
-        )
-        .await
-        .unwrap();
-    let subscribe_events: Vec<_> = subscribe_stream.collect().await;
-    assert_eq!(subscribe_events.len(), 1);
-
-    let err = transport
-        .get_task(
-            &ServiceParams::new(),
-            &GetTaskRequest {
-                id: "missing".to_string(),
-                history_length: None,
-                tenant: None,
-            },
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(err.code, error_code::TASK_NOT_FOUND);
-
-    let err = transport
+    let delete_missing = transport
         .delete_push_config(
             &ServiceParams::new(),
             &DeleteTaskPushNotificationConfigRequest {
@@ -625,24 +631,16 @@ async fn jsonrpc_transport_streaming_and_error_paths() {
         )
         .await
         .unwrap_err();
-    assert_eq!(err.code, error_code::TASK_NOT_FOUND);
+    assert_eq!(delete_missing.code, error_code::TASK_NOT_FOUND);
 
-    handle.abort();
-}
-
-#[tokio::test]
-async fn agent_card_resolver_reports_success_and_failures() {
-    let (base_url, handle) = spawn_http_server().await;
-    let resolver = AgentCardResolver::new(None);
-
-    let card = resolver.resolve(&base_url).await.unwrap();
+    let card = transport
+        .get_extended_agent_card(
+            &ServiceParams::new(),
+            &GetExtendedAgentCardRequest { tenant: None },
+        )
+        .await
+        .unwrap();
     assert_eq!(card.name, "Test Agent");
-
-    let err = resolver.resolve(&format!("{base_url}/missing")).await.unwrap_err();
-    assert_eq!(err.code, error_code::INTERNAL_ERROR);
-
-    let err = resolver.resolve(&format!("{base_url}/bad")).await.unwrap_err();
-    assert_eq!(err.code, error_code::INTERNAL_ERROR);
 
     handle.abort();
 }

@@ -204,8 +204,8 @@ fn parse_error(e: serde_json::Error) -> A2AError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::DefaultRequestHandler;
     use crate::executor::ExecutorContext;
+    use crate::handler::DefaultRequestHandler;
     use crate::task_store::InMemoryTaskStore;
     use axum::body::Body;
     use axum::http::Request;
@@ -432,11 +432,7 @@ mod tests {
                 "parts": [{"text": "hello"}]
             }
         });
-        let rpc = JsonRpcRequest::new(
-            JsonRpcId::Number(1),
-            "message.stream",
-            Some(body),
-        );
+        let rpc = JsonRpcRequest::new(JsonRpcId::Number(1), "message.stream", Some(body));
         let req = Request::builder()
             .uri("/")
             .method("POST")

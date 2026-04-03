@@ -1,11 +1,14 @@
 [package]
-name = "a2a"
+name = "agntcy-a2a"
 version = "0.2.0"
 description = "A2A v1 protocol types and core definitions"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "a2a"
 
 [dependencies]
 serde = { workspace = true }

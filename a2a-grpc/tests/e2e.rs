@@ -10,8 +10,8 @@ use a2a_grpc::{GrpcHandler, GrpcTransport, GrpcTransportFactory};
 use a2a_pb::proto::a2a_service_server::A2aServiceServer;
 use a2a_server::{RequestHandler, ServiceParams};
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream};
 use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -111,7 +111,10 @@ impl RequestHandler for TestHandler {
                 },
                 metadata: None,
             })),
-            Ok(StreamResponse::Task(sample_task("task-1", TaskState::Completed))),
+            Ok(StreamResponse::Task(sample_task(
+                "task-1",
+                TaskState::Completed,
+            ))),
         ])))
     }
 
@@ -273,7 +276,9 @@ async fn grpc_transport_end_to_end() {
     let (endpoint, handle) = spawn_grpc_server().await;
     let transport = GrpcTransport::connect(endpoint).await.unwrap();
 
-    let send_resp = transport.send_message(&ServiceParams::new(), &send_message_request()).await;
+    let send_resp = transport
+        .send_message(&ServiceParams::new(), &send_message_request())
+        .await;
     assert!(matches!(send_resp.unwrap(), SendMessageResponse::Task(_)));
 
     let task = transport
@@ -396,7 +401,10 @@ async fn grpc_transport_streaming_and_error_paths() {
         .unwrap();
     let events: Vec<_> = stream.collect().await;
     assert_eq!(events.len(), 2);
-    assert!(matches!(events[0].as_ref().unwrap(), StreamResponse::StatusUpdate(_)));
+    assert!(matches!(
+        events[0].as_ref().unwrap(),
+        StreamResponse::StatusUpdate(_)
+    ));
 
     let subscribe_stream = transport
         .subscribe_to_task(

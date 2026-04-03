@@ -3,6 +3,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use a2a::{A2AError, StreamResponse};
 use a2a_pb::pbconv;
 use a2a_pb::proto;
 use a2a_pb::proto::a2a_service_server::A2aService;
@@ -50,6 +51,16 @@ fn extract_service_params(
     params
 }
 
+#[allow(clippy::result_large_err)]
+fn map_proto_stream_item(
+    item: Result<StreamResponse, A2AError>,
+) -> Result<proto::StreamResponse, tonic::Status> {
+    match item {
+        Ok(response) => Ok(pbconv::to_proto_stream_response(&response)),
+        Err(error) => Err(a2a_error_to_status(&error)),
+    }
+}
+
 #[tonic::async_trait]
 impl<H: RequestHandler> A2aService for GrpcHandler<H> {
     async fn send_message(
@@ -81,10 +92,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
             .send_streaming_message(&params, native_req)
             .await
             .map_err(|e| a2a_error_to_status(&e))?;
-        let proto_stream = stream.map(|item| match item {
-            Ok(sr) => Ok(pbconv::to_proto_stream_response(&sr)),
-            Err(e) => Err(a2a_error_to_status(&e)),
-        });
+        let proto_stream = stream.map(map_proto_stream_item);
         Ok(tonic::Response::new(Box::pin(proto_stream)))
     }
 
@@ -145,10 +153,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
             .subscribe_to_task(&params, native_req)
             .await
             .map_err(|e| a2a_error_to_status(&e))?;
-        let proto_stream = stream.map(|item| match item {
-            Ok(sr) => Ok(pbconv::to_proto_stream_response(&sr)),
-            Err(e) => Err(a2a_error_to_status(&e)),
-        });
+        let proto_stream = stream.map(map_proto_stream_item);
         Ok(tonic::Response::new(Box::pin(proto_stream)))
     }
 
@@ -268,19 +273,15 @@ mod tests {
             fn execute(
                 &self,
                 _ctx: a2a_server::executor::ExecutorContext,
-            ) -> futures::stream::BoxStream<
-                'static,
-                Result<a2a::event::StreamResponse, A2AError>,
-            > {
+            ) -> futures::stream::BoxStream<'static, Result<a2a::event::StreamResponse, A2AError>>
+            {
                 Box::pin(futures::stream::empty())
             }
             fn cancel(
                 &self,
                 _ctx: a2a_server::executor::ExecutorContext,
-            ) -> futures::stream::BoxStream<
-                'static,
-                Result<a2a::event::StreamResponse, A2AError>,
-            > {
+            ) -> futures::stream::BoxStream<'static, Result<a2a::event::StreamResponse, A2AError>>
+            {
                 Box::pin(futures::stream::empty())
             }
         }

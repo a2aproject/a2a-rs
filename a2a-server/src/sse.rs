@@ -58,7 +58,9 @@ mod tests {
     #[tokio::test]
     async fn test_sse_from_stream_ok() {
         let s: BoxStream<'static, Result<serde_json::Value, A2AError>> =
-            Box::pin(stream::once(async { Ok(serde_json::json!({"key": "value"})) }));
+            Box::pin(stream::once(async {
+                Ok(serde_json::json!({"key": "value"}))
+            }));
         let sse = sse_from_stream(s);
         let resp = sse.into_response();
         assert_eq!(resp.status(), 200);
@@ -83,7 +85,9 @@ mod tests {
     #[tokio::test]
     async fn test_sse_jsonrpc_stream_ok() {
         let s: BoxStream<'static, Result<serde_json::Value, A2AError>> =
-            Box::pin(stream::once(async { Ok(serde_json::json!({"status": "ok"})) }));
+            Box::pin(stream::once(async {
+                Ok(serde_json::json!({"status": "ok"}))
+            }));
         let sse = sse_jsonrpc_stream(JsonRpcId::Number(1), s);
         let resp = sse.into_response();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -107,19 +111,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_sse_jsonrpc_stream_multiple_events() {
-        let s: BoxStream<'static, Result<serde_json::Value, A2AError>> = Box::pin(stream::iter(
-            vec![
+        let s: BoxStream<'static, Result<serde_json::Value, A2AError>> =
+            Box::pin(stream::iter(vec![
                 Ok(serde_json::json!({"n": 1})),
                 Ok(serde_json::json!({"n": 2})),
                 Err(A2AError::internal("done")),
-            ],
-        ));
+            ]));
         let sse = sse_jsonrpc_stream(JsonRpcId::String("req-1".into()), s);
         let resp = sse.into_response();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         // Should contain multiple data lines
         let data_count = body_str.matches("data:").count();
-        assert!(data_count >= 3, "expected >= 3 data lines, got {data_count}");
+        assert!(
+            data_count >= 3,
+            "expected >= 3 data lines, got {data_count}"
+        );
     }
 }

@@ -1,11 +1,14 @@
 [package]
-name = "a2a-server"
+name = "agntcy-a2a-server"
 version = "0.1.0"
 description = "A2A v1 async server framework"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "a2a_server"
 
 [dependencies]
 a2a = { workspace = true }

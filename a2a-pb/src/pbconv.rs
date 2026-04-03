@@ -2248,7 +2248,10 @@ mod tests {
     #[test]
     fn test_security_requirement_roundtrip() {
         let mut req: SecurityRequirement = HashMap::new();
-        req.insert("oauth2".to_string(), vec!["read".to_string(), "write".to_string()]);
+        req.insert(
+            "oauth2".to_string(),
+            vec!["read".to_string(), "write".to_string()],
+        );
         req.insert("api_key".to_string(), vec![]);
         let proto = to_proto_security_requirement(&req);
         let back = from_proto_security_requirement(&proto);

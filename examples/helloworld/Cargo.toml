@@ -14,3 +14,8 @@ axum = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+a2a-client = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }

@@ -271,8 +271,8 @@ fn rest_error_response(err: A2AError) -> axum::response::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::DefaultRequestHandler;
     use crate::executor::ExecutorContext;
+    use crate::handler::DefaultRequestHandler;
     use crate::task_store::InMemoryTaskStore;
     use axum::body::Body;
     use axum::http::Request;
@@ -542,7 +542,7 @@ mod tests {
 
         let app = make_app();
         let req = Request::builder()
-            .uri(&format!("/tasks/{}?historyLength=5", task_id))
+            .uri(format!("/tasks/{}?historyLength=5", task_id))
             .method("GET")
             .body(Body::empty())
             .unwrap();

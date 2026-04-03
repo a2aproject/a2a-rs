@@ -364,9 +364,7 @@ mod tests {
                 history: None,
                 metadata: None,
             };
-            Box::pin(stream::once(async move {
-                Ok(StreamResponse::Task(task))
-            }))
+            Box::pin(stream::once(async move { Ok(StreamResponse::Task(task)) }))
         }
 
         fn cancel(
@@ -385,9 +383,7 @@ mod tests {
                 history: None,
                 metadata: None,
             };
-            Box::pin(stream::once(async move {
-                Ok(StreamResponse::Task(task))
-            }))
+            Box::pin(stream::once(async move { Ok(StreamResponse::Task(task)) }))
         }
     }
 
@@ -429,10 +425,7 @@ mod tests {
             metadata: None,
             tenant: None,
         };
-        let mut stream = handler
-            .send_streaming_message(&params, req)
-            .await
-            .unwrap();
+        let mut stream = handler.send_streaming_message(&params, req).await.unwrap();
         let event = stream.next().await.unwrap().unwrap();
         assert!(matches!(event, StreamResponse::Task(_)));
     }

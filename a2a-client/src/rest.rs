@@ -216,7 +216,7 @@ impl Transport for RestTransport {
             params,
             &req.config,
         )
-            .await
+        .await
     }
 
     async fn get_push_config(

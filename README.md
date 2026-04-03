@@ -98,11 +98,11 @@ Until the crates are published, depend on them directly from Git:
 
 ```toml
 [dependencies]
-a2a = { git = "https://github.com/agntcy/a2a-rs.git" }
-a2a-client = { git = "https://github.com/agntcy/a2a-rs.git" }
-a2a-server = { git = "https://github.com/agntcy/a2a-rs.git" }
-a2a-pb = { git = "https://github.com/agntcy/a2a-rs.git" }
-a2a-grpc = { git = "https://github.com/agntcy/a2a-rs.git" }
+a2a = { package = "agntcy-a2a", git = "https://github.com/agntcy/a2a-rs.git" }
+a2a-client = { package = "agntcy-a2a-client", git = "https://github.com/agntcy/a2a-rs.git" }
+a2a-server = { package = "agntcy-a2a-server", git = "https://github.com/agntcy/a2a-rs.git" }
+a2a-pb = { package = "agntcy-a2a-pb", git = "https://github.com/agntcy/a2a-rs.git" }
+a2a-grpc = { package = "agntcy-a2a-grpc", git = "https://github.com/agntcy/a2a-rs.git" }
 ```
 
 Typical usage is:

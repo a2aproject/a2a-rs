@@ -346,7 +346,8 @@ impl Transport for JsonRpcTransport {
         let id = JsonRpcId::String(uuid::Uuid::now_v7().to_string());
         let request_params =
             serde_json::to_value(req).map_err(|e| A2AError::internal(e.to_string()))?;
-        let rpc_request = JsonRpcRequest::new(id, methods::DELETE_PUSH_CONFIG, Some(request_params));
+        let rpc_request =
+            JsonRpcRequest::new(id, methods::DELETE_PUSH_CONFIG, Some(request_params));
 
         let mut builder = self.client.post(&self.endpoint);
         for (key, values) in params {
