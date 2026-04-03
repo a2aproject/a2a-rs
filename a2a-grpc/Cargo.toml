@@ -2,6 +2,7 @@
 name = "agntcy-a2a-grpc"
 version = "0.1.0"
 description = "A2A v1 gRPC protocol binding for client and server"
+readme = "README.md"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
