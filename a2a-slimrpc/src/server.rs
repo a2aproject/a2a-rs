@@ -152,7 +152,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
                     Ok(())
                 })
             },
-            |_| Vec::new(),
+            |_| vec![0],
         );
     }
 }

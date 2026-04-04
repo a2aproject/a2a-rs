@@ -378,6 +378,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_slimrpc_target_slim_scheme_and_leading_slash() {
+        let name = parse_slimrpc_target("slim://org/namespace/agent").unwrap();
+        assert_eq!(name.components(), vec!["org", "namespace", "agent"]);
+
+        let name = parse_slimrpc_target("/org/namespace/agent").unwrap();
+        assert_eq!(name.components(), vec!["org", "namespace", "agent"]);
+    }
+
+    #[test]
     fn test_parse_slimrpc_target_invalid() {
         let error = parse_slimrpc_target("not-a-valid-target").unwrap_err();
         assert_eq!(error.code, a2a::error_code::INVALID_PARAMS);

@@ -105,4 +105,49 @@ mod tests {
     fn test_service_params_to_metadata_opt_empty() {
         assert!(service_params_to_metadata_opt(&ServiceParamsMap::new()).is_none());
     }
+
+    #[test]
+    fn test_service_params_to_metadata_opt_non_empty() {
+        let params = ServiceParamsMap::from([(
+            "x-test".to_string(),
+            vec!["one".to_string(), "two".to_string()],
+        )]);
+
+        let metadata = service_params_to_metadata_opt(&params).unwrap();
+        assert_eq!(metadata.get("x-test"), Some(&"one, two".to_string()));
+    }
+
+    #[test]
+    fn test_context_to_service_params_filters_internal_metadata() {
+        let context = Context::for_rpc(None, None).with_message_metadata(std::collections::HashMap::from([
+            (DEADLINE_KEY.to_string(), "1".to_string()),
+            (STATUS_CODE_KEY.to_string(), "0".to_string()),
+            ("rpc-id".to_string(), "abc".to_string()),
+            ("service".to_string(), "svc".to_string()),
+            ("method".to_string(), "m".to_string()),
+            ("x-user".to_string(), "value".to_string()),
+        ]));
+
+        let params = context_to_service_params(&context);
+        assert_eq!(params.get("x-user"), Some(&vec!["value".to_string()]));
+        assert!(!params.contains_key(DEADLINE_KEY));
+        assert!(!params.contains_key(STATUS_CODE_KEY));
+        assert!(!params.contains_key("rpc-id"));
+        assert!(!params.contains_key("service"));
+        assert!(!params.contains_key("method"));
+    }
+
+    #[test]
+    fn test_decode_proto_response_invalid_payload() {
+        let error = decode_proto_response::<a2a_pb::proto::Task>(vec![0xff], "Task").unwrap_err();
+        assert_eq!(error.code, a2a::error_code::INTERNAL_ERROR);
+        assert!(error.message.contains("invalid Task payload"));
+    }
+
+    #[test]
+    fn test_decode_proto_request_invalid_payload() {
+        let error = decode_proto_request::<a2a_pb::proto::Task>(vec![0xff], "Task").unwrap_err();
+        assert_eq!(error.code(), slim_bindings::RpcCode::InvalidArgument);
+        assert!(error.message().contains("invalid Task payload"));
+    }
 }

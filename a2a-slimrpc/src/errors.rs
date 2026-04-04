@@ -97,4 +97,39 @@ mod tests {
             assert_eq!(rpc_error_to_a2a_error(&error).code, expected);
         }
     }
+
+    #[test]
+    fn test_a2a_error_to_rpc_error_extended_mapping() {
+        let cases = [
+            (error_code::EXTENSION_SUPPORT_REQUIRED, RpcCode::FailedPrecondition),
+            (error_code::VERSION_NOT_SUPPORTED, RpcCode::FailedPrecondition),
+            (
+                error_code::EXTENDED_CARD_NOT_CONFIGURED,
+                RpcCode::Unimplemented,
+            ),
+            (error_code::PARSE_ERROR, RpcCode::InvalidArgument),
+            (error_code::INVALID_REQUEST, RpcCode::InvalidArgument),
+            (123_456, RpcCode::Unknown),
+        ];
+
+        for (code, expected) in cases {
+            let error = A2AError::new(code, "test");
+            assert_eq!(a2a_error_to_rpc_error(&error).code(), expected);
+        }
+    }
+
+    #[test]
+    fn test_rpc_error_to_a2a_error_extended_mapping() {
+        let cases = [
+            (RpcCode::DeadlineExceeded, error_code::INTERNAL_ERROR),
+            (RpcCode::Unavailable, error_code::INTERNAL_ERROR),
+            (RpcCode::Unauthenticated, error_code::INTERNAL_ERROR),
+            (RpcCode::Unknown, error_code::INTERNAL_ERROR),
+        ];
+
+        for (rpc_code, expected) in cases {
+            let error = slim_bindings::RpcError::new(rpc_code, "test");
+            assert_eq!(rpc_error_to_a2a_error(&error).code, expected);
+        }
+    }
 }
