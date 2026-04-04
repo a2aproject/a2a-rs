@@ -1,6 +1,6 @@
 [package]
 name = "agntcy-a2a"
-version = "0.2.2"
+version = "0.2.3"
 description = "A2A v1 protocol types and core definitions"
 readme = "README.md"
 edition.workspace = true

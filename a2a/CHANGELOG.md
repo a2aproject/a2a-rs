@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-v0.2.2...agntcy-a2a-v0.2.3) - 2026-04-04
+
+### Added
+
+- add SLIMRPC transport binding
+
+### Fixed
+
+- drop dotted jsonrpc aliases
+- align jsonrpc and agent-card interop
+
 ## [0.2.2](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-v0.2.1...agntcy-a2a-v0.2.2) - 2026-04-03
 
 ### Other

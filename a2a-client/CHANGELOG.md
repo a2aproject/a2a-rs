@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-client-v0.1.5...agntcy-a2a-client-v0.1.6) - 2026-04-04
+
+### Fixed
+
+- drop dotted jsonrpc aliases
+- align jsonrpc and agent-card interop
+
 ## [0.1.5](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-client-v0.1.4...agntcy-a2a-client-v0.1.5) - 2026-04-03
 
 ### Other
