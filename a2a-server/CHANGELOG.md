@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-server-v0.1.3...agntcy-a2a-server-v0.2.0) - 2026-04-04
+
+### Fixed
+
+- align HTTP+JSON REST interop
+
 ## [0.1.3](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-server-v0.1.2...agntcy-a2a-server-v0.1.3) - 2026-04-04
 
 ### Fixed
