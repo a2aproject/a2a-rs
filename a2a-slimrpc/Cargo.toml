@@ -1,0 +1,26 @@
+[package]
+name = "agntcy-a2a-slimrpc"
+version = "0.1.0"
+description = "A2A v1 SLIMRPC protocol binding for client and server"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "a2a_slimrpc"
+
+[dependencies]
+a2a = { workspace = true }
+a2a-client = { workspace = true }
+a2a-server = { workspace = true }
+a2a-pb = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+slim_bindings = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

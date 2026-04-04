@@ -1,4 +1,4 @@
-# a2a-rs
+# A2A Rust SDK
 
 [![CI](https://github.com/agntcy/a2a-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/agntcy/a2a-rs/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/agntcy/a2a-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/agntcy/a2a-rs)
@@ -15,6 +15,7 @@ The workspace supports:
 - JSON-RPC 2.0 over HTTP
 - REST / HTTP+JSON
 - gRPC via `tonic`
+- SLIMRPC via `slim_bindings`
 - Server-Sent Events for streaming responses
 - Protobuf-based interop with other SDKs and runtimes
 
@@ -27,6 +28,7 @@ The workspace supports:
 | `a2a-server` | Async server framework with REST and JSON-RPC bindings built on `axum` |
 | `a2a-pb` | Protobuf schema, generated types, and native <-> protobuf conversion helpers |
 | `a2a-grpc` | gRPC client and server bindings built on `tonic` |
+| `a2a-slimrpc` | SLIMRPC client and server bindings built on `slim_bindings` |
 | `examples/helloworld` | Minimal runnable example agent |
 
 ## Supported Bindings
@@ -36,6 +38,7 @@ The workspace supports:
 | JSON-RPC | `a2a-client` | `a2a-server` |
 | HTTP+JSON / REST | `a2a-client` | `a2a-server` |
 | gRPC | `a2a-grpc` | `a2a-grpc` |
+| SLIMRPC | `a2a-slimrpc` | `a2a-slimrpc` |
 
 The gRPC support uses the schema in `a2a-pb/proto/a2a.proto`. The REST and
 JSON-RPC bindings are intended to stay wire-compatible with other A2A SDKs,
@@ -109,6 +112,7 @@ a2a-client = { package = "agntcy-a2a-client", git = "https://github.com/agntcy/a
 a2a-server = { package = "agntcy-a2a-server", git = "https://github.com/agntcy/a2a-rs.git" }
 a2a-pb = { package = "agntcy-a2a-pb", git = "https://github.com/agntcy/a2a-rs.git" }
 a2a-grpc = { package = "agntcy-a2a-grpc", git = "https://github.com/agntcy/a2a-rs.git" }
+a2a-slimrpc = { package = "agntcy-a2a-slimrpc", git = "https://github.com/agntcy/a2a-rs.git" }
 ```
 
 Typical usage is:
@@ -117,6 +121,7 @@ Typical usage is:
 - `a2a-client` for clients that negotiate REST or JSON-RPC from an agent card
 - `a2a-server` for agent implementations on `axum`
 - `a2a-grpc` when you need gRPC transport support
+- `a2a-slimrpc` when you need SLIMRPC transport support
 - `a2a-pb` when you need direct access to protobuf messages or conversion helpers
 
 ## Repository Layout
@@ -126,6 +131,7 @@ Typical usage is:
 - `a2a-server/`: request handler, routers, streaming, and stores
 - `a2a-pb/`: protobuf schema and conversion layer
 - `a2a-grpc/`: tonic-based bindings
+- `a2a-slimrpc/`: SLIMRPC bindings
 - `examples/helloworld/`: runnable sample agent
 
 ## Contributing
