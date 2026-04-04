@@ -60,37 +60,33 @@ async fn handle_unary_request<H: RequestHandler>(
 ) -> axum::response::Response {
     let id = request.id.clone();
     let raw_params = request.params.clone().unwrap_or(Value::Null);
-    let canonical_method = methods::canonical_name(request.method.as_str());
 
-    let result: Result<Value, A2AError> = match canonical_method {
-        Some(methods::SEND_MESSAGE) => {
-            match serde_json::from_value::<SendMessageRequest>(raw_params) {
-                Ok(req) => state.handler.send_message(params, req).await.and_then(|r| {
-                    serde_json::to_value(r).map_err(|e| A2AError::internal(e.to_string()))
-                }),
-                Err(e) => Err(parse_error(e)),
-            }
-        }
-        Some(methods::GET_TASK) => match serde_json::from_value::<GetTaskRequest>(raw_params) {
+    let result: Result<Value, A2AError> = match request.method.as_str() {
+        methods::SEND_MESSAGE => match serde_json::from_value::<SendMessageRequest>(raw_params) {
+            Ok(req) => state.handler.send_message(params, req).await.and_then(|r| {
+                serde_json::to_value(r).map_err(|e| A2AError::internal(e.to_string()))
+            }),
+            Err(e) => Err(parse_error(e)),
+        },
+        methods::GET_TASK => match serde_json::from_value::<GetTaskRequest>(raw_params) {
             Ok(req) => state.handler.get_task(params, req).await.and_then(|r| {
                 serde_json::to_value(r).map_err(|e| A2AError::internal(e.to_string()))
             }),
             Err(e) => Err(parse_error(e)),
         },
-        Some(methods::LIST_TASKS) => match serde_json::from_value::<ListTasksRequest>(raw_params) {
+        methods::LIST_TASKS => match serde_json::from_value::<ListTasksRequest>(raw_params) {
             Ok(req) => state.handler.list_tasks(params, req).await.and_then(|r| {
                 serde_json::to_value(r).map_err(|e| A2AError::internal(e.to_string()))
             }),
             Err(e) => Err(parse_error(e)),
         },
-        Some(methods::CANCEL_TASK) => match serde_json::from_value::<CancelTaskRequest>(raw_params)
-        {
+        methods::CANCEL_TASK => match serde_json::from_value::<CancelTaskRequest>(raw_params) {
             Ok(req) => state.handler.cancel_task(params, req).await.and_then(|r| {
                 serde_json::to_value(r).map_err(|e| A2AError::internal(e.to_string()))
             }),
             Err(e) => Err(parse_error(e)),
         },
-        Some(methods::CREATE_PUSH_CONFIG) => {
+        methods::CREATE_PUSH_CONFIG => {
             match serde_json::from_value::<CreateTaskPushNotificationConfigRequest>(raw_params) {
                 Ok(req) => state
                     .handler
@@ -102,7 +98,7 @@ async fn handle_unary_request<H: RequestHandler>(
                 Err(e) => Err(parse_error(e)),
             }
         }
-        Some(methods::GET_PUSH_CONFIG) => {
+        methods::GET_PUSH_CONFIG => {
             match serde_json::from_value::<GetTaskPushNotificationConfigRequest>(raw_params) {
                 Ok(req) => state
                     .handler
@@ -114,7 +110,7 @@ async fn handle_unary_request<H: RequestHandler>(
                 Err(e) => Err(parse_error(e)),
             }
         }
-        Some(methods::LIST_PUSH_CONFIGS) => {
+        methods::LIST_PUSH_CONFIGS => {
             match serde_json::from_value::<ListTaskPushNotificationConfigsRequest>(raw_params) {
                 Ok(req) => state
                     .handler
@@ -126,7 +122,7 @@ async fn handle_unary_request<H: RequestHandler>(
                 Err(e) => Err(parse_error(e)),
             }
         }
-        Some(methods::DELETE_PUSH_CONFIG) => {
+        methods::DELETE_PUSH_CONFIG => {
             match serde_json::from_value::<DeleteTaskPushNotificationConfigRequest>(raw_params) {
                 Ok(req) => state
                     .handler
@@ -136,7 +132,7 @@ async fn handle_unary_request<H: RequestHandler>(
                 Err(e) => Err(parse_error(e)),
             }
         }
-        Some(methods::GET_EXTENDED_AGENT_CARD) => {
+        methods::GET_EXTENDED_AGENT_CARD => {
             match serde_json::from_value::<GetExtendedAgentCardRequest>(raw_params) {
                 Ok(req) => state
                     .handler
@@ -148,9 +144,8 @@ async fn handle_unary_request<H: RequestHandler>(
                 Err(e) => Err(parse_error(e)),
             }
         }
-        Some(_) => unreachable!("unknown canonical method"),
-        None if request.method.is_empty() => Err(A2AError::invalid_request("method is required")),
-        None => Err(A2AError::method_not_found(&request.method)),
+        "" => Err(A2AError::invalid_request("method is required")),
+        _ => Err(A2AError::method_not_found(&request.method)),
     };
 
     match result {
@@ -170,8 +165,8 @@ async fn handle_streaming_request<H: RequestHandler>(
     let id = request.id.clone();
     let raw_params = request.params.clone().unwrap_or(Value::Null);
 
-    match methods::canonical_name(request.method.as_str()) {
-        Some(methods::SEND_STREAMING_MESSAGE) => {
+    match request.method.as_str() {
+        methods::SEND_STREAMING_MESSAGE => {
             match serde_json::from_value::<SendMessageRequest>(raw_params) {
                 Ok(req) => match state.handler.send_streaming_message(params, req).await {
                     Ok(stream) => sse::sse_jsonrpc_stream(id, stream).into_response(),
@@ -180,7 +175,7 @@ async fn handle_streaming_request<H: RequestHandler>(
                 Err(e) => error_response(id, parse_error(e)),
             }
         }
-        Some(methods::SUBSCRIBE_TO_TASK) => {
+        methods::SUBSCRIBE_TO_TASK => {
             match serde_json::from_value::<SubscribeToTaskRequest>(raw_params) {
                 Ok(req) => match state.handler.subscribe_to_task(params, req).await {
                     Ok(stream) => sse::sse_jsonrpc_stream(id, stream).into_response(),
@@ -302,7 +297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_message_legacy_method_alias() {
+    async fn test_send_message_legacy_method_rejected() {
         let app = make_app();
         let params = serde_json::json!({
             "message": {
@@ -311,9 +306,9 @@ mod tests {
                 "parts": [{"text": "hello"}]
             }
         });
-        let resp = post_jsonrpc(app, methods::LEGACY_SEND_MESSAGE, params).await;
-        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
-        assert!(resp.result.is_some());
+        let resp = post_jsonrpc(app, "message.send", params).await;
+        assert!(resp.error.is_some(), "unexpected result: {:?}", resp.result);
+        assert_eq!(resp.error.unwrap().code, error_code::METHOD_NOT_FOUND);
     }
 
     #[tokio::test]
@@ -489,7 +484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_streaming_send_message_legacy_method_alias() {
+    async fn test_streaming_send_message_legacy_method_rejected() {
         let app = make_app();
         let body = serde_json::json!({
             "message": {
@@ -498,11 +493,7 @@ mod tests {
                 "parts": [{"text": "hello"}]
             }
         });
-        let rpc = JsonRpcRequest::new(
-            JsonRpcId::Number(1),
-            methods::LEGACY_SEND_STREAMING_MESSAGE,
-            Some(body),
-        );
+        let rpc = JsonRpcRequest::new(JsonRpcId::Number(1), "message.stream", Some(body));
         let req = Request::builder()
             .uri("/")
             .method("POST")
@@ -511,7 +502,14 @@ mod tests {
             .body(Body::from(serde_json::to_string(&rpc).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            rpc_resp.error.is_some(),
+            "unexpected result: {:?}",
+            rpc_resp.result
+        );
+        assert_eq!(rpc_resp.error.unwrap().code, error_code::METHOD_NOT_FOUND);
     }
 
     #[tokio::test]

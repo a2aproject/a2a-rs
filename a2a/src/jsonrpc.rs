@@ -147,46 +147,25 @@ pub mod methods {
     pub const DELETE_PUSH_CONFIG: &str = "DeleteTaskPushNotificationConfig";
     pub const GET_EXTENDED_AGENT_CARD: &str = "GetExtendedAgentCard";
 
-    pub const LEGACY_SEND_MESSAGE: &str = "message.send";
-    pub const LEGACY_SEND_STREAMING_MESSAGE: &str = "message.stream";
-    pub const LEGACY_GET_TASK: &str = "tasks.get";
-    pub const LEGACY_LIST_TASKS: &str = "tasks.list";
-    pub const LEGACY_CANCEL_TASK: &str = "tasks.cancel";
-    pub const LEGACY_SUBSCRIBE_TO_TASK: &str = "tasks.resubscribe";
-    pub const LEGACY_CREATE_PUSH_CONFIG: &str = "push-config.set";
-    pub const LEGACY_GET_PUSH_CONFIG: &str = "push-config.get";
-    pub const LEGACY_LIST_PUSH_CONFIGS: &str = "push-config.list";
-    pub const LEGACY_DELETE_PUSH_CONFIG: &str = "push-config.delete";
-    pub const LEGACY_GET_EXTENDED_AGENT_CARD: &str = "agent-card.extended.get";
-
-    pub fn canonical_name(method: &str) -> Option<&'static str> {
-        match method {
-            SEND_MESSAGE | LEGACY_SEND_MESSAGE => Some(SEND_MESSAGE),
-            SEND_STREAMING_MESSAGE | LEGACY_SEND_STREAMING_MESSAGE => Some(SEND_STREAMING_MESSAGE),
-            GET_TASK | LEGACY_GET_TASK => Some(GET_TASK),
-            LIST_TASKS | LEGACY_LIST_TASKS => Some(LIST_TASKS),
-            CANCEL_TASK | LEGACY_CANCEL_TASK => Some(CANCEL_TASK),
-            SUBSCRIBE_TO_TASK | LEGACY_SUBSCRIBE_TO_TASK => Some(SUBSCRIBE_TO_TASK),
-            CREATE_PUSH_CONFIG | LEGACY_CREATE_PUSH_CONFIG => Some(CREATE_PUSH_CONFIG),
-            GET_PUSH_CONFIG | LEGACY_GET_PUSH_CONFIG => Some(GET_PUSH_CONFIG),
-            LIST_PUSH_CONFIGS | LEGACY_LIST_PUSH_CONFIGS => Some(LIST_PUSH_CONFIGS),
-            DELETE_PUSH_CONFIG | LEGACY_DELETE_PUSH_CONFIG => Some(DELETE_PUSH_CONFIG),
-            GET_EXTENDED_AGENT_CARD | LEGACY_GET_EXTENDED_AGENT_CARD => {
-                Some(GET_EXTENDED_AGENT_CARD)
-            }
-            _ => None,
-        }
-    }
-
     pub fn is_streaming(method: &str) -> bool {
-        matches!(
-            canonical_name(method),
-            Some(SEND_STREAMING_MESSAGE | SUBSCRIBE_TO_TASK)
-        )
+        matches!(method, SEND_STREAMING_MESSAGE | SUBSCRIBE_TO_TASK)
     }
 
     pub fn is_valid(method: &str) -> bool {
-        canonical_name(method).is_some()
+        matches!(
+            method,
+            SEND_MESSAGE
+                | SEND_STREAMING_MESSAGE
+                | GET_TASK
+                | LIST_TASKS
+                | CANCEL_TASK
+                | SUBSCRIBE_TO_TASK
+                | CREATE_PUSH_CONFIG
+                | GET_PUSH_CONFIG
+                | LIST_PUSH_CONFIGS
+                | DELETE_PUSH_CONFIG
+                | GET_EXTENDED_AGENT_CARD
+        )
     }
 }
 
@@ -309,62 +288,11 @@ mod tests {
     }
 
     #[test]
-    fn test_methods_canonical_name_accepts_legacy_aliases() {
-        assert_eq!(
-            methods::canonical_name(methods::LEGACY_SEND_MESSAGE),
-            Some(methods::SEND_MESSAGE)
-        );
-        assert_eq!(
-            methods::canonical_name(methods::LEGACY_SEND_STREAMING_MESSAGE),
-            Some(methods::SEND_STREAMING_MESSAGE)
-        );
-        assert_eq!(
-            methods::canonical_name(methods::LEGACY_GET_TASK),
-            Some(methods::GET_TASK)
-        );
-        assert_eq!(
-            methods::canonical_name(methods::LEGACY_LIST_TASKS),
-            Some(methods::LIST_TASKS)
-        );
-        assert_eq!(
-            methods::canonical_name(methods::LEGACY_CANCEL_TASK),
-            Some(methods::CANCEL_TASK)
-        );
-        assert_eq!(
-            methods::canonical_name(methods::LEGACY_SUBSCRIBE_TO_TASK),
-            Some(methods::SUBSCRIBE_TO_TASK)
-        );
-        assert_eq!(
-            methods::canonical_name(methods::LEGACY_CREATE_PUSH_CONFIG),
-            Some(methods::CREATE_PUSH_CONFIG)
-        );
-        assert_eq!(
-            methods::canonical_name(methods::LEGACY_GET_PUSH_CONFIG),
-            Some(methods::GET_PUSH_CONFIG)
-        );
-        assert_eq!(
-            methods::canonical_name(methods::LEGACY_LIST_PUSH_CONFIGS),
-            Some(methods::LIST_PUSH_CONFIGS)
-        );
-        assert_eq!(
-            methods::canonical_name(methods::LEGACY_DELETE_PUSH_CONFIG),
-            Some(methods::DELETE_PUSH_CONFIG)
-        );
-        assert_eq!(
-            methods::canonical_name(methods::LEGACY_GET_EXTENDED_AGENT_CARD),
-            Some(methods::GET_EXTENDED_AGENT_CARD)
-        );
-        assert_eq!(methods::canonical_name("unknown.method"), None);
-    }
-
-    #[test]
     fn test_methods_is_streaming() {
         assert!(methods::is_streaming(methods::SEND_STREAMING_MESSAGE));
         assert!(methods::is_streaming(methods::SUBSCRIBE_TO_TASK));
-        assert!(methods::is_streaming(
-            methods::LEGACY_SEND_STREAMING_MESSAGE
-        ));
-        assert!(methods::is_streaming(methods::LEGACY_SUBSCRIBE_TO_TASK));
+        assert!(!methods::is_streaming("message.stream"));
+        assert!(!methods::is_streaming("tasks.resubscribe"));
         assert!(!methods::is_streaming(methods::SEND_MESSAGE));
         assert!(!methods::is_streaming(methods::GET_TASK));
         assert!(!methods::is_streaming("unknown"));
@@ -383,17 +311,17 @@ mod tests {
         assert!(methods::is_valid(methods::LIST_PUSH_CONFIGS));
         assert!(methods::is_valid(methods::DELETE_PUSH_CONFIG));
         assert!(methods::is_valid(methods::GET_EXTENDED_AGENT_CARD));
-        assert!(methods::is_valid(methods::LEGACY_SEND_MESSAGE));
-        assert!(methods::is_valid(methods::LEGACY_SEND_STREAMING_MESSAGE));
-        assert!(methods::is_valid(methods::LEGACY_GET_TASK));
-        assert!(methods::is_valid(methods::LEGACY_LIST_TASKS));
-        assert!(methods::is_valid(methods::LEGACY_CANCEL_TASK));
-        assert!(methods::is_valid(methods::LEGACY_SUBSCRIBE_TO_TASK));
-        assert!(methods::is_valid(methods::LEGACY_CREATE_PUSH_CONFIG));
-        assert!(methods::is_valid(methods::LEGACY_GET_PUSH_CONFIG));
-        assert!(methods::is_valid(methods::LEGACY_LIST_PUSH_CONFIGS));
-        assert!(methods::is_valid(methods::LEGACY_DELETE_PUSH_CONFIG));
-        assert!(methods::is_valid(methods::LEGACY_GET_EXTENDED_AGENT_CARD));
+        assert!(!methods::is_valid("message.send"));
+        assert!(!methods::is_valid("message.stream"));
+        assert!(!methods::is_valid("tasks.get"));
+        assert!(!methods::is_valid("tasks.list"));
+        assert!(!methods::is_valid("tasks.cancel"));
+        assert!(!methods::is_valid("tasks.resubscribe"));
+        assert!(!methods::is_valid("push-config.set"));
+        assert!(!methods::is_valid("push-config.get"));
+        assert!(!methods::is_valid("push-config.list"));
+        assert!(!methods::is_valid("push-config.delete"));
+        assert!(!methods::is_valid("agent-card.extended.get"));
         assert!(!methods::is_valid("unknown.method"));
     }
 }

@@ -121,8 +121,8 @@ mod tests {
     #[test]
     fn test_call_context_new() {
         let params = ServiceParams::new();
-        let ctx = CallContext::new("message.send", params);
-        assert_eq!(ctx.method, "message.send");
+        let ctx = CallContext::new(a2a::jsonrpc::methods::SEND_MESSAGE, params);
+        assert_eq!(ctx.method, a2a::jsonrpc::methods::SEND_MESSAGE);
         assert!(ctx.tenant.is_none());
         assert!(ctx.user.is_none());
     }
@@ -166,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn test_logging_interceptor_before() {
         let interceptor = LoggingInterceptor;
-        let mut ctx = CallContext::new("message.send", ServiceParams::new());
+        let mut ctx = CallContext::new(a2a::jsonrpc::methods::SEND_MESSAGE, ServiceParams::new());
         let result = interceptor.before(&mut ctx, &Value::Null).await;
         assert!(result.is_ok());
     }
@@ -174,7 +174,7 @@ mod tests {
     #[tokio::test]
     async fn test_logging_interceptor_after_ok() {
         let interceptor = LoggingInterceptor;
-        let ctx = CallContext::new("message.send", ServiceParams::new());
+        let ctx = CallContext::new(a2a::jsonrpc::methods::SEND_MESSAGE, ServiceParams::new());
         let result = interceptor.after(&ctx, &Ok(Value::Null)).await;
         assert!(result.is_ok());
     }
@@ -182,7 +182,7 @@ mod tests {
     #[tokio::test]
     async fn test_logging_interceptor_after_err() {
         let interceptor = LoggingInterceptor;
-        let ctx = CallContext::new("message.send", ServiceParams::new());
+        let ctx = CallContext::new(a2a::jsonrpc::methods::SEND_MESSAGE, ServiceParams::new());
         let err: Result<Value, A2AError> = Err(A2AError::internal("boom"));
         let result = interceptor.after(&ctx, &err).await;
         assert!(result.is_ok());
