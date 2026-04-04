@@ -428,7 +428,10 @@ async fn slimrpc_transport_end_to_end() {
     assert!(matches!(send_resp, SendMessageResponse::Task(_)));
 
     let send_resp = transport
-        .send_message(&ServiceParams::new(), &send_message_request("message-response"))
+        .send_message(
+            &ServiceParams::new(),
+            &send_message_request("message-response"),
+        )
         .await
         .unwrap();
     assert!(matches!(send_resp, SendMessageResponse::Message(_)));
@@ -561,7 +564,10 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
         .unwrap();
     let events: Vec<_> = stream.collect().await;
     assert_eq!(events.len(), 2);
-    assert_eq!(events[1].as_ref().unwrap_err().code, error_code::TASK_NOT_FOUND);
+    assert_eq!(
+        events[1].as_ref().unwrap_err().code,
+        error_code::TASK_NOT_FOUND
+    );
 
     let subscribe_stream = transport
         .subscribe_to_task(
@@ -658,7 +664,10 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
     let transport = factory
         .create(
             &sample_agent_card(&format!("slimrpc://{}", env.target())),
-            &AgentInterface::new(format!("slim://{}", env.target()), TRANSPORT_PROTOCOL_SLIMRPC),
+            &AgentInterface::new(
+                format!("slim://{}", env.target()),
+                TRANSPORT_PROTOCOL_SLIMRPC,
+            ),
         )
         .await
         .unwrap();
@@ -706,7 +715,9 @@ async fn slimrpc_transport_reports_malformed_payloads() {
     env.server.register_unary_stream_internal(
         A2A_SERVICE_NAME,
         SEND_STREAMING_MESSAGE_METHOD,
-        |_request: Vec<u8>, _context| async move { Ok(stream::iter(vec![Ok::<Vec<u8>, RpcError>(vec![0xff])])) },
+        |_request: Vec<u8>, _context| async move {
+            Ok(stream::iter(vec![Ok::<Vec<u8>, RpcError>(vec![0xff])]))
+        },
     );
     env.start().await;
 
@@ -727,7 +738,10 @@ async fn slimrpc_transport_reports_malformed_payloads() {
     assert!(error.message.contains("invalid Task payload"));
 
     let error = transport
-        .send_message(&ServiceParams::new(), &send_message_request("empty-response"))
+        .send_message(
+            &ServiceParams::new(),
+            &send_message_request("empty-response"),
+        )
         .await
         .unwrap_err();
     assert_eq!(error.code, error_code::INTERNAL_ERROR);

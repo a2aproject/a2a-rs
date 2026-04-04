@@ -101,8 +101,14 @@ mod tests {
     #[test]
     fn test_a2a_error_to_rpc_error_extended_mapping() {
         let cases = [
-            (error_code::EXTENSION_SUPPORT_REQUIRED, RpcCode::FailedPrecondition),
-            (error_code::VERSION_NOT_SUPPORTED, RpcCode::FailedPrecondition),
+            (
+                error_code::EXTENSION_SUPPORT_REQUIRED,
+                RpcCode::FailedPrecondition,
+            ),
+            (
+                error_code::VERSION_NOT_SUPPORTED,
+                RpcCode::FailedPrecondition,
+            ),
             (
                 error_code::EXTENDED_CARD_NOT_CONFIGURED,
                 RpcCode::Unimplemented,

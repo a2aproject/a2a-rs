@@ -119,14 +119,15 @@ mod tests {
 
     #[test]
     fn test_context_to_service_params_filters_internal_metadata() {
-        let context = Context::for_rpc(None, None).with_message_metadata(std::collections::HashMap::from([
-            (DEADLINE_KEY.to_string(), "1".to_string()),
-            (STATUS_CODE_KEY.to_string(), "0".to_string()),
-            ("rpc-id".to_string(), "abc".to_string()),
-            ("service".to_string(), "svc".to_string()),
-            ("method".to_string(), "m".to_string()),
-            ("x-user".to_string(), "value".to_string()),
-        ]));
+        let context =
+            Context::for_rpc(None, None).with_message_metadata(std::collections::HashMap::from([
+                (DEADLINE_KEY.to_string(), "1".to_string()),
+                (STATUS_CODE_KEY.to_string(), "0".to_string()),
+                ("rpc-id".to_string(), "abc".to_string()),
+                ("service".to_string(), "svc".to_string()),
+                ("method".to_string(), "m".to_string()),
+                ("x-user".to_string(), "value".to_string()),
+            ]));
 
         let params = context_to_service_params(&context);
         assert_eq!(params.get("x-user"), Some(&vec!["value".to_string()]));
