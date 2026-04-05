@@ -210,6 +210,28 @@ mod tests {
     }
 
     #[test]
+    fn test_http_status_codes_for_remaining_a2a_mappings() {
+        assert_eq!(
+            A2AError::push_notification_not_supported().http_status_code(),
+            400
+        );
+        assert_eq!(
+            A2AError::unsupported_operation("nope").http_status_code(),
+            400
+        );
+        assert_eq!(
+            A2AError::version_not_supported("9.9").http_status_code(),
+            400
+        );
+        assert_eq!(A2AError::parse_error("bad").http_status_code(), 400);
+        assert_eq!(A2AError::invalid_request("bad").http_status_code(), 400);
+        assert_eq!(
+            A2AError::method_not_found("missing").http_status_code(),
+            404
+        );
+    }
+
+    #[test]
     fn test_to_jsonrpc_error() {
         let e = A2AError::task_not_found("t1");
         let rpc = e.to_jsonrpc_error();

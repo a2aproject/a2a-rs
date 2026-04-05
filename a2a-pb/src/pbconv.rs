@@ -835,7 +835,7 @@ pub fn from_proto_stream_response(r: &proto::StreamResponse) -> Option<StreamRes
 
 pub fn to_proto_agent_interface(i: &AgentInterface) -> proto::AgentInterface {
     proto::AgentInterface {
-        url: i.url.clone(),
+        url: i.wire_url(),
         protocol_binding: i.protocol_binding.clone(),
         tenant: i.tenant.clone().unwrap_or_default(),
         protocol_version: i.protocol_version.clone(),
@@ -843,12 +843,10 @@ pub fn to_proto_agent_interface(i: &AgentInterface) -> proto::AgentInterface {
 }
 
 pub fn from_proto_agent_interface(i: &proto::AgentInterface) -> AgentInterface {
-    AgentInterface {
-        url: i.url.clone(),
-        protocol_binding: i.protocol_binding.clone(),
-        protocol_version: i.protocol_version.clone(),
-        tenant: empty_to_none(&i.tenant),
-    }
+    let mut iface = AgentInterface::new(i.url.clone(), i.protocol_binding.clone());
+    iface.protocol_version = i.protocol_version.clone();
+    iface.tenant = empty_to_none(&i.tenant);
+    iface
 }
 
 pub fn to_proto_agent_provider(p: &AgentProvider) -> proto::AgentProvider {
@@ -2214,6 +2212,25 @@ mod tests {
         let proto = to_proto_agent_interface(&iface);
         let back = from_proto_agent_interface(&proto);
         assert_eq!(iface, back);
+    }
+
+    #[test]
+    fn test_agent_interface_roundtrip_normalizes_grpc_http_scheme() {
+        let iface = AgentInterface {
+            url: "http://localhost:50051".to_string(),
+            protocol_binding: TRANSPORT_PROTOCOL_GRPC.to_string(),
+            protocol_version: "1.0".to_string(),
+            tenant: Some("ten".to_string()),
+        };
+
+        let proto = to_proto_agent_interface(&iface);
+        assert_eq!(proto.url, "localhost:50051");
+
+        let back = from_proto_agent_interface(&proto);
+        assert_eq!(back.url, "localhost:50051");
+        assert_eq!(back.protocol_binding, TRANSPORT_PROTOCOL_GRPC);
+        assert_eq!(back.protocol_version, "1.0");
+        assert_eq!(back.tenant.as_deref(), Some("ten"));
     }
 
     #[test]

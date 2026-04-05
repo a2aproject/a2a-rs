@@ -1,10 +1,10 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // SPDX-License-Identifier: Apache-2.0
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::types::{ProtocolVersion, TransportProtocol};
+use crate::types::{ProtocolVersion, TRANSPORT_PROTOCOL_GRPC, TransportProtocol};
 
 // ---------------------------------------------------------------------------
 // AgentCard
@@ -56,25 +56,76 @@ where
 // ---------------------------------------------------------------------------
 
 /// A URL + protocol binding combination for reaching the agent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentInterface {
     pub url: String,
     pub protocol_binding: TransportProtocol,
     pub protocol_version: ProtocolVersion,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentInterfaceSerde {
+    url: String,
+    protocol_binding: TransportProtocol,
+    protocol_version: ProtocolVersion,
+    #[serde(default)]
+    tenant: Option<String>,
+}
+
+fn normalize_agent_interface_url(url: String, protocol_binding: &str) -> String {
+    if protocol_binding.eq_ignore_ascii_case(TRANSPORT_PROTOCOL_GRPC) {
+        if let Some(stripped) = url.strip_prefix("http://") {
+            return stripped.to_string();
+        }
+    }
+
+    url
 }
 
 impl AgentInterface {
     pub fn new(url: impl Into<String>, protocol_binding: impl Into<String>) -> Self {
+        let protocol_binding = protocol_binding.into();
         AgentInterface {
-            url: url.into(),
-            protocol_binding: protocol_binding.into(),
+            url: normalize_agent_interface_url(url.into(), &protocol_binding),
+            protocol_binding,
             protocol_version: crate::VERSION.to_string(),
             tenant: None,
         }
+    }
+
+    pub fn wire_url(&self) -> String {
+        normalize_agent_interface_url(self.url.clone(), &self.protocol_binding)
+    }
+}
+
+impl Serialize for AgentInterface {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer
+            .serialize_struct("AgentInterface", if self.tenant.is_some() { 4 } else { 3 })?;
+        state.serialize_field("url", &self.wire_url())?;
+        state.serialize_field("protocolBinding", &self.protocol_binding)?;
+        state.serialize_field("protocolVersion", &self.protocol_version)?;
+        if let Some(tenant) = &self.tenant {
+            state.serialize_field("tenant", tenant)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentInterface {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = AgentInterfaceSerde::deserialize(deserializer)?;
+
+        Ok(Self {
+            url: normalize_agent_interface_url(raw.url, &raw.protocol_binding),
+            protocol_binding: raw.protocol_binding,
+            protocol_version: raw.protocol_version,
+            tenant: raw.tenant,
+        })
     }
 }
 
@@ -443,6 +494,81 @@ mod tests {
         assert_eq!(iface.url, "http://localhost:3000");
         assert_eq!(iface.protocol_binding, "JSONRPC");
         assert!(!iface.protocol_version.is_empty());
+    }
+
+    #[test]
+    fn test_agent_interface_new_normalizes_grpc_http_scheme() {
+        let iface = AgentInterface::new("http://localhost:50051", TRANSPORT_PROTOCOL_GRPC);
+        assert_eq!(iface.url, "localhost:50051");
+        assert_eq!(iface.protocol_binding, TRANSPORT_PROTOCOL_GRPC);
+    }
+
+    #[test]
+    fn test_agent_interface_new_preserves_grpc_https_scheme() {
+        let iface = AgentInterface::new("https://localhost:50051", TRANSPORT_PROTOCOL_GRPC);
+        assert_eq!(iface.url, "https://localhost:50051");
+        assert_eq!(iface.protocol_binding, TRANSPORT_PROTOCOL_GRPC);
+    }
+
+    #[test]
+    fn test_agent_interface_serde_normalizes_grpc_http_scheme() {
+        let iface = AgentInterface {
+            url: "http://localhost:50051".to_string(),
+            protocol_binding: TRANSPORT_PROTOCOL_GRPC.to_string(),
+            protocol_version: crate::VERSION.to_string(),
+            tenant: Some("tenant-a".to_string()),
+        };
+
+        let json = serde_json::to_string(&iface).unwrap();
+        assert!(json.contains("\"url\":\"localhost:50051\""));
+
+        let back: AgentInterface = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.url, "localhost:50051");
+        assert_eq!(back.protocol_binding, TRANSPORT_PROTOCOL_GRPC);
+        assert_eq!(back.tenant.as_deref(), Some("tenant-a"));
+    }
+
+    #[test]
+    fn test_agent_card_deserialize_null_skills_as_default() {
+        let json = serde_json::json!({
+            "name": "Test Agent",
+            "description": "A test agent",
+            "version": "1.0.0",
+            "supportedInterfaces": [
+                {
+                    "url": "http://localhost:3000",
+                    "protocolBinding": "JSONRPC",
+                    "protocolVersion": crate::VERSION
+                }
+            ],
+            "capabilities": {},
+            "defaultInputModes": ["text/plain"],
+            "defaultOutputModes": ["text/plain"],
+            "skills": null
+        });
+
+        let card: AgentCard = serde_json::from_value(json).unwrap();
+        assert!(card.skills.is_empty());
+    }
+
+    #[test]
+    fn test_security_scheme_deserialize_unknown_variant_errors() {
+        let err = serde_json::from_value::<SecurityScheme>(serde_json::json!({
+            "unknown": {"value": true}
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown security scheme variant"));
+    }
+
+    #[test]
+    fn test_oauth_flows_deserialize_unknown_variant_errors() {
+        let err = serde_json::from_value::<OAuthFlows>(serde_json::json!({
+            "unknown": {"tokenUrl": "https://example.com/token"}
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown OAuth flow variant"));
     }
 
     #[test]
