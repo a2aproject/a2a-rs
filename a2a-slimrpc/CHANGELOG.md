@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-slimrpc-v0.1.1...agntcy-a2a-slimrpc-v0.1.2) - 2026-04-05
+
+### Other
+
+- updated the following local packages: agntcy-a2a-pb, agntcy-a2a-client, agntcy-a2a-server
+
 ## [0.1.1](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-slimrpc-v0.1.0...agntcy-a2a-slimrpc-v0.1.1) - 2026-04-04
 
 ### Other

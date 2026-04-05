@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-grpc-v0.1.4...agntcy-a2a-grpc-v0.1.5) - 2026-04-05
+
+### Fixed
+
+- accept bare gRPC endpoints
+
+### Other
+
+- avoid serializing gRPC client calls
+
 ## [0.1.4](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-grpc-v0.1.3...agntcy-a2a-grpc-v0.1.4) - 2026-04-04
 
 ### Other

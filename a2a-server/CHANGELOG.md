@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-server-v0.2.0...agntcy-a2a-server-v0.2.1) - 2026-04-05
+
+### Added
+
+- use ProtoJSON for JSON wire payloads
+
+### Other
+
+- format ProtoJSON transport changes
+
 ## [0.2.0](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-server-v0.1.3...agntcy-a2a-server-v0.2.0) - 2026-04-04
 
 ### Fixed
