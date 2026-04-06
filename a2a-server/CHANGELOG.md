@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-server-v0.2.3...agntcy-a2a-server-v0.2.4) - 2026-04-06
+
+### Added
+
+- *(a2a-server)* support resumable subscriptions and push delivery
+
 ## [0.2.3](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-server-v0.2.2...agntcy-a2a-server-v0.2.3) - 2026-04-06
 
 ### Added

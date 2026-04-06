@@ -1,6 +1,6 @@
 [package]
 name = "agntcy-a2a-server"
-version = "0.2.3"
+version = "0.2.4"
 description = "A2A v1 async server framework"
 readme = "README.md"
 edition.workspace = true
