@@ -341,7 +341,9 @@ impl Transport for JsonRpcTransport {
         params: &ServiceParams,
         req: &CreateTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        let result = self.call_value(params, methods::CREATE_PUSH_CONFIG, req).await?;
+        let result = self
+            .call_value(params, methods::CREATE_PUSH_CONFIG, req)
+            .await?;
         deserialize_task_push_notification_config(result)
     }
 
@@ -350,7 +352,9 @@ impl Transport for JsonRpcTransport {
         params: &ServiceParams,
         req: &GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        let result = self.call_value(params, methods::GET_PUSH_CONFIG, req).await?;
+        let result = self
+            .call_value(params, methods::GET_PUSH_CONFIG, req)
+            .await?;
         deserialize_task_push_notification_config(result)
     }
 
@@ -359,7 +363,9 @@ impl Transport for JsonRpcTransport {
         params: &ServiceParams,
         req: &ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        let result = self.call_value(params, methods::LIST_PUSH_CONFIGS, req).await?;
+        let result = self
+            .call_value(params, methods::LIST_PUSH_CONFIGS, req)
+            .await?;
         deserialize_list_task_push_notification_configs_response(result)
     }
 

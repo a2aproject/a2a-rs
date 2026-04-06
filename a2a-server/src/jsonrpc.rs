@@ -444,7 +444,8 @@ mod tests {
         });
         let resp = post_jsonrpc(app, methods::CREATE_PUSH_CONFIG, params).await;
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
-        let result = serde_json::from_value::<TaskPushNotificationConfig>(resp.result.unwrap()).unwrap();
+        let result =
+            serde_json::from_value::<TaskPushNotificationConfig>(resp.result.unwrap()).unwrap();
         assert_eq!(result.task_id, "t1");
         assert_eq!(result.config.id.as_deref(), Some("cfg1"));
         assert_eq!(result.config.url, "http://example.com/callback");
@@ -462,7 +463,8 @@ mod tests {
         });
         let resp = post_jsonrpc(app, methods::CREATE_PUSH_CONFIG, params).await;
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
-        let result = serde_json::from_value::<TaskPushNotificationConfig>(resp.result.unwrap()).unwrap();
+        let result =
+            serde_json::from_value::<TaskPushNotificationConfig>(resp.result.unwrap()).unwrap();
         assert_eq!(result.task_id, "t1");
         assert_eq!(result.config.id.as_deref(), Some("cfg1"));
         assert_eq!(result.config.url, "http://example.com/callback");
@@ -487,8 +489,9 @@ mod tests {
         });
         let resp = post_jsonrpc(app, methods::LIST_PUSH_CONFIGS, params).await;
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
-        let result = serde_json::from_value::<Vec<TaskPushNotificationConfig>>(resp.result.unwrap())
-            .unwrap();
+        let result =
+            serde_json::from_value::<Vec<TaskPushNotificationConfig>>(resp.result.unwrap())
+                .unwrap();
         assert!(result.is_empty());
     }
 

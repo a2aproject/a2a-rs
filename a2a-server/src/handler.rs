@@ -809,6 +809,9 @@ impl RequestHandler for DefaultRequestHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::ExecutorContext;
+    use crate::push::InMemoryPushConfigStore;
+    use crate::task_store::InMemoryTaskStore;
     use axum::{
         Router,
         body::Bytes,
@@ -816,9 +819,6 @@ mod tests {
         http::{HeaderMap, StatusCode, header},
         routing::post,
     };
-    use crate::executor::ExecutorContext;
-    use crate::push::InMemoryPushConfigStore;
-    use crate::task_store::InMemoryTaskStore;
     use futures::stream;
     use std::sync::Arc;
     use tokio::{
@@ -1052,15 +1052,16 @@ mod tests {
         StatusCode::ACCEPTED
     }
 
-    async fn start_push_webhook(
-    ) -> (
+    async fn start_push_webhook() -> (
         String,
         mpsc::UnboundedReceiver<CapturedPush>,
         oneshot::Sender<()>,
         tokio::task::JoinHandle<()>,
     ) {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let app = Router::new().route("/", post(capture_push)).with_state(sender);
+        let app = Router::new()
+            .route("/", post(capture_push))
+            .with_state(sender);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();

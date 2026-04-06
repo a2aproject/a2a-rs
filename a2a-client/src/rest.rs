@@ -393,10 +393,10 @@ impl Transport for RestTransport {
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let payload = self
             .post_value(
-            &format!("/tasks/{}/pushNotificationConfigs", req.task_id),
-            params,
-            &req.config,
-        )
+                &format!("/tasks/{}/pushNotificationConfigs", req.task_id),
+                params,
+                &req.config,
+            )
             .await?;
         deserialize_task_push_notification_config(payload)
     }
@@ -408,10 +408,10 @@ impl Transport for RestTransport {
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let payload = self
             .get_value(
-            &format!("/tasks/{}/pushNotificationConfigs/{}", req.task_id, req.id),
-            params,
-            &[],
-        )
+                &format!("/tasks/{}/pushNotificationConfigs/{}", req.task_id, req.id),
+                params,
+                &[],
+            )
             .await?;
         deserialize_task_push_notification_config(payload)
     }
@@ -431,10 +431,10 @@ impl Transport for RestTransport {
 
         let payload = self
             .get_value(
-            &format!("/tasks/{}/pushNotificationConfigs", req.task_id),
-            params,
-            &query_parts,
-        )
+                &format!("/tasks/{}/pushNotificationConfigs", req.task_id),
+                params,
+                &query_parts,
+            )
             .await?;
         deserialize_list_task_push_notification_configs_response(payload)
     }

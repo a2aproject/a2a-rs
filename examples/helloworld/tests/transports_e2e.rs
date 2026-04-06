@@ -13,8 +13,7 @@ use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::rest::rest_router;
 use a2a_server::{
     DefaultRequestHandler, ExecutorContext, HttpPushSender, InMemoryPushConfigStore,
-    InMemoryTaskStore, RequestHandler, ServiceParams,
-    WELL_KNOWN_AGENT_CARD_PATH,
+    InMemoryTaskStore, RequestHandler, ServiceParams, WELL_KNOWN_AGENT_CARD_PATH,
 };
 use async_trait::async_trait;
 use axum::body::Bytes;
@@ -271,7 +270,10 @@ impl RequestHandler for TestHandler {
 }
 
 impl a2a_server::AgentExecutor for PushTransportExecutor {
-    fn execute(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    fn execute(
+        &self,
+        ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let working = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
             task_id: ctx.task_id.clone(),
             context_id: ctx.context_id.clone(),
@@ -346,10 +348,7 @@ async fn spawn_http_server() -> (String, tokio::task::JoinHandle<()>) {
 async fn spawn_push_http_server() -> (String, tokio::task::JoinHandle<()>) {
     let handler = Arc::new(
         DefaultRequestHandler::new(PushTransportExecutor, InMemoryTaskStore::new())
-            .with_push_notifications(
-                InMemoryPushConfigStore::new(),
-                HttpPushSender::new(None),
-            ),
+            .with_push_notifications(InMemoryPushConfigStore::new(), HttpPushSender::new(None)),
     );
     let app = Router::new()
         .nest("/rest", rest_router(handler.clone()))
@@ -389,14 +388,15 @@ async fn capture_push(
     StatusCode::ACCEPTED
 }
 
-async fn spawn_webhook_server(
-) -> (
+async fn spawn_webhook_server() -> (
     String,
     mpsc::UnboundedReceiver<CapturedPush>,
     tokio::task::JoinHandle<()>,
 ) {
     let (sender, receiver) = mpsc::unbounded_channel();
-    let app = Router::new().route("/", post(capture_push)).with_state(sender);
+    let app = Router::new()
+        .route("/", post(capture_push))
+        .with_state(sender);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
@@ -861,7 +861,10 @@ async fn rest_transport_push_delivery_end_to_end() {
     assert!(matches!(response, SendMessageResponse::Task(_)));
 
     let first = recv_push(&mut receiver).await;
-    assert_eq!(first.authorization.as_deref(), Some("Basic dGVzdDpzZWNyZXQ="));
+    assert_eq!(
+        first.authorization.as_deref(),
+        Some("Basic dGVzdDpzZWNyZXQ=")
+    );
     assert_eq!(first.notification_token.as_deref(), Some("rest-token"));
     match first.event {
         StreamResponse::StatusUpdate(update) => {
@@ -872,7 +875,10 @@ async fn rest_transport_push_delivery_end_to_end() {
     }
 
     let second = recv_push(&mut receiver).await;
-    assert_eq!(second.authorization.as_deref(), Some("Basic dGVzdDpzZWNyZXQ="));
+    assert_eq!(
+        second.authorization.as_deref(),
+        Some("Basic dGVzdDpzZWNyZXQ=")
+    );
     assert_eq!(second.notification_token.as_deref(), Some("rest-token"));
     match second.event {
         StreamResponse::Task(task) => {
