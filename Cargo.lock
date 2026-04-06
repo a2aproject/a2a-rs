@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "agntcy-a2a-client"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "agntcy-a2a",
  "agntcy-a2a-pb",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "agntcy-a2a-grpc"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "agntcy-a2a",
  "agntcy-a2a-client",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "agntcy-a2a-server"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "agntcy-a2a",
  "agntcy-a2a-pb",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "agntcy-a2a-slimrpc"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "agntcy-a2a",
  "agntcy-a2a-client",

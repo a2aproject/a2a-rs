@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-client-v0.1.10...agntcy-a2a-client-v0.1.11) - 2026-04-06
+
+### Fixed
+
+- *(interop)* align push-config JSON bindings with a2a-go ([#31](https://github.com/agntcy/a2a-rs/pull/31))
+
 ## [0.1.10](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-client-v0.1.9...agntcy-a2a-client-v0.1.10) - 2026-04-06
 
 ### Other
