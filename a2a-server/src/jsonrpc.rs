@@ -97,17 +97,14 @@ async fn handle_unary_request<H: RequestHandler>(
                 .and_then(|r| protojson_value(&r)),
             Err(e) => Err(parse_error(e)),
         },
-        methods::CREATE_PUSH_CONFIG => {
-            match protojson_conv::from_value::<CreateTaskPushNotificationConfigRequest>(raw_params)
-            {
-                Ok(req) => state
-                    .handler
-                    .create_push_config(params, req)
-                    .await
-                    .and_then(|r| protojson_value(&r)),
-                Err(e) => Err(parse_error(e)),
-            }
-        }
+        methods::CREATE_PUSH_CONFIG => match parse_create_push_config_request(raw_params) {
+            Ok(req) => state
+                .handler
+                .create_push_config(params, req)
+                .await
+                .and_then(|r| protojson_value(&r)),
+            Err(e) => Err(parse_error(e)),
+        },
         methods::GET_PUSH_CONFIG => {
             match protojson_conv::from_value::<GetTaskPushNotificationConfigRequest>(raw_params) {
                 Ok(req) => state
@@ -219,6 +216,21 @@ fn protojson_stream(
     }))
 }
 
+fn parse_create_push_config_request(
+    raw_params: Value,
+) -> Result<CreateTaskPushNotificationConfigRequest, String> {
+    match protojson_conv::from_value::<CreateTaskPushNotificationConfigRequest>(raw_params.clone())
+    {
+        Ok(req) => Ok(req),
+        Err(protojson_error) => serde_json::from_value::<CreateTaskPushNotificationConfigRequest>(
+            raw_params,
+        )
+        .map_err(|serde_error| {
+            format!("{protojson_error}; nested request parse failed: {serde_error}")
+        }),
+    }
+}
+
 fn parse_error(e: impl std::fmt::Display) -> A2AError {
     A2AError {
         code: error_code::PARSE_ERROR,
@@ -230,6 +242,7 @@ fn parse_error(e: impl std::fmt::Display) -> A2AError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::InMemoryPushConfigStore;
     use crate::executor::ExecutorContext;
     use crate::handler::DefaultRequestHandler;
     use crate::task_store::InMemoryTaskStore;
@@ -291,6 +304,14 @@ mod tests {
             EchoExecutor,
             InMemoryTaskStore::new(),
         ));
+        jsonrpc_router(handler)
+    }
+
+    fn make_push_app() -> axum::Router {
+        let handler = Arc::new(
+            DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+                .with_push_config_store(InMemoryPushConfigStore::new()),
+        );
         jsonrpc_router(handler)
     }
 
@@ -414,16 +435,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_push_config() {
-        let app = make_app();
+        let app = make_push_app();
+        let params = serde_json::json!({
+            "taskId": "t1",
+            "id": "cfg1",
+            "url": "http://example.com/callback"
+        });
+        let resp = post_jsonrpc(app, methods::CREATE_PUSH_CONFIG, params).await;
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result =
+            protojson_conv::from_value::<TaskPushNotificationConfig>(resp.result.unwrap()).unwrap();
+        assert_eq!(result.task_id, "t1");
+        assert_eq!(result.config.id.as_deref(), Some("cfg1"));
+        assert_eq!(result.config.url, "http://example.com/callback");
+    }
+
+    #[tokio::test]
+    async fn test_create_push_config_accepts_nested_config_object() {
+        let app = make_push_app();
         let params = serde_json::json!({
             "taskId": "t1",
             "config": {
+                "id": "cfg1",
                 "url": "http://example.com/callback"
             }
         });
         let resp = post_jsonrpc(app, methods::CREATE_PUSH_CONFIG, params).await;
-        // May fail since task doesn't exist, but method is dispatched
-        assert!(resp.error.is_some() || resp.result.is_some());
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result =
+            protojson_conv::from_value::<TaskPushNotificationConfig>(resp.result.unwrap()).unwrap();
+        assert_eq!(result.task_id, "t1");
+        assert_eq!(result.config.id.as_deref(), Some("cfg1"));
+        assert_eq!(result.config.url, "http://example.com/callback");
     }
 
     #[tokio::test]

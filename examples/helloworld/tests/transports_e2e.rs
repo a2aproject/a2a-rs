@@ -11,15 +11,23 @@ use a2a_client::jsonrpc::JsonRpcTransport;
 use a2a_client::rest::RestTransport;
 use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::rest::rest_router;
-use a2a_server::{RequestHandler, ServiceParams, WELL_KNOWN_AGENT_CARD_PATH};
+use a2a_server::{
+    DefaultRequestHandler, ExecutorContext, HttpPushSender, InMemoryPushConfigStore,
+    InMemoryTaskStore, RequestHandler, ServiceParams,
+    WELL_KNOWN_AGENT_CARD_PATH,
+};
 use async_trait::async_trait;
-use axum::http::StatusCode;
-use axum::routing::get;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use reqwest::Client;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 
 fn sample_message(role: Role, text: &str) -> Message {
     Message {
@@ -88,6 +96,15 @@ fn sample_agent_card() -> AgentCard {
 }
 
 struct TestHandler;
+
+struct PushTransportExecutor;
+
+#[derive(Debug)]
+struct CapturedPush {
+    authorization: Option<String>,
+    notification_token: Option<String>,
+    event: StreamResponse,
+}
 
 #[async_trait]
 impl RequestHandler for TestHandler {
@@ -253,6 +270,52 @@ impl RequestHandler for TestHandler {
     }
 }
 
+impl a2a_server::AgentExecutor for PushTransportExecutor {
+    fn execute(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        let working = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: ctx.task_id.clone(),
+            context_id: ctx.context_id.clone(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        let completed = StreamResponse::Task(Task {
+            id: ctx.task_id,
+            context_id: ctx.context_id,
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: ctx.message,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: ctx.stored_task.and_then(|task| task.history),
+            metadata: None,
+        });
+
+        Box::pin(stream::iter(vec![Ok(working), Ok(completed)]))
+    }
+
+    fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        Box::pin(stream::once(async move {
+            Ok(StreamResponse::Task(Task {
+                id: ctx.task_id,
+                context_id: ctx.context_id,
+                status: TaskStatus {
+                    state: TaskState::Canceled,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            }))
+        }))
+    }
+}
+
 async fn spawn_http_server() -> (String, tokio::task::JoinHandle<()>) {
     let handler = Arc::new(TestHandler);
     let app = Router::new()
@@ -278,6 +341,76 @@ async fn spawn_http_server() -> (String, tokio::task::JoinHandle<()>) {
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
     (format!("http://{addr}"), handle)
+}
+
+async fn spawn_push_http_server() -> (String, tokio::task::JoinHandle<()>) {
+    let handler = Arc::new(
+        DefaultRequestHandler::new(PushTransportExecutor, InMemoryTaskStore::new())
+            .with_push_notifications(
+                InMemoryPushConfigStore::new(),
+                HttpPushSender::new(None),
+            ),
+    );
+    let app = Router::new()
+        .nest("/rest", rest_router(handler.clone()))
+        .nest("/rpc", jsonrpc_router(handler))
+        .route(
+            WELL_KNOWN_AGENT_CARD_PATH,
+            get(|| async { Json(sample_agent_card()) }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (format!("http://{addr}"), handle)
+}
+
+async fn capture_push(
+    State(sender): State<mpsc::UnboundedSender<CapturedPush>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    sender
+        .send(CapturedPush {
+            authorization: headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned),
+            notification_token: headers
+                .get("A2A-Notification-Token")
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned),
+            event: serde_json::from_slice(&body).unwrap(),
+        })
+        .unwrap();
+    StatusCode::ACCEPTED
+}
+
+async fn spawn_webhook_server(
+) -> (
+    String,
+    mpsc::UnboundedReceiver<CapturedPush>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let app = Router::new().route("/", post(capture_push)).with_state(sender);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (format!("http://{addr}/"), receiver, handle)
+}
+
+async fn recv_push(receiver: &mut mpsc::UnboundedReceiver<CapturedPush>) -> CapturedPush {
+    timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 fn send_message_request() -> SendMessageRequest {
@@ -689,4 +822,135 @@ async fn jsonrpc_transport_end_to_end() {
     assert_eq!(card.name, "Test Agent");
 
     handle.abort();
+}
+
+#[tokio::test]
+async fn rest_transport_push_delivery_end_to_end() {
+    let (base_url, server_handle) = spawn_push_http_server().await;
+    let (webhook_url, mut receiver, webhook_handle) = spawn_webhook_server().await;
+    let transport = RestTransport::new(Client::new(), format!("{base_url}/rest"));
+
+    transport
+        .create_push_config(
+            &ServiceParams::new(),
+            &CreateTaskPushNotificationConfigRequest {
+                task_id: "task-rest-push".to_string(),
+                config: PushNotificationConfig {
+                    url: webhook_url,
+                    id: Some("cfg-rest".to_string()),
+                    token: Some("rest-token".to_string()),
+                    authentication: Some(AuthenticationInfo {
+                        scheme: "Basic".to_string(),
+                        credentials: Some("dGVzdDpzZWNyZXQ=".to_string()),
+                    }),
+                },
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut request = send_message_request();
+    request.message.task_id = Some("task-rest-push".to_string());
+    request.message.context_id = Some("ctx-rest-push".to_string());
+
+    let response = transport
+        .send_message(&ServiceParams::new(), &request)
+        .await
+        .unwrap();
+    assert!(matches!(response, SendMessageResponse::Task(_)));
+
+    let first = recv_push(&mut receiver).await;
+    assert_eq!(first.authorization.as_deref(), Some("Basic dGVzdDpzZWNyZXQ="));
+    assert_eq!(first.notification_token.as_deref(), Some("rest-token"));
+    match first.event {
+        StreamResponse::StatusUpdate(update) => {
+            assert_eq!(update.task_id, "task-rest-push");
+            assert_eq!(update.status.state, TaskState::Working);
+        }
+        _ => panic!("expected status update push"),
+    }
+
+    let second = recv_push(&mut receiver).await;
+    assert_eq!(second.authorization.as_deref(), Some("Basic dGVzdDpzZWNyZXQ="));
+    assert_eq!(second.notification_token.as_deref(), Some("rest-token"));
+    match second.event {
+        StreamResponse::Task(task) => {
+            assert_eq!(task.id, "task-rest-push");
+            assert_eq!(task.status.state, TaskState::Completed);
+        }
+        _ => panic!("expected final task push"),
+    }
+
+    server_handle.abort();
+    webhook_handle.abort();
+}
+
+#[tokio::test]
+async fn jsonrpc_transport_push_delivery_end_to_end() {
+    let (base_url, server_handle) = spawn_push_http_server().await;
+    let (webhook_url, mut receiver, webhook_handle) = spawn_webhook_server().await;
+    let transport = JsonRpcTransport::new(Client::new(), format!("{base_url}/rpc"));
+
+    let mut request = send_message_request();
+    request.message.task_id = Some("task-rpc-push".to_string());
+    request.message.context_id = Some("ctx-rpc-push".to_string());
+    request.configuration = Some(SendMessageConfiguration {
+        accepted_output_modes: None,
+        push_notification_config: Some(PushNotificationConfig {
+            url: webhook_url.clone(),
+            id: Some("cfg-rpc".to_string()),
+            token: Some("rpc-token".to_string()),
+            authentication: Some(AuthenticationInfo {
+                scheme: "Bearer".to_string(),
+                credentials: Some("rpc-secret".to_string()),
+            }),
+        }),
+        history_length: None,
+        return_immediately: None,
+    });
+
+    let response = transport
+        .send_message(&ServiceParams::new(), &request)
+        .await
+        .unwrap();
+    assert!(matches!(response, SendMessageResponse::Task(_)));
+
+    let saved = transport
+        .get_push_config(
+            &ServiceParams::new(),
+            &GetTaskPushNotificationConfigRequest {
+                task_id: "task-rpc-push".to_string(),
+                id: "cfg-rpc".to_string(),
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.config.url, webhook_url);
+
+    let first = recv_push(&mut receiver).await;
+    assert_eq!(first.authorization.as_deref(), Some("Bearer rpc-secret"));
+    assert_eq!(first.notification_token.as_deref(), Some("rpc-token"));
+    match first.event {
+        StreamResponse::StatusUpdate(update) => {
+            assert_eq!(update.task_id, "task-rpc-push");
+            assert_eq!(update.status.state, TaskState::Working);
+        }
+        _ => panic!("expected status update push"),
+    }
+
+    let second = recv_push(&mut receiver).await;
+    assert_eq!(second.authorization.as_deref(), Some("Bearer rpc-secret"));
+    assert_eq!(second.notification_token.as_deref(), Some("rpc-token"));
+    match second.event {
+        StreamResponse::Task(task) => {
+            assert_eq!(task.id, "task-rpc-push");
+            assert_eq!(task.status.state, TaskState::Completed);
+        }
+        _ => panic!("expected final task push"),
+    }
+
+    server_handle.abort();
+    webhook_handle.abort();
 }

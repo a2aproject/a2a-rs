@@ -19,3 +19,4 @@ chrono = { workspace = true }
 a2a-client = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+serde_json = { workspace = true }

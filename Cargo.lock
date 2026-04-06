@@ -1522,6 +1522,7 @@ dependencies = [
  "chrono",
  "futures",
  "reqwest",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tracing",
