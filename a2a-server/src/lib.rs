@@ -5,6 +5,7 @@ pub mod executor;
 pub mod handler;
 pub mod jsonrpc;
 pub mod middleware;
+mod push_config_compat;
 pub mod push;
 pub mod rest;
 pub mod sse;

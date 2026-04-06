@@ -6,6 +6,7 @@ pub mod client;
 pub mod factory;
 pub mod jsonrpc;
 pub mod middleware;
+mod push_config_compat;
 pub mod rest;
 pub mod transport;
 

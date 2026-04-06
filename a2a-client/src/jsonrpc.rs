@@ -6,6 +6,10 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use reqwest::Client;
 
+use crate::push_config_compat::{
+    deserialize_list_task_push_notification_configs_response,
+    deserialize_task_push_notification_config,
+};
 use crate::transport::{ServiceParams, Transport, TransportFactory};
 
 /// JSON-RPC transport implementation.
@@ -22,15 +26,14 @@ impl JsonRpcTransport {
         JsonRpcTransport { client, endpoint }
     }
 
-    async fn call<Req, Resp>(
+    async fn call_value<Req>(
         &self,
         params: &ServiceParams,
         method: &str,
         request_params: &Req,
-    ) -> Result<Resp, A2AError>
+    ) -> Result<serde_json::Value, A2AError>
     where
         Req: ProtoJsonPayload,
-        Resp: ProtoJsonPayload,
     {
         let id = JsonRpcId::String(uuid::Uuid::now_v7().to_string());
         let payload = protojson_conv::to_value(request_params).map_err(|e| {
@@ -63,6 +66,21 @@ impl JsonRpcTransport {
         let result = rpc_response
             .result
             .ok_or_else(|| A2AError::internal("JSON-RPC response missing result"))?;
+
+        Ok(result)
+    }
+
+    async fn call<Req, Resp>(
+        &self,
+        params: &ServiceParams,
+        method: &str,
+        request_params: &Req,
+    ) -> Result<Resp, A2AError>
+    where
+        Req: ProtoJsonPayload,
+        Resp: ProtoJsonPayload,
+    {
+        let result = self.call_value(params, method, request_params).await?;
 
         protojson_conv::from_value(result)
             .map_err(|e| A2AError::internal(format!("failed to deserialize result: {e}")))
@@ -323,7 +341,8 @@ impl Transport for JsonRpcTransport {
         params: &ServiceParams,
         req: &CreateTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.call(params, methods::CREATE_PUSH_CONFIG, req).await
+        let result = self.call_value(params, methods::CREATE_PUSH_CONFIG, req).await?;
+        deserialize_task_push_notification_config(result)
     }
 
     async fn get_push_config(
@@ -331,7 +350,8 @@ impl Transport for JsonRpcTransport {
         params: &ServiceParams,
         req: &GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.call(params, methods::GET_PUSH_CONFIG, req).await
+        let result = self.call_value(params, methods::GET_PUSH_CONFIG, req).await?;
+        deserialize_task_push_notification_config(result)
     }
 
     async fn list_push_configs(
@@ -339,7 +359,8 @@ impl Transport for JsonRpcTransport {
         params: &ServiceParams,
         req: &ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        self.call(params, methods::LIST_PUSH_CONFIGS, req).await
+        let result = self.call_value(params, methods::LIST_PUSH_CONFIGS, req).await?;
+        deserialize_list_task_push_notification_configs_response(result)
     }
 
     async fn delete_push_config(

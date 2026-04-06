@@ -9,6 +9,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::push_config_compat::{
+    deserialize_list_task_push_notification_configs_response,
+    deserialize_task_push_notification_config,
+};
 use crate::transport::{ServiceParams, Transport, TransportFactory};
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
@@ -99,15 +103,14 @@ impl RestTransport {
         parse_rest_error(status, &body)
     }
 
-    async fn post_json<Req, Resp>(
+    async fn post_value<Req>(
         &self,
         path: &str,
         params: &ServiceParams,
         body: &Req,
-    ) -> Result<Resp, A2AError>
+    ) -> Result<Value, A2AError>
     where
         Req: ProtoJsonPayload,
-        Resp: ProtoJsonPayload,
     {
         let payload = protojson_conv::to_value(body).map_err(|e| {
             A2AError::internal(format!("failed to serialize request as ProtoJSON: {e}"))
@@ -127,20 +130,32 @@ impl RestTransport {
             .await
             .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
 
+        Ok(payload)
+    }
+
+    async fn post_json<Req, Resp>(
+        &self,
+        path: &str,
+        params: &ServiceParams,
+        body: &Req,
+    ) -> Result<Resp, A2AError>
+    where
+        Req: ProtoJsonPayload,
+        Resp: ProtoJsonPayload,
+    {
+        let payload = self.post_value(path, params, body).await?;
+
         protojson_conv::from_value(payload).map_err(|e| {
             A2AError::internal(format!("failed to deserialize response as ProtoJSON: {e}"))
         })
     }
 
-    async fn get_json<Resp>(
+    async fn get_value(
         &self,
         path: &str,
         params: &ServiceParams,
         query: &[(String, String)],
-    ) -> Result<Resp, A2AError>
-    where
-        Resp: ProtoJsonPayload,
-    {
+    ) -> Result<Value, A2AError> {
         let resp = self
             .send(self.build_request_with_query(reqwest::Method::GET, path, params, query))
             .await?;
@@ -152,6 +167,20 @@ impl RestTransport {
             .json::<Value>()
             .await
             .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+
+        Ok(payload)
+    }
+
+    async fn get_json<Resp>(
+        &self,
+        path: &str,
+        params: &ServiceParams,
+        query: &[(String, String)],
+    ) -> Result<Resp, A2AError>
+    where
+        Resp: ProtoJsonPayload,
+    {
+        let payload = self.get_value(path, params, query).await?;
 
         protojson_conv::from_value(payload).map_err(|e| {
             A2AError::internal(format!("failed to deserialize response as ProtoJSON: {e}"))
@@ -362,12 +391,14 @@ impl Transport for RestTransport {
         params: &ServiceParams,
         req: &CreateTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.post_json(
+        let payload = self
+            .post_value(
             &format!("/tasks/{}/pushNotificationConfigs", req.task_id),
             params,
             &req.config,
         )
-        .await
+            .await?;
+        deserialize_task_push_notification_config(payload)
     }
 
     async fn get_push_config(
@@ -375,12 +406,14 @@ impl Transport for RestTransport {
         params: &ServiceParams,
         req: &GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.get_json(
+        let payload = self
+            .get_value(
             &format!("/tasks/{}/pushNotificationConfigs/{}", req.task_id, req.id),
             params,
             &[],
         )
-        .await
+            .await?;
+        deserialize_task_push_notification_config(payload)
     }
 
     async fn list_push_configs(
@@ -396,12 +429,14 @@ impl Transport for RestTransport {
             query_parts.push(("pageToken".to_string(), page_token.clone()));
         }
 
-        self.get_json(
+        let payload = self
+            .get_value(
             &format!("/tasks/{}/pushNotificationConfigs", req.task_id),
             params,
             &query_parts,
         )
-        .await
+            .await?;
+        deserialize_list_task_push_notification_configs_response(payload)
     }
 
     async fn delete_push_config(

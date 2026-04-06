@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use crate::handler::RequestHandler;
 use crate::middleware::ServiceParams;
+use crate::push_config_compat::json_value as compat_json_value;
 use crate::sse;
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
@@ -315,7 +316,7 @@ async fn handle_create_push_config<H: RequestHandler>(
     };
     let params = ServiceParams::new();
     match state.handler.create_push_config(&params, req).await {
-        Ok(resp) => protojson_json_response(&resp),
+        Ok(resp) => serde_json_response(&resp),
         Err(e) => rest_error_response(e),
     }
 }
@@ -331,7 +332,7 @@ async fn handle_get_push_config<H: RequestHandler>(
         tenant: None,
     };
     match state.handler.get_push_config(&params, req).await {
-        Ok(resp) => protojson_json_response(&resp),
+        Ok(resp) => serde_json_response(&resp),
         Err(e) => rest_error_response(e),
     }
 }
@@ -349,7 +350,7 @@ async fn handle_list_push_configs<H: RequestHandler>(
         tenant: None,
     };
     match state.handler.list_push_configs(&params, req).await {
-        Ok(resp) => protojson_json_response(&resp),
+        Ok(resp) => serde_json_response(&resp.configs),
         Err(e) => rest_error_response(e),
     }
 }
@@ -365,7 +366,7 @@ async fn handle_delete_push_config<H: RequestHandler>(
         tenant: None,
     };
     match state.handler.delete_push_config(&params, req).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => StatusCode::OK.into_response(),
         Err(e) => rest_error_response(e),
     }
 }
@@ -387,6 +388,13 @@ fn protojson_json_response<T: ProtoJsonPayload>(value: &T) -> axum::response::Re
         Err(e) => rest_error_response(A2AError::internal(format!(
             "failed to serialize ProtoJSON payload: {e}"
         ))),
+    }
+}
+
+fn serde_json_response<T: Serialize>(value: &T) -> axum::response::Response {
+    match compat_json_value(value) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(e) => rest_error_response(e),
     }
 }
 
@@ -707,10 +715,7 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let payload = protojson_conv::from_str::<TaskPushNotificationConfig>(
-            std::str::from_utf8(&body).unwrap(),
-        )
-        .unwrap();
+        let payload = serde_json::from_slice::<TaskPushNotificationConfig>(&body).unwrap();
         assert_eq!(payload.task_id, "t1");
         assert_eq!(payload.config.id.as_deref(), Some("cfg1"));
         assert_eq!(payload.config.url, "http://example.com/callback");
@@ -735,10 +740,7 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let payload = protojson_conv::from_str::<TaskPushNotificationConfig>(
-            std::str::from_utf8(&body).unwrap(),
-        )
-        .unwrap();
+        let payload = serde_json::from_slice::<TaskPushNotificationConfig>(&body).unwrap();
         assert_eq!(payload.task_id, "t1");
         assert_eq!(payload.config.id.as_deref(), Some("cfg1"));
         assert_eq!(payload.config.url, "http://example.com/callback");
@@ -841,14 +843,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_push_configs() {
-        let app = make_app();
+        let app = make_push_app();
         let req = Request::builder()
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("GET")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert!(resp.status().is_client_error());
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload = serde_json::from_slice::<Vec<TaskPushNotificationConfig>>(&body).unwrap();
+        assert!(payload.is_empty());
     }
 
     #[tokio::test]
@@ -861,6 +866,42 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert!(resp.status().is_client_error());
+    }
+
+    #[tokio::test]
+    async fn test_delete_push_config_with_store_returns_ok() {
+        let app = make_push_app();
+        let create_body = serde_json::json!({
+            "id": "cfg1",
+            "url": "http://example.com/callback"
+        });
+        let create_req = Request::builder()
+            .uri("/tasks/t1/pushNotificationConfigs")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&create_body).unwrap()))
+            .unwrap();
+        let create_resp = app.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let delete_req = Request::builder()
+            .uri("/tasks/t1/pushNotificationConfigs/cfg1")
+            .method("DELETE")
+            .body(Body::empty())
+            .unwrap();
+        let delete_resp = app.clone().oneshot(delete_req).await.unwrap();
+        assert_eq!(delete_resp.status(), StatusCode::OK);
+
+        let list_req = Request::builder()
+            .uri("/tasks/t1/pushNotificationConfigs")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let list_resp = app.oneshot(list_req).await.unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let body = list_resp.into_body().collect().await.unwrap().to_bytes();
+        let payload = serde_json::from_slice::<Vec<TaskPushNotificationConfig>>(&body).unwrap();
+        assert!(payload.is_empty());
     }
 
     #[tokio::test]

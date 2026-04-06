@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::handler::RequestHandler;
 use crate::middleware::ServiceParams;
+use crate::push_config_compat::json_value as compat_json_value;
 use crate::sse;
 
 /// Shared state for the JSON-RPC handler.
@@ -102,7 +103,7 @@ async fn handle_unary_request<H: RequestHandler>(
                 .handler
                 .create_push_config(params, req)
                 .await
-                .and_then(|r| protojson_value(&r)),
+                .and_then(|r| compat_json_value(&r)),
             Err(e) => Err(parse_error(e)),
         },
         methods::GET_PUSH_CONFIG => {
@@ -111,7 +112,7 @@ async fn handle_unary_request<H: RequestHandler>(
                     .handler
                     .get_push_config(params, req)
                     .await
-                    .and_then(|r| protojson_value(&r)),
+                    .and_then(|r| compat_json_value(&r)),
                 Err(e) => Err(parse_error(e)),
             }
         }
@@ -121,7 +122,7 @@ async fn handle_unary_request<H: RequestHandler>(
                     .handler
                     .list_push_configs(params, req)
                     .await
-                    .and_then(|r| protojson_value(&r)),
+                    .and_then(|r| compat_json_value(&r.configs)),
                 Err(e) => Err(parse_error(e)),
             }
         }
@@ -443,8 +444,7 @@ mod tests {
         });
         let resp = post_jsonrpc(app, methods::CREATE_PUSH_CONFIG, params).await;
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
-        let result =
-            protojson_conv::from_value::<TaskPushNotificationConfig>(resp.result.unwrap()).unwrap();
+        let result = serde_json::from_value::<TaskPushNotificationConfig>(resp.result.unwrap()).unwrap();
         assert_eq!(result.task_id, "t1");
         assert_eq!(result.config.id.as_deref(), Some("cfg1"));
         assert_eq!(result.config.url, "http://example.com/callback");
@@ -462,8 +462,7 @@ mod tests {
         });
         let resp = post_jsonrpc(app, methods::CREATE_PUSH_CONFIG, params).await;
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
-        let result =
-            protojson_conv::from_value::<TaskPushNotificationConfig>(resp.result.unwrap()).unwrap();
+        let result = serde_json::from_value::<TaskPushNotificationConfig>(resp.result.unwrap()).unwrap();
         assert_eq!(result.task_id, "t1");
         assert_eq!(result.config.id.as_deref(), Some("cfg1"));
         assert_eq!(result.config.url, "http://example.com/callback");
@@ -482,12 +481,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_push_configs() {
-        let app = make_app();
+        let app = make_push_app();
         let params = serde_json::json!({
             "taskId": "t1"
         });
         let resp = post_jsonrpc(app, methods::LIST_PUSH_CONFIGS, params).await;
-        assert!(resp.error.is_some() || resp.result.is_some());
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = serde_json::from_value::<Vec<TaskPushNotificationConfig>>(resp.result.unwrap())
+            .unwrap();
+        assert!(result.is_empty());
     }
 
     #[tokio::test]
