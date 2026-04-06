@@ -84,7 +84,10 @@ impl TaskStore for InMemoryTaskStore {
         tasks.sort_by(|a, b| a.id.cmp(&b.id));
 
         // Apply pagination
-        let page_size = req.page_size.unwrap_or(50) as usize;
+        let page_size = match req.page_size {
+            Some(size) if size > 0 => size as usize,
+            _ => 50,
+        };
         let start = if let Some(ref token) = req.page_token {
             // Simple offset-based pagination
             token.parse::<usize>().unwrap_or(0)
@@ -291,6 +294,31 @@ mod tests {
         };
         let resp2 = store.list(&req2).await.unwrap();
         assert_eq!(resp2.tasks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_zero_page_size_uses_default_window() {
+        let store = InMemoryTaskStore::new();
+        for i in 0..3 {
+            store
+                .create(make_task(&format!("t{i}"), "c1", TaskState::Submitted))
+                .await
+                .unwrap();
+        }
+
+        let req = ListTasksRequest {
+            context_id: None,
+            status: None,
+            page_size: Some(0),
+            page_token: None,
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: None,
+            tenant: None,
+        };
+        let resp = store.list(&req).await.unwrap();
+        assert_eq!(resp.tasks.len(), 3);
+        assert_eq!(resp.page_size, 50);
     }
 
     #[tokio::test]

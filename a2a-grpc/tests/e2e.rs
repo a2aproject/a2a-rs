@@ -8,7 +8,7 @@ use a2a::*;
 use a2a_client::{Transport, TransportFactory};
 use a2a_grpc::{GrpcHandler, GrpcTransport, GrpcTransportFactory};
 use a2a_pb::proto::a2a_service_server::A2aServiceServer;
-use a2a_server::{RequestHandler, ServiceParams};
+use a2a_server::{DefaultRequestHandler, InMemoryTaskStore, RequestHandler, ServiceParams};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
@@ -80,6 +80,8 @@ fn sample_agent_card() -> AgentCard {
 }
 
 struct TestHandler;
+
+struct StoredTaskExecutor;
 
 #[async_trait]
 impl RequestHandler for TestHandler {
@@ -245,8 +247,79 @@ impl RequestHandler for TestHandler {
     }
 }
 
+impl a2a_server::AgentExecutor for StoredTaskExecutor {
+    fn execute(
+        &self,
+        ctx: a2a_server::ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        let response = StreamResponse::Task(Task {
+            id: ctx.task_id.clone(),
+            context_id: ctx.context_id.clone(),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: Some(Message {
+                    message_id: "stored-task-response".to_string(),
+                    context_id: Some(ctx.context_id.clone()),
+                    task_id: Some(ctx.task_id.clone()),
+                    role: Role::Agent,
+                    parts: vec![Part::text("stored-task-done")],
+                    metadata: None,
+                    extensions: None,
+                    reference_task_ids: None,
+                }),
+                timestamp: None,
+            },
+            artifacts: None,
+            history: ctx.message.clone().map(|message| vec![message]),
+            metadata: None,
+        });
+
+        Box::pin(stream::once(async move { Ok(response) }))
+    }
+
+    fn cancel(
+        &self,
+        ctx: a2a_server::ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        let response = StreamResponse::Task(Task {
+            id: ctx.task_id.clone(),
+            context_id: ctx.context_id.clone(),
+            status: TaskStatus {
+                state: TaskState::Canceled,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        });
+
+        Box::pin(stream::once(async move { Ok(response) }))
+    }
+}
+
 async fn spawn_grpc_server() -> (String, tokio::task::JoinHandle<()>) {
     let handler = Arc::new(TestHandler);
+    let service = A2aServiceServer::new(GrpcHandler::new(handler));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = TcpListenerStream::new(listener);
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (format!("http://{addr}"), handle)
+}
+
+async fn spawn_default_handler_grpc_server() -> (String, tokio::task::JoinHandle<()>) {
+    let handler = Arc::new(DefaultRequestHandler::new(
+        StoredTaskExecutor,
+        InMemoryTaskStore::new(),
+    ));
     let service = A2aServiceServer::new(GrpcHandler::new(handler));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -498,6 +571,54 @@ async fn grpc_transport_accepts_bare_host_port_endpoints() {
         .await
         .unwrap();
     assert!(matches!(response, SendMessageResponse::Task(_)));
+
+    transport.destroy().await.unwrap();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn grpc_transport_treats_zero_page_size_as_unset() {
+    let (endpoint, handle) = spawn_default_handler_grpc_server().await;
+    let transport = GrpcTransport::connect(endpoint).await.unwrap();
+
+    let sent = transport
+        .send_message(
+            &ServiceParams::new(),
+            &SendMessageRequest {
+                message: Message::new(Role::User, vec![Part::text("hello")]),
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let task = match sent {
+        SendMessageResponse::Task(task) => task,
+        SendMessageResponse::Message(_) => panic!("expected task response"),
+    };
+
+    let listed = transport
+        .list_tasks(
+            &ServiceParams::new(),
+            &ListTasksRequest {
+                context_id: Some(task.context_id.clone()),
+                status: None,
+                page_size: Some(0),
+                page_token: None,
+                history_length: None,
+                status_timestamp_after: None,
+                include_artifacts: Some(false),
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(listed.tasks.len(), 1);
+    assert_eq!(listed.tasks[0].id, task.id);
+    assert_eq!(listed.page_size, 50);
 
     transport.destroy().await.unwrap();
     handle.abort();

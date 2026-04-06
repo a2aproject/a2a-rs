@@ -111,6 +111,10 @@ fn empty_to_none(s: &str) -> Option<String> {
     }
 }
 
+fn non_positive_to_none(value: Option<i32>) -> Option<i32> {
+    value.filter(|value| *value > 0)
+}
+
 // ---------------------------------------------------------------------------
 // Role
 // ---------------------------------------------------------------------------
@@ -519,7 +523,7 @@ pub fn from_proto_list_tasks_request(r: &proto::ListTasksRequest) -> ListTasksRe
         } else {
             Some(from_proto_task_state(r.status))
         },
-        page_size: r.page_size,
+        page_size: non_positive_to_none(r.page_size),
         page_token: empty_to_none(&r.page_token),
         history_length: r.history_length,
         status_timestamp_after: r
@@ -1624,6 +1628,24 @@ mod tests {
         assert_eq!(req.history_length, back.history_length);
         assert_eq!(req.include_artifacts, back.include_artifacts);
         assert_eq!(req.tenant, back.tenant);
+    }
+
+    #[test]
+    fn test_from_proto_list_tasks_request_treats_zero_page_size_as_unset() {
+        let proto = proto::ListTasksRequest {
+            tenant: String::new(),
+            context_id: "ctx-1".to_string(),
+            status: 0,
+            page_size: Some(0),
+            page_token: String::new(),
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: Some(false),
+        };
+
+        let back = from_proto_list_tasks_request(&proto);
+        assert_eq!(back.context_id.as_deref(), Some("ctx-1"));
+        assert_eq!(back.page_size, None);
     }
 
     #[test]

@@ -83,6 +83,7 @@ pub trait RequestHandler: Send + Sync + 'static {
 pub struct DefaultRequestHandler {
     executor: Box<dyn crate::AgentExecutor>,
     task_store: Box<dyn crate::TaskStore>,
+    push_config_store: Option<Box<dyn crate::PushConfigStore>>,
     capabilities: AgentCapabilities,
 }
 
@@ -91,13 +92,29 @@ impl DefaultRequestHandler {
         DefaultRequestHandler {
             executor: Box::new(executor),
             task_store: Box::new(task_store),
+            push_config_store: None,
             capabilities: AgentCapabilities::default(),
         }
+    }
+
+    pub fn with_push_config_store(
+        mut self,
+        push_config_store: impl crate::PushConfigStore,
+    ) -> Self {
+        self.push_config_store = Some(Box::new(push_config_store));
+        self.capabilities.push_notifications = Some(true);
+        self
     }
 
     pub fn with_capabilities(mut self, capabilities: AgentCapabilities) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    fn push_config_store(&self) -> Result<&dyn crate::PushConfigStore, A2AError> {
+        self.push_config_store
+            .as_deref()
+            .ok_or_else(A2AError::push_notification_not_supported)
     }
 }
 
@@ -298,33 +315,75 @@ impl RequestHandler for DefaultRequestHandler {
     async fn create_push_config(
         &self,
         _params: &ServiceParams,
-        _req: CreateTaskPushNotificationConfigRequest,
+        req: CreateTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        Err(A2AError::push_notification_not_supported())
+        let saved = self
+            .push_config_store()?
+            .save(&req.task_id, req.config)
+            .await?;
+        Ok(TaskPushNotificationConfig {
+            task_id: req.task_id,
+            config: saved,
+            tenant: req.tenant,
+        })
     }
 
     async fn get_push_config(
         &self,
         _params: &ServiceParams,
-        _req: GetTaskPushNotificationConfigRequest,
+        req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        Err(A2AError::push_notification_not_supported())
+        let config = self.push_config_store()?.get(&req.task_id, &req.id).await?;
+        Ok(TaskPushNotificationConfig {
+            task_id: req.task_id,
+            config,
+            tenant: req.tenant,
+        })
     }
 
     async fn list_push_configs(
         &self,
         _params: &ServiceParams,
-        _req: ListTaskPushNotificationConfigsRequest,
+        req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        Err(A2AError::push_notification_not_supported())
+        let mut configs = self.push_config_store()?.list(&req.task_id).await?;
+        configs.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let page_size = match req.page_size {
+            Some(size) if size > 0 => size as usize,
+            _ => 50,
+        };
+        let start = req
+            .page_token
+            .as_deref()
+            .and_then(|token| token.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(configs.len());
+        let end = (start + page_size).min(configs.len());
+        let next_page_token = (end < configs.len()).then(|| end.to_string());
+
+        Ok(ListTaskPushNotificationConfigsResponse {
+            configs: configs[start..end]
+                .iter()
+                .cloned()
+                .map(|config| TaskPushNotificationConfig {
+                    task_id: req.task_id.clone(),
+                    config,
+                    tenant: req.tenant.clone(),
+                })
+                .collect(),
+            next_page_token,
+        })
     }
 
     async fn delete_push_config(
         &self,
         _params: &ServiceParams,
-        _req: DeleteTaskPushNotificationConfigRequest,
+        req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
-        Err(A2AError::push_notification_not_supported())
+        self.push_config_store()?
+            .delete(&req.task_id, &req.id)
+            .await
     }
 
     async fn get_extended_agent_card(
@@ -342,6 +401,7 @@ impl RequestHandler for DefaultRequestHandler {
 mod tests {
     use super::*;
     use crate::executor::ExecutorContext;
+    use crate::push::InMemoryPushConfigStore;
     use crate::task_store::InMemoryTaskStore;
     use futures::stream;
 
@@ -389,6 +449,11 @@ mod tests {
 
     fn make_handler() -> DefaultRequestHandler {
         DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+    }
+
+    fn make_handler_with_push_configs() -> DefaultRequestHandler {
+        DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+            .with_push_config_store(InMemoryPushConfigStore::new())
     }
 
     fn make_message() -> Message {
@@ -568,7 +633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_push_config_not_supported() {
+    async fn test_push_config_not_supported_without_store() {
         let handler = make_handler();
         let params = ServiceParams::new();
         let result = handler
@@ -590,6 +655,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_push_config_crud_with_store() {
+        let handler = make_handler_with_push_configs();
+        let params = ServiceParams::new();
+
+        let created = handler
+            .create_push_config(
+                &params,
+                CreateTaskPushNotificationConfigRequest {
+                    task_id: "t1".into(),
+                    config: PushNotificationConfig {
+                        url: "https://example.com/first".into(),
+                        id: Some("cfg-1".into()),
+                        token: None,
+                        authentication: None,
+                    },
+                    tenant: Some("tenant-a".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.config.id.as_deref(), Some("cfg-1"));
+
+        handler
+            .create_push_config(
+                &params,
+                CreateTaskPushNotificationConfigRequest {
+                    task_id: "t1".into(),
+                    config: PushNotificationConfig {
+                        url: "https://example.com/second".into(),
+                        id: Some("cfg-2".into()),
+                        token: None,
+                        authentication: None,
+                    },
+                    tenant: Some("tenant-a".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let fetched = handler
+            .get_push_config(
+                &params,
+                GetTaskPushNotificationConfigRequest {
+                    task_id: "t1".into(),
+                    id: "cfg-1".into(),
+                    tenant: Some("tenant-a".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched.config.url, "https://example.com/first");
+
+        let first_page = handler
+            .list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: Some(1),
+                    page_token: Some("0".into()),
+                    tenant: Some("tenant-a".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_page.configs.len(), 1);
+        assert_eq!(first_page.configs[0].config.id.as_deref(), Some("cfg-1"));
+        assert_eq!(first_page.next_page_token.as_deref(), Some("1"));
+
+        let default_page = handler
+            .list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: Some(0),
+                    page_token: None,
+                    tenant: Some("tenant-a".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_page.configs.len(), 2);
+        assert!(default_page.next_page_token.is_none());
+
+        handler
+            .delete_push_config(
+                &params,
+                DeleteTaskPushNotificationConfigRequest {
+                    task_id: "t1".into(),
+                    id: "cfg-1".into(),
+                    tenant: Some("tenant-a".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let remaining = handler
+            .list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: None,
+                    page_token: None,
+                    tenant: Some("tenant-a".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(remaining.configs.len(), 1);
+        assert_eq!(remaining.configs[0].config.id.as_deref(), Some("cfg-2"));
+    }
+
+    #[tokio::test]
     async fn test_extended_agent_card_not_configured() {
         let handler = make_handler();
         let params = ServiceParams::new();
@@ -608,5 +785,11 @@ mod tests {
             extended_agent_card: None,
         });
         assert_eq!(handler.capabilities.streaming, Some(true));
+    }
+
+    #[test]
+    fn test_with_push_config_store_enables_push_capability() {
+        let handler = make_handler_with_push_configs();
+        assert_eq!(handler.capabilities.push_notifications, Some(true));
     }
 }
