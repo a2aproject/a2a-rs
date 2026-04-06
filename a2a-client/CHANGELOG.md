@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-client-v0.1.12...agntcy-a2a-client-v0.1.13) - 2026-04-06
+
+### Fixed
+
+- *(client)* serialize create-push requests for go interop ([#35](https://github.com/agntcy/a2a-rs/pull/35))
+
 ## [0.1.12](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-client-v0.1.11...agntcy-a2a-client-v0.1.12) - 2026-04-06
 
 ### Other
