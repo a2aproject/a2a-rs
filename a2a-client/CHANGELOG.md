@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-client-v0.1.11...agntcy-a2a-client-v0.1.12) - 2026-04-06
+
+### Other
+
+- apply rustfmt to interop changes ([#33](https://github.com/agntcy/a2a-rs/pull/33))
+
 ## [0.1.11](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-client-v0.1.10...agntcy-a2a-client-v0.1.11) - 2026-04-06
 
 ### Fixed
