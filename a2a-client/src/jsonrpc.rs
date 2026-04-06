@@ -466,6 +466,10 @@ mod tests {
     use super::*;
     use a2a_pb::protojson_conv;
     use futures::StreamExt;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
 
     /// Helper: build an SSE byte stream from raw text chunks.
     fn byte_stream(
@@ -477,6 +481,91 @@ mod tests {
                 .map(|s| Ok(bytes::Bytes::from(s)))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    async fn spawn_jsonrpc_server(response_body: String) -> (String, oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body,
+            );
+
+            let _ = request_tx.send(request);
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (format!("http://{addr}"), request_rx)
+    }
+
+    async fn read_http_request(socket: &mut TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let mut expected_len = None;
+
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+
+            if expected_len.is_none() {
+                if let Some(header_end) = find_header_end(&buffer) {
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                    expected_len = Some(header_end + parse_content_length(&headers));
+                }
+            }
+
+            if let Some(total_len) = expected_len {
+                if buffer.len() >= total_len {
+                    break;
+                }
+            }
+        }
+
+        String::from_utf8(buffer).unwrap()
+    }
+
+    fn find_header_end(buffer: &[u8]) -> Option<usize> {
+        buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+    }
+
+    fn parse_content_length(headers: &str) -> usize {
+        headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
+    }
+
+    fn sample_create_push_config_request() -> CreateTaskPushNotificationConfigRequest {
+        CreateTaskPushNotificationConfigRequest {
+            task_id: "task-1".into(),
+            config: PushNotificationConfig {
+                url: "https://example.invalid/webhook".into(),
+                id: Some("cfg-1".into()),
+                token: Some("secret-token".into()),
+                authentication: Some(AuthenticationInfo {
+                    scheme: "Bearer".into(),
+                    credentials: Some("credential".into()),
+                }),
+            },
+            tenant: Some("tenant-1".into()),
+        }
     }
 
     #[tokio::test]
@@ -714,5 +803,155 @@ mod tests {
         let transport = f.create(&card, &iface).await.unwrap();
         // Just verify it was created (it's a real transport but we can't call it without a server)
         transport.destroy().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_push_config_sends_nested_request_shape() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "taskId": "task-1",
+                "config": {
+                    "url": "https://example.invalid/webhook",
+                    "id": "cfg-1",
+                    "token": "secret-token",
+                    "authentication": {
+                        "scheme": "Bearer",
+                        "credentials": "credential"
+                    }
+                },
+                "tenant": "tenant-1"
+            }
+        })
+        .to_string();
+        let (endpoint, request_rx) = spawn_jsonrpc_server(response).await;
+        let transport = JsonRpcTransport::new(Client::new(), endpoint);
+        let mut params = ServiceParams::new();
+        params.insert("x-trace".into(), vec!["alpha".into(), "beta".into()]);
+
+        let result = transport
+            .create_push_config(&params, &sample_create_push_config_request())
+            .await
+            .unwrap();
+
+        assert_eq!(result.task_id, "task-1");
+        assert_eq!(result.config.id.as_deref(), Some("cfg-1"));
+
+        let request = request_rx.await.unwrap();
+        let request_lower = request.to_ascii_lowercase();
+        assert!(request_lower.contains("x-trace: alpha"));
+        assert!(request_lower.contains("x-trace: beta"));
+
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let payload: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(payload["method"], methods::CREATE_PUSH_CONFIG);
+        assert_eq!(
+            payload["params"],
+            json!({
+                "taskId": "task-1",
+                "config": {
+                    "url": "https://example.invalid/webhook",
+                    "id": "cfg-1",
+                    "token": "secret-token",
+                    "authentication": {
+                        "scheme": "Bearer",
+                        "credentials": "credential"
+                    }
+                },
+                "tenant": "tenant-1"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_push_config_surfaces_jsonrpc_error() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "error": {
+                "code": error_code::INVALID_PARAMS,
+                "message": "invalid params",
+                "data": null
+            }
+        })
+        .to_string();
+        let (endpoint, _request_rx) = spawn_jsonrpc_server(response).await;
+        let transport = JsonRpcTransport::new(Client::new(), endpoint);
+
+        let error = transport
+            .create_push_config(&ServiceParams::new(), &sample_create_push_config_request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, error_code::INVALID_PARAMS);
+        assert_eq!(error.message, "invalid params");
+    }
+
+    #[tokio::test]
+    async fn test_create_push_config_rejects_missing_result() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "1"
+        })
+        .to_string();
+        let (endpoint, _request_rx) = spawn_jsonrpc_server(response).await;
+        let transport = JsonRpcTransport::new(Client::new(), endpoint);
+
+        let error = transport
+            .create_push_config(&ServiceParams::new(), &sample_create_push_config_request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert_eq!(error.message, "JSON-RPC response missing result");
+    }
+
+    #[tokio::test]
+    async fn test_get_push_config_uses_protojson_request_path() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "taskId": "task-1",
+                "config": {
+                    "url": "https://example.invalid/webhook",
+                    "id": "cfg-1",
+                    "token": "secret-token"
+                },
+                "tenant": "tenant-1"
+            }
+        })
+        .to_string();
+        let (endpoint, request_rx) = spawn_jsonrpc_server(response).await;
+        let transport = JsonRpcTransport::new(Client::new(), endpoint);
+
+        let result = transport
+            .get_push_config(
+                &ServiceParams::new(),
+                &GetTaskPushNotificationConfigRequest {
+                    task_id: "task-1".into(),
+                    id: "cfg-1".into(),
+                    tenant: Some("tenant-1".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.task_id, "task-1");
+        assert_eq!(result.config.id.as_deref(), Some("cfg-1"));
+
+        let request = request_rx.await.unwrap();
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let payload: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(payload["method"], methods::GET_PUSH_CONFIG);
+        assert_eq!(
+            payload["params"],
+            json!({
+                "taskId": "task-1",
+                "id": "cfg-1",
+                "tenant": "tenant-1"
+            })
+        );
     }
 }
