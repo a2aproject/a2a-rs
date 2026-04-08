@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "agntcy-a2a"
+name = "a2aproj-a2a-rs"
 version = "0.2.4"
 dependencies = [
  "base64 0.22.1",
@@ -15,11 +15,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "agntcy-a2a-client"
+name = "a2aproj-a2a-rs-cli"
+version = "0.1.0"
+dependencies = [
+ "a2aproj-a2a-rs",
+ "a2aproj-a2a-rs-client",
+ "a2aproj-a2a-rs-server",
+ "assert_cmd",
+ "async-trait",
+ "axum",
+ "clap",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "a2aproj-a2a-rs-client"
 version = "0.1.13"
 dependencies = [
- "agntcy-a2a",
- "agntcy-a2a-pb",
+ "a2aproj-a2a-rs",
+ "a2aproj-a2a-rs-pb",
  "async-trait",
  "bytes",
  "futures",
@@ -35,13 +54,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "agntcy-a2a-grpc"
+name = "a2aproj-a2a-rs-grpc"
 version = "0.1.11"
 dependencies = [
- "agntcy-a2a",
- "agntcy-a2a-client",
- "agntcy-a2a-pb",
- "agntcy-a2a-server",
+ "a2aproj-a2a-rs",
+ "a2aproj-a2a-rs-client",
+ "a2aproj-a2a-rs-pb",
+ "a2aproj-a2a-rs-server",
  "async-trait",
  "futures",
  "prost 0.13.5",
@@ -52,10 +71,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "agntcy-a2a-pb"
+name = "a2aproj-a2a-rs-pb"
 version = "0.1.6"
 dependencies = [
- "agntcy-a2a",
+ "a2aproj-a2a-rs",
  "chrono",
  "pbjson",
  "pbjson-build",
@@ -70,11 +89,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "agntcy-a2a-server"
+name = "a2aproj-a2a-rs-server"
 version = "0.2.6"
 dependencies = [
- "agntcy-a2a",
- "agntcy-a2a-pb",
+ "a2aproj-a2a-rs",
+ "a2aproj-a2a-rs-pb",
  "async-trait",
  "axum",
  "chrono",
@@ -93,37 +112,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "agntcy-a2a-slimrpc"
+name = "a2aproj-a2a-rs-slimrpc"
 version = "0.1.8"
 dependencies = [
- "agntcy-a2a",
- "agntcy-a2a-client",
- "agntcy-a2a-pb",
- "agntcy-a2a-server",
+ "a2aproj-a2a-rs",
+ "a2aproj-a2a-rs-client",
+ "a2aproj-a2a-rs-pb",
+ "a2aproj-a2a-rs-server",
  "agntcy-slim-bindings",
  "async-trait",
  "futures",
  "prost 0.13.5",
  "prost-types 0.13.5",
- "tokio",
-]
-
-[[package]]
-name = "agntcy-a2acli"
-version = "0.1.0"
-dependencies = [
- "agntcy-a2a",
- "agntcy-a2a-client",
- "agntcy-a2a-server",
- "assert_cmd",
- "async-trait",
- "axum",
- "clap",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -1565,9 +1565,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "helloworld"
 version = "0.1.0"
 dependencies = [
- "agntcy-a2a",
- "agntcy-a2a-client",
- "agntcy-a2a-server",
+ "a2aproj-a2a-rs",
+ "a2aproj-a2a-rs-client",
+ "a2aproj-a2a-rs-server",
  "async-trait",
  "axum",
  "chrono",

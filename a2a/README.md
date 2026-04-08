@@ -1,8 +1,8 @@
-# agntcy-a2a
+# a2aproj-a2a-rs
 
 Core Rust types for the A2A v1 protocol.
 
-This crate is published as `agntcy-a2a` and imported in Rust as `a2a`.
+This crate is published as `a2aproj-a2a-rs` and imported in Rust as `a2a`.
 
 ## What It Provides
 
@@ -15,7 +15,7 @@ This crate is published as `agntcy-a2a` and imported in Rust as `a2a`.
 
 ```toml
 [dependencies]
-a2a = { package = "agntcy-a2a", version = "0.2" }
+a2a = { package = "a2aproj-a2a-rs", version = "0.2" }
 ```
 
 ## Example
@@ -31,5 +31,5 @@ assert_eq!(message.text(), Some("hello"));
 
 This crate is part of the `a2a-rs` workspace.
 
-- Repository: https://github.com/agntcy/a2a-rs
-- Workspace README: https://github.com/agntcy/a2a-rs/blob/main/README.md
+- Repository: https://github.com/a2aproject/a2a-rs
+- Workspace README: https://github.com/a2aproject/a2a-rs/blob/main/README.md

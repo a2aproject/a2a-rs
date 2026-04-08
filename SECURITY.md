@@ -21,5 +21,5 @@ Participation in security issue coordination processes is at the discretion of t
 ## Security advisories
 
 The project team is committed to transparency in the security issue disclosure
-process. The A2A Rust SDK team announces security issues via [project GitHub Release notes](https://github.com/agntcy/a2a-rs/releases)
+process. The A2A Rust SDK team announces security issues via [project GitHub Release notes](https://github.com/a2aproject/a2a-rs/releases)
 and the [RustSec advisory database](https://github.com/RustSec/advisory-db) (i.e. `cargo-audit`).

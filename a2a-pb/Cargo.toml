@@ -1,5 +1,5 @@
 [package]
-name = "agntcy-a2a-pb"
+name = "a2aproj-a2a-rs-pb"
 version = "0.1.6"
 description = "A2A v1 protobuf-generated types and conversion layer"
 readme = "README.md"

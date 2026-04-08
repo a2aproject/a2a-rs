@@ -1,5 +1,5 @@
 [package]
-name = "agntcy-a2a-grpc"
+name = "a2aproj-a2a-rs-grpc"
 version = "0.1.11"
 description = "A2A v1 gRPC protocol binding for client and server"
 readme = "README.md"

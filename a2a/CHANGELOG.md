@@ -7,13 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.4](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-v0.2.3...agntcy-a2a-v0.2.4) - 2026-04-05
+## [0.2.4](https://github.com/a2aproject/a2a-rs/compare/agntcy-a2a-v0.2.3...agntcy-a2a-v0.2.4) - 2026-04-05
 
 ### Fixed
 
 - normalize gRPC agent card URLs
 
-## [0.2.3](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-v0.2.2...agntcy-a2a-v0.2.3) - 2026-04-04
+## [0.2.3](https://github.com/a2aproject/a2a-rs/compare/agntcy-a2a-v0.2.2...agntcy-a2a-v0.2.3) - 2026-04-04
 
 ### Added
 
@@ -24,19 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - drop dotted jsonrpc aliases
 - align jsonrpc and agent-card interop
 
-## [0.2.2](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-v0.2.1...agntcy-a2a-v0.2.2) - 2026-04-03
+## [0.2.2](https://github.com/a2aproject/a2a-rs/compare/agntcy-a2a-v0.2.1...agntcy-a2a-v0.2.2) - 2026-04-03
 
 ### Other
 
 - add crate rustdoc for agntcy-a2a
 
-## [0.2.1](https://github.com/agntcy/a2a-rs/compare/agntcy-a2a-v0.2.0...agntcy-a2a-v0.2.1) - 2026-04-03
+## [0.2.1](https://github.com/a2aproject/a2a-rs/compare/agntcy-a2a-v0.2.0...agntcy-a2a-v0.2.1) - 2026-04-03
 
 ### Other
 
 - add crate readmes for crates.io
 
-## [0.2.0](https://github.com/agntcy/a2a-rs/compare/a2a-v0.1.0...a2a-v0.2.0) - 2026-04-03
+## [0.2.0](https://github.com/a2aproject/a2a-rs/compare/a2a-v0.1.0...a2a-v0.2.0) - 2026-04-03
 
 ### Added
 

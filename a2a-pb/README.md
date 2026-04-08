@@ -1,8 +1,8 @@
-# agntcy-a2a-pb
+# a2aproj-a2a-rs-pb
 
 Protobuf schema and conversion helpers for A2A v1.
 
-This crate is published as `agntcy-a2a-pb` and imported in Rust as `a2a_pb`.
+This crate is published as `a2aproj-a2a-rs-pb` and imported in Rust as `a2a_pb`.
 
 ## What It Provides
 
@@ -15,13 +15,13 @@ This crate is published as `agntcy-a2a-pb` and imported in Rust as `a2a_pb`.
 
 ```toml
 [dependencies]
-a2a = { package = "agntcy-a2a", version = "0.2" }
-a2a-pb = { package = "agntcy-a2a-pb", version = "0.1" }
+a2a = { package = "a2aproj-a2a-rs", version = "0.2" }
+a2a-pb = { package = "a2aproj-a2a-rs-pb", version = "0.1" }
 ```
 
 ## Workspace
 
 This crate is part of the `a2a-rs` workspace.
 
-- Repository: https://github.com/agntcy/a2a-rs
-- Workspace README: https://github.com/agntcy/a2a-rs/blob/main/README.md
+- Repository: https://github.com/a2aproject/a2a-rs
+- Workspace README: https://github.com/a2aproject/a2a-rs/blob/main/README.md

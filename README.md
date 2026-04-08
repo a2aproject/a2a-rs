@@ -1,10 +1,10 @@
 # A2A Rust SDK
 
-[![CI](https://github.com/agntcy/a2a-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/agntcy/a2a-rs/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/agntcy/a2a-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/agntcy/a2a-rs)
-[![crates.io](https://img.shields.io/crates/v/agntcy-a2a.svg)](https://crates.io/crates/agntcy-a2a)
-[![docs.rs](https://docs.rs/agntcy-a2a/badge.svg)](https://docs.rs/agntcy-a2a)
-[![License](https://img.shields.io/crates/l/agntcy-a2a.svg)](https://github.com/agntcy/a2a-rs/blob/main/LICENSE.md)
+[![CI](https://github.com/a2aproject/a2a-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/a2aproject/a2a-rs/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/a2aproject/a2a-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/a2aproject/a2a-rs)
+[![crates.io](https://img.shields.io/crates/v/a2aproj-a2a-rs.svg)](https://crates.io/crates/a2aproj-a2a-rs)
+[![docs.rs](https://docs.rs/a2aproj-a2a-rs/badge.svg)](https://docs.rs/a2aproj-a2a-rs)
+[![License](https://img.shields.io/crates/l/a2aproj-a2a-rs.svg)](https://github.com/a2aproject/a2a-rs/blob/main/LICENSE.md)
 
 `a2a-rs` is a Rust workspace for the A2A v1 protocol. It includes core protocol
 types, async client and server libraries, protobuf definitions, and gRPC
@@ -29,7 +29,7 @@ The workspace supports:
 | `a2a-pb` | Protobuf schema, generated types, ProtoJSON-capable generated types, and native <-> protobuf conversion helpers |
 | `a2a-grpc` | gRPC client and server bindings built on `tonic` |
 | `a2a-slimrpc` | SLIMRPC client and server bindings built on `slim_bindings` |
-| `a2acli` | Standalone A2A client CLI, published as `agntcy-a2acli`, for inspecting agent cards, sending messages, managing tasks, and handling push configs |
+| `a2acli` | Standalone A2A client CLI, published as `a2aproj-a2a-rs-cli`, for inspecting agent cards, sending messages, managing tasks, and handling push configs |
 | `examples/helloworld` | Minimal runnable example agent |
 
 ## Supported Bindings
@@ -124,7 +124,7 @@ transport selection, and pass `--bearer-token` or repeated `--header Name:Value`
 arguments when the server requires authentication.
 
 Install from the workspace with `cargo install --path a2acli`, or from crates.io
-after release with `cargo install agntcy-a2acli`.
+after release with `cargo install a2aproj-a2a-rs-cli`.
 
 ## Depending On The Workspace
 
@@ -132,12 +132,12 @@ Until the crates are published, depend on them directly from Git:
 
 ```toml
 [dependencies]
-a2a = { package = "agntcy-a2a", git = "https://github.com/agntcy/a2a-rs.git" }
-a2a-client = { package = "agntcy-a2a-client", git = "https://github.com/agntcy/a2a-rs.git" }
-a2a-server = { package = "agntcy-a2a-server", git = "https://github.com/agntcy/a2a-rs.git" }
-a2a-pb = { package = "agntcy-a2a-pb", git = "https://github.com/agntcy/a2a-rs.git" }
-a2a-grpc = { package = "agntcy-a2a-grpc", git = "https://github.com/agntcy/a2a-rs.git" }
-a2a-slimrpc = { package = "agntcy-a2a-slimrpc", git = "https://github.com/agntcy/a2a-rs.git" }
+a2a = { package = "a2aproj-a2a-rs", git = "https://github.com/a2aproject/a2a-rs.git" }
+a2a-client = { package = "a2aproj-a2a-rs-client", git = "https://github.com/a2aproject/a2a-rs.git" }
+a2a-server = { package = "a2aproj-a2a-rs-server", git = "https://github.com/a2aproject/a2a-rs.git" }
+a2a-pb = { package = "a2aproj-a2a-rs-pb", git = "https://github.com/a2aproject/a2a-rs.git" }
+a2a-grpc = { package = "a2aproj-a2a-rs-grpc", git = "https://github.com/a2aproject/a2a-rs.git" }
+a2a-slimrpc = { package = "a2aproj-a2a-rs-slimrpc", git = "https://github.com/a2aproject/a2a-rs.git" }
 ```
 
 Typical usage is:
