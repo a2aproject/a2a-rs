@@ -1,0 +1,33 @@
+[package]
+name = "agntcy-a2acli"
+version = "0.1.0"
+description = "Standalone A2A CLI client"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "a2acli"
+
+[[bin]]
+name = "a2acli"
+path = "src/main.rs"
+
+[dependencies]
+a2a = { workspace = true }
+a2a-client = { workspace = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+a2a-server = { workspace = true }
+assert_cmd = "2"
+async-trait = { workspace = true }
+axum = { workspace = true }

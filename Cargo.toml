@@ -6,6 +6,7 @@ members = [
     "a2a-pb",
     "a2a-grpc",
     "a2a-slimrpc",
+    "a2acli",
     "examples/helloworld",
 ]
 resolver = "2"

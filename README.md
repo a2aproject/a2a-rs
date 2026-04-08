@@ -29,6 +29,7 @@ The workspace supports:
 | `a2a-pb` | Protobuf schema, generated types, ProtoJSON-capable generated types, and native <-> protobuf conversion helpers |
 | `a2a-grpc` | gRPC client and server bindings built on `tonic` |
 | `a2a-slimrpc` | SLIMRPC client and server bindings built on `slim_bindings` |
+| `a2acli` | Standalone A2A client CLI, published as `agntcy-a2acli`, for inspecting agent cards, sending messages, managing tasks, and handling push configs |
 | `examples/helloworld` | Minimal runnable example agent |
 
 ## Supported Bindings
@@ -101,6 +102,30 @@ When the example starts, the following endpoints are available:
 The example does not start a gRPC server, but the `a2a-grpc` crate provides the
 client and server bindings needed to add one.
 
+## Running The A2A CLI
+
+The workspace includes a standalone CLI client built on `a2a-client`. It
+resolves the public agent card from a base URL, negotiates JSON-RPC or
+HTTP+JSON, prints responses as JSON, and manages task push notification
+configs.
+
+```sh
+cargo run --bin a2acli -- card
+cargo run --bin a2acli -- send "hello from rust"
+cargo run --bin a2acli -- stream "hello from rust"
+cargo run --bin a2acli -- list-tasks
+cargo run --bin a2acli -- push-config list task-123
+```
+
+By default the CLI targets `http://localhost:3000`, which matches the bundled
+hello world server. Override the target with `--base-url https://host` for any
+compatible A2A server, use `--binding jsonrpc` or `--binding http-json` to pin
+transport selection, and pass `--bearer-token` or repeated `--header Name:Value`
+arguments when the server requires authentication.
+
+Install from the workspace with `cargo install --path a2acli`, or from crates.io
+after release with `cargo install agntcy-a2acli`.
+
 ## Depending On The Workspace
 
 Until the crates are published, depend on them directly from Git:
@@ -132,6 +157,7 @@ Typical usage is:
 - `a2a-pb/`: protobuf schema and conversion layer
 - `a2a-grpc/`: tonic-based bindings
 - `a2a-slimrpc/`: SLIMRPC bindings
+- `a2acli/`: standalone A2A client CLI and published binary package
 - `examples/helloworld/`: runnable sample agent
 
 ## Contributing

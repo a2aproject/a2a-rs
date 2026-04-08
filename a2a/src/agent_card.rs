@@ -36,7 +36,11 @@ pub struct AgentCard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_schemes: Option<HashMap<String, SecurityScheme>>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_security_requirements"
+    )]
     pub security_requirements: Option<Vec<SecurityRequirement>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,6 +53,78 @@ where
     T: Deserialize<'de>,
 {
     Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_optional_security_requirements<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<SecurityRequirement>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<Vec<Value>>::deserialize(deserializer)?;
+
+    raw.map(|items| {
+        items
+            .into_iter()
+            .map(parse_security_requirement_value)
+            .collect()
+    })
+    .transpose()
+}
+
+fn parse_security_requirement_value<E>(value: Value) -> Result<SecurityRequirement, E>
+where
+    E: serde::de::Error,
+{
+    if let Ok(requirement) = serde_json::from_value::<SecurityRequirement>(value.clone()) {
+        return Ok(requirement);
+    }
+
+    let Value::Object(mut object) = value else {
+        return Err(E::custom("security requirement must be an object"));
+    };
+
+    if let Some(schemes) = object.remove("schemes") {
+        return parse_security_requirement_map::<E>(schemes);
+    }
+
+    Err(E::custom("invalid security requirement shape"))
+}
+
+fn parse_security_requirement_map<E>(value: Value) -> Result<SecurityRequirement, E>
+where
+    E: serde::de::Error,
+{
+    let Value::Object(object) = value else {
+        return Err(E::custom("security requirement schemes must be an object"));
+    };
+
+    let mut requirement = HashMap::new();
+    for (scheme, scopes_value) in object {
+        let scopes = match scopes_value {
+            Value::Array(_) => serde_json::from_value::<Vec<String>>(scopes_value)
+                .map_err(|e| E::custom(format!("invalid security scopes for {scheme}: {e}")))?,
+            Value::Object(mut wrapped) => {
+                let Some(list) = wrapped.remove("list") else {
+                    return Err(E::custom(format!(
+                        "invalid wrapped security scopes for {scheme}"
+                    )));
+                };
+                serde_json::from_value::<Vec<String>>(list).map_err(|e| {
+                    E::custom(format!("invalid wrapped security scopes for {scheme}: {e}"))
+                })?
+            }
+            _ => {
+                return Err(E::custom(format!(
+                    "security scopes for {scheme} must be a list"
+                )));
+            }
+        };
+
+        requirement.insert(scheme, scopes);
+    }
+
+    Ok(requirement)
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +280,11 @@ pub struct AgentSkill {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_modes: Option<Vec<String>>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_security_requirements"
+    )]
     pub security_requirements: Option<Vec<SecurityRequirement>>,
 }
 
@@ -764,5 +844,43 @@ mod tests {
         .unwrap();
 
         assert!(card.skills.is_empty());
+    }
+
+    #[test]
+    fn test_agent_card_deserializes_wrapped_security_requirements() {
+        let card: AgentCard = serde_json::from_str(
+            r#"{
+                "name": "Spec Agent",
+                "description": "A test agent",
+                "version": "1.0.0",
+                "supportedInterfaces": [
+                    {
+                        "url": "https://example.com/spec",
+                        "protocolBinding": "JSONRPC",
+                        "protocolVersion": "1.0"
+                    }
+                ],
+                "capabilities": {
+                    "streaming": true
+                },
+                "defaultInputModes": ["text/plain"],
+                "defaultOutputModes": ["text/plain"],
+                "skills": [],
+                "securityRequirements": [
+                    {
+                        "schemes": {
+                            "bearer_token": {
+                                "list": []
+                            }
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let requirements = card.security_requirements.unwrap();
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].get("bearer_token"), Some(&Vec::new()));
     }
 }
