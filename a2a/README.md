@@ -1,8 +1,8 @@
-# a2aproj-a2a-rs
+# a2a-lf
 
 Core Rust types for the A2A v1 protocol.
 
-This crate is published as `a2aproj-a2a-rs` and imported in Rust as `a2a`.
+This crate is published as `a2a-lf` and imported in Rust as `a2a`.
 
 ## What It Provides
 
@@ -15,7 +15,7 @@ This crate is published as `a2aproj-a2a-rs` and imported in Rust as `a2a`.
 
 ```toml
 [dependencies]
-a2a = { package = "a2aproj-a2a-rs", version = "0.2" }
+a2a = { package = "a2a-lf", version = "0.2" }
 ```
 
 ## Example

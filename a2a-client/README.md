@@ -1,8 +1,8 @@
-# a2aproj-a2a-rs-client
+# a2a-client-lf
 
 Async Rust client for A2A v1 agents.
 
-This crate is published as `a2aproj-a2a-rs-client` and imported in Rust as `a2a_client`.
+This crate is published as `a2a-client-lf` and imported in Rust as `a2a_client`.
 
 ## What It Provides
 
@@ -15,8 +15,8 @@ This crate is published as `a2aproj-a2a-rs-client` and imported in Rust as `a2a_
 
 ```toml
 [dependencies]
-a2a = { package = "a2aproj-a2a-rs", version = "0.2" }
-a2a-client = { package = "a2aproj-a2a-rs-client", version = "0.1" }
+a2a = { package = "a2a-lf", version = "0.2" }
+a2a-client = { package = "a2a-client-lf", version = "0.1" }
 ```
 
 ## Workspace

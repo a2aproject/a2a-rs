@@ -1,8 +1,8 @@
-# a2aproj-a2a-rs-server
+# a2a-server-lf
 
 Async server framework for implementing A2A v1 agents in Rust.
 
-This crate is published as `a2aproj-a2a-rs-server` and imported in Rust as `a2a_server`.
+This crate is published as `a2a-server-lf` and imported in Rust as `a2a_server`.
 
 ## What It Provides
 
@@ -15,8 +15,8 @@ This crate is published as `a2aproj-a2a-rs-server` and imported in Rust as `a2a_
 
 ```toml
 [dependencies]
-a2a = { package = "a2aproj-a2a-rs", version = "0.2" }
-a2a-server = { package = "a2aproj-a2a-rs-server", version = "0.1" }
+a2a = { package = "a2a-lf", version = "0.2" }
+a2a-server = { package = "a2a-server-lf", version = "0.1" }
 ```
 
 ## Workspace

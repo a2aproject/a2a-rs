@@ -19,12 +19,12 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Internal crates
-a2a = { package = "a2aproj-a2a-rs", path = "a2a", version = "0.2.4" }
-a2a-client = { package = "a2aproj-a2a-rs-client", path = "a2a-client", version = "0.1.13" }
-a2a-server = { package = "a2aproj-a2a-rs-server", path = "a2a-server", version = "0.2.6" }
-a2a-pb = { package = "a2aproj-a2a-rs-pb", path = "a2a-pb", version = "0.1.6" }
-a2a-grpc = { package = "a2aproj-a2a-rs-grpc", path = "a2a-grpc", version = "0.1.11" }
-a2a-slimrpc = { package = "a2aproj-a2a-rs-slimrpc", path = "a2a-slimrpc", version = "0.1.8" }
+a2a = { package = "a2a-lf", path = "a2a", version = "0.2.4" }
+a2a-client = { package = "a2a-client-lf", path = "a2a-client", version = "0.1.13" }
+a2a-server = { package = "a2a-server-lf", path = "a2a-server", version = "0.2.6" }
+a2a-pb = { package = "a2a-pb", path = "a2a-pb", version = "0.1.6" }
+a2a-grpc = { package = "a2a-grpc", path = "a2a-grpc", version = "0.1.11" }
+a2a-slimrpc = { package = "a2a-slimrpc", path = "a2a-slimrpc", version = "0.1.8" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

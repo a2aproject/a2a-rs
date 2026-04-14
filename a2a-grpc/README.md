@@ -1,8 +1,8 @@
-# a2aproj-a2a-rs-grpc
+# a2a-grpc
 
 gRPC bindings for A2A v1 client and server implementations.
 
-This crate is published as `a2aproj-a2a-rs-grpc` and imported in Rust as `a2a_grpc`.
+This crate is published as `a2a-grpc` and imported in Rust as `a2a_grpc`.
 
 ## What It Provides
 
@@ -20,8 +20,8 @@ before connecting so agent cards emitted by other SDKs remain usable.
 
 ```toml
 [dependencies]
-a2a = { package = "a2aproj-a2a-rs", version = "0.2" }
-a2a-grpc = { package = "a2aproj-a2a-rs-grpc", version = "0.1" }
+a2a = { package = "a2a-lf", version = "0.2" }
+a2a-grpc = { package = "a2a-grpc", version = "0.1" }
 ```
 
 ## Workspace

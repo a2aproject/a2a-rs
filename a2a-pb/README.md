@@ -1,8 +1,8 @@
-# a2aproj-a2a-rs-pb
+# a2a-pb
 
 Protobuf schema and conversion helpers for A2A v1.
 
-This crate is published as `a2aproj-a2a-rs-pb` and imported in Rust as `a2a_pb`.
+This crate is published as `a2a-pb` and imported in Rust as `a2a_pb`.
 
 ## What It Provides
 
@@ -15,8 +15,8 @@ This crate is published as `a2aproj-a2a-rs-pb` and imported in Rust as `a2a_pb`.
 
 ```toml
 [dependencies]
-a2a = { package = "a2aproj-a2a-rs", version = "0.2" }
-a2a-pb = { package = "a2aproj-a2a-rs-pb", version = "0.1" }
+a2a = { package = "a2a-lf", version = "0.2" }
+a2a-pb = { package = "a2a-pb", version = "0.1" }
 ```
 
 ## Workspace

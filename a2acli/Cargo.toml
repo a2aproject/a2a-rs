@@ -1,5 +1,5 @@
 [package]
-name = "a2aproj-a2a-rs-cli"
+name = "a2a-cli"
 version = "0.1.0"
 description = "Standalone A2A CLI client"
 readme = "README.md"

@@ -1,5 +1,5 @@
 [package]
-name = "a2aproj-a2a-rs-client"
+name = "a2a-client-lf"
 version = "0.1.13"
 description = "A2A v1 async client with protocol binding factory"
 readme = "README.md"

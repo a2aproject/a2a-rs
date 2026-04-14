@@ -1,5 +1,5 @@
 [package]
-name = "a2aproj-a2a-rs-slimrpc"
+name = "a2a-slimrpc"
 version = "0.1.8"
 description = "A2A v1 SLIMRPC protocol binding for client and server"
 readme = "README.md"

@@ -1,8 +1,8 @@
-# a2aproj-a2a-rs-slimrpc
+# a2a-slimrpc
 
 SLIMRPC bindings for A2A v1 client and server implementations.
 
-This crate is published as `a2aproj-a2a-rs-slimrpc` and imported in Rust as `a2a_slimrpc`.
+This crate is published as `a2a-slimrpc` and imported in Rust as `a2a_slimrpc`.
 
 ## What It Provides
 
@@ -25,8 +25,8 @@ Accepted forms are:
 
 ```toml
 [dependencies]
-a2a = { package = "a2aproj-a2a-rs", version = "0.2" }
-a2a-slimrpc = { package = "a2aproj-a2a-rs-slimrpc", version = "0.1" }
+a2a = { package = "a2a-lf", version = "0.2" }
+a2a-slimrpc = { package = "a2a-slimrpc", version = "0.1" }
 ```
 
 ## Workspace
