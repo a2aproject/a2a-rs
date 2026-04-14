@@ -11,4 +11,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add standalone `a2acli` binary crate
 - add task push notification config CRUD commands
-- make the package installable as `agntcy-a2acli`
+- make the package installable as `a2a-cli`

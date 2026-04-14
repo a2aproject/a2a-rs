@@ -22,7 +22,7 @@ please join us!
 For any issue, there are fundamentally three ways an individual can contribute:
 
 1. By opening the issue for discussion: For instance, if you believe that you
-   have discovered a bug in A2A-RS, creating a new issue in [the agntcy/a2a-rs
+   have discovered a bug in A2A-RS, creating a new issue in [the a2aproject/a2a-rs
    issue tracker][issue] is the way to report it.
 
 2. By helping to triage the issue: This can be done by providing
@@ -35,7 +35,7 @@ For any issue, there are fundamentally three ways an individual can contribute:
    often, by opening a Pull Request that changes some bit of something in
    A2A-RS in a concrete and reviewable manner.
 
-[issue]: https://github.com/agntcy/a2a-rs/issues
+[issue]: https://github.com/a2aproject/a2a-rs/issues
 
 **Anybody can participate in any stage of contribution**. We urge you to
 participate in the discussion around bugs and participate in reviewing PRs.
@@ -48,7 +48,7 @@ having problems, you can [open a discussion] asking for help.
 In exchange for receiving help, we ask that you contribute back a documentation
 PR that helps others avoid the problems that you encountered.
 
-[open a discussion]: https://github.com/agntcy/a2a-rs/discussions/new
+[open a discussion]: https://github.com/a2aproject/a2a-rs/discussions/new
 
 ### Submitting a Bug Report
 

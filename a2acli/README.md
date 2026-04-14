@@ -2,7 +2,7 @@
 
 Standalone A2A CLI client built on top of `a2a-client`.
 
-This crate is published as `agntcy-a2acli` and installs the `a2acli` binary.
+This crate is published as `a2a-cli` and installs the `a2acli` binary.
 
 ## Install
 
@@ -15,7 +15,7 @@ cargo install --path a2acli
 From crates.io after release:
 
 ```sh
-cargo install agntcy-a2acli
+cargo install a2a-cli
 ```
 
 ## What It Provides

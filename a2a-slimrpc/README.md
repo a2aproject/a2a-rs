@@ -1,8 +1,8 @@
-# agntcy-a2a-slimrpc
+# a2a-slimrpc
 
 SLIMRPC bindings for A2A v1 client and server implementations.
 
-This crate is published as `agntcy-a2a-slimrpc` and imported in Rust as `a2a_slimrpc`.
+This crate is published as `a2a-slimrpc` and imported in Rust as `a2a_slimrpc`.
 
 ## What It Provides
 
@@ -25,13 +25,13 @@ Accepted forms are:
 
 ```toml
 [dependencies]
-a2a = { package = "agntcy-a2a", version = "0.2" }
-a2a-slimrpc = { package = "agntcy-a2a-slimrpc", version = "0.1" }
+a2a = { package = "a2a-lf", version = "0.2" }
+a2a-slimrpc = { package = "a2a-slimrpc", version = "0.1" }
 ```
 
 ## Workspace
 
 This crate is part of the `a2a-rs` workspace.
 
-- Repository: https://github.com/agntcy/a2a-rs
-- Workspace README: https://github.com/agntcy/a2a-rs/blob/main/README.md
+- Repository: https://github.com/a2aproject/a2a-rs
+- Workspace README: https://github.com/a2aproject/a2a-rs/blob/main/README.md
