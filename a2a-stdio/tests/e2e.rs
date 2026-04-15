@@ -381,7 +381,7 @@ async fn setup() -> (
 async fn stdio_unary_send_message() {
     let (_server, mut client) = setup().await;
 
-    let params = serde_json::to_value(&send_message_request("task-1")).unwrap();
+    let params = serde_json::to_value(send_message_request("task-1")).unwrap();
     let resp = client.call("message/send", params).await;
 
     assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
@@ -542,7 +542,7 @@ async fn stdio_unary_get_extended_agent_card() {
 async fn stdio_streaming_send_message() {
     let (_server, mut client) = setup().await;
 
-    let params = serde_json::to_value(&send_message_request("task-1")).unwrap();
+    let params = serde_json::to_value(send_message_request("task-1")).unwrap();
     let (notifications, final_resp) = client.call_streaming("message/stream", params).await;
 
     // We expect 2 notifications (Working + Completed) then a final success.

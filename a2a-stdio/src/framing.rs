@@ -35,7 +35,7 @@ pub async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Optio
             return Ok(None);
         }
 
-        let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+        let trimmed = line.trim_end_matches(['\r', '\n']);
 
         // Empty line = end of headers.
         if trimmed.is_empty() {

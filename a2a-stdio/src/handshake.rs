@@ -204,14 +204,14 @@ mod tests {
         let ack = HandshakeAck::accept("a2a/v1".into());
         let json = serde_json::to_string(&ack).unwrap();
         let back: HandshakeAck = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.accept, true);
+        assert!(back.accept);
         assert_eq!(back.selected_variant, "a2a/v1");
     }
 
     #[test]
     fn test_handshake_ack_reject_serde() {
         let ack = HandshakeAck::reject();
-        assert_eq!(ack.accept, false);
+        assert!(!ack.accept);
     }
 
     #[test]
