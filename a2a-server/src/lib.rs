@@ -10,6 +10,8 @@ mod push_config_compat;
 pub mod rest;
 pub mod sse;
 pub mod task_store;
+#[cfg(feature = "rustls")]
+pub mod tls;
 
 pub use agent_card::{AgentCardProducer, StaticAgentCard, WELL_KNOWN_AGENT_CARD_PATH};
 pub use executor::{AgentExecutor, ExecutorContext};

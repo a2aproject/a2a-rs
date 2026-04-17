@@ -27,3 +27,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 semver = { workspace = true }
 pin-project-lite = { workspace = true }
+
+[features]
+default = ["rustls-tls"]
+native-tls = ["reqwest/native-tls"]
+rustls-tls = ["reqwest/rustls-tls"]
