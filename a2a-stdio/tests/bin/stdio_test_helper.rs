@@ -18,6 +18,17 @@
 //! - `bad-response` — manually write a JSON-RPC response whose `result`
 //!   cannot be deserialized into the expected type. Used to exercise the
 //!   client-side `deserialize result` error branch.
+//! - `stream-bad-frame` — handshake, then on the first request write a
+//!   non-JSON byte payload as a single frame. Exercises the streaming
+//!   `parse frame` branch in the client background reader.
+//! - `stream-bad-notification` — handshake, then on the first request write
+//!   one streaming notification whose `params` cannot be parsed as a
+//!   `StreamResponse`, followed by a valid final response. Exercises the
+//!   streaming `parse streaming event` branch.
+//! - `stream-bad-final` — handshake, then on the first request write a
+//!   final JSON-RPC response (with id) whose `result` is not a
+//!   `StreamResponse`. Exercises the streaming `failed to parse final
+//!   stream response` branch.
 
 use std::env;
 use std::sync::Arc;
@@ -29,7 +40,7 @@ use a2a_server::RequestHandler;
 use a2a_server::middleware::ServiceParams;
 use a2a_stdio::framing;
 use a2a_stdio::handshake::{Handshake, read_handshake_ack};
-use a2a_stdio::{StdioServer, handshake};
+use a2a_stdio::{handshake, serve};
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use tokio::io::{BufReader, stdin, stdout};
@@ -43,6 +54,9 @@ async fn main() {
         "handshake-then-hang" => handshake_then_hang().await,
         "full-echo" => full_echo().await,
         "bad-response" => bad_response().await,
+        "stream-bad-frame" => stream_bad_frame().await,
+        "stream-bad-notification" => stream_bad_notification().await,
+        "stream-bad-final" => stream_bad_final().await,
         other => {
             eprintln!("stdio_test_helper: unknown mode {other:?}");
             std::process::exit(2);
@@ -73,8 +87,88 @@ async fn full_echo() {
     let handler = Arc::new(EchoHandler {
         send_delay: Duration::from_millis(delay_ms),
     });
-    let server = StdioServer::new(handler);
-    let _ = server.run(stdin(), stdout()).await;
+    // Drive the server through the public `serve()` convenience function so
+    // that path is covered by the spawned-subprocess tests.
+    let _ = serve(handler).await;
+}
+
+/// Performs the handshake, reads one request, then writes a single frame
+/// containing non-JSON bytes. The client streaming reader hits the
+/// `parse frame` error branch.
+async fn stream_bad_frame() {
+    let mut writer = stdout();
+    let mut reader = BufReader::new(stdin());
+
+    let hs = Handshake::new("test-session".to_string(), vec!["a2a/v1".to_string()]);
+    handshake::write_handshake(&mut writer, &hs).await.unwrap();
+    let _ = read_handshake_ack(&mut reader).await;
+
+    let _ = framing::read_frame(&mut reader).await.unwrap().unwrap();
+    framing::write_frame(&mut writer, b"not-json-at-all")
+        .await
+        .unwrap();
+}
+
+/// Performs the handshake, reads one request, then writes one streaming
+/// notification whose `params` cannot be parsed as a `StreamResponse`,
+/// followed by a valid final response. Exercises the
+/// `parse streaming event` branch in the client background reader.
+async fn stream_bad_notification() {
+    let mut writer = stdout();
+    let mut reader = BufReader::new(stdin());
+
+    let hs = Handshake::new("test-session".to_string(), vec!["a2a/v1".to_string()]);
+    handshake::write_handshake(&mut writer, &hs).await.unwrap();
+    let _ = read_handshake_ack(&mut reader).await;
+
+    let frame = framing::read_frame(&mut reader).await.unwrap().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+    let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+
+    // Streaming notification (no id) with garbage params.
+    let notif = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "stream/event",
+        "params": "not-a-stream-response",
+    });
+    framing::write_frame(&mut writer, &serde_json::to_vec(&notif).unwrap())
+        .await
+        .unwrap();
+
+    // Final response that ends the stream cleanly.
+    let final_resp = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": serde_json::Value::Null,
+    });
+    framing::write_frame(&mut writer, &serde_json::to_vec(&final_resp).unwrap())
+        .await
+        .unwrap();
+}
+
+/// Performs the handshake, reads one request, then writes a final JSON-RPC
+/// response (with id) whose `result` is not a valid `StreamResponse`.
+/// Exercises the `failed to parse final stream response` branch.
+async fn stream_bad_final() {
+    let mut writer = stdout();
+    let mut reader = BufReader::new(stdin());
+
+    let hs = Handshake::new("test-session".to_string(), vec!["a2a/v1".to_string()]);
+    handshake::write_handshake(&mut writer, &hs).await.unwrap();
+    let _ = read_handshake_ack(&mut reader).await;
+
+    let frame = framing::read_frame(&mut reader).await.unwrap().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+    let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+
+    let resp = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": "not-a-stream-response",
+    });
+    framing::write_frame(&mut writer, &serde_json::to_vec(&resp).unwrap())
+        .await
+        .unwrap();
 }
 
 /// Performs the handshake, then on the first request writes back a JSON-RPC
