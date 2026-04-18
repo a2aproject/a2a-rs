@@ -676,3 +676,122 @@ async fn stdio_multiple_requests_in_sequence() {
         assert_eq!(task.id, task_id);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Server-side coverage: error branches in the request loop and dispatchers
+// ---------------------------------------------------------------------------
+
+/// Send a raw frame to the server bypassing TestClient::call, then read the
+/// next response frame back. Returns the parsed JsonRpcResponse.
+async fn send_raw_and_read(
+    client: &mut TestClient<tokio::io::DuplexStream, tokio::io::DuplexStream>,
+    frame: &[u8],
+) -> JsonRpcResponse {
+    framing::write_frame(&mut client.writer, frame)
+        .await
+        .unwrap();
+    let resp_frame = framing::read_frame(&mut client.reader)
+        .await
+        .unwrap()
+        .expect("expected response frame");
+    serde_json::from_slice(&resp_frame).unwrap()
+}
+
+#[tokio::test]
+async fn stdio_server_replies_parse_error_for_malformed_json() {
+    let (_server, mut client) = setup().await;
+
+    // Body that frames cleanly but is not valid JSON.
+    let resp = send_raw_and_read(&mut client, b"not-json-at-all").await;
+    let err = resp.error.expect("server should send a JSON-RPC error");
+    assert_eq!(err.code, error_code::PARSE_ERROR);
+    assert!(err.message.to_lowercase().contains("invalid json"));
+}
+
+#[tokio::test]
+async fn stdio_server_replies_parse_error_for_non_jsonrpc_object() {
+    let (_server, mut client) = setup().await;
+
+    // Valid JSON object that does not deserialize into JsonRpcRequest.
+    let resp = send_raw_and_read(&mut client, br#"{"hello":"world"}"#).await;
+    let err = resp.error.expect("server should send a JSON-RPC error");
+    assert_eq!(err.code, error_code::PARSE_ERROR);
+    assert!(err.message.to_lowercase().contains("invalid request"));
+}
+
+#[tokio::test]
+async fn stdio_server_recovers_after_malformed_json() {
+    let (_server, mut client) = setup().await;
+
+    // First frame: garbage. Second frame: a valid request. The server must
+    // continue serving after the parse-error response instead of exiting.
+    let resp1 = send_raw_and_read(&mut client, b"<not json>").await;
+    assert_eq!(resp1.error.unwrap().code, error_code::PARSE_ERROR);
+
+    let params = serde_json::to_value(&GetTaskRequest {
+        id: "task-after-garbage".to_string(),
+        history_length: None,
+        tenant: None,
+    })
+    .unwrap();
+    let resp2 = client.call("tasks/get", params).await;
+    assert!(resp2.error.is_none(), "server should still serve requests");
+    let task: Task = serde_json::from_value(resp2.result.unwrap()).unwrap();
+    assert_eq!(task.id, "task-after-garbage");
+}
+
+#[tokio::test]
+async fn stdio_streaming_invalid_params_returns_error() {
+    let (_server, mut client) = setup().await;
+
+    // Hits the dispatch_streaming! invalid-params branch.
+    let resp = client
+        .call("message/stream", serde_json::json!({"foo": 1}))
+        .await;
+    let err = resp.error.expect("expected INVALID_PARAMS");
+    assert_eq!(err.code, error_code::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn stdio_subscribe_invalid_params_returns_error() {
+    let (_server, mut client) = setup().await;
+
+    let resp = client
+        .call("tasks/subscribe", serde_json::json!({}))
+        .await;
+    let err = resp.error.expect("expected INVALID_PARAMS");
+    assert_eq!(err.code, error_code::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn stdio_subscribe_handler_error_returns_error_response() {
+    // Hits the dispatch_streaming! handler-error branch (TestHandler returns
+    // task_not_found for id == "missing").
+    let (_server, mut client) = setup().await;
+
+    let params = serde_json::to_value(&SubscribeToTaskRequest {
+        id: "missing".to_string(),
+        tenant: None,
+    })
+    .unwrap();
+    let resp = client.call("tasks/subscribe", params).await;
+    let err = resp.error.expect("expected handler error");
+    assert!(err.message.to_lowercase().contains("missing") || err.code != 0);
+}
+
+#[tokio::test]
+async fn stdio_get_task_handler_error_returns_error_response() {
+    // Hits the dispatch_unary! handler-error branch.
+    let (_server, mut client) = setup().await;
+
+    let params = serde_json::to_value(&GetTaskRequest {
+        id: "missing".to_string(),
+        history_length: None,
+        tenant: None,
+    })
+    .unwrap();
+    let resp = client.call("tasks/get", params).await;
+    let err = resp.error.expect("expected handler error");
+    assert!(err.message.to_lowercase().contains("missing") || err.code != 0);
+}
+

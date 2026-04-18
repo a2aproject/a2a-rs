@@ -287,4 +287,77 @@ mod tests {
         let err = read_handshake(&mut reader).await.unwrap_err();
         assert!(matches!(err, StdioError::HandshakeFailed(_)));
     }
+
+    #[tokio::test]
+    async fn test_read_handshake_rejects_invalid_json() {
+        let raw = b"not-json-at-all";
+        let mut buf = Vec::new();
+        framing::write_frame(&mut buf, raw).await.unwrap();
+
+        let mut reader = BufReader::new(Cursor::new(buf));
+        let err = read_handshake(&mut reader).await.unwrap_err();
+        assert!(matches!(err, StdioError::HandshakeFailed(_)));
+        assert!(err.to_string().contains("invalid JSON"));
+    }
+
+    #[tokio::test]
+    async fn test_read_handshake_rejects_empty_supported_variants() {
+        let json = br#"{"type":"handshake","sessionId":"s","supportedVariants":[]}"#;
+        let mut buf = Vec::new();
+        framing::write_frame(&mut buf, json).await.unwrap();
+
+        let mut reader = BufReader::new(Cursor::new(buf));
+        let err = read_handshake(&mut reader).await.unwrap_err();
+        match err {
+            StdioError::HandshakeFailed(msg) => {
+                assert!(msg.contains("no supported variants"), "got: {msg}");
+            }
+            other => panic!("expected HandshakeFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_handshake_ack_eof() {
+        let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
+        let err = read_handshake_ack(&mut reader).await.unwrap_err();
+        assert!(matches!(err, StdioError::HandshakeFailed(_)));
+        assert!(err.to_string().contains("EOF"));
+    }
+
+    #[tokio::test]
+    async fn test_read_handshake_ack_rejects_invalid_json() {
+        let raw = b"\xff\xfe garbage";
+        let mut buf = Vec::new();
+        framing::write_frame(&mut buf, raw).await.unwrap();
+
+        let mut reader = BufReader::new(Cursor::new(buf));
+        let err = read_handshake_ack(&mut reader).await.unwrap_err();
+        assert!(matches!(err, StdioError::HandshakeFailed(_)));
+        assert!(err.to_string().contains("invalid JSON"));
+    }
+
+    #[tokio::test]
+    async fn test_read_handshake_ack_rejects_wrong_type() {
+        // Send a handshake where an ack is expected.
+        let hs = Handshake::new("s".into(), vec!["a2a/v1".into()]);
+        let mut buf = Vec::new();
+        write_handshake(&mut buf, &hs).await.unwrap();
+
+        let mut reader = BufReader::new(Cursor::new(buf));
+        let err = read_handshake_ack(&mut reader).await.unwrap_err();
+        assert!(matches!(err, StdioError::HandshakeFailed(_)));
+        assert!(err.to_string().contains("expected type \"handshakeAck\""));
+    }
+
+    #[tokio::test]
+    async fn test_read_handshake_ack_rejects_missing_fields() {
+        let json = br#"{"type":"handshakeAck"}"#;
+        let mut buf = Vec::new();
+        framing::write_frame(&mut buf, json).await.unwrap();
+
+        let mut reader = BufReader::new(Cursor::new(buf));
+        let err = read_handshake_ack(&mut reader).await.unwrap_err();
+        assert!(matches!(err, StdioError::HandshakeFailed(_)));
+        assert!(err.to_string().contains("invalid handshake ack"));
+    }
 }
