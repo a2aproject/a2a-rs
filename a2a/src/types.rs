@@ -704,6 +704,8 @@ pub const TRANSPORT_PROTOCOL_GRPC: &str = "GRPC";
 pub const TRANSPORT_PROTOCOL_HTTP_JSON: &str = "HTTP+JSON";
 /// SLIMRPC transport protocol constant.
 pub const TRANSPORT_PROTOCOL_SLIMRPC: &str = "SLIMRPC";
+/// STDIO transport protocol constant.
+pub const TRANSPORT_PROTOCOL_STDIO: &str = "STDIO";
 
 /// Protocol version string (e.g., "1.0").
 pub type ProtocolVersion = String;

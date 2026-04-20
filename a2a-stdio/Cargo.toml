@@ -1,0 +1,32 @@
+[package]
+name = "agntcy-a2a-stdio"
+version = "0.1.0"
+description = "A2A v1 STDIO transport binding for client and server"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "a2a_stdio"
+
+# Test-only helper subprocess used by integration tests in tests/spawned.rs.
+# Not part of the public surface; kept under tests/bin/ to make that explicit.
+[[bin]]
+name = "stdio_test_helper"
+path = "tests/bin/stdio_test_helper.rs"
+
+[dependencies]
+a2a = { workspace = true }
+a2a-client = { workspace = true }
+a2a-server = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

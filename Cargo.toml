@@ -6,6 +6,7 @@ members = [
     "a2a-pb",
     "a2a-grpc",
     "a2a-slimrpc",
+    "a2a-stdio",
     "a2acli",
     "examples/helloworld",
 ]
@@ -25,6 +26,7 @@ a2a-server = { package = "a2a-server-lf", path = "a2a-server", version = "0.2.6"
 a2a-pb = { package = "a2a-pb", path = "a2a-pb", version = "0.1.6" }
 a2a-grpc = { package = "a2a-grpc", path = "a2a-grpc", version = "0.1.11" }
 a2a-slimrpc = { package = "a2a-slimrpc", path = "a2a-slimrpc", version = "0.1.8" }
+a2a-stdio = { package = "agntcy-a2a-stdio", path = "a2a-stdio", version = "0.1.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
