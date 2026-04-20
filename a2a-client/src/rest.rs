@@ -267,7 +267,7 @@ fn parse_rest_error(status: reqwest::StatusCode, body: &str) -> A2AError {
         }
 
         if let Value::Object(values) = raw_detail {
-            details.extend(values.into_iter());
+            details.extend(values);
         }
     }
 

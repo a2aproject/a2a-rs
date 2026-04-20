@@ -28,6 +28,14 @@ reqwest = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+axum-server = { workspace = true, features = ["tls-rustls"], optional = true }
+rustls = { workspace = true, optional = true }
+
+[features]
+default = ["rustls-tls"]
+native-tls = ["reqwest/native-tls"]
+rustls-tls = ["reqwest/rustls-tls"]
+rustls = ["dep:axum-server", "dep:rustls", "rustls-tls"]
 
 [dev-dependencies]
 http-body-util = "0.1"

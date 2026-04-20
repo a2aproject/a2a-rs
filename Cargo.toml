@@ -41,10 +41,12 @@ pin-project-lite = "0.2"
 
 # HTTP
 axum = { version = "0.8", features = ["macros"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 hyper = "1"
+axum-server = "0.8"
+rustls = "0.23"
 
 # gRPC + protobuf
 tonic = "0.13"
