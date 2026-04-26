@@ -164,7 +164,12 @@ where
     F: Fn(&str) -> Option<Result<StreamResponse, A2AError>> + Clone + Send + 'static,
 {
     let mapped = stream::unfold(
-        (Box::pin(stream), Vec::<u8>::new(), VecDeque::new(), parse_event),
+        (
+            Box::pin(stream),
+            Vec::<u8>::new(),
+            VecDeque::new(),
+            parse_event,
+        ),
         |(mut stream, mut buf, mut pending, parse_event)| async move {
             loop {
                 // Drain already-parsed events before reading more bytes.
@@ -199,9 +204,8 @@ where
                         }
                     }
                     Some(Err(e)) => {
-                        pending.push_back(Err(A2AError::internal(format!(
-                            "SSE stream error: {e}"
-                        ))));
+                        pending
+                            .push_back(Err(A2AError::internal(format!("SSE stream error: {e}"))));
                     }
                     None => return None,
                 }
