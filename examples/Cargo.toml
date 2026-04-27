@@ -1,22 +1,33 @@
 [package]
-name = "helloworld"
+name = "examples"
 version = "0.1.0"
 edition.workspace = true
 publish = false
 
+[[bin]]
+name = "helloworld-server"
+path = "src/helloworld/server.rs"
+
+[[bin]]
+name = "helloworld-client"
+path = "src/helloworld/client.rs"
+
 [dependencies]
 a2a = { workspace = true }
+a2a-client = { workspace = true }
+a2a-grpc = { workspace = true }
+a2a-pb = { workspace = true }
 a2a-server = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
 futures = { workspace = true }
 axum = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
-a2a-client = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
