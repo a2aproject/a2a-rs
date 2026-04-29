@@ -1097,6 +1097,7 @@ pub fn from_proto_security_requirement(r: &proto::SecurityRequirement) -> Securi
 // OAuthFlows
 // ---------------------------------------------------------------------------
 
+#[allow(deprecated)]
 pub fn to_proto_oauth_flows(f: &OAuthFlows) -> proto::OAuthFlows {
     let flow = match f {
         OAuthFlows::AuthorizationCode(ac) => Some(proto::o_auth_flows::Flow::AuthorizationCode(
@@ -1141,6 +1142,7 @@ pub fn to_proto_oauth_flows(f: &OAuthFlows) -> proto::OAuthFlows {
     proto::OAuthFlows { flow }
 }
 
+#[allow(deprecated)]
 pub fn from_proto_oauth_flows(f: &proto::OAuthFlows) -> Option<OAuthFlows> {
     match &f.flow {
         Some(proto::o_auth_flows::Flow::AuthorizationCode(ac)) => {

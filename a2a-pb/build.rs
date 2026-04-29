@@ -98,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .out_dir("src/gen")
@@ -107,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
     let descriptor_path = out_dir.join("a2a-descriptor.bin");
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(false)
         .build_client(false)
         .out_dir(&out_dir)

@@ -19,10 +19,11 @@ prost-types = { workspace = true }
 pbjson = { workspace = true }
 pbjson-types = { workspace = true }
 tonic = { workspace = true }
+tonic-prost = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 
 [build-dependencies]
 pbjson-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
-tonic-build = { workspace = true }
+tonic-prost-build = { workspace = true }
