@@ -173,18 +173,14 @@ where
         |(mut stream, mut buf, mut pending, parse_event)| async move {
             loop {
                 // Drain already-parsed events before reading more bytes.
-                // Without this, a single chunk carrying N complete SSE events
-                // would only deliver the first; the remaining N-1 would be
-                // silently dropped if the connection closed (burst-then-close).
+                // Ensures all events from a single chunk are delivered before
+                // polling the stream again.
                 if let Some(item) = pending.pop_front() {
                     return Some((item, (stream, buf, pending, parse_event)));
                 }
                 match stream.next().await {
                     Some(Ok(chunk)) => {
-                        // Keep the buffer as raw bytes; defer UTF-8 decoding
-                        // until an event boundary is found. Per-chunk
-                        // `from_utf8_lossy` would silently replace multi-byte
-                        // characters split across chunk boundaries with U+FFFD.
+                        // Keep the buffer as raw bytes; defer UTF-8 decoding to event boundaries.
                         buf.extend_from_slice(&chunk);
                         while let Some((start, end)) = find_event_boundary(&buf) {
                             let event_bytes: Vec<u8> = buf.drain(..end).collect();
@@ -773,16 +769,9 @@ mod tests {
         assert!(items[1].is_ok());
     }
 
-    /// Regression: multiple complete SSE events packed into a **single** byte
+    /// Regression: multiple complete SSE events packed into a single byte
     /// chunk must all be delivered, even when the upstream byte stream ends
     /// immediately after that chunk.
-    ///
-    /// Prior to the drain-buffer fix, `parse_sse_stream` returned after parsing
-    /// the first event in the buffer and only re-polled the byte stream on the
-    /// next consumer call. If the byte stream was already exhausted (e.g. the
-    /// server closed the connection after a final burst of events), the
-    /// remaining events sitting in the parser buffer were silently dropped —
-    /// commonly losing the terminal `TASK_STATE_COMPLETED` `Task` event.
     #[tokio::test]
     async fn test_parse_sse_stream_multiple_events_single_chunk() {
         let make_status = |state| {
