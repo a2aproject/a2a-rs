@@ -470,6 +470,7 @@ impl TransportFactory for JsonRpcTransportFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::rcgen_self_signed_ca_pem;
     use a2a_pb::protojson_conv;
     use futures::StreamExt;
     use serde_json::{Value, json};
@@ -991,16 +992,5 @@ mod tests {
         let iface = AgentInterface::new("https://localhost:3443/jsonrpc", "JSONRPC");
         let transport = f.create(&card, &iface).await.unwrap();
         transport.destroy().await.unwrap();
-    }
-
-    fn rcgen_self_signed_ca_pem() -> Vec<u8> {
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "Test CA");
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = params.self_signed(&key).unwrap();
-        cert.pem().into_bytes()
     }
 }

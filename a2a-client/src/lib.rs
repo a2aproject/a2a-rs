@@ -15,6 +15,20 @@ pub use factory::A2AClientFactory;
 pub use futures::stream::BoxStream;
 pub use transport::{ServiceParams, Transport, TransportFactory};
 
+#[cfg(test)]
+pub(crate) mod test_utils {
+    pub fn rcgen_self_signed_ca_pem() -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test CA");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        cert.pem().into_bytes()
+    }
+}
+
 pub(crate) fn build_reqwest_client_with_root_pem(
     pem: &[u8],
 ) -> Result<reqwest::Client, a2a::A2AError> {

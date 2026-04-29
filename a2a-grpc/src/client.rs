@@ -447,8 +447,8 @@ mod tests {
             let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
             let ca_cert = rustls_pemfile::certs(&mut &ca_pem[..])
                 .next()
-                .unwrap()
-                .unwrap();
+                .expect("should have at least one cert in ca.pem")
+                .expect("cert should be valid");
             let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
             root_store.add(ca_cert).unwrap();
             let mut config = tokio_rustls::rustls::ClientConfig::builder()
