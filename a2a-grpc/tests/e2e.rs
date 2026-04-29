@@ -525,7 +525,7 @@ async fn grpc_transport_streaming_and_error_paths() {
         .unwrap_err();
     assert_eq!(err.code, error_code::TASK_NOT_FOUND);
 
-    let factory = GrpcTransportFactory;
+    let factory = GrpcTransportFactory::new();
     assert_eq!(factory.protocol(), TRANSPORT_PROTOCOL_GRPC);
     let transport = factory
         .create(
@@ -558,7 +558,7 @@ async fn grpc_transport_accepts_bare_host_port_endpoints() {
         .unwrap();
     assert_eq!(task.id, "task-1");
 
-    let factory = GrpcTransportFactory;
+    let factory = GrpcTransportFactory::new();
     let transport = factory
         .create(
             &sample_agent_card(),

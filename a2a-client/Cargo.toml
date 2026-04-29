@@ -28,6 +28,9 @@ uuid = { workspace = true }
 semver = { workspace = true }
 pin-project-lite = { workspace = true }
 
+[dev-dependencies]
+rcgen = { workspace = true }
+
 [features]
 default = ["rustls-tls"]
 native-tls = ["reqwest/native-tls"]

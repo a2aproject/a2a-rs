@@ -23,3 +23,14 @@ tokio-stream = { workspace = true, features = ["net"] }
 futures = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+http = { workspace = true }
+tonic-tls = { workspace = true, features = ["rustls"], optional = true }
+tokio-rustls = { workspace = true, optional = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+[features]
+default = []
+rustls = ["dep:tonic-tls", "dep:tokio-rustls"]

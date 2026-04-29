@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 
+[lib]
+name = "examples_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "helloworld-server"
 path = "src/helloworld/server.rs"
@@ -12,22 +16,36 @@ path = "src/helloworld/server.rs"
 name = "helloworld-client"
 path = "src/helloworld/client.rs"
 
+[[bin]]
+name = "helloworld-tls-server"
+path = "src/helloworld_tls/server.rs"
+
+[[bin]]
+name = "helloworld-tls-client"
+path = "src/helloworld_tls/client.rs"
+
 [dependencies]
 a2a = { workspace = true }
 a2a-client = { workspace = true }
-a2a-grpc = { workspace = true }
+a2a-grpc = { workspace = true, features = ["rustls"] }
 a2a-pb = { workspace = true }
-a2a-server = { workspace = true }
+a2a-server = { workspace = true, features = ["rustls"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
+tokio-rustls = { workspace = true }
+tonic-tls = { workspace = true, features = ["rustls"] }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true }
 tonic = { workspace = true }
+rustls-pemfile = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 
+[build-dependencies]
+rcgen = { workspace = true }
+
 [dev-dependencies]
-async-trait = { workspace = true }
-reqwest = { workspace = true }
 serde_json = { workspace = true }

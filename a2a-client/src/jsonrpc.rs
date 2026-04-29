@@ -441,6 +441,16 @@ impl JsonRpcTransportFactory {
             client: client.unwrap_or_default(),
         }
     }
+
+    pub fn with_root_certificates_pem(pem: &[u8]) -> Result<Self, A2AError> {
+        let cert = reqwest::Certificate::from_pem(pem)
+            .map_err(|e| A2AError::internal(format!("invalid PEM certificate: {e}")))?;
+        let client = Client::builder()
+            .add_root_certificate(cert)
+            .build()
+            .map_err(|e| A2AError::internal(format!("failed to build HTTP client: {e}")))?;
+        Ok(Self { client })
+    }
 }
 
 #[async_trait]
@@ -953,5 +963,48 @@ mod tests {
                 "tenant": "tenant-1"
             })
         );
+    }
+
+    #[test]
+    fn test_with_root_certificates_pem_valid() {
+        let pem = rcgen_self_signed_ca_pem();
+        let f = JsonRpcTransportFactory::with_root_certificates_pem(&pem).unwrap();
+        assert_eq!(f.protocol(), TRANSPORT_PROTOCOL_JSONRPC);
+    }
+
+    #[tokio::test]
+    async fn test_with_root_certificates_pem_factory_create() {
+        let pem = rcgen_self_signed_ca_pem();
+        let f = JsonRpcTransportFactory::with_root_certificates_pem(&pem).unwrap();
+        let card = AgentCard {
+            name: "Test".into(),
+            description: "Test".into(),
+            version: "1.0".into(),
+            supported_interfaces: vec![],
+            capabilities: AgentCapabilities::default(),
+            default_input_modes: vec!["text/plain".into()],
+            default_output_modes: vec!["text/plain".into()],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        };
+        let iface = AgentInterface::new("https://localhost:3443/jsonrpc", "JSONRPC");
+        let transport = f.create(&card, &iface).await.unwrap();
+        transport.destroy().await.unwrap();
+    }
+
+    fn rcgen_self_signed_ca_pem() -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test CA");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        cert.pem().into_bytes()
     }
 }
