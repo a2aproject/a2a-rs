@@ -443,13 +443,9 @@ impl JsonRpcTransportFactory {
     }
 
     pub fn with_root_certificates_pem(pem: &[u8]) -> Result<Self, A2AError> {
-        let cert = reqwest::Certificate::from_pem(pem)
-            .map_err(|e| A2AError::internal(format!("invalid PEM certificate: {e}")))?;
-        let client = Client::builder()
-            .add_root_certificate(cert)
-            .build()
-            .map_err(|e| A2AError::internal(format!("failed to build HTTP client: {e}")))?;
-        Ok(Self { client })
+        Ok(Self {
+            client: crate::build_reqwest_client_with_root_pem(pem)?,
+        })
     }
 }
 

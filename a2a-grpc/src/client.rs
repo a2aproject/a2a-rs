@@ -304,6 +304,27 @@ fn server_name_from_url(
         .map_err(|e| A2AError::internal(format!("invalid server name: {e}")))
 }
 
+#[cfg(feature = "rustls")]
+impl GrpcTransportFactory {
+    async fn connect_tls(
+        url: &str,
+        tls_config: &std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+    ) -> Result<GrpcTransport, A2AError> {
+        let url = normalize_grpc_endpoint(url);
+        let server_name = server_name_from_url(&url)?;
+        let ep = Endpoint::from_shared(url)
+            .map_err(|e| A2AError::internal(format!("invalid endpoint: {e}")))?;
+        let transport = tonic_tls::TcpTransport::from_endpoint(&ep);
+        let connector =
+            tonic_tls::rustls::TlsConnector::new(transport, tls_config.clone(), server_name);
+        let channel = ep
+            .connect_with_connector(connector)
+            .await
+            .map_err(|e| A2AError::internal(format!("gRPC TLS connect: {e}")))?;
+        Ok(GrpcTransport::from_channel(channel))
+    }
+}
+
 #[async_trait]
 impl TransportFactory for GrpcTransportFactory {
     fn protocol(&self) -> &str {
@@ -317,18 +338,7 @@ impl TransportFactory for GrpcTransportFactory {
     ) -> Result<Box<dyn Transport>, A2AError> {
         #[cfg(feature = "rustls")]
         if let Some(tls_config) = &self.tls_config {
-            let url = normalize_grpc_endpoint(&iface.url);
-            let server_name = server_name_from_url(&url)?;
-            let ep = Endpoint::from_shared(url)
-                .map_err(|e| A2AError::internal(format!("invalid endpoint: {e}")))?;
-            let transport = tonic_tls::TcpTransport::from_endpoint(&ep);
-            let connector =
-                tonic_tls::rustls::TlsConnector::new(transport, tls_config.clone(), server_name);
-            let channel = ep
-                .connect_with_connector(connector)
-                .await
-                .map_err(|e| A2AError::internal(format!("gRPC TLS connect: {e}")))?;
-            return Ok(Box::new(GrpcTransport::from_channel(channel)));
+            return Ok(Box::new(Self::connect_tls(&iface.url, tls_config).await?));
         }
 
         let transport = GrpcTransport::connect(&iface.url).await?;
