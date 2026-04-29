@@ -19,8 +19,7 @@ fn main() {
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
-    let mut server_params =
-        rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let mut server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     server_params
         .subject_alt_names
         .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(

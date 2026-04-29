@@ -9,8 +9,8 @@
 //!   cargo run --bin helloworld-client --package examples
 
 use a2a::*;
-use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::A2AClientFactory;
+use a2a_client::agent_card::AgentCardResolver;
 use a2a_grpc::GrpcTransportFactory;
 use examples_lib::exercise_client;
 use std::sync::Arc;

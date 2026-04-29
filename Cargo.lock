@@ -34,6 +34,7 @@ dependencies = [
  "pin-project-lite",
  "rcgen",
  "reqwest",
+ "rustls",
  "semver",
  "serde",
  "serde_json",

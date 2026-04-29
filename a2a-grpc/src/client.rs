@@ -276,9 +276,7 @@ impl GrpcTransportFactory {
     }
 
     #[cfg(feature = "rustls")]
-    pub fn with_rustls_config(
-        config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
-    ) -> Self {
+    pub fn with_rustls_config(config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>) -> Self {
         GrpcTransportFactory {
             tls_config: Some(config),
         }
@@ -319,15 +317,13 @@ impl TransportFactory for GrpcTransportFactory {
     ) -> Result<Box<dyn Transport>, A2AError> {
         #[cfg(feature = "rustls")]
         if let Some(tls_config) = &self.tls_config {
-            let server_name = server_name_from_url(&iface.url)?;
-            let ep = Endpoint::from_shared(iface.url.clone())
+            let url = normalize_grpc_endpoint(&iface.url);
+            let server_name = server_name_from_url(&url)?;
+            let ep = Endpoint::from_shared(url)
                 .map_err(|e| A2AError::internal(format!("invalid endpoint: {e}")))?;
             let transport = tonic_tls::TcpTransport::from_endpoint(&ep);
-            let connector = tonic_tls::rustls::TlsConnector::new(
-                transport,
-                tls_config.clone(),
-                server_name,
-            );
+            let connector =
+                tonic_tls::rustls::TlsConnector::new(transport, tls_config.clone(), server_name);
             let channel = ep
                 .connect_with_connector(connector)
                 .await
@@ -427,8 +423,7 @@ mod tests {
         use std::sync::Arc;
 
         fn self_signed_ca_pem() -> Vec<u8> {
-            let mut params =
-                rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
             params
                 .distinguished_name
@@ -439,8 +434,7 @@ mod tests {
         }
 
         fn build_test_tls_config(ca_pem: &[u8]) -> Arc<tokio_rustls::rustls::ClientConfig> {
-            let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
-                .install_default();
+            let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
             let ca_cert = rustls_pemfile::certs(&mut &ca_pem[..])
                 .next()
                 .unwrap()
@@ -523,8 +517,7 @@ mod tests {
                 security_requirements: None,
                 signatures: None,
             };
-            let iface =
-                AgentInterface::new("https://127.0.0.1:1", TRANSPORT_PROTOCOL_GRPC);
+            let iface = AgentInterface::new("https://127.0.0.1:1", TRANSPORT_PROTOCOL_GRPC);
             let result = f.create(&card, &iface).await;
             assert!(result.is_err());
         }

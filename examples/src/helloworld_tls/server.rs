@@ -62,7 +62,10 @@ async fn main() {
         )
         .init();
 
-    let handler = Arc::new(DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new()));
+    let handler = Arc::new(DefaultRequestHandler::new(
+        EchoExecutor,
+        InMemoryTaskStore::new(),
+    ));
     let agent_card = build_agent_card(vec![
         AgentInterface::new("https://localhost:3443/jsonrpc", TRANSPORT_PROTOCOL_JSONRPC),
         AgentInterface::new("https://localhost:3443/rest", TRANSPORT_PROTOCOL_HTTP_JSON),
@@ -71,7 +74,10 @@ async fn main() {
     let card_producer = Arc::new(StaticAgentCard::new(agent_card));
 
     let app = axum::Router::new()
-        .nest("/jsonrpc", a2a_server::jsonrpc::jsonrpc_router(handler.clone()))
+        .nest(
+            "/jsonrpc",
+            a2a_server::jsonrpc::jsonrpc_router(handler.clone()),
+        )
         .nest("/rest", a2a_server::rest::rest_router(handler.clone()))
         .merge(a2a_server::agent_card::agent_card_router(card_producer));
 

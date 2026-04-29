@@ -5,8 +5,8 @@ use a2a::event::StreamResponse;
 use a2a::*;
 use a2a_client::{A2AClient, Transport};
 use a2a_server::*;
-use futures::stream::{self, BoxStream};
 use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 use tokio_stream::wrappers::ReceiverStream;
 
 // ---------------------------------------------------------------------------
@@ -188,40 +188,57 @@ pub fn wait_req(text: &str) -> SendMessageRequest {
 // ---------------------------------------------------------------------------
 
 pub fn short_id(id: &str) -> &str {
-    if id.len() > 8 { &id[id.len() - 8..] } else { id }
+    if id.len() > 8 {
+        &id[id.len() - 8..]
+    } else {
+        id
+    }
 }
 
 pub fn fmt_state(state: &TaskState) -> &'static str {
     match state {
-        TaskState::Working       => "⟳ working",
-        TaskState::Completed     => "✓ completed",
-        TaskState::Canceled      => "✗ canceled",
-        TaskState::Failed        => "! failed",
-        TaskState::Submitted     => "· submitted",
-        TaskState::Rejected      => "✗ rejected",
-        TaskState::AuthRequired  => "? auth-required",
+        TaskState::Working => "⟳ working",
+        TaskState::Completed => "✓ completed",
+        TaskState::Canceled => "✗ canceled",
+        TaskState::Failed => "! failed",
+        TaskState::Submitted => "· submitted",
+        TaskState::Rejected => "✗ rejected",
+        TaskState::AuthRequired => "? auth-required",
         TaskState::InputRequired => "? input-required",
-        TaskState::Unspecified   => "? unspecified",
+        TaskState::Unspecified => "? unspecified",
     }
 }
 
 #[macro_export]
 macro_rules! row {
     ($method:expr, $id:expr, $state:expr) => {
-        println!("{:<26}  …{}  {}", $method,
-                 $crate::short_id($id), $crate::fmt_state($state))
+        println!(
+            "{:<26}  …{}  {}",
+            $method,
+            $crate::short_id($id),
+            $crate::fmt_state($state)
+        )
     };
 }
 
 #[macro_export]
 macro_rules! sub_row {
     ($n:expr, $kind:expr, $id:expr, $state:expr) => {
-        println!("  [{n:>2}] {:<13}  …{}  {}", $kind,
-                 $crate::short_id($id), $crate::fmt_state($state), n = $n)
+        println!(
+            "  [{n:>2}] {:<13}  …{}  {}",
+            $kind,
+            $crate::short_id($id),
+            $crate::fmt_state($state),
+            n = $n
+        )
     };
     ($n:expr, $kind:expr, $id:expr) => {
-        println!("  [{n:>2}] {:<13}  …{}", $kind,
-                 $crate::short_id($id), n = $n)
+        println!(
+            "  [{n:>2}] {:<13}  …{}",
+            $kind,
+            $crate::short_id($id),
+            n = $n
+        )
     };
 }
 
@@ -254,10 +271,14 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
 
     // ---- get_task --------------------------------------------------------
     match client
-        .get_task(&GetTaskRequest { id: task_id.clone(), history_length: Some(10), tenant: None })
+        .get_task(&GetTaskRequest {
+            id: task_id.clone(),
+            history_length: Some(10),
+            tenant: None,
+        })
         .await
     {
-        Ok(t)  => row!("get_task", &t.id, &t.status.state),
+        Ok(t) => row!("get_task", &t.id, &t.status.state),
         Err(e) => eprintln!("get_task                   ✗  {e}"),
     }
 
@@ -275,7 +296,7 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
         })
         .await
     {
-        Ok(l)  => println!("{:<26}  {} task(s)", "list_tasks", l.tasks.len()),
+        Ok(l) => println!("{:<26}  {} task(s)", "list_tasks", l.tasks.len()),
         Err(e) => eprintln!("list_tasks                 ✗  {e}"),
     }
 
@@ -283,10 +304,14 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
     match client.send_message(&wait_req("cancel demo")).await {
         Ok(SendMessageResponse::Task(t)) => {
             match client
-                .cancel_task(&CancelTaskRequest { id: t.id, metadata: None, tenant: None })
+                .cancel_task(&CancelTaskRequest {
+                    id: t.id,
+                    metadata: None,
+                    tenant: None,
+                })
                 .await
             {
-                Ok(t)  => row!("cancel_task", &t.id, &t.status.state),
+                Ok(t) => row!("cancel_task", &t.id, &t.status.state),
                 Err(e) => eprintln!("cancel_task                ✗  {e}"),
             }
         }
@@ -308,16 +333,15 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
             while let Some(event) = stream.next().await {
                 n += 1;
                 match event {
-                    Ok(StreamResponse::Task(t)) =>
-                        sub_row!(n, "task", &t.id, &t.status.state),
-                    Ok(StreamResponse::StatusUpdate(u)) =>
-                        sub_row!(n, "status_update", &u.task_id, &u.status.state),
-                    Ok(StreamResponse::Message(m)) =>
-                        sub_row!(n, "message", &m.message_id),
-                    Ok(StreamResponse::ArtifactUpdate(a)) =>
-                        sub_row!(n, "artifact", &a.artifact.artifact_id),
-                    Err(e) =>
-                        eprintln!("  [{n:>2}] ✗  {e}"),
+                    Ok(StreamResponse::Task(t)) => sub_row!(n, "task", &t.id, &t.status.state),
+                    Ok(StreamResponse::StatusUpdate(u)) => {
+                        sub_row!(n, "status_update", &u.task_id, &u.status.state)
+                    }
+                    Ok(StreamResponse::Message(m)) => sub_row!(n, "message", &m.message_id),
+                    Ok(StreamResponse::ArtifactUpdate(a)) => {
+                        sub_row!(n, "artifact", &a.artifact.artifact_id)
+                    }
+                    Err(e) => eprintln!("  [{n:>2}] ✗  {e}"),
                 }
             }
         }
@@ -329,25 +353,34 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
         Ok(SendMessageResponse::Task(t)) => {
             let sub_id = t.id;
             match client
-                .subscribe_to_task(&SubscribeToTaskRequest { id: sub_id.clone(), tenant: None })
+                .subscribe_to_task(&SubscribeToTaskRequest {
+                    id: sub_id.clone(),
+                    tenant: None,
+                })
                 .await
             {
                 Ok(mut sub) => {
                     match client
-                        .cancel_task(&CancelTaskRequest { id: sub_id.clone(), metadata: None, tenant: None })
+                        .cancel_task(&CancelTaskRequest {
+                            id: sub_id.clone(),
+                            metadata: None,
+                            tenant: None,
+                        })
                         .await
                     {
-                        Ok(t)  => row!("subscribe_to_task (cancel)", &t.id, &t.status.state),
+                        Ok(t) => row!("subscribe_to_task (cancel)", &t.id, &t.status.state),
                         Err(e) => eprintln!("subscribe_to_task (cancel) ✗  {e}"),
                     }
                     let mut n = 0usize;
                     while let Some(event) = sub.next().await {
                         n += 1;
                         match event {
-                            Ok(StreamResponse::Task(t)) =>
-                                sub_row!(n, "task", &t.id, &t.status.state),
-                            Ok(StreamResponse::StatusUpdate(u)) =>
-                                sub_row!(n, "status_update", &u.task_id, &u.status.state),
+                            Ok(StreamResponse::Task(t)) => {
+                                sub_row!(n, "task", &t.id, &t.status.state)
+                            }
+                            Ok(StreamResponse::StatusUpdate(u)) => {
+                                sub_row!(n, "status_update", &u.task_id, &u.status.state)
+                            }
                             Ok(_) => {}
                             Err(e) => eprintln!("  [{n:>2}] ✗  {e}"),
                         }

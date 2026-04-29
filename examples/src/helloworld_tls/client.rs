@@ -11,12 +11,12 @@
 use std::sync::Arc;
 
 use a2a::*;
+use a2a_client::A2AClientFactory;
 use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::jsonrpc::JsonRpcTransportFactory;
 use a2a_client::rest::RestTransportFactory;
-use a2a_client::A2AClientFactory;
-use a2a_grpc::rustls;
 use a2a_grpc::GrpcTransportFactory;
+use a2a_grpc::rustls;
 use examples_lib::exercise_client;
 
 const SERVER_URLS: &[&str] = &["https://localhost:3443"];
@@ -77,9 +77,9 @@ async fn main() {
 
         for &protocol in protocols {
             let factory = A2AClientFactory::builder()
-                .register(Arc::new(
-                    GrpcTransportFactory::with_rustls_config(grpc_tls_config.clone()),
-                ))
+                .register(Arc::new(GrpcTransportFactory::with_rustls_config(
+                    grpc_tls_config.clone(),
+                )))
                 .register(Arc::new(
                     RestTransportFactory::with_root_certificates_pem(CA_PEM).unwrap(),
                 ))
