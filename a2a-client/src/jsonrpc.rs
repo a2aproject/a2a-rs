@@ -5,6 +5,7 @@ use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use reqwest::Client;
+use std::collections::VecDeque;
 
 use crate::push_config_compat::{
     deserialize_list_task_push_notification_configs_response,
@@ -132,91 +133,75 @@ impl JsonRpcTransport {
     }
 }
 
-/// Parse an SSE byte stream into StreamResponse events.
-fn parse_sse_stream(
+/// Find the end of an SSE event boundary in a byte buffer.
+///
+/// SSE line terminators per https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation:
+/// `\n\n`, `\r\r`, and `\r\n\r\n` are all valid event separators.
+fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    for i in 0..buf.len().saturating_sub(1) {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some((i, i + 2));
+        }
+        if buf[i] == b'\r' && buf[i + 1] == b'\r' {
+            return Some((i, i + 2));
+        }
+        if i + 3 < buf.len() && &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some((i, i + 4));
+        }
+    }
+    None
+}
+
+/// Shared SSE byte-stream parser that abstracts over the event-parse callback.
+///
+/// `parse_event` is invoked on each complete `\n\n`/`\r\r`/`\r\n\r\n`-delimited
+/// event; it should return `Some(result)` to emit the event or `None` to skip it.
+fn parse_sse_bytes<F>(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
-) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    parse_event: F,
+) -> BoxStream<'static, Result<StreamResponse, A2AError>>
+where
+    F: Fn(&str) -> Option<Result<StreamResponse, A2AError>> + Clone + Send + 'static,
+{
     let mapped = stream::unfold(
-        (Box::pin(stream), String::new()),
-        |(mut stream, mut buf)| async move {
+        (
+            Box::pin(stream),
+            Vec::<u8>::new(),
+            VecDeque::new(),
+            parse_event,
+        ),
+        |(mut stream, mut buf, mut pending, parse_event)| async move {
             loop {
+                // Drain already-parsed events before reading more bytes.
+                // Ensures all events from a single chunk are delivered before
+                // polling the stream again.
+                if let Some(item) = pending.pop_front() {
+                    return Some((item, (stream, buf, pending, parse_event)));
+                }
                 match stream.next().await {
                     Some(Ok(chunk)) => {
-                        buf.push_str(&String::from_utf8_lossy(&chunk));
-                        // Process complete SSE events (double newline terminated)
-                        while let Some(pos) = buf.find(
-                            "
-
-",
-                        ) {
-                            let event_text = buf[..pos].to_string();
-                            buf = buf[pos + 2..].to_string();
-
-                            // Extract data from SSE event
-                            let mut data = String::new();
-                            for line in event_text.lines() {
-                                if let Some(d) = line.strip_prefix("data: ") {
-                                    if !data.is_empty() {
-                                        data.push('\n');
-                                    }
-                                    data.push_str(d);
-                                } else if let Some(d) = line.strip_prefix("data:") {
-                                    if !data.is_empty() {
-                                        data.push('\n');
-                                    }
-                                    data.push_str(d);
+                        // Keep the buffer as raw bytes; defer UTF-8 decoding to event boundaries.
+                        buf.extend_from_slice(&chunk);
+                        while let Some((start, end)) = find_event_boundary(&buf) {
+                            let event_bytes: Vec<u8> = buf.drain(..end).collect();
+                            let event_text = match std::str::from_utf8(&event_bytes[..start]) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    pending.push_back(Err(A2AError::internal(format!(
+                                        "SSE UTF-8 decode error: {e}"
+                                    ))));
+                                    continue;
                                 }
-                            }
+                            };
 
-                            if data.is_empty() {
-                                continue;
-                            }
-
-                            // Parse as JSON-RPC response containing a StreamResponse
-                            match serde_json::from_str::<JsonRpcResponse>(&data) {
-                                Ok(rpc_resp) => {
-                                    if let Some(err) = rpc_resp.error {
-                                        return Some((
-                                            Err(A2AError::new(err.code, err.message)),
-                                            (stream, buf),
-                                        ));
-                                    }
-                                    if let Some(result) = rpc_resp.result {
-                                        match protojson_conv::from_value::<StreamResponse>(result) {
-                                            Ok(sr) => return Some((Ok(sr), (stream, buf))),
-                                            Err(e) => {
-                                                return Some((
-                                                    Err(A2AError::internal(format!(
-                                                        "SSE parse error: {e}"
-                                                    ))),
-                                                    (stream, buf),
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    // Try parsing directly as StreamResponse
-                                    match protojson_conv::from_str::<StreamResponse>(&data) {
-                                        Ok(sr) => return Some((Ok(sr), (stream, buf))),
-                                        Err(e) => {
-                                            return Some((
-                                                Err(A2AError::internal(format!(
-                                                    "SSE parse error: {e}"
-                                                ))),
-                                                (stream, buf),
-                                            ));
-                                        }
-                                    }
-                                }
+                            if let Some(result) = parse_event(event_text) {
+                                pending.push_back(result);
                             }
                         }
                     }
                     Some(Err(e)) => {
-                        return Some((
-                            Err(A2AError::internal(format!("SSE stream error: {e}"))),
-                            (stream, buf),
-                        ));
+                        pending
+                            .push_back(Err(A2AError::internal(format!("SSE stream error: {e}"))));
                     }
                     None => return None,
                 }
@@ -227,70 +212,86 @@ fn parse_sse_stream(
     Box::pin(mapped)
 }
 
+/// Parse an SSE byte stream into StreamResponse events (JSON-RPC envelope).
+fn parse_sse_stream(
+    stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    parse_sse_bytes(stream, |event_text| {
+        // Extract `data:` lines from the SSE event
+        let mut data = String::new();
+        for line in event_text.lines() {
+            if let Some(d) = line.strip_prefix("data: ") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(d);
+            } else if let Some(d) = line.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(d);
+            }
+        }
+        if data.is_empty() {
+            return None;
+        }
+
+        // Try JSON-RPC envelope first
+        match serde_json::from_str::<JsonRpcResponse>(&data) {
+            Ok(rpc_resp) => {
+                if let Some(err) = rpc_resp.error {
+                    return Some(Err(A2AError::new(err.code, err.message)));
+                }
+                if let Some(result) = rpc_resp.result {
+                    match protojson_conv::from_value::<StreamResponse>(result) {
+                        Ok(sr) => Some(Ok(sr)),
+                        Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
+                    }
+                } else {
+                    None
+                }
+            }
+            Err(_) => {
+                // Fallback: parse directly as StreamResponse
+                match protojson_conv::from_str::<StreamResponse>(&data) {
+                    Ok(sr) => Some(Ok(sr)),
+                    Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
+                }
+            }
+        }
+    })
+}
+
 /// Parse an SSE byte stream into StreamResponse events (REST binding).
 /// Unlike the JSON-RPC variant, this expects data lines to contain
 /// raw StreamResponse JSON (not wrapped in a JSON-RPC envelope).
 pub(crate) fn parse_sse_stream_rest(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-    let mapped = stream::unfold(
-        (Box::pin(stream), String::new()),
-        |(mut stream, mut buf)| async move {
-            loop {
-                match stream.next().await {
-                    Some(Ok(chunk)) => {
-                        buf.push_str(&String::from_utf8_lossy(&chunk));
-                        while let Some(pos) = buf.find(
-                            "
-
-",
-                        ) {
-                            let event_text = buf[..pos].to_string();
-                            buf = buf[pos + 2..].to_string();
-
-                            let mut data = String::new();
-                            for line in event_text.lines() {
-                                if let Some(d) = line.strip_prefix("data: ") {
-                                    if !data.is_empty() {
-                                        data.push('\n');
-                                    }
-                                    data.push_str(d);
-                                } else if let Some(d) = line.strip_prefix("data:") {
-                                    if !data.is_empty() {
-                                        data.push('\n');
-                                    }
-                                    data.push_str(d);
-                                }
-                            }
-
-                            if data.is_empty() {
-                                continue;
-                            }
-
-                            match protojson_conv::from_str::<StreamResponse>(&data) {
-                                Ok(sr) => return Some((Ok(sr), (stream, buf))),
-                                Err(e) => {
-                                    return Some((
-                                        Err(A2AError::internal(format!("SSE parse error: {e}"))),
-                                        (stream, buf),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        return Some((
-                            Err(A2AError::internal(format!("SSE stream error: {e}"))),
-                            (stream, buf),
-                        ));
-                    }
-                    None => return None,
+    parse_sse_bytes(stream, |event_text| {
+        let mut data = String::new();
+        for line in event_text.lines() {
+            if let Some(d) = line.strip_prefix("data: ") {
+                if !data.is_empty() {
+                    data.push('\n');
                 }
+                data.push_str(d);
+            } else if let Some(d) = line.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(d);
             }
-        },
-    );
+        }
+        if data.is_empty() {
+            return None;
+        }
 
-    Box::pin(mapped)
+        match protojson_conv::from_str::<StreamResponse>(&data) {
+            Ok(sr) => Some(Ok(sr)),
+            Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
+        }
+    })
 }
 
 #[async_trait]
@@ -766,6 +767,327 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert!(items[0].is_ok());
         assert!(items[1].is_ok());
+    }
+
+    /// Regression: multiple complete SSE events packed into a single byte
+    /// chunk must all be delivered, even when the upstream byte stream ends
+    /// immediately after that chunk.
+    #[tokio::test]
+    async fn test_parse_sse_stream_multiple_events_single_chunk() {
+        let make_status = |state| {
+            StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: "t1".into(),
+                context_id: "c1".into(),
+                status: TaskStatus {
+                    state,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            })
+        };
+        let rpc_payload = |sr: StreamResponse, id: i64| -> String {
+            let result = protojson_conv::to_value(&sr).unwrap();
+            serde_json::to_string(&JsonRpcResponse::success(JsonRpcId::Number(id), result)).unwrap()
+        };
+        let combined = format!(
+            "data: {}\n\ndata: {}\n\n",
+            rpc_payload(make_status(TaskState::Working), 1),
+            rpc_payload(make_status(TaskState::Completed), 2),
+        );
+
+        // All events in one chunk; stream ends immediately after.
+        let stream = byte_stream(vec![combined]);
+        let items: Vec<_> = parse_sse_stream(stream).collect().await;
+        assert_eq!(
+            items.len(),
+            2,
+            "both events must be delivered even when packed into a single \
+             byte chunk followed by end-of-stream; got {items:?}",
+        );
+        assert!(items[0].is_ok());
+        assert!(items[1].is_ok());
+    }
+
+    /// REST-binding counterpart of
+    /// [`test_parse_sse_stream_multiple_events_single_chunk`]. Same
+    /// drain-buffer bug existed in `parse_sse_stream_rest`.
+    #[tokio::test]
+    async fn test_parse_sse_stream_rest_multiple_events_single_chunk() {
+        let make_status = |state| {
+            StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: "t1".into(),
+                context_id: "c1".into(),
+                status: TaskStatus {
+                    state,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            })
+        };
+        let encode = |sr: StreamResponse| -> String {
+            serde_json::to_string(&protojson_conv::to_value(&sr).unwrap()).unwrap()
+        };
+        let combined = format!(
+            "data: {}\n\ndata: {}\n\n",
+            encode(make_status(TaskState::Working)),
+            encode(make_status(TaskState::Completed)),
+        );
+
+        let stream = byte_stream(vec![combined]);
+        let items: Vec<_> = parse_sse_stream_rest(stream).collect().await;
+        assert_eq!(
+            items.len(),
+            2,
+            "both events must be delivered even when packed into a single \
+             byte chunk followed by end-of-stream; got {items:?}",
+        );
+        assert!(items[0].is_ok());
+        assert!(items[1].is_ok());
+    }
+
+    /// Regression: a multi-byte UTF-8 character split across two byte chunks
+    /// must be decoded intact.  Per-chunk `String::from_utf8_lossy` corrupts
+    /// it into U+FFFD; per-event strict decode reassembles it correctly.
+    #[tokio::test]
+    async fn test_parse_sse_stream_split_multibyte_utf8() {
+        // Build `data: {"statusUpdate":{..., "message":{..., "parts":[{"text":"中"}]}}}\n\n`
+        // and split the 3-byte UTF-8 encoding of "中" across two byte chunks.
+        let message = Message {
+            message_id: "m-1".into(),
+            role: Role::Agent,
+            parts: vec![Part::text("中")],
+            context_id: None,
+            task_id: Some("t1".into()),
+            metadata: None,
+            extensions: None,
+            reference_task_ids: None,
+        };
+        let status_update = TaskStatusUpdateEvent {
+            task_id: "t1".into(),
+            context_id: "c1".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: Some(message),
+                timestamp: None,
+            },
+            metadata: None,
+        };
+        let sr = StreamResponse::StatusUpdate(status_update);
+        let result = protojson_conv::to_value(&sr).unwrap();
+        let rpc_resp = JsonRpcResponse::success(JsonRpcId::Number(1), result);
+        let data = serde_json::to_string(&rpc_resp).unwrap();
+        let sse_text = format!("data: {data}\n\n");
+        let bytes = sse_text.as_bytes();
+
+        // Find the first multi-byte UTF-8 sequence and split it down the middle.
+        let zhong_start = bytes
+            .windows(3)
+            .position(|w| w == [0xE4, 0xB8, 0xAD])
+            .expect("payload must contain the UTF-8 encoding of '中'");
+        let split = zhong_start + 1;
+        let chunk1 = String::from_utf8_lossy(&bytes[..split]).into_owned();
+        let chunk2 = String::from_utf8_lossy(&bytes[split..]).into_owned();
+        // Sanity: the naive per-chunk lossy decode we just used for the test
+        // setup really did corrupt the payload, so the assertion below is
+        // meaningful (the parser must do better).
+        assert!(
+            chunk1.ends_with(char::REPLACEMENT_CHARACTER)
+                || chunk2.starts_with(char::REPLACEMENT_CHARACTER),
+            "test setup should split a multi-byte char so naive decode corrupts it",
+        );
+
+        // But we feed the parser the ORIGINAL bytes, not the corrupted strings.
+        let raw1 = bytes[..split].to_vec();
+        let raw2 = bytes[split..].to_vec();
+        let raw_stream = stream::iter(vec![
+            Ok::<_, reqwest::Error>(bytes::Bytes::from(raw1)),
+            Ok::<_, reqwest::Error>(bytes::Bytes::from(raw2)),
+        ]);
+        let items: Vec<_> = parse_sse_stream(raw_stream).collect().await;
+        assert_eq!(items.len(), 1, "expected one event, got {items:?}");
+        let event = items.into_iter().next().unwrap().expect("decoded");
+        match event {
+            StreamResponse::StatusUpdate(su) => {
+                let msg = su.status.message.expect("message present");
+                let text = match &msg.parts[0].content {
+                    PartContent::Text(t) => t.clone(),
+                    other => panic!("expected text part, got {other:?}"),
+                };
+                assert_eq!(text, "中", "multi-byte char must survive chunk split");
+            }
+            other => panic!("expected StatusUpdate, got {other:?}"),
+        }
+    }
+
+    /// Invalid UTF-8 inside a complete event must surface an error rather
+    /// than silently producing U+FFFD replacement characters.
+    #[tokio::test]
+    async fn test_parse_sse_stream_invalid_utf8_surfaces_error() {
+        // "data: " prefix is ASCII; follow it with an invalid UTF-8 byte
+        // sequence (a lone continuation byte), then the \n\n terminator.
+        let mut bytes = b"data: ".to_vec();
+        bytes.push(0xFF); // never valid in UTF-8
+        bytes.extend_from_slice(b"\n\n");
+        let raw_stream = stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(bytes))]);
+        let items: Vec<_> = parse_sse_stream(raw_stream).collect().await;
+        assert_eq!(items.len(), 1, "expected one error item, got {items:?}");
+        let err = items.into_iter().next().unwrap().expect_err("should error");
+        assert!(
+            err.to_string().contains("UTF-8"),
+            "error should mention UTF-8 decoding: {err}",
+        );
+    }
+
+    /// JSON-RPC envelope whose `result` is not a valid `StreamResponse`
+    /// must surface a parse error instead of silently dropping the event.
+    #[tokio::test]
+    async fn test_parse_sse_stream_invalid_protojson_result_surfaces_error() {
+        let rpc_resp = JsonRpcResponse::success(
+            JsonRpcId::Number(1),
+            serde_json::json!({"not_a_stream_response_field": 42}),
+        );
+        let data = serde_json::to_string(&rpc_resp).unwrap();
+        let sse_text = format!("data: {data}\n\n");
+        let stream = byte_stream(vec![sse_text]);
+        let items: Vec<_> = parse_sse_stream(stream).collect().await;
+        assert_eq!(items.len(), 1, "expected one error item, got {items:?}");
+        let err = items.into_iter().next().unwrap().expect_err("should error");
+        assert!(
+            err.to_string().contains("parse error"),
+            "error should mention parse error: {err}",
+        );
+    }
+
+    /// Direct `StreamResponse` JSON (JSON-RPC fallback path) that fails
+    /// protojson conversion must surface a parse error.
+    #[tokio::test]
+    async fn test_parse_sse_stream_direct_invalid_protojson_surfaces_error() {
+        // Not a JSON-RPC envelope (missing `jsonrpc`/`id`) and not a valid
+        // StreamResponse — exercises the `Err(_)` fallback branch.
+        let sse_text = "data: {\"foo\":\"bar\"}\n\n".to_string();
+        let stream = byte_stream(vec![sse_text]);
+        let items: Vec<_> = parse_sse_stream(stream).collect().await;
+        assert_eq!(items.len(), 1, "expected one error item, got {items:?}");
+        let err = items.into_iter().next().unwrap().expect_err("should error");
+        assert!(
+            err.to_string().contains("parse error"),
+            "error should mention parse error: {err}",
+        );
+    }
+
+    /// Errors yielded by the underlying byte stream must be surfaced to the
+    /// consumer rather than swallowed.  `futures::stream::iter` only accepts
+    /// `Ok` variants typed as `reqwest::Error`, so we need an actual
+    /// reqwest::Error instance — obtained by issuing a request against an
+    /// address that cannot accept a connection.
+    #[tokio::test]
+    async fn test_parse_sse_stream_surfaces_stream_errors() {
+        // Produce a real reqwest::Error by hitting a listener we bound and
+        // then dropped, so the connect fails immediately.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let err = reqwest::get(format!("http://{addr}/"))
+            .await
+            .expect_err("connection should fail");
+
+        let s = stream::iter(vec![Err::<bytes::Bytes, reqwest::Error>(err)]);
+        let items: Vec<_> = parse_sse_stream(s).collect().await;
+        assert_eq!(items.len(), 1, "expected one error item, got {items:?}");
+        let got = items.into_iter().next().unwrap().expect_err("should error");
+        assert!(
+            got.to_string().contains("SSE stream error"),
+            "error should mention SSE stream error: {got}",
+        );
+    }
+
+    /// REST variant of [`test_parse_sse_stream_surfaces_stream_errors`].
+    #[tokio::test]
+    async fn test_parse_sse_stream_rest_surfaces_stream_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let err = reqwest::get(format!("http://{addr}/"))
+            .await
+            .expect_err("connection should fail");
+
+        let s = stream::iter(vec![Err::<bytes::Bytes, reqwest::Error>(err)]);
+        let items: Vec<_> = parse_sse_stream_rest(s).collect().await;
+        assert_eq!(items.len(), 1, "expected one error item, got {items:?}");
+        let got = items.into_iter().next().unwrap().expect_err("should error");
+        assert!(
+            got.to_string().contains("SSE stream error"),
+            "error should mention SSE stream error: {got}",
+        );
+    }
+
+    /// SSE spec allows `\r\n\r\n`, `\n\n`, and `\r\r` as event separators.
+    /// This test exercises the `\r\n\r\n` variant.
+    #[tokio::test]
+    async fn test_parse_sse_stream_crlf_line_endings() {
+        let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "t1".into(),
+            context_id: "c1".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        let data = serde_json::to_string(&protojson_conv::to_value(&sr).unwrap()).unwrap();
+        // Use \r\n\r\n instead of \n\n
+        let sse_text = format!("data: {}\r\n\r\n", data);
+
+        let stream = byte_stream(vec![sse_text]);
+        let mut parsed = parse_sse_stream(stream);
+        let item = parsed.next().await.unwrap().unwrap();
+        assert!(matches!(item, StreamResponse::StatusUpdate(_)));
+        assert!(parsed.next().await.is_none());
+    }
+
+    /// `\r\r` is also a valid SSE event separator per the spec.
+    #[tokio::test]
+    async fn test_parse_sse_stream_cr_line_endings() {
+        let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "t1".into(),
+            context_id: "c1".into(),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        let data = serde_json::to_string(&protojson_conv::to_value(&sr).unwrap()).unwrap();
+        let sse_text = format!("data: {}\r\r", data);
+
+        let stream = byte_stream(vec![sse_text]);
+        let mut parsed = parse_sse_stream_rest(stream);
+        let item = parsed.next().await.unwrap().unwrap();
+        assert!(matches!(item, StreamResponse::StatusUpdate(_)));
+    }
+
+    #[test]
+    fn test_find_event_boundary_lf() {
+        assert_eq!(find_event_boundary(b"foo\n\nbar"), Some((3, 5)));
+    }
+
+    #[test]
+    fn test_find_event_boundary_cr() {
+        assert_eq!(find_event_boundary(b"foo\r\rbar"), Some((3, 5)));
+    }
+
+    #[test]
+    fn test_find_event_boundary_crlf() {
+        assert_eq!(find_event_boundary(b"foo\r\n\r\nbar"), Some((3, 7)));
+    }
+
+    #[test]
+    fn test_find_event_boundary_none() {
+        assert!(find_event_boundary(b"no boundary here").is_none());
     }
 
     #[test]
