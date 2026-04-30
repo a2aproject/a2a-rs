@@ -26,7 +26,7 @@ path = "src/helloworld_tls/client.rs"
 
 [dependencies]
 a2a = { workspace = true }
-a2a-client = { workspace = true }
+a2a-client = { workspace = true, features = ["rustls-tls"] }
 a2a-grpc = { workspace = true, features = ["rustls"] }
 a2a-pb = { workspace = true }
 a2a-server = { workspace = true, features = ["rustls"] }
@@ -35,7 +35,7 @@ tokio-stream = { workspace = true, features = ["net"] }
 tokio-rustls = { workspace = true }
 tonic-tls = { workspace = true, features = ["rustls"] }
 async-trait = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls-webpki-roots-no-provider"] }
 futures = { workspace = true }
 axum = { workspace = true }
 tonic = { workspace = true }

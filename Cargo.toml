@@ -20,8 +20,8 @@ rust-version = "1.85"
 [workspace.dependencies]
 # Internal crates
 a2a = { package = "a2a-lf", path = "a2a", version = "0.2.4" }
-a2a-client = { package = "a2a-client-lf", path = "a2a-client", version = "0.1.14" }
-a2a-server = { package = "a2a-server-lf", path = "a2a-server", version = "0.2.7" }
+a2a-client = { package = "a2a-client-lf", path = "a2a-client", version = "0.1.14", default-features = false }
+a2a-server = { package = "a2a-server-lf", path = "a2a-server", version = "0.2.7", default-features = false }
 a2a-pb = { package = "a2a-pb", path = "a2a-pb", version = "0.1.7" }
 a2a-grpc = { package = "a2a-grpc", path = "a2a-grpc", version = "0.2.0" }
 a2a-slimrpc = { package = "a2a-slimrpc", path = "a2a-slimrpc", version = "0.1.9" }
