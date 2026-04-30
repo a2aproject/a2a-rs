@@ -10,13 +10,11 @@ pub fn a2a_error_to_rpc_error(err: &A2AError) -> slim_bindings::RpcError {
         error_code::TASK_NOT_FOUND => slim_bindings::RpcError::not_found(err.message.clone()),
         error_code::TASK_NOT_CANCELABLE
         | error_code::EXTENSION_SUPPORT_REQUIRED
-        | error_code::VERSION_NOT_SUPPORTED => {
-            slim_bindings::RpcError::failed_precondition(err.message.clone())
-        }
-        error_code::PUSH_NOTIFICATION_NOT_SUPPORTED
+        | error_code::VERSION_NOT_SUPPORTED
+        | error_code::PUSH_NOTIFICATION_NOT_SUPPORTED
         | error_code::UNSUPPORTED_OPERATION
         | error_code::EXTENDED_CARD_NOT_CONFIGURED => {
-            slim_bindings::RpcError::unimplemented(err.message.clone())
+            slim_bindings::RpcError::failed_precondition(err.message.clone())
         }
         error_code::CONTENT_TYPE_NOT_SUPPORTED
         | error_code::PARSE_ERROR
@@ -64,9 +62,12 @@ mod tests {
             (error_code::TASK_NOT_CANCELABLE, RpcCode::FailedPrecondition),
             (
                 error_code::PUSH_NOTIFICATION_NOT_SUPPORTED,
-                RpcCode::Unimplemented,
+                RpcCode::FailedPrecondition,
             ),
-            (error_code::UNSUPPORTED_OPERATION, RpcCode::Unimplemented),
+            (
+                error_code::UNSUPPORTED_OPERATION,
+                RpcCode::FailedPrecondition,
+            ),
             (
                 error_code::CONTENT_TYPE_NOT_SUPPORTED,
                 RpcCode::InvalidArgument,
@@ -111,7 +112,7 @@ mod tests {
             ),
             (
                 error_code::EXTENDED_CARD_NOT_CONFIGURED,
-                RpcCode::Unimplemented,
+                RpcCode::FailedPrecondition,
             ),
             (error_code::PARSE_ERROR, RpcCode::InvalidArgument),
             (error_code::INVALID_REQUEST, RpcCode::InvalidArgument),

@@ -8,11 +8,11 @@ pub fn a2a_error_to_status(err: &A2AError) -> tonic::Status {
     let code = match err.code {
         error_code::TASK_NOT_FOUND => tonic::Code::NotFound,
         error_code::TASK_NOT_CANCELABLE => tonic::Code::FailedPrecondition,
-        error_code::PUSH_NOTIFICATION_NOT_SUPPORTED => tonic::Code::Unimplemented,
-        error_code::UNSUPPORTED_OPERATION => tonic::Code::Unimplemented,
+        error_code::PUSH_NOTIFICATION_NOT_SUPPORTED => tonic::Code::FailedPrecondition,
+        error_code::UNSUPPORTED_OPERATION => tonic::Code::FailedPrecondition,
         error_code::CONTENT_TYPE_NOT_SUPPORTED => tonic::Code::InvalidArgument,
         error_code::INVALID_AGENT_RESPONSE => tonic::Code::Internal,
-        error_code::EXTENDED_CARD_NOT_CONFIGURED => tonic::Code::Unimplemented,
+        error_code::EXTENDED_CARD_NOT_CONFIGURED => tonic::Code::FailedPrecondition,
         error_code::EXTENSION_SUPPORT_REQUIRED => tonic::Code::FailedPrecondition,
         error_code::VERSION_NOT_SUPPORTED => tonic::Code::FailedPrecondition,
         error_code::PARSE_ERROR => tonic::Code::InvalidArgument,
@@ -31,7 +31,7 @@ pub fn status_to_a2a_error(status: &tonic::Status) -> A2AError {
     let code = match status.code() {
         tonic::Code::NotFound => error_code::TASK_NOT_FOUND,
         tonic::Code::FailedPrecondition => error_code::TASK_NOT_CANCELABLE,
-        tonic::Code::Unimplemented => error_code::UNSUPPORTED_OPERATION,
+        tonic::Code::Unimplemented => error_code::METHOD_NOT_FOUND,
         tonic::Code::InvalidArgument => error_code::INVALID_PARAMS,
         tonic::Code::Internal => error_code::INTERNAL_ERROR,
         _ => error_code::INTERNAL_ERROR,
@@ -54,11 +54,11 @@ mod tests {
             ),
             (
                 error_code::PUSH_NOTIFICATION_NOT_SUPPORTED,
-                tonic::Code::Unimplemented,
+                tonic::Code::FailedPrecondition,
             ),
             (
                 error_code::UNSUPPORTED_OPERATION,
-                tonic::Code::Unimplemented,
+                tonic::Code::FailedPrecondition,
             ),
             (
                 error_code::CONTENT_TYPE_NOT_SUPPORTED,
@@ -91,10 +91,7 @@ mod tests {
                 tonic::Code::FailedPrecondition,
                 error_code::TASK_NOT_CANCELABLE,
             ),
-            (
-                tonic::Code::Unimplemented,
-                error_code::UNSUPPORTED_OPERATION,
-            ),
+            (tonic::Code::Unimplemented, error_code::METHOD_NOT_FOUND),
             (tonic::Code::InvalidArgument, error_code::INVALID_PARAMS),
             (tonic::Code::Internal, error_code::INTERNAL_ERROR),
         ];
@@ -121,7 +118,7 @@ mod tests {
         let cases = [
             (
                 error_code::EXTENDED_CARD_NOT_CONFIGURED,
-                tonic::Code::Unimplemented,
+                tonic::Code::FailedPrecondition,
             ),
             (
                 error_code::EXTENSION_SUPPORT_REQUIRED,

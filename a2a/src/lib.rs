@@ -3,12 +3,14 @@
 #![doc = include_str!("../README.md")]
 
 pub mod agent_card;
+pub mod errordetails;
 pub mod errors;
 pub mod event;
 pub mod jsonrpc;
 pub mod types;
 
 pub use agent_card::*;
+pub use errordetails::*;
 pub use errors::*;
 pub use event::*;
 pub use jsonrpc::*;

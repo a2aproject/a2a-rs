@@ -7,12 +7,31 @@ use futures::stream::{self, BoxStream, StreamExt};
 use reqwest::Client;
 use std::collections::VecDeque;
 
+use serde_json::Value;
+
 use crate::push_config_compat::{
     deserialize_list_task_push_notification_configs_response,
     deserialize_task_push_notification_config,
     serialize_create_task_push_notification_config_request,
 };
 use crate::transport::{ServiceParams, Transport, TransportFactory};
+
+fn parse_jsonrpc_error(err: JsonRpcError) -> A2AError {
+    let details: Vec<TypedDetail> = err
+        .data
+        .and_then(|data| match data {
+            Value::Array(a) => Some(a),
+            _ => None,
+        })
+        .map(|arr| {
+            arr.into_iter()
+                .filter_map(|v| serde_json::from_value::<TypedDetail>(v).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    crate::a2a_error_from_details(err.code, err.message, details)
+}
 
 /// JSON-RPC transport implementation.
 ///
@@ -56,7 +75,7 @@ impl JsonRpcTransport {
             .map_err(|e| A2AError::internal(format!("failed to parse JSON-RPC response: {e}")))?;
 
         if let Some(err) = rpc_response.error {
-            return Err(A2AError::new(err.code, err.message));
+            return Err(parse_jsonrpc_error(err));
         }
 
         rpc_response
@@ -240,7 +259,7 @@ fn parse_sse_stream(
         match serde_json::from_str::<JsonRpcResponse>(&data) {
             Ok(rpc_resp) => {
                 if let Some(err) = rpc_resp.error {
-                    return Some(Err(A2AError::new(err.code, err.message)));
+                    return Some(Err(parse_jsonrpc_error(err)));
                 }
                 if let Some(result) = rpc_resp.result {
                     match protojson_conv::from_value::<StreamResponse>(result) {
@@ -411,7 +430,7 @@ impl Transport for JsonRpcTransport {
             .map_err(|e| A2AError::internal(format!("failed to parse JSON-RPC response: {e}")))?;
 
         if let Some(err) = rpc_response.error {
-            return Err(A2AError::new(err.code, err.message));
+            return Err(parse_jsonrpc_error(err));
         }
 
         Ok(())
@@ -1314,5 +1333,159 @@ mod tests {
         let iface = AgentInterface::new("https://localhost:3443/jsonrpc", "JSONRPC");
         let transport = f.create(&card, &iface).await.unwrap();
         transport.destroy().await.unwrap();
+    }
+
+    #[test]
+    fn test_parse_jsonrpc_error_no_data() {
+        let err = JsonRpcError {
+            code: error_code::TASK_NOT_FOUND,
+            message: "task not found".into(),
+            data: None,
+        };
+        let a2a_err = parse_jsonrpc_error(err);
+        assert_eq!(a2a_err.code, error_code::TASK_NOT_FOUND);
+        assert_eq!(a2a_err.message, "task not found");
+        assert!(a2a_err.details.is_none());
+    }
+
+    #[test]
+    fn test_parse_jsonrpc_error_non_array_data() {
+        let err = JsonRpcError {
+            code: error_code::INTERNAL_ERROR,
+            message: "err".into(),
+            data: Some(json!("just a string")),
+        };
+        let a2a_err = parse_jsonrpc_error(err);
+        assert_eq!(a2a_err.code, error_code::INTERNAL_ERROR);
+        assert!(a2a_err.details.is_none());
+    }
+
+    #[test]
+    fn test_parse_jsonrpc_error_with_error_info() {
+        let err = JsonRpcError {
+            code: error_code::INTERNAL_ERROR,
+            message: "task not found: t1".into(),
+            data: Some(json!([
+                {
+                    "@type": errordetails::ERROR_INFO_TYPE,
+                    "reason": "TASK_NOT_FOUND",
+                    "domain": errordetails::PROTOCOL_DOMAIN,
+                    "metadata": {"taskId": "t1"}
+                }
+            ])),
+        };
+        let a2a_err = parse_jsonrpc_error(err);
+        assert_eq!(a2a_err.code, error_code::TASK_NOT_FOUND);
+        assert_eq!(a2a_err.message, "task not found: t1");
+        let details = a2a_err.details.unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].type_url, errordetails::ERROR_INFO_TYPE);
+    }
+
+    #[test]
+    fn test_parse_jsonrpc_error_with_bad_request() {
+        let err = JsonRpcError {
+            code: error_code::INTERNAL_ERROR,
+            message: "invalid params".into(),
+            data: Some(json!([
+                {
+                    "@type": errordetails::BAD_REQUEST_TYPE,
+                    "fieldViolations": [
+                        {"field": "message.parts", "description": "required"},
+                        {"field": "message.role", "description": "must be user or agent"}
+                    ]
+                }
+            ])),
+        };
+        let a2a_err = parse_jsonrpc_error(err);
+        assert_eq!(a2a_err.code, error_code::INVALID_PARAMS);
+        assert!(a2a_err.message.contains("message.parts: required"));
+        assert!(
+            a2a_err
+                .message
+                .contains("message.role: must be user or agent")
+        );
+    }
+
+    #[test]
+    fn test_parse_jsonrpc_error_bad_request_does_not_override_explicit_code() {
+        let err = JsonRpcError {
+            code: error_code::PARSE_ERROR,
+            message: "parse error".into(),
+            data: Some(json!([
+                {
+                    "@type": errordetails::BAD_REQUEST_TYPE,
+                    "fieldViolations": [
+                        {"field": "body", "description": "invalid json"}
+                    ]
+                }
+            ])),
+        };
+        let a2a_err = parse_jsonrpc_error(err);
+        // BadRequest only overrides INTERNAL_ERROR, not other codes
+        assert_eq!(a2a_err.code, error_code::PARSE_ERROR);
+    }
+
+    #[test]
+    fn test_parse_jsonrpc_error_error_info_overrides_bad_request_code() {
+        let err = JsonRpcError {
+            code: error_code::INTERNAL_ERROR,
+            message: "bad params".into(),
+            data: Some(json!([
+                {
+                    "@type": errordetails::BAD_REQUEST_TYPE,
+                    "fieldViolations": [
+                        {"field": "task.id", "description": "required"}
+                    ]
+                },
+                {
+                    "@type": errordetails::ERROR_INFO_TYPE,
+                    "reason": "INVALID_PARAMS",
+                    "domain": errordetails::PROTOCOL_DOMAIN,
+                    "metadata": {}
+                }
+            ])),
+        };
+        let a2a_err = parse_jsonrpc_error(err);
+        // ErrorInfo reason takes precedence
+        assert_eq!(a2a_err.code, error_code::INVALID_PARAMS);
+        assert!(a2a_err.message.contains("task.id: required"));
+    }
+
+    #[test]
+    fn test_parse_jsonrpc_error_ignores_non_protocol_domain() {
+        let err = JsonRpcError {
+            code: error_code::INTERNAL_ERROR,
+            message: "err".into(),
+            data: Some(json!([
+                {
+                    "@type": errordetails::ERROR_INFO_TYPE,
+                    "reason": "TASK_NOT_FOUND",
+                    "domain": "other.domain.com",
+                    "metadata": {}
+                }
+            ])),
+        };
+        let a2a_err = parse_jsonrpc_error(err);
+        // Should not override code since domain doesn't match
+        assert_eq!(a2a_err.code, error_code::INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn test_parse_jsonrpc_error_bad_request_empty_violations() {
+        let err = JsonRpcError {
+            code: error_code::INTERNAL_ERROR,
+            message: "invalid".into(),
+            data: Some(json!([
+                {
+                    "@type": errordetails::BAD_REQUEST_TYPE,
+                    "fieldViolations": []
+                }
+            ])),
+        };
+        let a2a_err = parse_jsonrpc_error(err);
+        assert_eq!(a2a_err.code, error_code::INVALID_PARAMS);
+        // Message should not be modified when violations are empty
+        assert_eq!(a2a_err.message, "invalid");
     }
 }
