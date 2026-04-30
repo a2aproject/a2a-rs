@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/a2aproject/a2a-rs/compare/a2a-pb-v0.1.6...a2a-pb-v0.1.7) - 2026-04-30
+
+### Added
+
+- *(a2a-pb)* upgrade tonic to 0.14, prost to 0.14, pbjson to 0.9 ([#55](https://github.com/a2aproject/a2a-rs/pull/55))
+
 ## [0.1.6](https://github.com/a2aproject/a2a-rs/compare/agntcy-a2a-pb-v0.1.5...agntcy-a2a-pb-v0.1.6) - 2026-04-06
 
 ### Added

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.2.6...a2a-server-lf-v0.2.7) - 2026-04-30
+
+### Added
+
+- built-in TLS (rustls) support for transport factories ([#56](https://github.com/a2aproject/a2a-rs/pull/56))
+- use rustls everywhere and expose TLS backend selection via feature flags ([#47](https://github.com/a2aproject/a2a-rs/pull/47))
+
 ## [0.2.6](https://github.com/a2aproject/a2a-rs/compare/agntcy-a2a-server-v0.2.5...agntcy-a2a-server-v0.2.6) - 2026-04-06
 
 ### Other
