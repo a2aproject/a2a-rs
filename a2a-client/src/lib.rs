@@ -15,6 +15,7 @@ pub use factory::A2AClientFactory;
 pub use futures::stream::BoxStream;
 pub use transport::{ServiceParams, Transport, TransportFactory};
 
+#[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
 pub(crate) fn build_reqwest_client_with_root_pem(
     pem: &[u8],
 ) -> Result<reqwest::Client, a2a::A2AError> {
