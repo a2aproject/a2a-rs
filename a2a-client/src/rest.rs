@@ -476,6 +476,12 @@ impl RestTransportFactory {
             client: client.unwrap_or_default(),
         }
     }
+
+    pub fn with_root_certificates_pem(pem: &[u8]) -> Result<Self, A2AError> {
+        Ok(Self {
+            client: crate::build_reqwest_client_with_root_pem(pem)?,
+        })
+    }
 }
 
 #[async_trait]
@@ -499,6 +505,7 @@ impl TransportFactory for RestTransportFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::rcgen_self_signed_ca_pem;
     use serde_json::json;
 
     #[test]
@@ -613,5 +620,37 @@ mod tests {
 
         let err = parse_rest_error(reqwest::StatusCode::BAD_REQUEST, &body);
         assert_eq!(err.code, error_code::CONTENT_TYPE_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn test_with_root_certificates_pem_valid() {
+        let pem = rcgen_self_signed_ca_pem();
+        let f = RestTransportFactory::with_root_certificates_pem(&pem).unwrap();
+        assert_eq!(f.protocol(), TRANSPORT_PROTOCOL_HTTP_JSON);
+    }
+
+    #[tokio::test]
+    async fn test_with_root_certificates_pem_factory_create() {
+        let pem = rcgen_self_signed_ca_pem();
+        let f = RestTransportFactory::with_root_certificates_pem(&pem).unwrap();
+        let card = AgentCard {
+            name: "Test".into(),
+            description: "Test".into(),
+            version: "1.0".into(),
+            supported_interfaces: vec![],
+            capabilities: AgentCapabilities::default(),
+            default_input_modes: vec!["text/plain".into()],
+            default_output_modes: vec!["text/plain".into()],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        };
+        let iface = AgentInterface::new("https://localhost:3443/rest", "HTTP+JSON");
+        let transport = f.create(&card, &iface).await.unwrap();
+        transport.destroy().await.unwrap();
     }
 }

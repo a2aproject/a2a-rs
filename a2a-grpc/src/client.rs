@@ -258,7 +258,72 @@ impl Transport for GrpcTransport {
 }
 
 /// Factory for creating gRPC transports.
-pub struct GrpcTransportFactory;
+///
+/// Supports optional TLS via rustls when the `rustls` feature is enabled.
+/// Use [`GrpcTransportFactory::new()`] for plain connections, or
+/// [`GrpcTransportFactory::with_rustls_config()`] to enable TLS.
+pub struct GrpcTransportFactory {
+    #[cfg(feature = "rustls")]
+    tls_config: Option<std::sync::Arc<tokio_rustls::rustls::ClientConfig>>,
+}
+
+impl GrpcTransportFactory {
+    pub fn new() -> Self {
+        GrpcTransportFactory {
+            #[cfg(feature = "rustls")]
+            tls_config: None,
+        }
+    }
+
+    #[cfg(feature = "rustls")]
+    pub fn with_rustls_config(config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>) -> Self {
+        GrpcTransportFactory {
+            tls_config: Some(config),
+        }
+    }
+}
+
+impl Default for GrpcTransportFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "rustls")]
+fn server_name_from_url(
+    url: &str,
+) -> Result<tokio_rustls::rustls::pki_types::ServerName<'static>, A2AError> {
+    let uri: http::Uri = url
+        .parse()
+        .map_err(|e| A2AError::internal(format!("invalid URL: {e}")))?;
+    let host = uri
+        .host()
+        .ok_or_else(|| A2AError::internal("URL has no host"))?
+        .to_string();
+    tokio_rustls::rustls::pki_types::ServerName::try_from(host)
+        .map_err(|e| A2AError::internal(format!("invalid server name: {e}")))
+}
+
+#[cfg(feature = "rustls")]
+impl GrpcTransportFactory {
+    async fn connect_tls(
+        url: &str,
+        tls_config: &std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+    ) -> Result<GrpcTransport, A2AError> {
+        let url = normalize_grpc_endpoint(url);
+        let server_name = server_name_from_url(&url)?;
+        let ep = Endpoint::from_shared(url)
+            .map_err(|e| A2AError::internal(format!("invalid endpoint: {e}")))?;
+        let transport = tonic_tls::TcpTransport::from_endpoint(&ep);
+        let connector =
+            tonic_tls::rustls::TlsConnector::new(transport, tls_config.clone(), server_name);
+        let channel = ep
+            .connect_with_connector(connector)
+            .await
+            .map_err(|e| A2AError::internal(format!("gRPC TLS connect: {e}")))?;
+        Ok(GrpcTransport::from_channel(channel))
+    }
+}
 
 #[async_trait]
 impl TransportFactory for GrpcTransportFactory {
@@ -271,6 +336,11 @@ impl TransportFactory for GrpcTransportFactory {
         _card: &AgentCard,
         iface: &AgentInterface,
     ) -> Result<Box<dyn Transport>, A2AError> {
+        #[cfg(feature = "rustls")]
+        if let Some(tls_config) = &self.tls_config {
+            return Ok(Box::new(Self::connect_tls(&iface.url, tls_config).await?));
+        }
+
         let transport = GrpcTransport::connect(&iface.url).await?;
         Ok(Box::new(transport))
     }
@@ -330,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_grpc_transport_factory_protocol() {
-        let f = GrpcTransportFactory;
+        let f = GrpcTransportFactory::new();
         assert_eq!(f.protocol(), "GRPC");
     }
 
@@ -347,7 +417,119 @@ mod tests {
     fn test_grpc_transport_from_channel() {
         // We can't easily create a real Channel without a server,
         // but we can test the factory protocol
-        let f = GrpcTransportFactory;
+        let f = GrpcTransportFactory::new();
         assert_eq!(f.protocol(), a2a::TRANSPORT_PROTOCOL_GRPC);
+    }
+
+    #[test]
+    fn test_grpc_transport_factory_default() {
+        let f = GrpcTransportFactory::default();
+        assert_eq!(f.protocol(), a2a::TRANSPORT_PROTOCOL_GRPC);
+    }
+
+    #[cfg(feature = "rustls")]
+    mod tls_tests {
+        use super::*;
+        use std::sync::Arc;
+
+        fn self_signed_ca_pem() -> Vec<u8> {
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "Test CA");
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = params.self_signed(&key).unwrap();
+            cert.pem().into_bytes()
+        }
+
+        fn build_test_tls_config(ca_pem: &[u8]) -> Arc<tokio_rustls::rustls::ClientConfig> {
+            let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let ca_cert = rustls_pemfile::certs(&mut &ca_pem[..])
+                .next()
+                .expect("should have at least one cert in ca.pem")
+                .expect("cert should be valid");
+            let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+            root_store.add(ca_cert).unwrap();
+            let mut config = tokio_rustls::rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            config.alpn_protocols = vec![tonic_tls::ALPN_H2.to_vec()];
+            Arc::new(config)
+        }
+
+        #[test]
+        fn test_with_rustls_config_protocol() {
+            let ca_pem = self_signed_ca_pem();
+            let config = build_test_tls_config(&ca_pem);
+            let f = GrpcTransportFactory::with_rustls_config(config);
+            assert_eq!(f.protocol(), a2a::TRANSPORT_PROTOCOL_GRPC);
+            assert!(f.tls_config.is_some());
+        }
+
+        #[test]
+        fn test_new_has_no_tls_config() {
+            let f = GrpcTransportFactory::new();
+            assert!(f.tls_config.is_none());
+        }
+
+        #[test]
+        fn test_server_name_from_url_https() {
+            let name = server_name_from_url("https://example.com:443").unwrap();
+            assert_eq!(
+                name,
+                tokio_rustls::rustls::pki_types::ServerName::try_from("example.com").unwrap()
+            );
+        }
+
+        #[test]
+        fn test_server_name_from_url_localhost() {
+            let name = server_name_from_url("https://localhost:50052").unwrap();
+            assert_eq!(
+                name,
+                tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap()
+            );
+        }
+
+        #[test]
+        fn test_server_name_from_url_ip() {
+            let name = server_name_from_url("https://127.0.0.1:50052").unwrap();
+            assert_eq!(
+                name,
+                tokio_rustls::rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap()
+            );
+        }
+
+        #[test]
+        fn test_server_name_from_url_invalid() {
+            let result = server_name_from_url("not a url");
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn test_tls_factory_create_fails_on_unreachable() {
+            let ca_pem = self_signed_ca_pem();
+            let config = build_test_tls_config(&ca_pem);
+            let f = GrpcTransportFactory::with_rustls_config(config);
+            let card = AgentCard {
+                name: "test".into(),
+                description: "test".into(),
+                version: "1.0".into(),
+                supported_interfaces: vec![],
+                capabilities: AgentCapabilities::default(),
+                default_input_modes: vec!["text".into()],
+                default_output_modes: vec!["text".into()],
+                skills: vec![],
+                provider: None,
+                documentation_url: None,
+                icon_url: None,
+                security_schemes: None,
+                security_requirements: None,
+                signatures: None,
+            };
+            let iface = AgentInterface::new("https://127.0.0.1:1", TRANSPORT_PROTOCOL_GRPC);
+            let result = f.create(&card, &iface).await;
+            assert!(result.is_err());
+        }
     }
 }

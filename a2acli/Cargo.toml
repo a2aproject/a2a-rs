@@ -29,7 +29,7 @@ tokio = { workspace = true }
 [features]
 default = ["rustls-tls"]
 native-tls = ["a2a-client/native-tls", "reqwest/native-tls"]
-rustls-tls = ["a2a-client/rustls-tls", "reqwest/rustls-tls"]
+rustls-tls = ["a2a-client/rustls-tls", "reqwest/rustls-tls-webpki-roots-no-provider"]
 
 [dev-dependencies]
 a2a-server = { workspace = true }

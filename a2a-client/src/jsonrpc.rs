@@ -442,6 +442,12 @@ impl JsonRpcTransportFactory {
             client: client.unwrap_or_default(),
         }
     }
+
+    pub fn with_root_certificates_pem(pem: &[u8]) -> Result<Self, A2AError> {
+        Ok(Self {
+            client: crate::build_reqwest_client_with_root_pem(pem)?,
+        })
+    }
 }
 
 #[async_trait]
@@ -465,6 +471,7 @@ impl TransportFactory for JsonRpcTransportFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::rcgen_self_signed_ca_pem;
     use a2a_pb::protojson_conv;
     use futures::StreamExt;
     use serde_json::{Value, json};
@@ -1275,5 +1282,37 @@ mod tests {
                 "tenant": "tenant-1"
             })
         );
+    }
+
+    #[test]
+    fn test_with_root_certificates_pem_valid() {
+        let pem = rcgen_self_signed_ca_pem();
+        let f = JsonRpcTransportFactory::with_root_certificates_pem(&pem).unwrap();
+        assert_eq!(f.protocol(), TRANSPORT_PROTOCOL_JSONRPC);
+    }
+
+    #[tokio::test]
+    async fn test_with_root_certificates_pem_factory_create() {
+        let pem = rcgen_self_signed_ca_pem();
+        let f = JsonRpcTransportFactory::with_root_certificates_pem(&pem).unwrap();
+        let card = AgentCard {
+            name: "Test".into(),
+            description: "Test".into(),
+            version: "1.0".into(),
+            supported_interfaces: vec![],
+            capabilities: AgentCapabilities::default(),
+            default_input_modes: vec!["text/plain".into()],
+            default_output_modes: vec!["text/plain".into()],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        };
+        let iface = AgentInterface::new("https://localhost:3443/jsonrpc", "JSONRPC");
+        let transport = f.create(&card, &iface).await.unwrap();
+        transport.destroy().await.unwrap();
     }
 }
