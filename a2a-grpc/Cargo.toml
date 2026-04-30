@@ -1,6 +1,6 @@
 [package]
 name = "a2a-grpc"
-version = "0.1.11"
+version = "0.2.0"
 description = "A2A v1 gRPC protocol binding for client and server"
 readme = "README.md"
 edition.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "a2a-server-lf"
-version = "0.2.6"
+version = "0.2.7"
 description = "A2A v1 async server framework"
 readme = "README.md"
 edition.workspace = true
