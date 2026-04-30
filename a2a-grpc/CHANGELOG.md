@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/a2aproject/a2a-rs/compare/a2a-grpc-v0.2.0...a2a-grpc-v0.2.1) - 2026-04-30
+
+### Fixed
+
+- allow disabling TLS in a2a-grpc ([#60](https://github.com/a2aproject/a2a-rs/pull/60))
+
 ## [0.2.0](https://github.com/a2aproject/a2a-rs/compare/a2a-grpc-v0.1.11...a2a-grpc-v0.2.0) - 2026-04-30
 
 ### Added

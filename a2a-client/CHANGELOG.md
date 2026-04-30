@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.1.14...a2a-client-lf-v0.1.15) - 2026-04-30
+
+### Fixed
+
+- allow disabling TLS in a2a-grpc ([#60](https://github.com/a2aproject/a2a-rs/pull/60))
+
 ## [0.1.14](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.1.13...a2a-client-lf-v0.1.14) - 2026-04-30
 
 ### Added
