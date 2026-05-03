@@ -16,6 +16,7 @@ The workspace supports:
 - REST / HTTP+JSON
 - gRPC via `tonic`
 - SLIMRPC via `slim_bindings`
+- WebSocket for bidirectional JSON-RPC-style sessions
 - Server-Sent Events for streaming responses
 - Protobuf-based interop with other SDKs and runtimes
 
@@ -40,10 +41,29 @@ The workspace supports:
 | HTTP+JSON / REST | `a2a-client` | `a2a-server` |
 | gRPC | `a2a-grpc` | `a2a-grpc` |
 | SLIMRPC | `a2a-slimrpc` | `a2a-slimrpc` |
+| WebSocket | `a2a-client` | `a2a-server` |
 
 The gRPC support uses the schema in `a2a-pb/proto/a2a.proto`. The REST and
 JSON-RPC bindings are intended to stay wire-compatible with other A2A SDKs,
 including Go and C# implementations.
+
+### WebSocket binding
+
+Agents advertise WebSocket support with the `WEBSOCKET` protocol binding and a
+`ws://` or `wss://` interface URL. The client factory registers WebSocket by
+default, while preserving JSON-RPC and HTTP+JSON ahead of WebSocket in the
+default preference order unless callers override `preferred_bindings`.
+
+Each WebSocket text frame contains one JSON object. Client requests use the
+same A2A JSON-RPC method names with a string `id`, optional `params`, and
+optional per-message `serviceParams`. Server responses correlate on the same
+`id` and contain either `result`, `error`, `streamEvent`, `streamError`, or
+`streamEnd`. Streaming operations send zero or more `streamEvent` frames,
+followed by either `streamEnd` or `streamError`.
+
+Connection headers are converted into service parameters during WebSocket
+upgrade. Per-message `serviceParams` are merged into those connection-level
+parameters before dispatching through the server `RequestHandler`.
 
 ## Requirements
 
@@ -143,7 +163,7 @@ a2a-slimrpc = { package = "a2a-slimrpc", git = "https://github.com/a2aproject/a2
 Typical usage is:
 
 - `a2a` for protocol types and serde models
-- `a2a-client` for clients that negotiate REST or JSON-RPC from an agent card
+- `a2a-client` for clients that negotiate REST, JSON-RPC, or WebSocket from an agent card
 - `a2a-server` for agent implementations on `axum`
 - `a2a-grpc` when you need gRPC transport support
 - `a2a-slimrpc` when you need SLIMRPC transport support

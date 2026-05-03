@@ -40,7 +40,7 @@ async-trait = "0.1"
 pin-project-lite = "0.2"
 
 # HTTP
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
@@ -73,3 +73,4 @@ semver = "1"
 tracing = "0.1"
 auto_impl = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-tungstenite = "0.24"

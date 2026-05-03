@@ -28,6 +28,7 @@ uuid = { workspace = true }
 semver = { workspace = true }
 pin-project-lite = { workspace = true }
 rustls = { workspace = true, optional = true, features = ["aws-lc-rs"] }
+tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

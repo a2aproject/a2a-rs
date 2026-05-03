@@ -9,8 +9,10 @@ use a2a_client::Transport;
 use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::jsonrpc::JsonRpcTransport;
 use a2a_client::rest::RestTransport;
+use a2a_client::websocket::WebSocketTransport;
 use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::rest::rest_router;
+use a2a_server::websocket::websocket_router;
 use a2a_server::{
     DefaultRequestHandler, ExecutorContext, HttpPushSender, InMemoryPushConfigStore,
     InMemoryTaskStore, RequestHandler, ServiceParams, WELL_KNOWN_AGENT_CARD_PATH,
@@ -21,8 +23,8 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures::StreamExt;
 use futures::stream::{self, BoxStream};
+use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -80,6 +82,7 @@ fn sample_agent_card() -> AgentCard {
         supported_interfaces: vec![
             AgentInterface::new("http://localhost/rest", TRANSPORT_PROTOCOL_HTTP_JSON),
             AgentInterface::new("http://localhost/rpc", TRANSPORT_PROTOCOL_JSONRPC),
+            AgentInterface::new("ws://localhost/ws", TRANSPORT_PROTOCOL_WEBSOCKET),
         ],
         capabilities: AgentCapabilities::default(),
         default_input_modes: vec!["text/plain".to_string()],
@@ -144,11 +147,14 @@ impl RequestHandler for TestHandler {
 
     async fn get_task(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
         if req.id == "missing" {
             return Err(A2AError::task_not_found(&req.id));
+        }
+        if let Some(task_id) = params.get("x-task-id").and_then(|values| values.first()) {
+            return Ok(sample_task(task_id, TaskState::Completed));
         }
         Ok(sample_task(&req.id, TaskState::Completed))
     }
@@ -322,7 +328,8 @@ async fn spawn_http_server() -> (String, tokio::task::JoinHandle<()>) {
     let handler = Arc::new(TestHandler);
     let app = Router::new()
         .nest("/rest", rest_router(handler.clone()))
-        .nest("/rpc", jsonrpc_router(handler))
+        .nest("/rpc", jsonrpc_router(handler.clone()))
+        .nest("/ws", websocket_router(handler))
         .route(
             WELL_KNOWN_AGENT_CARD_PATH,
             get(|| async { Json(sample_agent_card()) }),
@@ -352,7 +359,8 @@ async fn spawn_push_http_server() -> (String, tokio::task::JoinHandle<()>) {
     );
     let app = Router::new()
         .nest("/rest", rest_router(handler.clone()))
-        .nest("/rpc", jsonrpc_router(handler))
+        .nest("/rpc", jsonrpc_router(handler.clone()))
+        .nest("/ws", websocket_router(handler))
         .route(
             WELL_KNOWN_AGENT_CARD_PATH,
             get(|| async { Json(sample_agent_card()) }),
@@ -959,4 +967,120 @@ async fn jsonrpc_transport_push_delivery_end_to_end() {
 
     server_handle.abort();
     webhook_handle.abort();
+}
+
+#[tokio::test]
+async fn websocket_transport_end_to_end() {
+    let (base_url, handle) = spawn_http_server().await;
+    let ws_url = base_url.replacen("http://", "ws://", 1);
+    let transport = WebSocketTransport::connect(&format!("{ws_url}/ws"))
+        .await
+        .unwrap();
+
+    let send_resp = transport
+        .send_message(&ServiceParams::new(), &send_message_request())
+        .await;
+    assert!(matches!(send_resp.unwrap(), SendMessageResponse::Task(_)));
+
+    let stream = transport
+        .send_streaming_message(&ServiceParams::new(), &send_message_request())
+        .await
+        .unwrap();
+    let items: Vec<_> = stream.collect().await;
+    assert_eq!(items.len(), 2);
+
+    let task = transport
+        .get_task(
+            &ServiceParams::new(),
+            &GetTaskRequest {
+                id: "task-1".to_string(),
+                history_length: Some(2),
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(task.id, "task-1");
+
+    let not_found = transport
+        .get_task(
+            &ServiceParams::new(),
+            &GetTaskRequest {
+                id: "missing".to_string(),
+                history_length: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(not_found.code, error_code::TASK_NOT_FOUND);
+
+    let subscribed = transport
+        .subscribe_to_task(
+            &ServiceParams::new(),
+            &SubscribeToTaskRequest {
+                id: "task-1".to_string(),
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    let events: Vec<_> = subscribed.collect().await;
+    assert_eq!(events.len(), 1);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn websocket_transport_propagates_message_service_params() {
+    let (base_url, handle) = spawn_http_server().await;
+    let ws_url = base_url.replacen("http://", "ws://", 1);
+    let transport = WebSocketTransport::connect(&format!("{ws_url}/ws"))
+        .await
+        .unwrap();
+    let mut params = ServiceParams::new();
+    params.insert(
+        "x-task-id".to_string(),
+        vec!["task-from-params".to_string()],
+    );
+
+    let task = transport
+        .get_task(
+            &params,
+            &GetTaskRequest {
+                id: "task-from-request".to_string(),
+                history_length: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(task.id, "task-from-params");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn websocket_transport_reports_malformed_frame() {
+    let (base_url, handle) = spawn_http_server().await;
+    let ws_url = base_url.replacen("http://", "ws://", 1);
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("{ws_url}/ws"))
+        .await
+        .unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            "not-json".to_string(),
+        ))
+        .await
+        .unwrap();
+    let response = socket.next().await.unwrap().unwrap();
+    let text = response.into_text().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+    assert_eq!(value["jsonrpc"], "2.0");
+    assert_eq!(value["id"], serde_json::Value::Null);
+    assert_eq!(value["error"]["code"], error_code::PARSE_ERROR);
+
+    handle.abort();
 }

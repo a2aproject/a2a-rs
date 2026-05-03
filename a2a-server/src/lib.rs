@@ -12,6 +12,7 @@ pub mod sse;
 pub mod task_store;
 #[cfg(feature = "rustls")]
 pub mod tls;
+pub mod websocket;
 
 pub use agent_card::{AgentCardProducer, StaticAgentCard, WELL_KNOWN_AGENT_CARD_PATH};
 pub use executor::{AgentExecutor, ExecutorContext};

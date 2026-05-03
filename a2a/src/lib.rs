@@ -7,12 +7,14 @@ pub mod errors;
 pub mod event;
 pub mod jsonrpc;
 pub mod types;
+pub mod websocket;
 
 pub use agent_card::*;
 pub use errors::*;
 pub use event::*;
 pub use jsonrpc::*;
 pub use types::*;
+pub use websocket::*;
 
 /// The A2A protocol version this SDK implements.
 pub const VERSION: &str = "1.0";

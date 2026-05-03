@@ -9,6 +9,7 @@ use crate::jsonrpc::JsonRpcTransportFactory;
 use crate::middleware::CallInterceptor;
 use crate::rest::RestTransportFactory;
 use crate::transport::TransportFactory;
+use crate::websocket::WebSocketTransportFactory;
 
 /// Key for looking up transport factories.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -178,6 +179,11 @@ impl A2AClientFactoryBuilder {
             self.factories
                 .entry(rest_key)
                 .or_insert_with(|| Arc::new(RestTransportFactory::new(None)));
+
+            let ws_key = TransportKey::from_protocol(TRANSPORT_PROTOCOL_WEBSOCKET, VERSION);
+            self.factories
+                .entry(ws_key)
+                .or_insert_with(|| Arc::new(WebSocketTransportFactory::new()));
         }
 
         A2AClientFactory {
@@ -191,6 +197,8 @@ impl A2AClientFactoryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures::stream;
 
     #[test]
     fn test_transport_key_from_interface() {
@@ -217,7 +225,7 @@ mod tests {
     #[test]
     fn test_builder_defaults() {
         let factory = A2AClientFactory::builder().build();
-        assert_eq!(factory.factories.len(), 2); // jsonrpc + rest
+        assert_eq!(factory.factories.len(), 3); // jsonrpc + rest + websocket
         assert_eq!(factory.preferred_bindings.len(), 2);
     }
 
@@ -265,5 +273,178 @@ mod tests {
         };
         let result = factory.create_from_card(&card).await;
         assert!(result.is_err());
+    }
+
+    struct DummyTransport;
+
+    #[async_trait]
+    impl crate::Transport for DummyTransport {
+        async fn send_message(
+            &self,
+            _params: &crate::ServiceParams,
+            _req: &SendMessageRequest,
+        ) -> Result<SendMessageResponse, A2AError> {
+            unimplemented!()
+        }
+
+        async fn send_streaming_message(
+            &self,
+            _params: &crate::ServiceParams,
+            _req: &SendMessageRequest,
+        ) -> Result<crate::BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+            Ok(Box::pin(stream::empty()))
+        }
+
+        async fn get_task(
+            &self,
+            _params: &crate::ServiceParams,
+            _req: &GetTaskRequest,
+        ) -> Result<Task, A2AError> {
+            unimplemented!()
+        }
+
+        async fn list_tasks(
+            &self,
+            _params: &crate::ServiceParams,
+            _req: &ListTasksRequest,
+        ) -> Result<ListTasksResponse, A2AError> {
+            unimplemented!()
+        }
+
+        async fn cancel_task(
+            &self,
+            _params: &crate::ServiceParams,
+            _req: &CancelTaskRequest,
+        ) -> Result<Task, A2AError> {
+            unimplemented!()
+        }
+
+        async fn subscribe_to_task(
+            &self,
+            _params: &crate::ServiceParams,
+            _req: &SubscribeToTaskRequest,
+        ) -> Result<crate::BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+            Ok(Box::pin(stream::empty()))
+        }
+
+        async fn create_push_config(
+            &self,
+            _params: &crate::ServiceParams,
+            _req: &CreateTaskPushNotificationConfigRequest,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            unimplemented!()
+        }
+
+        async fn get_push_config(
+            &self,
+            _params: &crate::ServiceParams,
+            _req: &GetTaskPushNotificationConfigRequest,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            unimplemented!()
+        }
+
+        async fn list_push_configs(
+            &self,
+            _params: &crate::ServiceParams,
+            _req: &ListTaskPushNotificationConfigsRequest,
+        ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
+            unimplemented!()
+        }
+
+        async fn delete_push_config(
+            &self,
+            _params: &crate::ServiceParams,
+            _req: &DeleteTaskPushNotificationConfigRequest,
+        ) -> Result<(), A2AError> {
+            unimplemented!()
+        }
+
+        async fn get_extended_agent_card(
+            &self,
+            _params: &crate::ServiceParams,
+            _req: &GetExtendedAgentCardRequest,
+        ) -> Result<AgentCard, A2AError> {
+            unimplemented!()
+        }
+
+        async fn destroy(&self) -> Result<(), A2AError> {
+            Ok(())
+        }
+    }
+
+    struct DummyFactory {
+        protocol: &'static str,
+    }
+
+    #[async_trait]
+    impl TransportFactory for DummyFactory {
+        fn protocol(&self) -> &str {
+            self.protocol
+        }
+
+        async fn create(
+            &self,
+            _card: &AgentCard,
+            _iface: &AgentInterface,
+        ) -> Result<Box<dyn crate::Transport>, A2AError> {
+            Ok(Box::new(DummyTransport))
+        }
+    }
+
+    fn card_with_interfaces(supported_interfaces: Vec<AgentInterface>) -> AgentCard {
+        AgentCard {
+            name: "test".into(),
+            description: "test agent".into(),
+            version: "1.0".into(),
+            supported_interfaces,
+            capabilities: AgentCapabilities::default(),
+            default_input_modes: vec!["text".into()],
+            default_output_modes: vec!["text".into()],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_from_card_selects_websocket_when_only_match() {
+        let factory = A2AClientFactory::builder()
+            .no_defaults()
+            .register(Arc::new(DummyFactory {
+                protocol: TRANSPORT_PROTOCOL_WEBSOCKET,
+            }))
+            .build();
+        let card = card_with_interfaces(vec![AgentInterface::new(
+            "ws://localhost/ws",
+            TRANSPORT_PROTOCOL_WEBSOCKET,
+        )]);
+
+        let result = factory.create_from_card(&card).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_from_card_honors_websocket_preference() {
+        let factory = A2AClientFactory::builder()
+            .no_defaults()
+            .register(Arc::new(DummyFactory {
+                protocol: TRANSPORT_PROTOCOL_JSONRPC,
+            }))
+            .register(Arc::new(DummyFactory {
+                protocol: TRANSPORT_PROTOCOL_WEBSOCKET,
+            }))
+            .preferred_bindings(vec![TRANSPORT_PROTOCOL_WEBSOCKET.to_string()])
+            .build();
+        let card = card_with_interfaces(vec![
+            AgentInterface::new("http://localhost/rpc", TRANSPORT_PROTOCOL_JSONRPC),
+            AgentInterface::new("ws://localhost/ws", TRANSPORT_PROTOCOL_WEBSOCKET),
+        ]);
+
+        let result = factory.create_from_card(&card).await;
+        assert!(result.is_ok());
     }
 }

@@ -32,6 +32,7 @@ async fn main() {
     let agent_card = build_agent_card(vec![
         AgentInterface::new("http://localhost:3000/jsonrpc", TRANSPORT_PROTOCOL_JSONRPC),
         AgentInterface::new("http://localhost:3000/rest", TRANSPORT_PROTOCOL_HTTP_JSON),
+        AgentInterface::new("ws://localhost:3000/ws", TRANSPORT_PROTOCOL_WEBSOCKET),
         AgentInterface::new("http://localhost:50051", TRANSPORT_PROTOCOL_GRPC),
     ]);
     let card_producer = Arc::new(StaticAgentCard::new(agent_card));
@@ -42,6 +43,10 @@ async fn main() {
             a2a_server::jsonrpc::jsonrpc_router(handler.clone()),
         )
         .nest("/rest", a2a_server::rest::rest_router(handler.clone()))
+        .nest(
+            "/ws",
+            a2a_server::websocket::websocket_router(handler.clone()),
+        )
         .merge(a2a_server::agent_card::agent_card_router(card_producer));
 
     let grpc_service = A2aServiceServer::new(GrpcHandler::new(handler));
@@ -50,6 +55,7 @@ async fn main() {
     tracing::info!("Agent card:  http://localhost:3000/.well-known/agent-card.json");
     tracing::info!("JSON-RPC:    http://localhost:3000/jsonrpc");
     tracing::info!("REST:        http://localhost:3000/rest");
+    tracing::info!("WebSocket:   ws://localhost:3000/ws");
     tracing::info!("gRPC:        http://localhost:50051");
 
     let http_listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
