@@ -7,7 +7,6 @@ use futures::stream::BoxStream;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
 
 use crate::push_config_compat::{
     deserialize_list_task_push_notification_configs_response,
@@ -18,8 +17,6 @@ use crate::transport::{ServiceParams, Transport, TransportFactory};
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
 const REST_STREAM_MESSAGE_PATH: &str = "/message:stream";
 const REST_EXTENDED_AGENT_CARD_PATH: &str = "/extendedAgentCard";
-const REST_ERROR_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.ErrorInfo";
-const REST_ERROR_DOMAIN: &str = "a2a-protocol.org";
 
 #[derive(Debug, Deserialize)]
 struct RestErrorEnvelope {
@@ -31,18 +28,7 @@ struct RestErrorStatus {
     message: String,
 
     #[serde(default)]
-    details: Vec<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RestErrorInfo {
-    #[serde(rename = "@type")]
-    type_url: String,
-    reason: String,
-    domain: String,
-
-    #[serde(default)]
-    metadata: HashMap<String, String>,
+    details: Vec<TypedDetail>,
 }
 
 /// REST (HTTP+JSON) transport implementation.
@@ -252,54 +238,11 @@ fn parse_rest_error(status: reqwest::StatusCode, body: &str) -> A2AError {
         return A2AError::internal(format!("HTTP {status}: {body}"));
     };
 
-    let mut details = HashMap::new();
-    let mut code = None;
-
-    for raw_detail in envelope.error.details {
-        if let Ok(info) = serde_json::from_value::<RestErrorInfo>(raw_detail.clone()) {
-            if info.type_url == REST_ERROR_INFO_TYPE_URL && info.domain == REST_ERROR_DOMAIN {
-                code = reason_to_error_code(&info.reason).or(code);
-                for (key, value) in info.metadata {
-                    details.insert(key, Value::String(value));
-                }
-                continue;
-            }
-        }
-
-        if let Value::Object(values) = raw_detail {
-            details.extend(values);
-        }
-    }
-
-    A2AError {
-        code: code.unwrap_or(error_code::INTERNAL_ERROR),
-        message: envelope.error.message,
-        details: (!details.is_empty()).then_some(details),
-    }
-}
-
-fn reason_to_error_code(reason: &str) -> Option<i32> {
-    match reason {
-        "TASK_NOT_FOUND" => Some(error_code::TASK_NOT_FOUND),
-        "TASK_NOT_CANCELABLE" => Some(error_code::TASK_NOT_CANCELABLE),
-        "PUSH_NOTIFICATION_NOT_SUPPORTED" => Some(error_code::PUSH_NOTIFICATION_NOT_SUPPORTED),
-        "UNSUPPORTED_OPERATION" => Some(error_code::UNSUPPORTED_OPERATION),
-        "UNSUPPORTED_CONTENT_TYPE" | "CONTENT_TYPE_NOT_SUPPORTED" => {
-            Some(error_code::CONTENT_TYPE_NOT_SUPPORTED)
-        }
-        "INVALID_AGENT_RESPONSE" => Some(error_code::INVALID_AGENT_RESPONSE),
-        "EXTENDED_AGENT_CARD_NOT_CONFIGURED" | "EXTENDED_CARD_NOT_CONFIGURED" => {
-            Some(error_code::EXTENDED_CARD_NOT_CONFIGURED)
-        }
-        "EXTENSION_SUPPORT_REQUIRED" => Some(error_code::EXTENSION_SUPPORT_REQUIRED),
-        "VERSION_NOT_SUPPORTED" => Some(error_code::VERSION_NOT_SUPPORTED),
-        "PARSE_ERROR" => Some(error_code::PARSE_ERROR),
-        "INVALID_REQUEST" => Some(error_code::INVALID_REQUEST),
-        "METHOD_NOT_FOUND" => Some(error_code::METHOD_NOT_FOUND),
-        "INVALID_PARAMS" => Some(error_code::INVALID_PARAMS),
-        "INTERNAL_ERROR" => Some(error_code::INTERNAL_ERROR),
-        _ => None,
-    }
+    crate::a2a_error_from_details(
+        error_code::INTERNAL_ERROR,
+        envelope.error.message,
+        envelope.error.details,
+    )
 }
 
 #[async_trait]
@@ -576,9 +519,9 @@ mod tests {
                 "message": "task not found: t1",
                 "details": [
                     {
-                        "@type": REST_ERROR_INFO_TYPE_URL,
+                        "@type": errordetails::ERROR_INFO_TYPE,
                         "reason": "TASK_NOT_FOUND",
-                        "domain": REST_ERROR_DOMAIN,
+                        "domain": errordetails::PROTOCOL_DOMAIN,
                         "metadata": {
                             "taskId": "t1"
                         }
@@ -596,8 +539,12 @@ mod tests {
         assert_eq!(err.code, error_code::TASK_NOT_FOUND);
         assert_eq!(err.message, "task not found: t1");
         let details = err.details.expect("expected structured details");
-        assert_eq!(details.get("taskId"), Some(&Value::String("t1".into())));
-        assert_eq!(details.get("resource"), Some(&Value::String("task".into())));
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].type_url, errordetails::ERROR_INFO_TYPE);
+        assert_eq!(
+            details[1].value.get("resource"),
+            Some(&Value::String("task".into()))
+        );
     }
 
     #[test]
@@ -609,9 +556,9 @@ mod tests {
                 "message": "incompatible content types",
                 "details": [
                     {
-                        "@type": REST_ERROR_INFO_TYPE_URL,
+                        "@type": errordetails::ERROR_INFO_TYPE,
                         "reason": "UNSUPPORTED_CONTENT_TYPE",
-                        "domain": REST_ERROR_DOMAIN,
+                        "domain": errordetails::PROTOCOL_DOMAIN,
                         "metadata": {}
                     }
                 ]
@@ -621,6 +568,70 @@ mod tests {
 
         let err = parse_rest_error(reqwest::StatusCode::BAD_REQUEST, &body);
         assert_eq!(err.code, error_code::CONTENT_TYPE_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn test_parse_rest_error_bad_request_fallback() {
+        let body = json!({
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": "invalid request parameters",
+                "details": [
+                    {
+                        "@type": errordetails::BAD_REQUEST_TYPE,
+                        "fieldViolations": [
+                            {
+                                "field": "message.parts",
+                                "description": "At least one part is required"
+                            }
+                        ]
+                    }
+                ]
+            }
+        })
+        .to_string();
+
+        let err = parse_rest_error(reqwest::StatusCode::BAD_REQUEST, &body);
+        assert_eq!(err.code, error_code::INVALID_PARAMS);
+        assert!(
+            err.message
+                .contains("message.parts: At least one part is required")
+        );
+        let details = err.details.expect("expected details");
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].type_url, errordetails::BAD_REQUEST_TYPE);
+        let violations = details[0].value.get("fieldViolations").unwrap();
+        assert_eq!(violations[0]["field"], "message.parts");
+    }
+
+    #[test]
+    fn test_parse_rest_error_bad_request_with_error_info_uses_reason() {
+        let body = json!({
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": "bad params",
+                "details": [
+                    {
+                        "@type": errordetails::BAD_REQUEST_TYPE,
+                        "fieldViolations": [
+                            {"field": "task.id", "description": "required"}
+                        ]
+                    },
+                    {
+                        "@type": errordetails::ERROR_INFO_TYPE,
+                        "reason": "INVALID_PARAMS",
+                        "domain": errordetails::PROTOCOL_DOMAIN,
+                        "metadata": {}
+                    }
+                ]
+            }
+        })
+        .to_string();
+
+        let err = parse_rest_error(reqwest::StatusCode::BAD_REQUEST, &body);
+        assert_eq!(err.code, error_code::INVALID_PARAMS);
     }
 
     #[test]

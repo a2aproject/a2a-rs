@@ -31,9 +31,6 @@ const REST_PUSH_CONFIGS_PATH: &str = "/tasks/{id}/pushNotificationConfigs";
 const REST_PUSH_CONFIGS_LEGACY_PATH: &str = "/tasks/{id}/push-configs";
 const REST_PUSH_CONFIG_PATH: &str = "/tasks/{id}/pushNotificationConfigs/{config_id}";
 const REST_PUSH_CONFIG_LEGACY_PATH: &str = "/tasks/{id}/push-configs/{config_id}";
-const REST_ERROR_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.ErrorInfo";
-const REST_ERROR_DOMAIN: &str = "a2a-protocol.org";
-
 #[derive(Serialize)]
 struct RestErrorEnvelope {
     error: RestErrorStatus,
@@ -44,16 +41,7 @@ struct RestErrorStatus {
     code: u16,
     status: &'static str,
     message: String,
-    details: Vec<Value>,
-}
-
-#[derive(Serialize)]
-struct RestErrorInfo {
-    #[serde(rename = "@type")]
-    type_url: &'static str,
-    reason: &'static str,
-    domain: &'static str,
-    metadata: HashMap<String, String>,
+    details: Vec<TypedDetail>,
 }
 
 /// Shared state for REST handlers.
@@ -437,45 +425,46 @@ fn parse_create_push_config_request(
 }
 
 fn rest_payload_error_response(error: impl std::fmt::Display) -> axum::response::Response {
-    rest_error_response(A2AError {
-        code: error_code::PARSE_ERROR,
-        message: format!("invalid request body: {error}"),
-        details: None,
-    })
+    let violation = FieldViolation {
+        field: String::new(),
+        description: error.to_string(),
+    };
+    rest_error_response(
+        A2AError::invalid_params("invalid request body")
+            .with_details(vec![TypedDetail::bad_request(vec![violation])]),
+    )
 }
 
 fn rest_error_response(err: A2AError) -> axum::response::Response {
     let status =
         StatusCode::from_u16(err.http_status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let reason = rest_error_reason(err.code);
+    let reason = error_reason(err.code);
     let grpc_status = rest_grpc_status(err.code);
 
     let mut metadata = HashMap::from([("timestamp".to_string(), Utc::now().to_rfc3339())]);
-    let mut extra_details = serde_json::Map::new();
+    let mut details = Vec::new();
 
-    if let Some(details) = err.details {
-        for (key, value) in details {
-            if let Some(as_string) = value.as_str() {
-                metadata.insert(key, as_string.to_string());
+    if let Some(extra) = err.details {
+        for detail in extra {
+            if detail.type_url == errordetails::ERROR_INFO_TYPE {
+                if let Some(Value::Object(meta)) = detail.value.get("metadata") {
+                    for (k, v) in meta {
+                        if let Some(s) = v.as_str() {
+                            metadata.entry(k.clone()).or_insert_with(|| s.to_string());
+                        }
+                    }
+                }
             } else {
-                extra_details.insert(key, value);
+                details.push(detail);
             }
         }
     }
 
-    let mut details = vec![
-        serde_json::to_value(RestErrorInfo {
-            type_url: REST_ERROR_INFO_TYPE_URL,
-            reason,
-            domain: REST_ERROR_DOMAIN,
-            metadata,
-        })
-        .expect("rest error info should serialize"),
-    ];
-
-    if !extra_details.is_empty() {
-        details.push(Value::Object(extra_details));
-    }
+    details.push(TypedDetail::error_info(
+        reason,
+        errordetails::PROTOCOL_DOMAIN,
+        Some(metadata),
+    ));
 
     let body = RestErrorEnvelope {
         error: RestErrorStatus {
@@ -489,34 +478,16 @@ fn rest_error_response(err: A2AError) -> axum::response::Response {
     (status, Json(body)).into_response()
 }
 
-fn rest_error_reason(code: i32) -> &'static str {
-    match code {
-        error_code::TASK_NOT_FOUND => "TASK_NOT_FOUND",
-        error_code::TASK_NOT_CANCELABLE => "TASK_NOT_CANCELABLE",
-        error_code::PUSH_NOTIFICATION_NOT_SUPPORTED => "PUSH_NOTIFICATION_NOT_SUPPORTED",
-        error_code::UNSUPPORTED_OPERATION => "UNSUPPORTED_OPERATION",
-        error_code::CONTENT_TYPE_NOT_SUPPORTED => "UNSUPPORTED_CONTENT_TYPE",
-        error_code::INVALID_AGENT_RESPONSE => "INVALID_AGENT_RESPONSE",
-        error_code::EXTENDED_CARD_NOT_CONFIGURED => "EXTENDED_AGENT_CARD_NOT_CONFIGURED",
-        error_code::EXTENSION_SUPPORT_REQUIRED => "EXTENSION_SUPPORT_REQUIRED",
-        error_code::VERSION_NOT_SUPPORTED => "VERSION_NOT_SUPPORTED",
-        error_code::PARSE_ERROR => "PARSE_ERROR",
-        error_code::INVALID_REQUEST => "INVALID_REQUEST",
-        error_code::METHOD_NOT_FOUND => "METHOD_NOT_FOUND",
-        error_code::INVALID_PARAMS => "INVALID_PARAMS",
-        _ => "INTERNAL_ERROR",
-    }
-}
-
 fn rest_grpc_status(code: i32) -> &'static str {
     match code {
-        error_code::TASK_NOT_FOUND | error_code::METHOD_NOT_FOUND => "NOT_FOUND",
+        error_code::TASK_NOT_FOUND => "NOT_FOUND",
+        error_code::METHOD_NOT_FOUND => "UNIMPLEMENTED",
         error_code::TASK_NOT_CANCELABLE
         | error_code::EXTENDED_CARD_NOT_CONFIGURED
-        | error_code::EXTENSION_SUPPORT_REQUIRED => "FAILED_PRECONDITION",
-        error_code::PUSH_NOTIFICATION_NOT_SUPPORTED
+        | error_code::EXTENSION_SUPPORT_REQUIRED
+        | error_code::PUSH_NOTIFICATION_NOT_SUPPORTED
         | error_code::UNSUPPORTED_OPERATION
-        | error_code::VERSION_NOT_SUPPORTED => "UNIMPLEMENTED",
+        | error_code::VERSION_NOT_SUPPORTED => "FAILED_PRECONDITION",
         error_code::CONTENT_TYPE_NOT_SUPPORTED
         | error_code::PARSE_ERROR
         | error_code::INVALID_REQUEST
@@ -792,7 +763,74 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         let resp = rest_error_response(A2AError::content_type_not_supported());
-        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_rest_error_response_merges_error_info_metadata() {
+        let existing_info = TypedDetail::error_info(
+            "TASK_NOT_FOUND",
+            errordetails::PROTOCOL_DOMAIN,
+            Some(HashMap::from([("taskId".to_string(), "t99".to_string())])),
+        );
+        let err = A2AError::task_not_found("t99").with_details(vec![existing_info]);
+        let resp = rest_error_response(err);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let details = payload["error"]["details"].as_array().unwrap();
+        // Only one ErrorInfo should be present (merged)
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["@type"], errordetails::ERROR_INFO_TYPE);
+        assert_eq!(details[0]["reason"], "TASK_NOT_FOUND");
+        // Merged metadata should contain both taskId and timestamp
+        assert_eq!(details[0]["metadata"]["taskId"], "t99");
+        assert!(details[0]["metadata"]["timestamp"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_rest_error_response_preserves_non_error_info_details() {
+        let bad_req = TypedDetail::bad_request(vec![FieldViolation {
+            field: "message.parts".into(),
+            description: "required".into(),
+        }]);
+        let err = A2AError::invalid_params("bad request").with_details(vec![bad_req]);
+        let resp = rest_error_response(err);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let details = payload["error"]["details"].as_array().unwrap();
+        // BadRequest detail + auto-generated ErrorInfo
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0]["@type"], errordetails::BAD_REQUEST_TYPE);
+        assert_eq!(details[0]["fieldViolations"][0]["field"], "message.parts");
+        assert_eq!(details[1]["@type"], errordetails::ERROR_INFO_TYPE);
+        assert_eq!(details[1]["reason"], "INVALID_PARAMS");
+    }
+
+    #[tokio::test]
+    async fn test_rest_payload_error_response() {
+        let resp = rest_payload_error_response("missing field 'parts'");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["error"]["message"].as_str().unwrap(),
+            "invalid request body"
+        );
+        let details = payload["error"]["details"].as_array().unwrap();
+        // BadRequest detail + ErrorInfo
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0]["@type"], errordetails::BAD_REQUEST_TYPE);
+        assert_eq!(
+            details[0]["fieldViolations"][0]["description"],
+            "missing field 'parts'"
+        );
+        assert_eq!(details[1]["@type"], errordetails::ERROR_INFO_TYPE);
+        assert_eq!(details[1]["reason"], "INVALID_PARAMS");
     }
 
     #[tokio::test]
