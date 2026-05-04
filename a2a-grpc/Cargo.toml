@@ -1,6 +1,6 @@
 [package]
 name = "a2a-grpc"
-version = "0.2.0"
+version = "0.2.1"
 description = "A2A v1 gRPC protocol binding for client and server"
 readme = "README.md"
 edition.workspace = true
@@ -13,8 +13,8 @@ name = "a2a_grpc"
 
 [dependencies]
 a2a = { workspace = true }
-a2a-client = { workspace = true }
-a2a-server = { workspace = true }
+a2a-client = { workspace = true, default-features = false }
+a2a-server = { workspace = true, default-features = false }
 a2a-pb = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
@@ -32,5 +32,7 @@ rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
 
 [features]
-default = []
-rustls = ["dep:tonic-tls", "dep:tokio-rustls"]
+default = ["rustls-tls"]
+native-tls = ["a2a-client/native-tls", "a2a-server/native-tls"]
+rustls-tls = ["a2a-client/rustls-tls", "a2a-server/rustls-tls"]
+rustls = ["dep:tonic-tls", "dep:tokio-rustls", "rustls-tls"]

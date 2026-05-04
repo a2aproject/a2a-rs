@@ -35,7 +35,11 @@ pub(crate) fn a2a_error_from_details(
                         .filter_map(|v| {
                             let field = v.get("field")?.as_str()?;
                             let desc = v.get("description")?.as_str()?;
-                            Some(format!("{field}: {desc}"))
+                            if field.is_empty() {
+                                Some(desc.to_string())
+                            } else {
+                                Some(format!("{field}: {desc}"))
+                            }
                         })
                         .collect();
                     if !violation_strs.is_empty() {
@@ -68,6 +72,7 @@ pub(crate) fn a2a_error_from_details(
     }
 }
 
+#[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
 pub(crate) fn build_reqwest_client_with_root_pem(
     pem: &[u8],
 ) -> Result<reqwest::Client, a2a::A2AError> {

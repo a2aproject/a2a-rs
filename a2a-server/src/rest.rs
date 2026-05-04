@@ -430,7 +430,7 @@ fn rest_payload_error_response(error: impl std::fmt::Display) -> axum::response:
         description: error.to_string(),
     };
     rest_error_response(
-        A2AError::invalid_params(format!("invalid request body: {error}"))
+        A2AError::invalid_params("invalid request body")
             .with_details(vec![TypedDetail::bad_request(vec![violation])]),
     )
 }
@@ -817,11 +817,9 @@ mod tests {
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            payload["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("missing field 'parts'")
+        assert_eq!(
+            payload["error"]["message"].as_str().unwrap(),
+            "invalid request body"
         );
         let details = payload["error"]["details"].as_array().unwrap();
         // BadRequest detail + ErrorInfo

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "a2a-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "a2a-client-lf"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "a2a-lf",
  "a2a-pb",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "a2a-grpc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "a2a-slimrpc"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",

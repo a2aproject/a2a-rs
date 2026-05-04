@@ -206,9 +206,9 @@ impl A2AError {
             TypedDetail::error_info(reason, errordetails::PROTOCOL_DOMAIN, Some(metadata));
 
         if let Some(details) = &self.details {
-            if let Some(existing) = details
+            for existing in details
                 .iter()
-                .find(|d| d.type_url == errordetails::ERROR_INFO_TYPE)
+                .filter(|d| d.type_url == errordetails::ERROR_INFO_TYPE)
             {
                 if let Some(Value::Object(meta)) = existing.value.get("metadata") {
                     if let Some(Value::Object(info_meta)) = error_info.value.get_mut("metadata") {

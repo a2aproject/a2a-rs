@@ -420,6 +420,7 @@ impl RestTransportFactory {
         }
     }
 
+    #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
     pub fn with_root_certificates_pem(pem: &[u8]) -> Result<Self, A2AError> {
         Ok(Self {
             client: crate::build_reqwest_client_with_root_pem(pem)?,
