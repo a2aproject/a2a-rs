@@ -1,0 +1,36 @@
+[package]
+name = "a2a-websocket"
+version = "0.1.0"
+description = "A2A v1 WebSocket protocol binding for client and server"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "a2a_websocket"
+
+[dependencies]
+a2a = { workspace = true }
+a2a-client = { workspace = true }
+a2a-server = { workspace = true }
+a2a-pb = { workspace = true }
+fastwebsockets = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
