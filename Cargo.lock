@@ -146,6 +146,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "a2a-websocket"
+version = "0.1.0"
+dependencies = [
+ "a2a-client-lf",
+ "a2a-lf",
+ "a2a-pb",
+ "a2a-server-lf",
+ "async-trait",
+ "axum",
+ "bytes",
+ "fastwebsockets",
+ "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "agntcy-slim-auth"
 version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1582,8 +1607,11 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "305d3ba574508e27190906d11707dad683e0494e6b85eae9b044cb2734a5e422"
 dependencies = [
+ "async-trait",
+ "axum-core",
  "base64 0.21.7",
  "bytes",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-util",

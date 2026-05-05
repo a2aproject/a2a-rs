@@ -6,6 +6,7 @@ members = [
     "a2a-pb",
     "a2a-grpc",
     "a2a-slimrpc",
+    "a2a-websocket",
     "a2acli",
     "examples",
 ]
@@ -37,6 +38,7 @@ a2a-server = { package = "a2a-server-lf", path = "a2a-server", version = "0.4.1"
 a2a-pb = { package = "a2a-pb", path = "a2a-pb", version = "0.2.0" }
 a2a-grpc = { package = "a2a-grpc", path = "a2a-grpc", version = "0.3.2", default-features = false }
 a2a-slimrpc = { package = "a2a-slimrpc", path = "a2a-slimrpc", version = "0.2.4" }
+a2a-websocket = { package = "a2a-websocket", path = "a2a-websocket", version = "0.1.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -61,6 +63,10 @@ http = "1"
 hyper = "1"
 axum-server = {version = "0.8", default-features = false }
 rustls = "0.23"
+fastwebsockets = { version = "0.10", features = ["upgrade", "with_axum"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+bytes = "1"
 
 # gRPC + protobuf
 tonic = "0.14"
