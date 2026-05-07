@@ -218,7 +218,7 @@ impl Transport for SlimRpcTransport {
     async fn create_push_config(
         &self,
         params: &ServiceParams,
-        req: &CreateTaskPushNotificationConfigRequest,
+        req: &TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let request = pbconv::to_proto_create_task_push_notification_config_request(req);
         let response = self

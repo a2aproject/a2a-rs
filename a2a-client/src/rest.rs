@@ -332,13 +332,13 @@ impl Transport for RestTransport {
     async fn create_push_config(
         &self,
         params: &ServiceParams,
-        req: &CreateTaskPushNotificationConfigRequest,
+        req: &TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let payload = self
             .post_value(
                 &format!("/tasks/{}/pushNotificationConfigs", req.task_id),
                 params,
-                &req.config,
+                req,
             )
             .await?;
         deserialize_task_push_notification_config(payload)

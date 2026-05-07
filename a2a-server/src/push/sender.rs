@@ -44,7 +44,7 @@ impl HttpPushSender {
     /// Send an event to the push notification endpoint.
     pub async fn send_push(
         &self,
-        config: &PushNotificationConfig,
+        config: &TaskPushNotificationConfig,
         event: StreamResponse,
     ) -> Result<(), A2AError> {
         let body = match serde_json::to_vec(&event) {
@@ -102,6 +102,8 @@ impl HttpPushSender {
 mod tests {
     use super::*;
 
+    use crate::test_util::install_crypto_provider;
+
     #[test]
     fn test_default_config() {
         let config = HttpPushSenderConfig::default();
@@ -111,12 +113,14 @@ mod tests {
 
     #[test]
     fn test_sender_new_default() {
+        install_crypto_provider();
         let sender = HttpPushSender::new(None);
         assert!(!sender.fail_on_error);
     }
 
     #[test]
     fn test_sender_new_custom() {
+        install_crypto_provider();
         let config = HttpPushSenderConfig {
             timeout: Duration::from_secs(10),
             fail_on_error: true,
@@ -127,6 +131,7 @@ mod tests {
 
     #[test]
     fn test_handle_error_fail_on_error() {
+        install_crypto_provider();
         let sender = HttpPushSender::new(Some(HttpPushSenderConfig {
             timeout: Duration::from_secs(5),
             fail_on_error: true,
@@ -137,6 +142,7 @@ mod tests {
 
     #[test]
     fn test_handle_error_ignore() {
+        install_crypto_provider();
         let sender = HttpPushSender::new(None);
         let result = sender.handle_error("test error".to_string());
         assert!(result.is_ok());
@@ -145,9 +151,10 @@ mod tests {
     #[tokio::test]
     async fn test_send_push_connection_refused_no_fail() {
         use a2a::event::*;
-        // With fail_on_error=false, network errors are logged but Ok
+        install_crypto_provider();
         let sender = HttpPushSender::new(None);
-        let config = PushNotificationConfig {
+        let config = TaskPushNotificationConfig {
+            task_id: String::new(),
             url: "http://127.0.0.1:1/callback".to_string(),
             id: None,
             token: Some("tok".to_string()),
@@ -155,6 +162,7 @@ mod tests {
                 scheme: "bearer".to_string(),
                 credentials: Some("secret".to_string()),
             }),
+            tenant: None,
         };
         let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
             task_id: "t1".into(),
@@ -174,15 +182,18 @@ mod tests {
     #[tokio::test]
     async fn test_send_push_connection_refused_fail() {
         use a2a::event::*;
+        install_crypto_provider();
         let sender = HttpPushSender::new(Some(HttpPushSenderConfig {
             timeout: std::time::Duration::from_millis(100),
             fail_on_error: true,
         }));
-        let config = PushNotificationConfig {
+        let config = TaskPushNotificationConfig {
+            task_id: String::new(),
             url: "http://127.0.0.1:1/callback".to_string(),
             id: None,
             token: None,
             authentication: None,
+            tenant: None,
         };
         let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
             task_id: "t1".into(),
@@ -201,8 +212,10 @@ mod tests {
     #[tokio::test]
     async fn test_send_push_with_basic_auth() {
         use a2a::event::*;
+        install_crypto_provider();
         let sender = HttpPushSender::new(None);
-        let config = PushNotificationConfig {
+        let config = TaskPushNotificationConfig {
+            task_id: String::new(),
             url: "http://127.0.0.1:1/callback".to_string(),
             id: None,
             token: None,
@@ -210,6 +223,7 @@ mod tests {
                 scheme: "basic".to_string(),
                 credentials: Some("dXNlcjpwYXNz".to_string()),
             }),
+            tenant: None,
         };
         let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
             task_id: "t1".into(),
@@ -229,8 +243,10 @@ mod tests {
     #[tokio::test]
     async fn test_send_push_with_unknown_auth_scheme() {
         use a2a::event::*;
+        install_crypto_provider();
         let sender = HttpPushSender::new(None);
-        let config = PushNotificationConfig {
+        let config = TaskPushNotificationConfig {
+            task_id: String::new(),
             url: "http://127.0.0.1:1/callback".to_string(),
             id: None,
             token: None,
@@ -238,6 +254,7 @@ mod tests {
                 scheme: "custom".to_string(),
                 credentials: Some("cred".to_string()),
             }),
+            tenant: None,
         };
         let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
             task_id: "t1".into(),

@@ -11,16 +11,18 @@ pub trait PushConfigStore: Send + Sync + 'static {
     /// Save a push config for a task. Generates an ID if none provided.
     async fn save(
         &self,
-        task_id: &str,
-        config: PushNotificationConfig,
-    ) -> Result<PushNotificationConfig, A2AError>;
+        config: TaskPushNotificationConfig,
+    ) -> Result<TaskPushNotificationConfig, A2AError>;
 
     /// Get a specific push config by task and config ID.
-    async fn get(&self, task_id: &str, config_id: &str)
-    -> Result<PushNotificationConfig, A2AError>;
+    async fn get(
+        &self,
+        task_id: &str,
+        config_id: &str,
+    ) -> Result<TaskPushNotificationConfig, A2AError>;
 
     /// List all push configs for a task.
-    async fn list(&self, task_id: &str) -> Result<Vec<PushNotificationConfig>, A2AError>;
+    async fn list(&self, task_id: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError>;
 
     /// Delete a specific push config.
     async fn delete(&self, task_id: &str, config_id: &str) -> Result<(), A2AError>;
@@ -31,7 +33,7 @@ pub trait PushConfigStore: Send + Sync + 'static {
 
 /// In-memory push config store.
 pub struct InMemoryPushConfigStore {
-    configs: RwLock<HashMap<String, HashMap<String, PushNotificationConfig>>>,
+    configs: RwLock<HashMap<String, HashMap<String, TaskPushNotificationConfig>>>,
 }
 
 impl InMemoryPushConfigStore {
@@ -52,11 +54,15 @@ impl Default for InMemoryPushConfigStore {
 impl PushConfigStore for InMemoryPushConfigStore {
     async fn save(
         &self,
-        task_id: &str,
-        mut config: PushNotificationConfig,
-    ) -> Result<PushNotificationConfig, A2AError> {
+        mut config: TaskPushNotificationConfig,
+    ) -> Result<TaskPushNotificationConfig, A2AError> {
         if config.url.is_empty() {
             return Err(A2AError::invalid_params("push config URL cannot be empty"));
+        }
+        if config.task_id.is_empty() {
+            return Err(A2AError::invalid_params(
+                "push config task_id cannot be empty",
+            ));
         }
 
         if config.id.is_none() {
@@ -64,7 +70,7 @@ impl PushConfigStore for InMemoryPushConfigStore {
         }
 
         let mut store = self.configs.write().await;
-        let task_configs = store.entry(task_id.to_string()).or_default();
+        let task_configs = store.entry(config.task_id.clone()).or_default();
         let config_id = config.id.clone().unwrap();
         task_configs.insert(config_id, config.clone());
         Ok(config)
@@ -74,7 +80,7 @@ impl PushConfigStore for InMemoryPushConfigStore {
         &self,
         task_id: &str,
         config_id: &str,
-    ) -> Result<PushNotificationConfig, A2AError> {
+    ) -> Result<TaskPushNotificationConfig, A2AError> {
         let store = self.configs.read().await;
         store
             .get(task_id)
@@ -83,7 +89,7 @@ impl PushConfigStore for InMemoryPushConfigStore {
             .ok_or_else(A2AError::push_notification_not_supported)
     }
 
-    async fn list(&self, task_id: &str) -> Result<Vec<PushNotificationConfig>, A2AError> {
+    async fn list(&self, task_id: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
         let store = self.configs.read().await;
         Ok(store
             .get(task_id)
@@ -110,12 +116,14 @@ impl PushConfigStore for InMemoryPushConfigStore {
 mod tests {
     use super::*;
 
-    fn make_config(url: &str) -> PushNotificationConfig {
-        PushNotificationConfig {
+    fn make_config(task_id: &str, url: &str) -> TaskPushNotificationConfig {
+        TaskPushNotificationConfig {
             url: url.to_string(),
             id: None,
+            task_id: task_id.to_string(),
             token: None,
             authentication: None,
+            tenant: None,
         }
     }
 
@@ -123,7 +131,7 @@ mod tests {
     async fn test_save_and_get() {
         let store = InMemoryPushConfigStore::new();
         let config = store
-            .save("t1", make_config("https://example.com/hook"))
+            .save(make_config("t1", "https://example.com/hook"))
             .await
             .unwrap();
         assert!(config.id.is_some());
@@ -135,16 +143,25 @@ mod tests {
     #[tokio::test]
     async fn test_save_empty_url() {
         let store = InMemoryPushConfigStore::new();
-        let result = store.save("t1", make_config("")).await;
+        let result = store.save(make_config("t1", "")).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_save_empty_task_id() {
+        let store = InMemoryPushConfigStore::new();
+        let result = store
+            .save(make_config("", "https://example.com/hook"))
+            .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_save_with_existing_id() {
         let store = InMemoryPushConfigStore::new();
-        let mut config = make_config("https://example.com/hook");
+        let mut config = make_config("t1", "https://example.com/hook");
         config.id = Some("my-id".to_string());
-        let saved = store.save("t1", config).await.unwrap();
+        let saved = store.save(config).await.unwrap();
         assert_eq!(saved.id.as_deref(), Some("my-id"));
     }
 
@@ -159,15 +176,15 @@ mod tests {
     async fn test_list() {
         let store = InMemoryPushConfigStore::new();
         store
-            .save("t1", make_config("https://a.com"))
+            .save(make_config("t1", "https://a.com"))
             .await
             .unwrap();
         store
-            .save("t1", make_config("https://b.com"))
+            .save(make_config("t1", "https://b.com"))
             .await
             .unwrap();
         store
-            .save("t2", make_config("https://c.com"))
+            .save(make_config("t2", "https://c.com"))
             .await
             .unwrap();
 
@@ -185,7 +202,7 @@ mod tests {
     async fn test_delete() {
         let store = InMemoryPushConfigStore::new();
         let config = store
-            .save("t1", make_config("https://a.com"))
+            .save(make_config("t1", "https://a.com"))
             .await
             .unwrap();
         let config_id = config.id.unwrap();
@@ -199,11 +216,11 @@ mod tests {
     async fn test_delete_all() {
         let store = InMemoryPushConfigStore::new();
         store
-            .save("t1", make_config("https://a.com"))
+            .save(make_config("t1", "https://a.com"))
             .await
             .unwrap();
         store
-            .save("t1", make_config("https://b.com"))
+            .save(make_config("t1", "https://b.com"))
             .await
             .unwrap();
 

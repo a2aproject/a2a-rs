@@ -367,15 +367,11 @@ pub fn to_proto_task_push_notification_config(
 ) -> proto::TaskPushNotificationConfig {
     proto::TaskPushNotificationConfig {
         tenant: c.tenant.clone().unwrap_or_default(),
-        id: c.config.id.clone().unwrap_or_default(),
+        id: c.id.clone().unwrap_or_default(),
         task_id: c.task_id.clone(),
-        url: c.config.url.clone(),
-        token: c.config.token.clone().unwrap_or_default(),
-        authentication: c
-            .config
-            .authentication
-            .as_ref()
-            .map(to_proto_authentication_info),
+        url: c.url.clone(),
+        token: c.token.clone().unwrap_or_default(),
+        authentication: c.authentication.as_ref().map(to_proto_authentication_info),
     }
 }
 
@@ -383,17 +379,15 @@ pub fn from_proto_task_push_notification_config(
     c: &proto::TaskPushNotificationConfig,
 ) -> TaskPushNotificationConfig {
     TaskPushNotificationConfig {
+        url: c.url.clone(),
+        id: empty_to_none(&c.id),
         task_id: c.task_id.clone(),
+        token: empty_to_none(&c.token),
+        authentication: c
+            .authentication
+            .as_ref()
+            .map(from_proto_authentication_info),
         tenant: empty_to_none(&c.tenant),
-        config: PushNotificationConfig {
-            url: c.url.clone(),
-            id: empty_to_none(&c.id),
-            token: empty_to_none(&c.token),
-            authentication: c
-                .authentication
-                .as_ref()
-                .map(from_proto_authentication_info),
-        },
     }
 }
 
@@ -406,19 +400,10 @@ pub fn to_proto_send_message_configuration(
 ) -> proto::SendMessageConfiguration {
     proto::SendMessageConfiguration {
         accepted_output_modes: c.accepted_output_modes.clone().unwrap_or_default(),
-        task_push_notification_config: c.push_notification_config.as_ref().map(|pnc| {
-            proto::TaskPushNotificationConfig {
-                tenant: String::new(),
-                id: pnc.id.clone().unwrap_or_default(),
-                task_id: String::new(),
-                url: pnc.url.clone(),
-                token: pnc.token.clone().unwrap_or_default(),
-                authentication: pnc
-                    .authentication
-                    .as_ref()
-                    .map(to_proto_authentication_info),
-            }
-        }),
+        task_push_notification_config: c
+            .task_push_notification_config
+            .as_ref()
+            .map(to_proto_task_push_notification_config),
         history_length: c.history_length,
         return_immediately: c.return_immediately.unwrap_or(false),
     }
@@ -433,17 +418,10 @@ pub fn from_proto_send_message_configuration(
         } else {
             Some(c.accepted_output_modes.clone())
         },
-        push_notification_config: c.task_push_notification_config.as_ref().map(|tpnc| {
-            PushNotificationConfig {
-                url: tpnc.url.clone(),
-                id: empty_to_none(&tpnc.id),
-                token: empty_to_none(&tpnc.token),
-                authentication: tpnc
-                    .authentication
-                    .as_ref()
-                    .map(from_proto_authentication_info),
-            }
-        }),
+        task_push_notification_config: c
+            .task_push_notification_config
+            .as_ref()
+            .map(from_proto_task_push_notification_config),
         history_length: c.history_length,
         return_immediately: if c.return_immediately {
             Some(true)
@@ -1285,29 +1263,19 @@ pub fn from_proto_agent_card(c: &proto::AgentCard) -> AgentCard {
 }
 
 // ---------------------------------------------------------------------------
-// CreateTaskPushNotificationConfigRequest
+// TaskPushNotificationConfig
 // ---------------------------------------------------------------------------
 
 pub fn to_proto_create_task_push_notification_config_request(
-    r: &CreateTaskPushNotificationConfigRequest,
+    r: &TaskPushNotificationConfig,
 ) -> proto::TaskPushNotificationConfig {
-    let tpnc = TaskPushNotificationConfig {
-        task_id: r.task_id.clone(),
-        config: r.config.clone(),
-        tenant: r.tenant.clone(),
-    };
-    to_proto_task_push_notification_config(&tpnc)
+    to_proto_task_push_notification_config(r)
 }
 
 pub fn from_proto_create_task_push_notification_config_request(
     r: &proto::TaskPushNotificationConfig,
-) -> CreateTaskPushNotificationConfigRequest {
-    let tpnc = from_proto_task_push_notification_config(r);
-    CreateTaskPushNotificationConfigRequest {
-        task_id: tpnc.task_id,
-        config: tpnc.config,
-        tenant: tpnc.tenant,
-    }
+) -> TaskPushNotificationConfig {
+    from_proto_task_push_notification_config(r)
 }
 
 #[cfg(test)]
@@ -1521,15 +1489,13 @@ mod tests {
         let tpnc = TaskPushNotificationConfig {
             task_id: "task-1".to_string(),
             tenant: Some("tenant-1".to_string()),
-            config: PushNotificationConfig {
-                url: "https://example.com/webhook".to_string(),
-                id: Some("config-1".to_string()),
-                token: Some("tok-123".to_string()),
-                authentication: Some(AuthenticationInfo {
-                    scheme: "Bearer".to_string(),
-                    credentials: Some("secret".to_string()),
-                }),
-            },
+            url: "https://example.com/webhook".to_string(),
+            id: Some("config-1".to_string()),
+            token: Some("tok-123".to_string()),
+            authentication: Some(AuthenticationInfo {
+                scheme: "Bearer".to_string(),
+                credentials: Some("secret".to_string()),
+            }),
         };
         let proto_tpnc = to_proto_task_push_notification_config(&tpnc);
         let back = from_proto_task_push_notification_config(&proto_tpnc);
@@ -1551,14 +1517,16 @@ mod tests {
             },
             configuration: Some(SendMessageConfiguration {
                 accepted_output_modes: Some(vec!["text/plain".to_string()]),
-                push_notification_config: Some(PushNotificationConfig {
+                task_push_notification_config: Some(TaskPushNotificationConfig {
                     url: "http://push.example.com".to_string(),
                     id: Some("pnc-1".to_string()),
+                    task_id: String::new(),
                     token: Some("tok".to_string()),
                     authentication: Some(AuthenticationInfo {
                         scheme: "Bearer".to_string(),
                         credentials: Some("secret".to_string()),
                     }),
+                    tenant: None,
                 }),
                 history_length: Some(5),
                 return_immediately: Some(true),
@@ -1755,12 +1723,10 @@ mod tests {
             configs: vec![TaskPushNotificationConfig {
                 task_id: "t1".to_string(),
                 tenant: None,
-                config: PushNotificationConfig {
-                    url: "http://x.com".to_string(),
-                    id: Some("c1".to_string()),
-                    token: None,
-                    authentication: None,
-                },
+                url: "http://x.com".to_string(),
+                id: Some("c1".to_string()),
+                token: None,
+                authentication: None,
             }],
             next_page_token: Some("next".to_string()),
         };
@@ -2187,20 +2153,18 @@ mod tests {
 
     #[test]
     fn test_create_push_notification_config_request_roundtrip() {
-        let req = CreateTaskPushNotificationConfigRequest {
+        let req = TaskPushNotificationConfig {
+            url: "http://cb.example.com".to_string(),
+            id: Some("c1".to_string()),
             task_id: "t1".to_string(),
-            config: PushNotificationConfig {
-                url: "http://cb.example.com".to_string(),
-                id: Some("c1".to_string()),
-                token: Some("tok".to_string()),
-                authentication: None,
-            },
+            token: Some("tok".to_string()),
+            authentication: None,
             tenant: Some("ten".to_string()),
         };
         let proto = to_proto_create_task_push_notification_config_request(&req);
         let back = from_proto_create_task_push_notification_config_request(&proto);
         assert_eq!(req.task_id, back.task_id);
-        assert_eq!(req.config.url, back.config.url);
+        assert_eq!(req.url, back.url);
     }
 
     #[test]
@@ -2277,7 +2241,7 @@ mod tests {
     fn test_send_message_configuration_defaults() {
         let config = SendMessageConfiguration {
             accepted_output_modes: None,
-            push_notification_config: None,
+            task_push_notification_config: None,
             history_length: None,
             return_immediately: None,
         };

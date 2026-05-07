@@ -118,7 +118,7 @@ impl<T: Transport> A2AClient<T> {
 
     pub async fn create_push_config(
         &self,
-        req: &CreateTaskPushNotificationConfigRequest,
+        req: &TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let params = self.apply_before(methods::CREATE_PUSH_CONFIG).await?;
         let result = self.transport.create_push_config(&params, req).await;
@@ -344,14 +344,10 @@ mod tests {
         async fn create_push_config(
             &self,
             params: &ServiceParams,
-            req: &CreateTaskPushNotificationConfigRequest,
+            req: &TaskPushNotificationConfig,
         ) -> Result<TaskPushNotificationConfig, A2AError> {
             self.record(methods::CREATE_PUSH_CONFIG, params);
-            Ok(TaskPushNotificationConfig {
-                task_id: req.task_id.clone(),
-                config: req.config.clone(),
-                tenant: None,
-            })
+            Ok(req.clone())
         }
 
         async fn get_push_config(
@@ -362,12 +358,10 @@ mod tests {
             self.record(methods::GET_PUSH_CONFIG, params);
             Ok(TaskPushNotificationConfig {
                 task_id: req.task_id.clone(),
-                config: PushNotificationConfig {
-                    url: "http://example.com".into(),
-                    id: Some(req.id.clone()),
-                    token: None,
-                    authentication: None,
-                },
+                url: "http://example.com".into(),
+                id: Some(req.id.clone()),
+                token: None,
+                authentication: None,
                 tenant: None,
             })
         }
@@ -626,14 +620,12 @@ mod tests {
     #[tokio::test]
     async fn test_create_push_config() {
         let client = make_client();
-        let req = CreateTaskPushNotificationConfigRequest {
+        let req = TaskPushNotificationConfig {
             task_id: "t1".into(),
-            config: PushNotificationConfig {
-                url: "http://example.com".into(),
-                id: None,
-                token: None,
-                authentication: None,
-            },
+            url: "http://example.com".into(),
+            id: None,
+            token: None,
+            authentication: None,
             tenant: None,
         };
         let resp = client.create_push_config(&req).await.unwrap();
@@ -649,7 +641,7 @@ mod tests {
             tenant: None,
         };
         let resp = client.get_push_config(&req).await.unwrap();
-        assert_eq!(resp.config.id, Some("cfg1".into()));
+        assert_eq!(resp.id, Some("cfg1".into()));
     }
 
     #[tokio::test]

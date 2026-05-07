@@ -60,15 +60,13 @@ fn sample_push_config(id: &str) -> TaskPushNotificationConfig {
     TaskPushNotificationConfig {
         task_id: "task-1".to_string(),
         tenant: None,
-        config: PushNotificationConfig {
-            url: "https://example.com/callback".to_string(),
-            id: Some(id.to_string()),
-            token: Some("tok-1".to_string()),
-            authentication: Some(AuthenticationInfo {
-                scheme: "Bearer".to_string(),
-                credentials: Some("secret".to_string()),
-            }),
-        },
+        url: "https://example.com/callback".to_string(),
+        id: Some(id.to_string()),
+        token: Some("tok-1".to_string()),
+        authentication: Some(AuthenticationInfo {
+            scheme: "Bearer".to_string(),
+            credentials: Some("secret".to_string()),
+        }),
     }
 }
 
@@ -202,16 +200,12 @@ impl RequestHandler for TestHandler {
     async fn create_push_config(
         &self,
         _params: &ServiceParams,
-        req: CreateTaskPushNotificationConfigRequest,
+        req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         if req.task_id == "missing" {
             return Err(A2AError::task_not_found(&req.task_id));
         }
-        Ok(TaskPushNotificationConfig {
-            task_id: req.task_id,
-            config: req.config,
-            tenant: req.tenant,
-        })
+        Ok(req)
     }
 
     async fn get_push_config(
@@ -225,12 +219,10 @@ impl RequestHandler for TestHandler {
         Ok(TaskPushNotificationConfig {
             task_id: req.task_id,
             tenant: req.tenant,
-            config: PushNotificationConfig {
-                url: "https://example.com/callback".to_string(),
-                id: Some(req.id),
-                token: Some("tok-1".to_string()),
-                authentication: None,
-            },
+            url: "https://example.com/callback".to_string(),
+            id: Some(req.id),
+            token: Some("tok-1".to_string()),
+            authentication: None,
         })
     }
 
@@ -516,14 +508,7 @@ async fn rest_transport_end_to_end() {
     assert_eq!(events.len(), 1);
 
     let created = transport
-        .create_push_config(
-            &ServiceParams::new(),
-            &CreateTaskPushNotificationConfigRequest {
-                task_id: "task-1".to_string(),
-                config: sample_push_config("cfg-1").config,
-                tenant: None,
-            },
-        )
+        .create_push_config(&ServiceParams::new(), &sample_push_config("cfg-1"))
         .await
         .unwrap();
     assert_eq!(created.task_id, "task-1");
@@ -531,10 +516,9 @@ async fn rest_transport_end_to_end() {
     let created_missing = transport
         .create_push_config(
             &ServiceParams::new(),
-            &CreateTaskPushNotificationConfigRequest {
+            &TaskPushNotificationConfig {
                 task_id: "missing".to_string(),
-                config: sample_push_config("cfg-1").config,
-                tenant: None,
+                ..sample_push_config("cfg-1")
             },
         )
         .await
@@ -552,7 +536,7 @@ async fn rest_transport_end_to_end() {
         )
         .await
         .unwrap();
-    assert_eq!(fetched.config.id.as_deref(), Some("cfg-1"));
+    assert_eq!(fetched.id.as_deref(), Some("cfg-1"));
 
     let fetched_missing = transport
         .get_push_config(
@@ -722,14 +706,7 @@ async fn jsonrpc_transport_end_to_end() {
     assert_eq!(events.len(), 1);
 
     let created = transport
-        .create_push_config(
-            &ServiceParams::new(),
-            &CreateTaskPushNotificationConfigRequest {
-                task_id: "task-1".to_string(),
-                config: sample_push_config("cfg-1").config,
-                tenant: None,
-            },
-        )
+        .create_push_config(&ServiceParams::new(), &sample_push_config("cfg-1"))
         .await
         .unwrap();
     assert_eq!(created.task_id, "task-1");
@@ -737,10 +714,9 @@ async fn jsonrpc_transport_end_to_end() {
     let created_missing = transport
         .create_push_config(
             &ServiceParams::new(),
-            &CreateTaskPushNotificationConfigRequest {
+            &TaskPushNotificationConfig {
                 task_id: "missing".to_string(),
-                config: sample_push_config("cfg-1").config,
-                tenant: None,
+                ..sample_push_config("cfg-1")
             },
         )
         .await
@@ -758,7 +734,7 @@ async fn jsonrpc_transport_end_to_end() {
         )
         .await
         .unwrap();
-    assert_eq!(fetched.config.id.as_deref(), Some("cfg-1"));
+    assert_eq!(fetched.id.as_deref(), Some("cfg-1"));
 
     let fetched_missing = transport
         .get_push_config(
@@ -833,17 +809,15 @@ async fn rest_transport_push_delivery_end_to_end() {
     transport
         .create_push_config(
             &ServiceParams::new(),
-            &CreateTaskPushNotificationConfigRequest {
+            &TaskPushNotificationConfig {
                 task_id: "task-rest-push".to_string(),
-                config: PushNotificationConfig {
-                    url: webhook_url,
-                    id: Some("cfg-rest".to_string()),
-                    token: Some("rest-token".to_string()),
-                    authentication: Some(AuthenticationInfo {
-                        scheme: "Basic".to_string(),
-                        credentials: Some("dGVzdDpzZWNyZXQ=".to_string()),
-                    }),
-                },
+                url: webhook_url,
+                id: Some("cfg-rest".to_string()),
+                token: Some("rest-token".to_string()),
+                authentication: Some(AuthenticationInfo {
+                    scheme: "Basic".to_string(),
+                    credentials: Some("dGVzdDpzZWNyZXQ=".to_string()),
+                }),
                 tenant: None,
             },
         )
@@ -903,7 +877,8 @@ async fn jsonrpc_transport_push_delivery_end_to_end() {
     request.message.context_id = Some("ctx-rpc-push".to_string());
     request.configuration = Some(SendMessageConfiguration {
         accepted_output_modes: None,
-        push_notification_config: Some(PushNotificationConfig {
+        task_push_notification_config: Some(TaskPushNotificationConfig {
+            task_id: String::new(),
             url: webhook_url.clone(),
             id: Some("cfg-rpc".to_string()),
             token: Some("rpc-token".to_string()),
@@ -911,6 +886,7 @@ async fn jsonrpc_transport_push_delivery_end_to_end() {
                 scheme: "Bearer".to_string(),
                 credentials: Some("rpc-secret".to_string()),
             }),
+            tenant: None,
         }),
         history_length: None,
         return_immediately: None,
@@ -933,7 +909,7 @@ async fn jsonrpc_transport_push_delivery_end_to_end() {
         )
         .await
         .unwrap();
-    assert_eq!(saved.config.url, webhook_url);
+    assert_eq!(saved.url, webhook_url);
 
     let first = recv_push(&mut receiver).await;
     assert_eq!(first.authorization.as_deref(), Some("Bearer rpc-secret"));

@@ -6,7 +6,6 @@ pub mod handler;
 pub mod jsonrpc;
 pub mod middleware;
 pub mod push;
-mod push_config_compat;
 pub mod rest;
 pub mod sse;
 pub mod task_store;
@@ -19,3 +18,13 @@ pub use handler::{DefaultRequestHandler, RequestHandler};
 pub use middleware::{CallContext, CallInterceptor, InterceptedHandler, ServiceParams, User};
 pub use push::{HttpPushSender, InMemoryPushConfigStore, PushConfigStore};
 pub use task_store::{InMemoryTaskStore, TaskStore};
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    pub fn install_crypto_provider() {
+        #[cfg(feature = "rustls-tls")]
+        {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
+    }
+}

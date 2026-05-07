@@ -9,6 +9,18 @@ members = [
     "a2acli",
     "examples",
 ]
+
+default-members = [
+    "a2a",
+    "a2a-client",
+    "a2a-server",
+    "a2a-pb",
+    "a2a-grpc",
+    "a2a-slimrpc",
+    "a2acli",
+    "examples",
+]
+
 resolver = "2"
 
 [workspace.package]

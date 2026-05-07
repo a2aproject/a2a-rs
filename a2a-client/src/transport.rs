@@ -57,7 +57,7 @@ pub trait Transport: Send + Sync {
     async fn create_push_config(
         &self,
         params: &ServiceParams,
-        req: &CreateTaskPushNotificationConfigRequest,
+        req: &TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError>;
 
     async fn get_push_config(

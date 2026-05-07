@@ -437,8 +437,8 @@ pub struct SendMessageConfiguration {
     pub accepted_output_modes: Option<Vec<String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "pushNotificationConfig")]
-    pub push_notification_config: Option<PushNotificationConfig>,
+    #[serde(alias = "pushNotificationConfig")]
+    pub task_push_notification_config: Option<TaskPushNotificationConfig>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_length: Option<i32>,
@@ -587,26 +587,6 @@ pub struct GetExtendedAgentCardRequest {
 // Push Notification types
 // ---------------------------------------------------------------------------
 
-/// Push notification configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PushNotificationConfig {
-    /// Callback URL for push notifications.
-    pub url: String,
-
-    /// Optional unique ID for this configuration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-
-    /// Optional session/task token for validation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-
-    /// Optional authentication details for the webhook.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authentication: Option<AuthenticationInfo>,
-}
-
 /// Authentication details for a push notification endpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -619,12 +599,28 @@ pub struct AuthenticationInfo {
     pub credentials: Option<String>,
 }
 
-/// Container associating push config with a task.
+/// Push notification configuration for a task.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskPushNotificationConfig {
+    /// Callback URL for push notifications.
+    pub url: String,
+
+    /// Optional unique ID for this configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
+    /// The task this configuration is associated with.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub task_id: TaskId,
-    pub config: PushNotificationConfig,
+
+    /// Optional session/task token for validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+
+    /// Optional authentication details for the webhook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<AuthenticationInfo>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
@@ -661,21 +657,11 @@ pub struct ListTaskPushNotificationConfigsRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListTaskPushNotificationConfigsResponse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub configs: Vec<TaskPushNotificationConfig>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_page_token: Option<String>,
-}
-
-/// Request to create a push config for a task.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateTaskPushNotificationConfigRequest {
-    pub task_id: TaskId,
-    pub config: PushNotificationConfig,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tenant: Option<String>,
 }
 
 /// Request to delete a push config.
@@ -896,17 +882,19 @@ mod tests {
 
     #[test]
     fn test_push_notification_config_serde() {
-        let config = PushNotificationConfig {
+        let config = TaskPushNotificationConfig {
             url: "https://example.com/webhook".to_string(),
             id: Some("cfg-1".to_string()),
+            task_id: "task-1".to_string(),
             token: Some("tok-1".to_string()),
             authentication: Some(AuthenticationInfo {
                 scheme: "Bearer".to_string(),
                 credentials: Some("secret".to_string()),
             }),
+            tenant: None,
         };
         let json = serde_json::to_string(&config).unwrap();
-        let back: PushNotificationConfig = serde_json::from_str(&json).unwrap();
+        let back: TaskPushNotificationConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, back);
     }
 
@@ -916,7 +904,7 @@ mod tests {
             message: Message::new(Role::User, vec![Part::text("hello")]),
             configuration: Some(SendMessageConfiguration {
                 accepted_output_modes: Some(vec!["text/plain".to_string()]),
-                push_notification_config: None,
+                task_push_notification_config: None,
                 history_length: Some(10),
                 return_immediately: Some(true),
             }),

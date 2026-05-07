@@ -289,29 +289,24 @@ impl RequestHandler for TestHandler {
     async fn create_push_config(
         &self,
         _params: &ServiceParams,
-        req: CreateTaskPushNotificationConfigRequest,
+        req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         if !self.state.tasks.lock().unwrap().contains_key(&req.task_id) {
             return Err(A2AError::task_not_found(&req.task_id));
         }
 
-        let mut config = req.config;
+        let mut config = req;
         let config_id = config
             .id
             .clone()
             .unwrap_or_else(|| "cfg-generated".to_string());
         config.id = Some(config_id.clone());
-        let task_config = TaskPushNotificationConfig {
-            task_id: req.task_id.clone(),
-            config,
-            tenant: req.tenant,
-        };
         self.state
             .push_configs
             .lock()
             .unwrap()
-            .insert((req.task_id, config_id), task_config.clone());
-        Ok(task_config)
+            .insert((config.task_id.clone(), config_id), config.clone());
+        Ok(config)
     }
 
     async fn get_push_config(
@@ -606,7 +601,7 @@ async fn push_config_crud_commands_work() {
     );
     let create_json: Value = serde_json::from_str(create.trim()).unwrap();
     assert_eq!(create_json["taskId"], "task-1");
-    assert_eq!(create_json["config"]["id"], "cfg-1");
+    assert_eq!(create_json["id"], "cfg-1");
     assert_eq!(create_json["tenant"], "tenant-1");
 
     let get = run_cli_success(
@@ -614,7 +609,7 @@ async fn push_config_crud_commands_work() {
         &["--compact", "push-config", "get", "task-1", "cfg-1"],
     );
     let get_json: Value = serde_json::from_str(get.trim()).unwrap();
-    assert_eq!(get_json["config"]["authentication"]["scheme"], "Bearer");
+    assert_eq!(get_json["authentication"]["scheme"], "Bearer");
 
     let list = run_cli_success(
         &server,

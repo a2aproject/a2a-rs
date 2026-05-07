@@ -368,7 +368,7 @@ impl Transport for JsonRpcTransport {
     async fn create_push_config(
         &self,
         params: &ServiceParams,
-        req: &CreateTaskPushNotificationConfigRequest,
+        req: &TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let payload = serialize_create_task_push_notification_config_request(req)?;
         let result = self
@@ -580,18 +580,16 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn sample_create_push_config_request() -> CreateTaskPushNotificationConfigRequest {
-        CreateTaskPushNotificationConfigRequest {
+    fn sample_create_push_config_request() -> TaskPushNotificationConfig {
+        TaskPushNotificationConfig {
             task_id: "task-1".into(),
-            config: PushNotificationConfig {
-                url: "https://example.invalid/webhook".into(),
-                id: Some("cfg-1".into()),
-                token: Some("secret-token".into()),
-                authentication: Some(AuthenticationInfo {
-                    scheme: "Bearer".into(),
-                    credentials: Some("credential".into()),
-                }),
-            },
+            url: "https://example.invalid/webhook".into(),
+            id: Some("cfg-1".into()),
+            token: Some("secret-token".into()),
+            authentication: Some(AuthenticationInfo {
+                scheme: "Bearer".into(),
+                credentials: Some("credential".into()),
+            }),
             tenant: Some("tenant-1".into()),
         }
     }
@@ -1155,20 +1153,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_push_config_sends_nested_request_shape() {
+    async fn test_create_push_config_sends_flat_request_shape() {
         let response = json!({
             "jsonrpc": "2.0",
             "id": "1",
             "result": {
                 "taskId": "task-1",
-                "config": {
-                    "url": "https://example.invalid/webhook",
-                    "id": "cfg-1",
-                    "token": "secret-token",
-                    "authentication": {
-                        "scheme": "Bearer",
-                        "credentials": "credential"
-                    }
+                "url": "https://example.invalid/webhook",
+                "id": "cfg-1",
+                "token": "secret-token",
+                "authentication": {
+                    "scheme": "Bearer",
+                    "credentials": "credential"
                 },
                 "tenant": "tenant-1"
             }
@@ -1185,7 +1181,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.task_id, "task-1");
-        assert_eq!(result.config.id.as_deref(), Some("cfg-1"));
+        assert_eq!(result.id.as_deref(), Some("cfg-1"));
 
         let request = request_rx.await.unwrap();
         let request_lower = request.to_ascii_lowercase();
@@ -1199,14 +1195,12 @@ mod tests {
             payload["params"],
             json!({
                 "taskId": "task-1",
-                "config": {
-                    "url": "https://example.invalid/webhook",
-                    "id": "cfg-1",
-                    "token": "secret-token",
-                    "authentication": {
-                        "scheme": "Bearer",
-                        "credentials": "credential"
-                    }
+                "url": "https://example.invalid/webhook",
+                "id": "cfg-1",
+                "token": "secret-token",
+                "authentication": {
+                    "scheme": "Bearer",
+                    "credentials": "credential"
                 },
                 "tenant": "tenant-1"
             })
@@ -1263,11 +1257,9 @@ mod tests {
             "id": "1",
             "result": {
                 "taskId": "task-1",
-                "config": {
-                    "url": "https://example.invalid/webhook",
-                    "id": "cfg-1",
-                    "token": "secret-token"
-                },
+                "url": "https://example.invalid/webhook",
+                "id": "cfg-1",
+                "token": "secret-token",
                 "tenant": "tenant-1"
             }
         })
@@ -1288,7 +1280,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.task_id, "task-1");
-        assert_eq!(result.config.id.as_deref(), Some("cfg-1"));
+        assert_eq!(result.id.as_deref(), Some("cfg-1"));
 
         let request = request_rx.await.unwrap();
         let body = request.split("\r\n\r\n").nth(1).unwrap();

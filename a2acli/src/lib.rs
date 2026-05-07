@@ -361,7 +361,7 @@ fn build_send_message_request(
         Some(SendMessageConfiguration {
             accepted_output_modes: (!command.accepted_output_modes.is_empty())
                 .then_some(command.accepted_output_modes.clone()),
-            push_notification_config: None,
+            task_push_notification_config: None,
             history_length: command.history_length,
             return_immediately: command.return_immediately.then_some(true),
         })
@@ -379,7 +379,7 @@ fn build_send_message_request(
 
 fn build_push_notification_config(
     command: &CreatePushConfigCommand,
-) -> Result<PushNotificationConfig, CliError> {
+) -> Result<TaskPushNotificationConfig, CliError> {
     if command.auth_credentials.is_some() && command.auth_scheme.is_none() {
         return Err(CliError::InvalidInput(
             "--auth-credentials requires --auth-scheme".to_string(),
@@ -394,11 +394,13 @@ fn build_push_notification_config(
             credentials: command.auth_credentials.clone(),
         });
 
-    Ok(PushNotificationConfig {
+    Ok(TaskPushNotificationConfig {
+        task_id: String::new(),
         url: command.url.clone(),
         id: command.config_id.clone(),
         token: command.token.clone(),
         authentication,
+        tenant: None,
     })
 }
 
@@ -406,14 +408,10 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
     match command {
         PushConfigCommand::Create(command) => {
             let client = resolve_client(cli).await?;
-            let config = build_push_notification_config(command)?;
-            let result = client
-                .create_push_config(&CreateTaskPushNotificationConfigRequest {
-                    task_id: command.task_id.clone(),
-                    config,
-                    tenant: cli.tenant.clone(),
-                })
-                .await;
+            let mut config = build_push_notification_config(command)?;
+            config.task_id = command.task_id.clone();
+            config.tenant = cli.tenant.clone();
+            let result = client.create_push_config(&config).await;
             let response = finish_client_call(client, result).await?;
             print_json(&response, cli.compact)?;
         }
@@ -652,7 +650,7 @@ mod tests {
         async fn create_push_config(
             &self,
             _params: &ServiceParams,
-            _req: &CreateTaskPushNotificationConfigRequest,
+            _req: &TaskPushNotificationConfig,
         ) -> Result<TaskPushNotificationConfig, A2AError> {
             Err(A2AError::unsupported_operation("unused"))
         }
@@ -963,28 +961,19 @@ mod tests {
         async fn create_push_config(
             &self,
             _params: &HandlerServiceParams,
-            req: CreateTaskPushNotificationConfigRequest,
+            req: TaskPushNotificationConfig,
         ) -> Result<TaskPushNotificationConfig, A2AError> {
             if !self.state.tasks.lock().unwrap().contains_key(&req.task_id) {
                 return Err(A2AError::task_not_found(&req.task_id));
             }
 
-            let config = TaskPushNotificationConfig {
-                task_id: req.task_id.clone(),
-                config: req.config,
-                tenant: req.tenant,
-            };
-            let config_id = config
-                .config
-                .id
-                .clone()
-                .unwrap_or_else(|| "generated".to_string());
+            let config_id = req.id.clone().unwrap_or_else(|| "generated".to_string());
             self.state
                 .push_configs
                 .lock()
                 .unwrap()
-                .insert((req.task_id, config_id), config.clone());
-            Ok(config)
+                .insert((req.task_id.clone(), config_id), req.clone());
+            Ok(req)
         }
 
         async fn get_push_config(
@@ -1472,14 +1461,12 @@ mod tests {
             transport
                 .create_push_config(
                     &params,
-                    &CreateTaskPushNotificationConfigRequest {
+                    &TaskPushNotificationConfig {
                         task_id: "task-1".to_string(),
-                        config: PushNotificationConfig {
-                            url: "https://example.com/callback".to_string(),
-                            id: Some("cfg-1".to_string()),
-                            token: None,
-                            authentication: None,
-                        },
+                        url: "https://example.com/callback".to_string(),
+                        id: Some("cfg-1".to_string()),
+                        token: None,
+                        authentication: None,
                         tenant: None,
                     },
                 )

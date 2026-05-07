@@ -10,7 +10,6 @@ use serde_json::Value;
 
 use crate::handler::RequestHandler;
 use crate::middleware::ServiceParams;
-use crate::push_config_compat::json_value as compat_json_value;
 use crate::sse;
 
 /// Shared state for the JSON-RPC handler.
@@ -103,7 +102,7 @@ async fn handle_unary_request<H: RequestHandler>(
                 .handler
                 .create_push_config(params, req)
                 .await
-                .and_then(|r| compat_json_value(&r)),
+                .and_then(|r| protojson_value(&r)),
             Err(e) => Err(parse_error(e)),
         },
         methods::GET_PUSH_CONFIG => {
@@ -112,7 +111,7 @@ async fn handle_unary_request<H: RequestHandler>(
                     .handler
                     .get_push_config(params, req)
                     .await
-                    .and_then(|r| compat_json_value(&r)),
+                    .and_then(|r| protojson_value(&r)),
                 Err(e) => Err(parse_error(e)),
             }
         }
@@ -122,7 +121,7 @@ async fn handle_unary_request<H: RequestHandler>(
                     .handler
                     .list_push_configs(params, req)
                     .await
-                    .and_then(|r| compat_json_value(&r.configs)),
+                    .and_then(|r| protojson_value(&r)),
                 Err(e) => Err(parse_error(e)),
             }
         }
@@ -219,17 +218,8 @@ fn protojson_stream(
 
 fn parse_create_push_config_request(
     raw_params: Value,
-) -> Result<CreateTaskPushNotificationConfigRequest, String> {
-    match protojson_conv::from_value::<CreateTaskPushNotificationConfigRequest>(raw_params.clone())
-    {
-        Ok(req) => Ok(req),
-        Err(protojson_error) => serde_json::from_value::<CreateTaskPushNotificationConfigRequest>(
-            raw_params,
-        )
-        .map_err(|serde_error| {
-            format!("{protojson_error}; nested request parse failed: {serde_error}")
-        }),
-    }
+) -> Result<TaskPushNotificationConfig, String> {
+    protojson_conv::from_value::<TaskPushNotificationConfig>(raw_params).map_err(|e| e.to_string())
 }
 
 fn parse_error(e: impl std::fmt::Display) -> A2AError {
@@ -250,6 +240,8 @@ mod tests {
     use a2a_pb::protojson_conv;
     use axum::body::Body;
     use axum::http::Request;
+
+    use crate::test_util::install_crypto_provider;
     use futures::stream::BoxStream;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -309,6 +301,7 @@ mod tests {
     }
 
     fn make_push_app() -> axum::Router {
+        install_crypto_provider();
         let handler = Arc::new(
             DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
                 .with_push_config_store(InMemoryPushConfigStore::new()),
@@ -447,27 +440,25 @@ mod tests {
         let result =
             serde_json::from_value::<TaskPushNotificationConfig>(resp.result.unwrap()).unwrap();
         assert_eq!(result.task_id, "t1");
-        assert_eq!(result.config.id.as_deref(), Some("cfg1"));
-        assert_eq!(result.config.url, "http://example.com/callback");
+        assert_eq!(result.id.as_deref(), Some("cfg1"));
+        assert_eq!(result.url, "http://example.com/callback");
     }
 
     #[tokio::test]
-    async fn test_create_push_config_accepts_nested_config_object() {
+    async fn test_create_push_config_accepts_flat_config_object() {
         let app = make_push_app();
         let params = serde_json::json!({
             "taskId": "t1",
-            "config": {
-                "id": "cfg1",
-                "url": "http://example.com/callback"
-            }
+            "id": "cfg1",
+            "url": "http://example.com/callback"
         });
         let resp = post_jsonrpc(app, methods::CREATE_PUSH_CONFIG, params).await;
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
         let result =
             serde_json::from_value::<TaskPushNotificationConfig>(resp.result.unwrap()).unwrap();
         assert_eq!(result.task_id, "t1");
-        assert_eq!(result.config.id.as_deref(), Some("cfg1"));
-        assert_eq!(result.config.url, "http://example.com/callback");
+        assert_eq!(result.id.as_deref(), Some("cfg1"));
+        assert_eq!(result.url, "http://example.com/callback");
     }
 
     #[tokio::test]
@@ -490,9 +481,9 @@ mod tests {
         let resp = post_jsonrpc(app, methods::LIST_PUSH_CONFIGS, params).await;
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
         let result =
-            serde_json::from_value::<Vec<TaskPushNotificationConfig>>(resp.result.unwrap())
+            serde_json::from_value::<ListTaskPushNotificationConfigsResponse>(resp.result.unwrap())
                 .unwrap();
-        assert!(result.is_empty());
+        assert!(result.configs.is_empty());
     }
 
     #[tokio::test]

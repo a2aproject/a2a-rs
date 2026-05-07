@@ -56,12 +56,10 @@ fn sample_push_config(id: &str) -> TaskPushNotificationConfig {
     TaskPushNotificationConfig {
         task_id: "task-1".to_string(),
         tenant: None,
-        config: PushNotificationConfig {
-            url: "https://example.com/callback".to_string(),
-            id: Some(id.to_string()),
-            token: Some("tok-1".to_string()),
-            authentication: None,
-        },
+        url: "https://example.com/callback".to_string(),
+        id: Some(id.to_string()),
+        token: Some("tok-1".to_string()),
+        authentication: None,
     }
 }
 
@@ -338,16 +336,12 @@ impl RequestHandler for TestHandler {
     async fn create_push_config(
         &self,
         _params: &ServiceParams,
-        req: CreateTaskPushNotificationConfigRequest,
+        req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         if req.task_id == "missing" {
             return Err(A2AError::task_not_found(&req.task_id));
         }
-        Ok(TaskPushNotificationConfig {
-            task_id: req.task_id,
-            config: req.config,
-            tenant: req.tenant,
-        })
+        Ok(req)
     }
 
     async fn get_push_config(
@@ -361,12 +355,10 @@ impl RequestHandler for TestHandler {
         Ok(TaskPushNotificationConfig {
             task_id: req.task_id,
             tenant: req.tenant,
-            config: PushNotificationConfig {
-                url: "https://example.com/callback".to_string(),
-                id: Some(req.id),
-                token: Some("tok-1".to_string()),
-                authentication: None,
-            },
+            url: "https://example.com/callback".to_string(),
+            id: Some(req.id),
+            token: Some("tok-1".to_string()),
+            authentication: None,
         })
     }
 
@@ -481,17 +473,10 @@ async fn slimrpc_transport_end_to_end() {
     assert_eq!(canceled.status.state, TaskState::Canceled);
 
     let created = transport
-        .create_push_config(
-            &ServiceParams::new(),
-            &CreateTaskPushNotificationConfigRequest {
-                task_id: "task-1".to_string(),
-                config: sample_push_config("cfg-1").config,
-                tenant: None,
-            },
-        )
+        .create_push_config(&ServiceParams::new(), &sample_push_config("cfg-1"))
         .await
         .unwrap();
-    assert_eq!(created.config.id.as_deref(), Some("cfg-1"));
+    assert_eq!(created.id.as_deref(), Some("cfg-1"));
 
     let fetched = transport
         .get_push_config(
@@ -504,7 +489,7 @@ async fn slimrpc_transport_end_to_end() {
         )
         .await
         .unwrap();
-    assert_eq!(fetched.config.id.as_deref(), Some("cfg-1"));
+    assert_eq!(fetched.id.as_deref(), Some("cfg-1"));
 
     let configs = transport
         .list_push_configs(
@@ -608,10 +593,9 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
         transport
             .create_push_config(
                 &ServiceParams::new(),
-                &CreateTaskPushNotificationConfigRequest {
+                &TaskPushNotificationConfig {
                     task_id: "missing".to_string(),
-                    config: sample_push_config("cfg-1").config,
-                    tenant: None,
+                    ..sample_push_config("cfg-1")
                 },
             )
             .await

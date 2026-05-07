@@ -5,7 +5,7 @@ use a2a_pb::protojson_conv;
 use serde_json::Value;
 
 pub(crate) fn serialize_create_task_push_notification_config_request(
-    request: &CreateTaskPushNotificationConfigRequest,
+    request: &TaskPushNotificationConfig,
 ) -> Result<Value, A2AError> {
     serde_json::to_value(request).map_err(|error| {
         A2AError::internal(format!(
@@ -55,47 +55,33 @@ mod tests {
     fn sample_task_push_config() -> TaskPushNotificationConfig {
         TaskPushNotificationConfig {
             task_id: "t1".into(),
-            config: PushNotificationConfig {
-                url: "https://example.invalid/webhook".into(),
-                id: Some("cfg1".into()),
-                token: Some("token-1".into()),
-                authentication: Some(AuthenticationInfo {
-                    scheme: "Bearer".into(),
-                    credentials: Some("secret".into()),
-                }),
-            },
+            url: "https://example.invalid/webhook".into(),
+            id: Some("cfg1".into()),
+            token: Some("token-1".into()),
+            authentication: Some(AuthenticationInfo {
+                scheme: "Bearer".into(),
+                credentials: Some("secret".into()),
+            }),
             tenant: Some("tenant-1".into()),
         }
     }
 
-    fn sample_create_task_push_config_request() -> CreateTaskPushNotificationConfigRequest {
-        let config = sample_task_push_config();
-        CreateTaskPushNotificationConfigRequest {
-            task_id: config.task_id.clone(),
-            config: config.config,
-            tenant: config.tenant,
-        }
-    }
-
     #[test]
-    fn serializes_nested_create_task_push_config_request_shape() {
-        let payload = serialize_create_task_push_notification_config_request(
-            &sample_create_task_push_config_request(),
-        )
-        .unwrap();
+    fn serializes_flat_create_task_push_config_request() {
+        let payload =
+            serialize_create_task_push_notification_config_request(&sample_task_push_config())
+                .unwrap();
 
         assert_eq!(
             payload,
             json!({
                 "taskId": "t1",
-                "config": {
-                    "id": "cfg1",
-                    "url": "https://example.invalid/webhook",
-                    "token": "token-1",
-                    "authentication": {
-                        "scheme": "Bearer",
-                        "credentials": "secret"
-                    }
+                "id": "cfg1",
+                "url": "https://example.invalid/webhook",
+                "token": "token-1",
+                "authentication": {
+                    "scheme": "Bearer",
+                    "credentials": "secret"
                 },
                 "tenant": "tenant-1"
             })

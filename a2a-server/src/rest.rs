@@ -18,7 +18,6 @@ use std::collections::HashMap;
 
 use crate::handler::RequestHandler;
 use crate::middleware::ServiceParams;
-use crate::push_config_compat::json_value as compat_json_value;
 use crate::sse;
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
@@ -304,7 +303,7 @@ async fn handle_create_push_config<H: RequestHandler>(
     };
     let params = ServiceParams::new();
     match state.handler.create_push_config(&params, req).await {
-        Ok(resp) => serde_json_response(&resp),
+        Ok(resp) => protojson_json_response(&resp),
         Err(e) => rest_error_response(e),
     }
 }
@@ -320,7 +319,7 @@ async fn handle_get_push_config<H: RequestHandler>(
         tenant: None,
     };
     match state.handler.get_push_config(&params, req).await {
-        Ok(resp) => serde_json_response(&resp),
+        Ok(resp) => protojson_json_response(&resp),
         Err(e) => rest_error_response(e),
     }
 }
@@ -338,7 +337,7 @@ async fn handle_list_push_configs<H: RequestHandler>(
         tenant: None,
     };
     match state.handler.list_push_configs(&params, req).await {
-        Ok(resp) => serde_json_response(&resp.configs),
+        Ok(resp) => protojson_json_response(&resp),
         Err(e) => rest_error_response(e),
     }
 }
@@ -379,13 +378,6 @@ fn protojson_json_response<T: ProtoJsonPayload>(value: &T) -> axum::response::Re
     }
 }
 
-fn serde_json_response<T: Serialize>(value: &T) -> axum::response::Response {
-    match compat_json_value(value) {
-        Ok(payload) => Json(payload).into_response(),
-        Err(e) => rest_error_response(e),
-    }
-}
-
 fn protojson_stream(
     stream: BoxStream<'static, Result<StreamResponse, A2AError>>,
 ) -> BoxStream<'static, Result<Value, A2AError>> {
@@ -401,27 +393,20 @@ fn protojson_stream(
 fn parse_create_push_config_request(
     task_id: String,
     raw_config: Value,
-) -> Result<CreateTaskPushNotificationConfigRequest, String> {
-    match protojson_conv::from_value::<PushNotificationConfig>(raw_config.clone()) {
-        Ok(config) => Ok(CreateTaskPushNotificationConfigRequest {
-            task_id,
-            config,
-            tenant: None,
-        }),
-        Err(protojson_error) => {
-            let req = serde_json::from_value::<CreateTaskPushNotificationConfigRequest>(raw_config)
-                .map_err(|serde_error| {
-                    format!("{protojson_error}; nested request parse failed: {serde_error}")
-                })?;
-            if req.task_id != task_id {
-                return Err(format!(
+) -> Result<TaskPushNotificationConfig, String> {
+    protojson_conv::from_value::<TaskPushNotificationConfig>(raw_config)
+        .map_err(|e| e.to_string())
+        .and_then(|mut config| {
+            if !config.task_id.is_empty() && config.task_id != task_id {
+                Err(format!(
                     "taskId in request body ({}) did not match task id in path ({task_id})",
-                    req.task_id
-                ));
+                    config.task_id
+                ))
+            } else {
+                config.task_id = task_id;
+                Ok(config)
             }
-            Ok(req)
-        }
-    }
+        })
 }
 
 fn rest_payload_error_response(error: impl std::fmt::Display) -> axum::response::Response {
@@ -508,6 +493,8 @@ mod tests {
     use axum::http::Request;
     use futures::stream::BoxStream;
     use http_body_util::BodyExt;
+
+    use crate::test_util::install_crypto_provider;
     use tower::ServiceExt;
 
     struct EchoExecutor;
@@ -565,6 +552,7 @@ mod tests {
     }
 
     fn make_push_app() -> axum::Router {
+        install_crypto_provider();
         let handler = Arc::new(
             DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
                 .with_push_config_store(InMemoryPushConfigStore::new()),
@@ -688,19 +676,17 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let payload = serde_json::from_slice::<TaskPushNotificationConfig>(&body).unwrap();
         assert_eq!(payload.task_id, "t1");
-        assert_eq!(payload.config.id.as_deref(), Some("cfg1"));
-        assert_eq!(payload.config.url, "http://example.com/callback");
+        assert_eq!(payload.id.as_deref(), Some("cfg1"));
+        assert_eq!(payload.url, "http://example.com/callback");
     }
 
     #[tokio::test]
-    async fn test_create_push_config_accepts_nested_request_body() {
+    async fn test_create_push_config_accepts_flat_request_body() {
         let app = make_push_app();
         let body = serde_json::json!({
             "taskId": "t1",
-            "config": {
-                "id": "cfg1",
-                "url": "http://example.com/callback"
-            }
+            "id": "cfg1",
+            "url": "http://example.com/callback"
         });
         let req = Request::builder()
             .uri("/tasks/t1/pushNotificationConfigs")
@@ -713,8 +699,8 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let payload = serde_json::from_slice::<TaskPushNotificationConfig>(&body).unwrap();
         assert_eq!(payload.task_id, "t1");
-        assert_eq!(payload.config.id.as_deref(), Some("cfg1"));
-        assert_eq!(payload.config.url, "http://example.com/callback");
+        assert_eq!(payload.id.as_deref(), Some("cfg1"));
+        assert_eq!(payload.url, "http://example.com/callback");
     }
 
     #[tokio::test]
@@ -722,9 +708,7 @@ mod tests {
         let app = make_push_app();
         let body = serde_json::json!({
             "taskId": "other-task",
-            "config": {
-                "url": "http://example.com/callback"
-            }
+            "url": "http://example.com/callback"
         });
         let req = Request::builder()
             .uri("/tasks/t1/pushNotificationConfigs")
@@ -890,8 +874,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let payload = serde_json::from_slice::<Vec<TaskPushNotificationConfig>>(&body).unwrap();
-        assert!(payload.is_empty());
+        let payload =
+            serde_json::from_slice::<ListTaskPushNotificationConfigsResponse>(&body).unwrap();
+        assert!(payload.configs.is_empty());
     }
 
     #[tokio::test]
@@ -938,8 +923,9 @@ mod tests {
         let list_resp = app.oneshot(list_req).await.unwrap();
         assert_eq!(list_resp.status(), StatusCode::OK);
         let body = list_resp.into_body().collect().await.unwrap().to_bytes();
-        let payload = serde_json::from_slice::<Vec<TaskPushNotificationConfig>>(&body).unwrap();
-        assert!(payload.is_empty());
+        let payload =
+            serde_json::from_slice::<ListTaskPushNotificationConfigsResponse>(&body).unwrap();
+        assert!(payload.configs.is_empty());
     }
 
     #[tokio::test]

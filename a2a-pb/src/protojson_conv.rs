@@ -3,11 +3,10 @@
 use std::fmt;
 
 use a2a::{
-    AgentCard, CancelTaskRequest, CreateTaskPushNotificationConfigRequest,
-    DeleteTaskPushNotificationConfigRequest, GetExtendedAgentCardRequest,
-    GetTaskPushNotificationConfigRequest, GetTaskRequest, ListTaskPushNotificationConfigsRequest,
-    ListTaskPushNotificationConfigsResponse, ListTasksRequest, ListTasksResponse,
-    PushNotificationConfig, SendMessageRequest, SendMessageResponse, StreamResponse,
+    AgentCard, CancelTaskRequest, DeleteTaskPushNotificationConfigRequest,
+    GetExtendedAgentCardRequest, GetTaskPushNotificationConfigRequest, GetTaskRequest,
+    ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
+    ListTasksRequest, ListTasksResponse, SendMessageRequest, SendMessageResponse, StreamResponse,
     SubscribeToTaskRequest, Task, TaskPushNotificationConfig,
 };
 use prost::Message;
@@ -169,11 +168,11 @@ impl_protojson_payload!(
     crate::pbconv::from_proto_list_task_push_notification_configs_request
 );
 impl_protojson_payload!(
-    CreateTaskPushNotificationConfigRequest,
+    TaskPushNotificationConfig,
     crate::proto::TaskPushNotificationConfig,
     crate::protojson::TaskPushNotificationConfig,
-    crate::pbconv::to_proto_create_task_push_notification_config_request,
-    crate::pbconv::from_proto_create_task_push_notification_config_request
+    crate::pbconv::to_proto_task_push_notification_config,
+    crate::pbconv::from_proto_task_push_notification_config
 );
 impl_protojson_payload!(
     Task,
@@ -189,29 +188,6 @@ impl_protojson_payload!(
     crate::pbconv::to_proto_list_tasks_response,
     crate::pbconv::from_proto_list_tasks_response
 );
-impl_protojson_payload!(
-    TaskPushNotificationConfig,
-    crate::proto::TaskPushNotificationConfig,
-    crate::protojson::TaskPushNotificationConfig,
-    crate::pbconv::to_proto_task_push_notification_config,
-    crate::pbconv::from_proto_task_push_notification_config
-);
-impl ProtoJsonPayload for PushNotificationConfig {
-    type Proto = crate::proto::TaskPushNotificationConfig;
-    type ProtoJson = crate::protojson::TaskPushNotificationConfig;
-
-    fn to_proto(value: &Self) -> Self::Proto {
-        crate::pbconv::to_proto_task_push_notification_config(&TaskPushNotificationConfig {
-            task_id: String::new(),
-            config: value.clone(),
-            tenant: None,
-        })
-    }
-
-    fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
-        Ok(crate::pbconv::from_proto_task_push_notification_config(value).config)
-    }
-}
 impl_protojson_payload!(
     ListTaskPushNotificationConfigsResponse,
     crate::proto::ListTaskPushNotificationConfigsResponse,

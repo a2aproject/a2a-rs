@@ -387,7 +387,7 @@ pub trait RequestHandler: Send + Sync + 'static {
     async fn create_push_config(
         &self,
         params: &ServiceParams,
-        req: CreateTaskPushNotificationConfigRequest,
+        req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError>;
 
     async fn get_push_config(
@@ -519,12 +519,17 @@ impl DefaultRequestHandler {
         let Some(config) = req
             .configuration
             .as_ref()
-            .and_then(|configuration| configuration.push_notification_config.clone())
+            .and_then(|configuration| configuration.task_push_notification_config.clone())
         else {
             return Ok(());
         };
 
-        self.push_config_store()?.save(task_id, config).await?;
+        let mut config = config;
+        config.task_id = task_id.to_string();
+        if config.tenant.is_none() {
+            config.tenant = req.tenant.clone();
+        }
+        self.push_config_store()?.save(config).await?;
         Ok(())
     }
 
@@ -724,17 +729,9 @@ impl RequestHandler for DefaultRequestHandler {
     async fn create_push_config(
         &self,
         _params: &ServiceParams,
-        req: CreateTaskPushNotificationConfigRequest,
+        req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        let saved = self
-            .push_config_store()?
-            .save(&req.task_id, req.config)
-            .await?;
-        Ok(TaskPushNotificationConfig {
-            task_id: req.task_id,
-            config: saved,
-            tenant: req.tenant,
-        })
+        self.push_config_store()?.save(req).await
     }
 
     async fn get_push_config(
@@ -742,12 +739,7 @@ impl RequestHandler for DefaultRequestHandler {
         _params: &ServiceParams,
         req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        let config = self.push_config_store()?.get(&req.task_id, &req.id).await?;
-        Ok(TaskPushNotificationConfig {
-            task_id: req.task_id,
-            config,
-            tenant: req.tenant,
-        })
+        self.push_config_store()?.get(&req.task_id, &req.id).await
     }
 
     async fn list_push_configs(
@@ -772,15 +764,7 @@ impl RequestHandler for DefaultRequestHandler {
         let next_page_token = (end < configs.len()).then(|| end.to_string());
 
         Ok(ListTaskPushNotificationConfigsResponse {
-            configs: configs[start..end]
-                .iter()
-                .cloned()
-                .map(|config| TaskPushNotificationConfig {
-                    task_id: req.task_id.clone(),
-                    config,
-                    tenant: req.tenant.clone(),
-                })
-                .collect(),
+            configs: configs[start..end].to_vec(),
             next_page_token,
         })
     }
@@ -812,6 +796,8 @@ mod tests {
     use crate::executor::ExecutorContext;
     use crate::push::InMemoryPushConfigStore;
     use crate::task_store::InMemoryTaskStore;
+
+    use crate::test_util::install_crypto_provider;
     use axum::{
         Router,
         body::Bytes,
@@ -1276,7 +1262,7 @@ mod tests {
                     message,
                     configuration: Some(SendMessageConfiguration {
                         accepted_output_modes: None,
-                        push_notification_config: None,
+                        task_push_notification_config: None,
                         history_length: None,
                         return_immediately: Some(true),
                     }),
@@ -1343,14 +1329,12 @@ mod tests {
         let result = handler
             .create_push_config(
                 &params,
-                CreateTaskPushNotificationConfigRequest {
+                TaskPushNotificationConfig {
                     task_id: "t1".into(),
-                    config: PushNotificationConfig {
-                        url: "http://example.com".into(),
-                        id: None,
-                        token: None,
-                        authentication: None,
-                    },
+                    url: "http://example.com".into(),
+                    id: None,
+                    token: None,
+                    authentication: None,
                     tenant: None,
                 },
             )
@@ -1360,38 +1344,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_push_config_crud_with_store() {
+        install_crypto_provider();
         let handler = make_handler_with_push_configs();
         let params = ServiceParams::new();
 
         let created = handler
             .create_push_config(
                 &params,
-                CreateTaskPushNotificationConfigRequest {
+                TaskPushNotificationConfig {
                     task_id: "t1".into(),
-                    config: PushNotificationConfig {
-                        url: "https://example.com/first".into(),
-                        id: Some("cfg-1".into()),
-                        token: None,
-                        authentication: None,
-                    },
+                    url: "https://example.com/first".into(),
+                    id: Some("cfg-1".into()),
+                    token: None,
+                    authentication: None,
                     tenant: Some("tenant-a".into()),
                 },
             )
             .await
             .unwrap();
-        assert_eq!(created.config.id.as_deref(), Some("cfg-1"));
+        assert_eq!(created.id.as_deref(), Some("cfg-1"));
 
         handler
             .create_push_config(
                 &params,
-                CreateTaskPushNotificationConfigRequest {
+                TaskPushNotificationConfig {
                     task_id: "t1".into(),
-                    config: PushNotificationConfig {
-                        url: "https://example.com/second".into(),
-                        id: Some("cfg-2".into()),
-                        token: None,
-                        authentication: None,
-                    },
+                    url: "https://example.com/second".into(),
+                    id: Some("cfg-2".into()),
+                    token: None,
+                    authentication: None,
                     tenant: Some("tenant-a".into()),
                 },
             )
@@ -1409,7 +1390,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(fetched.config.url, "https://example.com/first");
+        assert_eq!(fetched.url, "https://example.com/first");
 
         let first_page = handler
             .list_push_configs(
@@ -1424,7 +1405,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first_page.configs.len(), 1);
-        assert_eq!(first_page.configs[0].config.id.as_deref(), Some("cfg-1"));
+        assert_eq!(first_page.configs[0].id.as_deref(), Some("cfg-1"));
         assert_eq!(first_page.next_page_token.as_deref(), Some("1"));
 
         let default_page = handler
@@ -1467,11 +1448,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining.configs.len(), 1);
-        assert_eq!(remaining.configs[0].config.id.as_deref(), Some("cfg-2"));
+        assert_eq!(remaining.configs[0].id.as_deref(), Some("cfg-2"));
     }
 
     #[tokio::test]
     async fn test_send_message_request_push_config_delivers_webhooks() {
+        install_crypto_provider();
         let (url, mut receiver, shutdown_tx, server) = start_push_webhook().await;
         let handler = make_push_delivery_handler();
         let params = ServiceParams::new();
@@ -1486,7 +1468,8 @@ mod tests {
                     message,
                     configuration: Some(SendMessageConfiguration {
                         accepted_output_modes: None,
-                        push_notification_config: Some(PushNotificationConfig {
+                        task_push_notification_config: Some(TaskPushNotificationConfig {
+                            task_id: String::new(),
                             url: url.clone(),
                             id: Some("cfg-request".into()),
                             token: Some("notify-token".into()),
@@ -1494,6 +1477,7 @@ mod tests {
                                 scheme: "bearer".into(),
                                 credentials: Some("secret-token".into()),
                             }),
+                            tenant: None,
                         }),
                         history_length: None,
                         return_immediately: None,
@@ -1521,7 +1505,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(saved.config.url, url);
+        assert_eq!(saved.url, url);
 
         let first = next_push(&mut receiver).await;
         assert_eq!(first.authorization.as_deref(), Some("Bearer secret-token"));
@@ -1551,6 +1535,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_message_stored_push_config_delivers_webhooks() {
+        install_crypto_provider();
         let (url, mut receiver, shutdown_tx, server) = start_push_webhook().await;
         let handler = make_push_delivery_handler();
         let params = ServiceParams::new();
@@ -1558,14 +1543,12 @@ mod tests {
         handler
             .create_push_config(
                 &params,
-                CreateTaskPushNotificationConfigRequest {
+                TaskPushNotificationConfig {
                     task_id: "t-push-stored".into(),
-                    config: PushNotificationConfig {
-                        url: url.clone(),
-                        id: Some("cfg-stored".into()),
-                        token: Some("stored-token".into()),
-                        authentication: None,
-                    },
+                    url: url.clone(),
+                    id: Some("cfg-stored".into()),
+                    token: Some("stored-token".into()),
+                    authentication: None,
                     tenant: None,
                 },
             )
@@ -1640,6 +1623,7 @@ mod tests {
 
     #[test]
     fn test_with_push_config_store_enables_push_capability() {
+        install_crypto_provider();
         let handler = make_handler_with_push_configs();
         assert_eq!(handler.capabilities.push_notifications, Some(true));
     }

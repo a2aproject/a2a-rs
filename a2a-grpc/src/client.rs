@@ -176,7 +176,7 @@ impl Transport for GrpcTransport {
     async fn create_push_config(
         &self,
         params: &ServiceParams,
-        req: &CreateTaskPushNotificationConfigRequest,
+        req: &TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let proto_req = pbconv::to_proto_create_task_push_notification_config_request(req);
         let grpc_req = make_request(params, proto_req);

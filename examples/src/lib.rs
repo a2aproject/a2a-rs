@@ -175,7 +175,7 @@ pub fn wait_req(text: &str) -> SendMessageRequest {
         configuration: Some(SendMessageConfiguration {
             return_immediately: Some(true),
             accepted_output_modes: None,
-            push_notification_config: None,
+            task_push_notification_config: None,
             history_length: None,
         }),
         metadata: None,
