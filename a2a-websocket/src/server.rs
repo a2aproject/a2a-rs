@@ -673,6 +673,10 @@ mod tests {
 
     struct StubHandler;
 
+    struct FatalHandler;
+
+    struct PendingStreamHandler;
+
     fn sample_task(id: &str) -> Task {
         Task {
             id: id.into(),
@@ -855,6 +859,188 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl RequestHandler for FatalHandler {
+        async fn send_message(
+            &self,
+            _params: &ServiceParams,
+            _req: SendMessageRequest,
+        ) -> Result<SendMessageResponse, A2AError> {
+            Err(A2AError::new(error_code::PARSE_ERROR, "fatal parse"))
+        }
+
+        async fn send_streaming_message(
+            &self,
+            _params: &ServiceParams,
+            _req: SendMessageRequest,
+        ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+            unreachable!()
+        }
+
+        async fn get_task(
+            &self,
+            _params: &ServiceParams,
+            _req: GetTaskRequest,
+        ) -> Result<Task, A2AError> {
+            unreachable!()
+        }
+
+        async fn list_tasks(
+            &self,
+            _params: &ServiceParams,
+            _req: ListTasksRequest,
+        ) -> Result<ListTasksResponse, A2AError> {
+            unreachable!()
+        }
+
+        async fn cancel_task(
+            &self,
+            _params: &ServiceParams,
+            _req: CancelTaskRequest,
+        ) -> Result<Task, A2AError> {
+            unreachable!()
+        }
+
+        async fn subscribe_to_task(
+            &self,
+            _params: &ServiceParams,
+            _req: SubscribeToTaskRequest,
+        ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+            unreachable!()
+        }
+
+        async fn create_push_config(
+            &self,
+            _params: &ServiceParams,
+            _req: CreateTaskPushNotificationConfigRequest,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            unreachable!()
+        }
+
+        async fn get_push_config(
+            &self,
+            _params: &ServiceParams,
+            _req: GetTaskPushNotificationConfigRequest,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            unreachable!()
+        }
+
+        async fn list_push_configs(
+            &self,
+            _params: &ServiceParams,
+            _req: ListTaskPushNotificationConfigsRequest,
+        ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
+            unreachable!()
+        }
+
+        async fn delete_push_config(
+            &self,
+            _params: &ServiceParams,
+            _req: DeleteTaskPushNotificationConfigRequest,
+        ) -> Result<(), A2AError> {
+            unreachable!()
+        }
+
+        async fn get_extended_agent_card(
+            &self,
+            _params: &ServiceParams,
+            _req: GetExtendedAgentCardRequest,
+        ) -> Result<AgentCard, A2AError> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
+    impl RequestHandler for PendingStreamHandler {
+        async fn send_message(
+            &self,
+            _params: &ServiceParams,
+            _req: SendMessageRequest,
+        ) -> Result<SendMessageResponse, A2AError> {
+            unreachable!()
+        }
+
+        async fn send_streaming_message(
+            &self,
+            _params: &ServiceParams,
+            _req: SendMessageRequest,
+        ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        async fn get_task(
+            &self,
+            _params: &ServiceParams,
+            _req: GetTaskRequest,
+        ) -> Result<Task, A2AError> {
+            unreachable!()
+        }
+
+        async fn list_tasks(
+            &self,
+            _params: &ServiceParams,
+            _req: ListTasksRequest,
+        ) -> Result<ListTasksResponse, A2AError> {
+            unreachable!()
+        }
+
+        async fn cancel_task(
+            &self,
+            _params: &ServiceParams,
+            _req: CancelTaskRequest,
+        ) -> Result<Task, A2AError> {
+            unreachable!()
+        }
+
+        async fn subscribe_to_task(
+            &self,
+            _params: &ServiceParams,
+            _req: SubscribeToTaskRequest,
+        ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+            unreachable!()
+        }
+
+        async fn create_push_config(
+            &self,
+            _params: &ServiceParams,
+            _req: CreateTaskPushNotificationConfigRequest,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            unreachable!()
+        }
+
+        async fn get_push_config(
+            &self,
+            _params: &ServiceParams,
+            _req: GetTaskPushNotificationConfigRequest,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            unreachable!()
+        }
+
+        async fn list_push_configs(
+            &self,
+            _params: &ServiceParams,
+            _req: ListTaskPushNotificationConfigsRequest,
+        ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
+            unreachable!()
+        }
+
+        async fn delete_push_config(
+            &self,
+            _params: &ServiceParams,
+            _req: DeleteTaskPushNotificationConfigRequest,
+        ) -> Result<(), A2AError> {
+            unreachable!()
+        }
+
+        async fn get_extended_agent_card(
+            &self,
+            _params: &ServiceParams,
+            _req: GetExtendedAgentCardRequest,
+        ) -> Result<AgentCard, A2AError> {
+            unreachable!()
+        }
+    }
+
     #[test]
     fn websocket_router_constructs_with_request_handler() {
         let _router = websocket_router(make_handler());
@@ -1025,6 +1211,21 @@ mod tests {
         let error = response.error.unwrap();
         assert_eq!(error.error_type, error_types::INVALID_REQUEST);
         assert_eq!(error.message, "bad request");
+    }
+
+    #[tokio::test]
+    async fn cancel_all_streams_signals_and_drains_registry() {
+        let streams: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        streams.lock().await.insert("s1".into(), tx1);
+        streams.lock().await.insert("s2".into(), tx2);
+
+        cancel_all_streams(&streams).await;
+
+        rx1.await.unwrap();
+        rx2.await.unwrap();
+        assert!(streams.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -1340,6 +1541,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_unary_request_emits_close_for_fatal_error() {
+        let handler = Arc::new(FatalHandler);
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+        let req = SendMessageRequest {
+            message: sample_message(),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+
+        run_unary_request(
+            methods::SEND_MESSAGE.into(),
+            "req-fatal".into(),
+            protojson_conv::to_value(&req).unwrap(),
+            ServiceParams::new(),
+            handler,
+            out_tx,
+        )
+        .await;
+
+        let response = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(response.id.as_deref(), Some("req-fatal"));
+        assert_eq!(response.error.unwrap().error_type, error_types::JSON_PARSE);
+
+        match out_rx.recv().await.unwrap() {
+            OutboundMessage::Close { code, reason } => {
+                assert_eq!(code, close_codes::PROTOCOL_ERROR);
+                assert_eq!(reason, "fatal parse");
+            }
+            OutboundMessage::Frame(_) => panic!("expected close after fatal error"),
+        }
+    }
+
+    #[tokio::test]
     async fn run_streaming_request_emits_event_and_stream_end() {
         let handler = Arc::new(StubHandler);
         let streams = Arc::new(Mutex::new(HashMap::new()));
@@ -1367,6 +1602,48 @@ mod tests {
         assert!(event.event.is_some());
         let end = frame_payload(out_rx.recv().await.unwrap());
         assert_eq!(end.stream_end, Some(true));
+        assert!(streams.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_streaming_request_emits_stream_end_after_cancellation() {
+        let handler = Arc::new(PendingStreamHandler);
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+        let req = SendMessageRequest {
+            message: sample_message(),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        let task_streams = streams.clone();
+
+        let join = tokio::spawn(run_streaming_request(
+            methods::SEND_STREAMING_MESSAGE.into(),
+            "stream-cancel".into(),
+            protojson_conv::to_value(&req).unwrap(),
+            ServiceParams::new(),
+            handler,
+            task_streams,
+            out_tx,
+        ));
+
+        let cancel_tx = loop {
+            if let Some(tx) = streams.lock().await.remove("stream-cancel") {
+                break tx;
+            }
+            tokio::task::yield_now().await;
+        };
+        cancel_tx.send(()).unwrap();
+
+        let end = tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = frame_payload(end);
+        assert_eq!(response.id.as_deref(), Some("stream-cancel"));
+        assert_eq!(response.stream_end, Some(true));
+        join.await.unwrap();
         assert!(streams.lock().await.is_empty());
     }
 
