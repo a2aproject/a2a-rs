@@ -189,7 +189,7 @@ async fn run_connection<H: RequestHandler>(
                 match incoming {
                     Ok(frame) => match frame.opcode {
                         OpCode::Close => break,
-                        OpCode::Text => {
+                        OpCode::Text
                             if !handle_text_frame(
                                 &frame.payload,
                                 &handler,
@@ -197,11 +197,11 @@ async fn run_connection<H: RequestHandler>(
                                 &streams,
                                 &out_tx,
                             )
-                            .await
-                            {
-                                break;
-                            }
+                            .await =>
+                        {
+                            break;
                         }
+                        OpCode::Text => {}
                         OpCode::Binary => {
                             let _ = ws
                                 .write_frame(Frame::close(
@@ -994,6 +994,37 @@ mod tests {
         let value = serde_json::json!({ "bogus": true });
         let err: A2AError = parse_params::<SendMessageRequest>(value).unwrap_err();
         assert_eq!(err.code, error_code::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn send_outbound_drops_message_when_receiver_is_closed() {
+        let (out_tx, out_rx) = mpsc::channel(1);
+        drop(out_rx);
+
+        send_outbound(
+            &out_tx,
+            OutboundMessage::Frame(serialize_response(WsResponseEnvelope::stream_end("req"))),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn send_error_emits_error_envelope() {
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+
+        send_error(
+            &out_tx,
+            Some("req-1".into()),
+            error_types::INVALID_REQUEST,
+            "bad request",
+        )
+        .await;
+
+        let response = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(response.id.as_deref(), Some("req-1"));
+        let error = response.error.unwrap();
+        assert_eq!(error.error_type, error_types::INVALID_REQUEST);
+        assert_eq!(error.message, "bad request");
     }
 
     #[tokio::test]
