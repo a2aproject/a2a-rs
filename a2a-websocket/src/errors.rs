@@ -12,9 +12,7 @@ pub fn a2a_error_to_ws_error(err: &A2AError) -> WsErrorObject {
     let error_type = match err.code {
         error_code::TASK_NOT_FOUND => error_types::TASK_NOT_FOUND,
         error_code::TASK_NOT_CANCELABLE => error_types::TASK_NOT_CANCELABLE,
-        error_code::PUSH_NOTIFICATION_NOT_SUPPORTED => {
-            error_types::PUSH_NOTIFICATION_NOT_SUPPORTED
-        }
+        error_code::PUSH_NOTIFICATION_NOT_SUPPORTED => error_types::PUSH_NOTIFICATION_NOT_SUPPORTED,
         error_code::UNSUPPORTED_OPERATION => error_types::UNSUPPORTED_OPERATION,
         error_code::CONTENT_TYPE_NOT_SUPPORTED => error_types::CONTENT_TYPE_NOT_SUPPORTED,
         error_code::INVALID_AGENT_RESPONSE => error_types::INVALID_AGENT_RESPONSE,
@@ -41,9 +39,7 @@ pub fn ws_error_to_a2a_error(err: &WsErrorObject) -> A2AError {
     let code = match err.error_type.as_str() {
         error_types::TASK_NOT_FOUND => error_code::TASK_NOT_FOUND,
         error_types::TASK_NOT_CANCELABLE => error_code::TASK_NOT_CANCELABLE,
-        error_types::PUSH_NOTIFICATION_NOT_SUPPORTED => {
-            error_code::PUSH_NOTIFICATION_NOT_SUPPORTED
-        }
+        error_types::PUSH_NOTIFICATION_NOT_SUPPORTED => error_code::PUSH_NOTIFICATION_NOT_SUPPORTED,
         error_types::UNSUPPORTED_OPERATION => error_code::UNSUPPORTED_OPERATION,
         error_types::CONTENT_TYPE_NOT_SUPPORTED => error_code::CONTENT_TYPE_NOT_SUPPORTED,
         error_types::INVALID_AGENT_RESPONSE => error_code::INVALID_AGENT_RESPONSE,
@@ -121,7 +117,10 @@ mod tests {
         for (code, expected) in cases {
             let err = A2AError::new(code, "msg");
             let ws = a2a_error_to_ws_error(&err);
-            assert_eq!(ws.error_type, expected, "code {code} should map to {expected}");
+            assert_eq!(
+                ws.error_type, expected,
+                "code {code} should map to {expected}"
+            );
             assert_eq!(ws.message, "msg");
         }
     }
@@ -129,7 +128,10 @@ mod tests {
     #[test]
     fn unknown_a2a_code_collapses_to_internal_error_type() {
         let err = A2AError::new(99999, "boom");
-        assert_eq!(a2a_error_to_ws_error(&err).error_type, error_types::INTERNAL);
+        assert_eq!(
+            a2a_error_to_ws_error(&err).error_type,
+            error_types::INTERNAL
+        );
     }
 
     #[test]
@@ -141,8 +143,32 @@ mod tests {
                 error_code::TASK_NOT_CANCELABLE,
             ),
             (
+                error_types::PUSH_NOTIFICATION_NOT_SUPPORTED,
+                error_code::PUSH_NOTIFICATION_NOT_SUPPORTED,
+            ),
+            (
                 error_types::UNSUPPORTED_OPERATION,
                 error_code::UNSUPPORTED_OPERATION,
+            ),
+            (
+                error_types::CONTENT_TYPE_NOT_SUPPORTED,
+                error_code::CONTENT_TYPE_NOT_SUPPORTED,
+            ),
+            (
+                error_types::INVALID_AGENT_RESPONSE,
+                error_code::INVALID_AGENT_RESPONSE,
+            ),
+            (
+                error_types::EXTENDED_CARD_NOT_CONFIGURED,
+                error_code::EXTENDED_CARD_NOT_CONFIGURED,
+            ),
+            (
+                error_types::EXTENSION_SUPPORT_REQUIRED,
+                error_code::EXTENSION_SUPPORT_REQUIRED,
+            ),
+            (
+                error_types::VERSION_NOT_SUPPORTED,
+                error_code::VERSION_NOT_SUPPORTED,
             ),
             (error_types::JSON_PARSE, error_code::PARSE_ERROR),
             (error_types::INVALID_REQUEST, error_code::INVALID_REQUEST),

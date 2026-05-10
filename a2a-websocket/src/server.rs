@@ -29,6 +29,7 @@ use crate::common::{
 use crate::errors::{a2a_error_to_ws_error, close_code_for_fatal};
 
 const SEC_WEBSOCKET_PROTOCOL: &str = "sec-websocket-protocol";
+const OUTBOUND_BUFFER_CAPACITY: usize = 64;
 
 /// Shared state for the WebSocket binding handler.
 pub struct WebSocketState<H: RequestHandler> {
@@ -116,10 +117,7 @@ fn capture_connection_params(headers: &HeaderMap) -> ServiceParams {
             continue;
         }
         if let Ok(value) = value.to_str() {
-            params
-                .entry(key)
-                .or_default()
-                .push(value.to_string());
+            params.entry(key).or_default().push(value.to_string());
         }
     }
     params
@@ -158,7 +156,7 @@ async fn run_connection<H: RequestHandler>(
     ws.set_auto_pong(true);
     let mut ws = FragmentCollector::new(ws);
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutboundMessage>();
+    let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(OUTBOUND_BUFFER_CAPACITY);
     let streams: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
     let connection_params = Arc::new(connection_params);
 
@@ -198,7 +196,9 @@ async fn run_connection<H: RequestHandler>(
                                 &connection_params,
                                 &streams,
                                 &out_tx,
-                            ) {
+                            )
+                            .await
+                            {
                                 break;
                             }
                         }
@@ -236,12 +236,12 @@ async fn cancel_all_streams(streams: &StreamRegistry) {
 
 /// Returns `false` if the connection should be terminated (fatal protocol
 /// error already signalled to the client via the outbound channel).
-fn handle_text_frame<H: RequestHandler>(
+async fn handle_text_frame<H: RequestHandler>(
     payload: &[u8],
     handler: &Arc<H>,
     connection_params: &Arc<ServiceParams>,
     streams: &StreamRegistry,
-    out_tx: &mpsc::UnboundedSender<OutboundMessage>,
+    out_tx: &mpsc::Sender<OutboundMessage>,
 ) -> bool {
     let envelope: WsRequestEnvelope = match serde_json::from_slice(payload) {
         Ok(envelope) => envelope,
@@ -256,14 +256,16 @@ fn handle_text_frame<H: RequestHandler>(
                         details: None,
                     },
                 ))),
-            );
+            )
+            .await;
             send_outbound(
                 out_tx,
                 OutboundMessage::Close {
                     code: close_codes::PROTOCOL_ERROR,
                     reason: "JSON parse error".to_string(),
                 },
-            );
+            )
+            .await;
             return false;
         }
     };
@@ -274,28 +276,18 @@ fn handle_text_frame<H: RequestHandler>(
             None,
             error_types::INVALID_REQUEST,
             "request id is required",
-        );
+        )
+        .await;
         return true;
     }
 
     if envelope.cancel_stream.unwrap_or(false) {
         let id = envelope.id.clone();
         let streams = streams.clone();
-        let out_tx = out_tx.clone();
         tokio::spawn(async move {
-            let canceled = {
-                let mut map = streams.lock().await;
-                map.remove(&id)
-            };
-            if let Some(tx) = canceled {
+            if let Some(tx) = streams.lock().await.remove(&id) {
                 let _ = tx.send(());
             }
-            send_outbound(
-                &out_tx,
-                OutboundMessage::Frame(serialize_response(
-                    WsResponseEnvelope::stream_end(id.clone()),
-                )),
-            );
         });
         return true;
     }
@@ -306,7 +298,8 @@ fn handle_text_frame<H: RequestHandler>(
             Some(envelope.id),
             error_types::INVALID_REQUEST,
             "method is required",
-        );
+        )
+        .await;
         return true;
     };
 
@@ -316,7 +309,8 @@ fn handle_text_frame<H: RequestHandler>(
             Some(envelope.id),
             error_types::METHOD_NOT_FOUND,
             &format!("method not found: {method}"),
-        );
+        )
+        .await;
         return true;
     }
 
@@ -375,17 +369,16 @@ async fn run_unary_request<H: RequestHandler>(
     raw_params: Value,
     params: ServiceParams,
     handler: Arc<H>,
-    out_tx: mpsc::UnboundedSender<OutboundMessage>,
+    out_tx: mpsc::Sender<OutboundMessage>,
 ) {
     let result = dispatch_unary(&method, &handler, &params, raw_params).await;
     match result {
         Ok(value) => {
             send_outbound(
                 &out_tx,
-                OutboundMessage::Frame(serialize_response(WsResponseEnvelope::result(
-                    id, value,
-                ))),
-            );
+                OutboundMessage::Frame(serialize_response(WsResponseEnvelope::result(id, value))),
+            )
+            .await;
         }
         Err(err) => {
             let error_obj = a2a_error_to_ws_error(&err);
@@ -395,7 +388,8 @@ async fn run_unary_request<H: RequestHandler>(
                     Some(id),
                     error_obj,
                 ))),
-            );
+            )
+            .await;
             if let Some(code) = close_code_for_fatal(&err) {
                 send_outbound(
                     &out_tx,
@@ -403,7 +397,8 @@ async fn run_unary_request<H: RequestHandler>(
                         code,
                         reason: err.message,
                     },
-                );
+                )
+                .await;
             }
         }
     }
@@ -472,7 +467,7 @@ async fn run_streaming_request<H: RequestHandler>(
     params: ServiceParams,
     handler: Arc<H>,
     streams: StreamRegistry,
-    out_tx: mpsc::UnboundedSender<OutboundMessage>,
+    out_tx: mpsc::Sender<OutboundMessage>,
 ) {
     let stream_result: Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> =
         match method.as_str() {
@@ -496,7 +491,8 @@ async fn run_streaming_request<H: RequestHandler>(
                     Some(id),
                     a2a_error_to_ws_error(&err),
                 ))),
-            );
+            )
+            .await;
             return;
         }
     };
@@ -513,8 +509,8 @@ async fn run_streaming_request<H: RequestHandler>(
             biased;
 
             _ = &mut cancel_rx => {
-                // Cancellation: stop sending events and emit streamEnd. The
-                // streamEnd response itself is emitted by the cancel handler.
+                // Cancellation: stop sending events; the final streamEnd is
+                // emitted below once the stream has been removed from the registry.
                 break;
             }
 
@@ -528,7 +524,8 @@ async fn run_streaming_request<H: RequestHandler>(
                                 OutboundMessage::Frame(serialize_response(
                                     WsResponseEnvelope::event(id.clone(), value),
                                 )),
-                            );
+                            )
+                            .await;
                         }
                         Err(err) => {
                             send_outbound(
@@ -541,7 +538,8 @@ async fn run_streaming_request<H: RequestHandler>(
                                         ))),
                                     ),
                                 )),
-                            );
+                            )
+                            .await;
                             errored = true;
                             break;
                         }
@@ -555,7 +553,8 @@ async fn run_streaming_request<H: RequestHandler>(
                                     a2a_error_to_ws_error(&err),
                                 ),
                             )),
-                        );
+                        )
+                        .await;
                         errored = true;
                         break;
                     }
@@ -573,7 +572,8 @@ async fn run_streaming_request<H: RequestHandler>(
         send_outbound(
             &out_tx,
             OutboundMessage::Frame(serialize_response(WsResponseEnvelope::stream_end(id))),
-        );
+        )
+        .await;
     }
 }
 
@@ -601,14 +601,14 @@ fn serialize_response(resp: WsResponseEnvelope) -> String {
     })
 }
 
-fn send_outbound(out_tx: &mpsc::UnboundedSender<OutboundMessage>, message: OutboundMessage) {
-    if out_tx.send(message).is_err() {
+async fn send_outbound(out_tx: &mpsc::Sender<OutboundMessage>, message: OutboundMessage) {
+    if out_tx.send(message).await.is_err() {
         tracing::debug!("outbound channel closed; dropping message");
     }
 }
 
-fn send_error(
-    out_tx: &mpsc::UnboundedSender<OutboundMessage>,
+async fn send_error(
+    out_tx: &mpsc::Sender<OutboundMessage>,
     id: Option<String>,
     error_type: &str,
     message: &str,
@@ -621,10 +621,7 @@ fn send_error(
             details: None,
         },
     );
-    send_outbound(
-        out_tx,
-        OutboundMessage::Frame(serialize_response(envelope)),
-    );
+    send_outbound(out_tx, OutboundMessage::Frame(serialize_response(envelope))).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +641,7 @@ mod tests {
     use super::*;
     use a2a_server::handler::DefaultRequestHandler;
     use a2a_server::task_store::InMemoryTaskStore;
+    use async_trait::async_trait;
     use axum::http::HeaderValue;
 
     struct NoopExecutor;
@@ -671,6 +669,190 @@ mod tests {
             NoopExecutor,
             InMemoryTaskStore::new(),
         ))
+    }
+
+    struct StubHandler;
+
+    fn sample_task(id: &str) -> Task {
+        Task {
+            id: id.into(),
+            context_id: "ctx-1".into(),
+            status: TaskStatus {
+                state: TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        }
+    }
+
+    fn sample_message() -> Message {
+        Message {
+            message_id: "msg-1".into(),
+            context_id: None,
+            task_id: None,
+            role: Role::User,
+            parts: vec![Part::text("hello")],
+            metadata: None,
+            extensions: None,
+            reference_task_ids: None,
+        }
+    }
+
+    fn sample_agent_card() -> AgentCard {
+        AgentCard {
+            name: "stub".into(),
+            description: "stub agent".into(),
+            version: "1.0.0".into(),
+            supported_interfaces: vec![AgentInterface::new(
+                "ws://example.test/a2a/ws",
+                TRANSPORT_PROTOCOL_WEBSOCKET,
+            )],
+            capabilities: AgentCapabilities::default(),
+            default_input_modes: vec!["text/plain".into()],
+            default_output_modes: vec!["text/plain".into()],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        }
+    }
+
+    fn frame_payload(message: OutboundMessage) -> WsResponseEnvelope {
+        match message {
+            OutboundMessage::Frame(text) => serde_json::from_str(&text).unwrap(),
+            OutboundMessage::Close { .. } => panic!("expected frame"),
+        }
+    }
+
+    #[async_trait]
+    impl RequestHandler for StubHandler {
+        async fn send_message(
+            &self,
+            _params: &ServiceParams,
+            _req: SendMessageRequest,
+        ) -> Result<SendMessageResponse, A2AError> {
+            Ok(SendMessageResponse::Task(sample_task("send")))
+        }
+
+        async fn send_streaming_message(
+            &self,
+            _params: &ServiceParams,
+            _req: SendMessageRequest,
+        ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: "stream".into(),
+                    context_id: "ctx-1".into(),
+                    status: TaskStatus {
+                        state: TaskState::Working,
+                        message: None,
+                        timestamp: None,
+                    },
+                    metadata: None,
+                }),
+            )])))
+        }
+
+        async fn get_task(
+            &self,
+            _params: &ServiceParams,
+            req: GetTaskRequest,
+        ) -> Result<Task, A2AError> {
+            Ok(sample_task(&req.id))
+        }
+
+        async fn list_tasks(
+            &self,
+            _params: &ServiceParams,
+            _req: ListTasksRequest,
+        ) -> Result<ListTasksResponse, A2AError> {
+            Ok(ListTasksResponse {
+                tasks: vec![sample_task("listed")],
+                next_page_token: "".into(),
+                page_size: 1,
+                total_size: 1,
+            })
+        }
+
+        async fn cancel_task(
+            &self,
+            _params: &ServiceParams,
+            req: CancelTaskRequest,
+        ) -> Result<Task, A2AError> {
+            Ok(sample_task(&req.id))
+        }
+
+        async fn subscribe_to_task(
+            &self,
+            _params: &ServiceParams,
+            _req: SubscribeToTaskRequest,
+        ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+            Ok(Box::pin(futures::stream::iter(vec![Err(
+                A2AError::internal("stream failed"),
+            )])))
+        }
+
+        async fn create_push_config(
+            &self,
+            _params: &ServiceParams,
+            req: CreateTaskPushNotificationConfigRequest,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            Ok(TaskPushNotificationConfig {
+                task_id: req.task_id,
+                config: req.config,
+                tenant: req.tenant,
+            })
+        }
+
+        async fn get_push_config(
+            &self,
+            _params: &ServiceParams,
+            req: GetTaskPushNotificationConfigRequest,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            Ok(TaskPushNotificationConfig {
+                task_id: req.task_id,
+                config: PushNotificationConfig {
+                    url: "https://hook.example.test".into(),
+                    id: Some(req.id),
+                    token: None,
+                    authentication: None,
+                },
+                tenant: req.tenant,
+            })
+        }
+
+        async fn list_push_configs(
+            &self,
+            _params: &ServiceParams,
+            _req: ListTaskPushNotificationConfigsRequest,
+        ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
+            Ok(ListTaskPushNotificationConfigsResponse {
+                configs: vec![],
+                next_page_token: None,
+            })
+        }
+
+        async fn delete_push_config(
+            &self,
+            _params: &ServiceParams,
+            _req: DeleteTaskPushNotificationConfigRequest,
+        ) -> Result<(), A2AError> {
+            Ok(())
+        }
+
+        async fn get_extended_agent_card(
+            &self,
+            _params: &ServiceParams,
+            _req: GetExtendedAgentCardRequest,
+        ) -> Result<AgentCard, A2AError> {
+            Ok(sample_agent_card())
+        }
     }
 
     #[test]
@@ -773,14 +955,8 @@ mod tests {
     #[test]
     fn combine_service_params_per_request_overrides_connection_scope() {
         let mut connection: ServiceParams = HashMap::new();
-        connection.insert(
-            "a2a-version".into(),
-            vec!["1.0".into()],
-        );
-        connection.insert(
-            "x-keep".into(),
-            vec!["preserve".into()],
-        );
+        connection.insert("a2a-version".into(), vec!["1.0".into()]);
+        connection.insert("x-keep".into(), vec!["preserve".into()]);
 
         let envelope = WsRequestEnvelope {
             id: "req".into(),
@@ -798,7 +974,10 @@ mod tests {
             combined.get("a2a-version").unwrap(),
             &vec!["1.5".to_string()]
         );
-        assert_eq!(combined.get("x-keep").unwrap(), &vec!["preserve".to_string()]);
+        assert_eq!(
+            combined.get("x-keep").unwrap(),
+            &vec!["preserve".to_string()]
+        );
         assert_eq!(combined.get("x-extra").unwrap(), &vec!["added".to_string()]);
     }
 
@@ -815,5 +994,400 @@ mod tests {
         let value = serde_json::json!({ "bogus": true });
         let err: A2AError = parse_params::<SendMessageRequest>(value).unwrap_err();
         assert_eq!(err.code, error_code::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn handle_text_frame_invalid_json_sends_error_and_close() {
+        let handler = Arc::new(StubHandler);
+        let params = Arc::new(ServiceParams::new());
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+
+        assert!(!handle_text_frame(b"{not json", &handler, &params, &streams, &out_tx,).await);
+
+        let envelope = frame_payload(out_rx.try_recv().unwrap());
+        assert_eq!(envelope.id, None);
+        assert_eq!(envelope.error.unwrap().error_type, error_types::JSON_PARSE);
+
+        match out_rx.try_recv().unwrap() {
+            OutboundMessage::Close { code, reason } => {
+                assert_eq!(code, close_codes::PROTOCOL_ERROR);
+                assert_eq!(reason, "JSON parse error");
+            }
+            OutboundMessage::Frame(_) => panic!("expected close frame"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_text_frame_empty_id_sends_invalid_request() {
+        let handler = Arc::new(StubHandler);
+        let params = Arc::new(ServiceParams::new());
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+        let envelope = WsRequestEnvelope {
+            id: "".into(),
+            method: Some(methods::SEND_MESSAGE.into()),
+            ..Default::default()
+        };
+        let payload = serde_json::to_vec(&envelope).unwrap();
+
+        assert!(handle_text_frame(&payload, &handler, &params, &streams, &out_tx,).await);
+
+        let response = frame_payload(out_rx.try_recv().unwrap());
+        assert_eq!(response.id, None);
+        assert_eq!(
+            response.error.unwrap().error_type,
+            error_types::INVALID_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_text_frame_missing_method_sends_invalid_request() {
+        let handler = Arc::new(StubHandler);
+        let params = Arc::new(ServiceParams::new());
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+        let envelope = WsRequestEnvelope {
+            id: "req-1".into(),
+            ..Default::default()
+        };
+        let payload = serde_json::to_vec(&envelope).unwrap();
+
+        assert!(handle_text_frame(&payload, &handler, &params, &streams, &out_tx,).await);
+
+        let response = frame_payload(out_rx.try_recv().unwrap());
+        assert_eq!(response.id.as_deref(), Some("req-1"));
+        assert_eq!(
+            response.error.unwrap().error_type,
+            error_types::INVALID_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_text_frame_unknown_method_sends_method_not_found() {
+        let handler = Arc::new(StubHandler);
+        let params = Arc::new(ServiceParams::new());
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+        let envelope = WsRequestEnvelope {
+            id: "req-1".into(),
+            method: Some("Bogus".into()),
+            ..Default::default()
+        };
+        let payload = serde_json::to_vec(&envelope).unwrap();
+
+        assert!(handle_text_frame(&payload, &handler, &params, &streams, &out_tx,).await);
+
+        let response = frame_payload(out_rx.try_recv().unwrap());
+        assert_eq!(response.id.as_deref(), Some("req-1"));
+        assert_eq!(
+            response.error.unwrap().error_type,
+            error_types::METHOD_NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_text_frame_cancel_stream_removes_registered_stream() {
+        let handler = Arc::new(StubHandler);
+        let params = Arc::new(ServiceParams::new());
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        streams.lock().await.insert("stream-1".into(), cancel_tx);
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+        let envelope = WsRequestEnvelope {
+            id: "stream-1".into(),
+            cancel_stream: Some(true),
+            ..Default::default()
+        };
+        let payload = serde_json::to_vec(&envelope).unwrap();
+
+        assert!(handle_text_frame(&payload, &handler, &params, &streams, &out_tx,).await);
+
+        cancel_rx.await.unwrap();
+        assert!(out_rx.try_recv().is_err());
+        assert!(streams.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_text_frame_cancel_unknown_stream_does_not_emit_stream_end() {
+        let handler = Arc::new(StubHandler);
+        let params = Arc::new(ServiceParams::new());
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+        let envelope = WsRequestEnvelope {
+            id: "missing-stream".into(),
+            cancel_stream: Some(true),
+            ..Default::default()
+        };
+        let payload = serde_json::to_vec(&envelope).unwrap();
+
+        assert!(handle_text_frame(&payload, &handler, &params, &streams, &out_tx,).await);
+
+        assert!(out_rx.try_recv().is_err());
+        assert!(streams.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_unary_covers_all_supported_methods() {
+        let handler = Arc::new(StubHandler);
+        let params = ServiceParams::new();
+        let msg_req = SendMessageRequest {
+            message: sample_message(),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+
+        let send = dispatch_unary(
+            methods::SEND_MESSAGE,
+            &handler,
+            &params,
+            protojson_conv::to_value(&msg_req).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(send.get("task").is_some());
+
+        let task = dispatch_unary(
+            methods::GET_TASK,
+            &handler,
+            &params,
+            protojson_conv::to_value(&GetTaskRequest {
+                id: "task-1".into(),
+                history_length: None,
+                tenant: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(task["id"], "task-1");
+
+        let listed = dispatch_unary(
+            methods::LIST_TASKS,
+            &handler,
+            &params,
+            protojson_conv::to_value(&ListTasksRequest {
+                context_id: None,
+                status: None,
+                page_size: None,
+                page_token: None,
+                history_length: None,
+                status_timestamp_after: None,
+                include_artifacts: None,
+                tenant: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed["totalSize"], 1);
+
+        let canceled = dispatch_unary(
+            methods::CANCEL_TASK,
+            &handler,
+            &params,
+            protojson_conv::to_value(&CancelTaskRequest {
+                id: "cancel-1".into(),
+                metadata: None,
+                tenant: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(canceled["id"], "cancel-1");
+
+        let push_config = PushNotificationConfig {
+            url: "https://hook.example.test".into(),
+            id: Some("cfg-1".into()),
+            token: None,
+            authentication: None,
+        };
+        let created = dispatch_unary(
+            methods::CREATE_PUSH_CONFIG,
+            &handler,
+            &params,
+            protojson_conv::to_value(&CreateTaskPushNotificationConfigRequest {
+                task_id: "task-1".into(),
+                config: push_config,
+                tenant: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created["taskId"], "task-1");
+
+        let got = dispatch_unary(
+            methods::GET_PUSH_CONFIG,
+            &handler,
+            &params,
+            protojson_conv::to_value(&GetTaskPushNotificationConfigRequest {
+                task_id: "task-1".into(),
+                id: "cfg-1".into(),
+                tenant: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got["taskId"], "task-1");
+
+        let push_list = dispatch_unary(
+            methods::LIST_PUSH_CONFIGS,
+            &handler,
+            &params,
+            protojson_conv::to_value(&ListTaskPushNotificationConfigsRequest {
+                task_id: "task-1".into(),
+                page_size: None,
+                page_token: None,
+                tenant: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(push_list.as_object().is_some());
+
+        let deleted = dispatch_unary(
+            methods::DELETE_PUSH_CONFIG,
+            &handler,
+            &params,
+            protojson_conv::to_value(&DeleteTaskPushNotificationConfigRequest {
+                task_id: "task-1".into(),
+                id: "cfg-1".into(),
+                tenant: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(deleted.as_object().unwrap().is_empty());
+
+        let card = dispatch_unary(
+            methods::GET_EXTENDED_AGENT_CARD,
+            &handler,
+            &params,
+            protojson_conv::to_value(&GetExtendedAgentCardRequest { tenant: None }).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(card["name"], "stub");
+    }
+
+    #[tokio::test]
+    async fn dispatch_unary_unknown_method_returns_method_not_found() {
+        let handler = Arc::new(StubHandler);
+        let err = dispatch_unary("Nope", &handler, &ServiceParams::new(), Value::Null)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, error_code::METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn run_unary_request_emits_error_for_bad_params() {
+        let handler = Arc::new(StubHandler);
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+
+        run_unary_request(
+            methods::GET_TASK.into(),
+            "req-1".into(),
+            serde_json::json!({"notId": true}),
+            ServiceParams::new(),
+            handler,
+            out_tx,
+        )
+        .await;
+
+        let response = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(response.id.as_deref(), Some("req-1"));
+        assert_eq!(
+            response.error.unwrap().error_type,
+            error_types::INVALID_PARAMS
+        );
+    }
+
+    #[tokio::test]
+    async fn run_streaming_request_emits_event_and_stream_end() {
+        let handler = Arc::new(StubHandler);
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+        let req = SendMessageRequest {
+            message: sample_message(),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+
+        run_streaming_request(
+            methods::SEND_STREAMING_MESSAGE.into(),
+            "stream-1".into(),
+            protojson_conv::to_value(&req).unwrap(),
+            ServiceParams::new(),
+            handler,
+            streams.clone(),
+            out_tx,
+        )
+        .await;
+
+        let event = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(event.id.as_deref(), Some("stream-1"));
+        assert!(event.event.is_some());
+        let end = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(end.stream_end, Some(true));
+        assert!(streams.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_streaming_request_emits_error_for_stream_item_error() {
+        let handler = Arc::new(StubHandler);
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+
+        run_streaming_request(
+            methods::SUBSCRIBE_TO_TASK.into(),
+            "sub-1".into(),
+            protojson_conv::to_value(&SubscribeToTaskRequest {
+                id: "task-1".into(),
+                tenant: None,
+            })
+            .unwrap(),
+            ServiceParams::new(),
+            handler,
+            streams.clone(),
+            out_tx,
+        )
+        .await;
+
+        let response = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(response.id.as_deref(), Some("sub-1"));
+        assert_eq!(response.error.unwrap().error_type, error_types::INTERNAL);
+        assert!(out_rx.try_recv().is_err());
+        assert!(streams.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_streaming_request_emits_error_for_bad_stream_params() {
+        let handler = Arc::new(StubHandler);
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+
+        run_streaming_request(
+            methods::SEND_STREAMING_MESSAGE.into(),
+            "stream-1".into(),
+            serde_json::json!({"bad": true}),
+            ServiceParams::new(),
+            handler,
+            streams,
+            out_tx,
+        )
+        .await;
+
+        let response = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(
+            response.error.unwrap().error_type,
+            error_types::INVALID_PARAMS
+        );
     }
 }
