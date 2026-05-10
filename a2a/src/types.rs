@@ -1102,6 +1102,21 @@ mod tests {
     }
 
     #[test]
+    fn test_part_deserialize_uses_first_present_content_field() {
+        let json = r#"{"text": "hello", "raw": "AQID", "url": "https://example.com"}"#;
+        let part: Part = serde_json::from_str(json).unwrap();
+        assert_eq!(part.content, PartContent::Text("hello".into()));
+    }
+
+    #[test]
+    fn test_part_deserialize_ignores_non_object_metadata() {
+        let json = r#"{"text": "hello", "metadata": "not-an-object"}"#;
+        let part: Part = serde_json::from_str(json).unwrap();
+        assert_eq!(part.as_text(), Some("hello"));
+        assert_eq!(part.metadata, None);
+    }
+
+    #[test]
     fn test_send_message_response_deserialize_missing_both_errors() {
         let json = r#"{"something": 1}"#;
         let result = serde_json::from_str::<SendMessageResponse>(json);
