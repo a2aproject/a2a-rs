@@ -1,21 +1,21 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // SPDX-License-Identifier: Apache-2.0
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use a2a::*;
 use a2a_client::transport::{ServiceParams, Transport, TransportFactory};
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use async_trait::async_trait;
-use fastwebsockets::{
-    FragmentCollector, Frame, OpCode, Payload, WebSocketError, handshake,
-};
+use fastwebsockets::{FragmentCollector, Frame, OpCode, Payload, WebSocketError, handshake};
 use futures::Stream;
 use futures::stream::BoxStream;
-use http::header::{CONNECTION, HOST, UPGRADE};
 use http::Request;
+use http::header::{CONNECTION, HOST, UPGRADE};
 use http_body_util::Empty;
 use hyper::body::Bytes;
 use hyper::upgrade::Upgraded;
@@ -23,12 +23,16 @@ use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
 
 use crate::common::{
     DEFAULT_MAX_FRAME_BYTES, SUBPROTOCOL, TRANSPORT_PROTOCOL_WEBSOCKET, WsRequestEnvelope,
     WsResponseEnvelope, methods, service_params_to_envelope,
 };
 use crate::errors::ws_error_to_a2a_error;
+
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const OUTBOUND_BUFFER_CAPACITY: usize = 64;
 
 #[derive(Debug)]
 enum OutboundClient {
@@ -58,14 +62,21 @@ impl Pending {
 }
 
 struct ConnectionInner {
-    outbound: mpsc::UnboundedSender<OutboundClient>,
+    outbound: mpsc::Sender<OutboundClient>,
     pending: Arc<Mutex<Pending>>,
 }
 
 impl ConnectionInner {
-    fn send_outbound(&self, message: OutboundClient) -> Result<(), A2AError> {
+    async fn send_outbound(&self, message: OutboundClient) -> Result<(), A2AError> {
         self.outbound
             .send(message)
+            .await
+            .map_err(|_| connection_closed_error(&self.pending))
+    }
+
+    fn try_send_outbound(&self, message: OutboundClient) -> Result<(), A2AError> {
+        self.outbound
+            .try_send(message)
             .map_err(|_| connection_closed_error(&self.pending))
     }
 
@@ -108,8 +119,8 @@ impl ConnectionInner {
         pending.streaming.remove(id);
     }
 
-    fn close(&self) {
-        let _ = self.outbound.send(OutboundClient::Close);
+    async fn close(&self) {
+        let _ = self.send_outbound(OutboundClient::Close).await;
     }
 }
 
@@ -135,14 +146,7 @@ impl WebSocketTransport {
         let endpoint = endpoint.into();
         let parsed = parse_endpoint(&endpoint)?;
 
-        let stream = TcpStream::connect((parsed.host.as_str(), parsed.port))
-            .await
-            .map_err(|err| {
-                A2AError::internal(format!(
-                    "failed to connect to {}:{}: {err}",
-                    parsed.host, parsed.port
-                ))
-            })?;
+        let stream = connect_tcp(&parsed.host, parsed.port).await?;
 
         let host_header = if uses_default_port(&parsed.scheme, parsed.port) {
             parsed.host.clone()
@@ -172,7 +176,7 @@ impl WebSocketTransport {
             ));
         }
 
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundClient>();
+        let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
         let pending = Arc::new(Mutex::new(Pending::default()));
         let inner = Arc::new(ConnectionInner {
             outbound: outbound_tx,
@@ -230,10 +234,13 @@ impl WebSocketTransport {
         };
 
         let receiver = self.inner.register_unary(&id)?;
-        self.inner.send_outbound(OutboundClient::Frame(
-            serde_json::to_string(&envelope)
-                .map_err(|err| A2AError::internal(format!("failed to serialize envelope: {err}")))?,
-        ))?;
+        self.inner
+            .send_outbound(OutboundClient::Frame(
+                serde_json::to_string(&envelope).map_err(|err| {
+                    A2AError::internal(format!("failed to serialize envelope: {err}"))
+                })?,
+            ))
+            .await?;
 
         match receiver.await {
             Ok(result) => result,
@@ -263,10 +270,13 @@ impl WebSocketTransport {
         };
 
         let receiver = self.inner.register_streaming(&id)?;
-        self.inner.send_outbound(OutboundClient::Frame(
-            serde_json::to_string(&envelope)
-                .map_err(|err| A2AError::internal(format!("failed to serialize envelope: {err}")))?,
-        ))?;
+        self.inner
+            .send_outbound(OutboundClient::Frame(
+                serde_json::to_string(&envelope).map_err(|err| {
+                    A2AError::internal(format!("failed to serialize envelope: {err}"))
+                })?,
+            ))
+            .await?;
 
         let stream = StreamingResponse {
             receiver,
@@ -276,6 +286,37 @@ impl WebSocketTransport {
             terminated: false,
         };
         Ok(Box::pin(stream))
+    }
+}
+
+async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, A2AError> {
+    connect_with_timeout(
+        TcpStream::connect((host, port)),
+        DEFAULT_CONNECT_TIMEOUT,
+        host,
+        port,
+    )
+    .await
+}
+
+async fn connect_with_timeout<F, T, E>(
+    connect: F,
+    timeout_duration: Duration,
+    host: &str,
+    port: u16,
+) -> Result<T, A2AError>
+where
+    F: Future<Output = Result<T, E>>,
+    E: Display,
+{
+    match timeout(timeout_duration, connect).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(err)) => Err(A2AError::internal(format!(
+            "failed to connect to {host}:{port}: {err}"
+        ))),
+        Err(_) => Err(A2AError::internal(format!(
+            "timed out connecting to {host}:{port} after {timeout_duration:?}"
+        ))),
     }
 }
 
@@ -316,7 +357,7 @@ impl Drop for StreamingResponse {
                 ..Default::default()
             };
             if let Ok(text) = serde_json::to_string(&envelope) {
-                let _ = self.inner.send_outbound(OutboundClient::Frame(text));
+                let _ = self.inner.try_send_outbound(OutboundClient::Frame(text));
             }
         } else {
             self.inner.deregister_streaming(&self.id);
@@ -371,9 +412,9 @@ fn parse_endpoint(endpoint: &str) -> Result<ParsedEndpoint, A2AError> {
 
     let (host, port) = match host_port.rsplit_once(':') {
         Some((host, port_str)) => {
-            let port: u16 = port_str.parse().map_err(|err| {
-                A2AError::internal(format!("invalid port '{port_str}': {err}"))
-            })?;
+            let port: u16 = port_str
+                .parse()
+                .map_err(|err| A2AError::internal(format!("invalid port '{port_str}': {err}")))?;
             (host.to_string(), port)
         }
         None => (host_port.to_string(), default_port(&scheme)),
@@ -400,7 +441,7 @@ fn uses_default_port(scheme: &str, port: u16) -> bool {
 
 async fn run_connection(
     mut ws: fastwebsockets::WebSocket<TokioIo<Upgraded>>,
-    mut outbound_rx: mpsc::UnboundedReceiver<OutboundClient>,
+    mut outbound_rx: mpsc::Receiver<OutboundClient>,
     pending: Arc<Mutex<Pending>>,
 ) {
     ws.set_max_message_size(DEFAULT_MAX_FRAME_BYTES);
@@ -582,7 +623,8 @@ impl Transport for WebSocketTransport {
         params: &ServiceParams,
         req: &CreateTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.call_unary(methods::CREATE_PUSH_CONFIG, params, req).await
+        self.call_unary(methods::CREATE_PUSH_CONFIG, params, req)
+            .await
     }
 
     async fn get_push_config(
@@ -598,7 +640,8 @@ impl Transport for WebSocketTransport {
         params: &ServiceParams,
         req: &ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        self.call_unary(methods::LIST_PUSH_CONFIGS, params, req).await
+        self.call_unary(methods::LIST_PUSH_CONFIGS, params, req)
+            .await
     }
 
     async fn delete_push_config(
@@ -621,7 +664,7 @@ impl Transport for WebSocketTransport {
     }
 
     async fn destroy(&self) -> Result<(), A2AError> {
-        self.inner.close();
+        self.inner.close().await;
         Ok(())
     }
 }
@@ -739,6 +782,56 @@ mod tests {
         assert!(!uses_default_port("ws", 9000));
     }
 
+    #[tokio::test]
+    async fn connect_with_timeout_returns_successful_connection_result() {
+        let result = connect_with_timeout(
+            futures::future::ready(Ok::<_, std::io::Error>(())),
+            Duration::from_secs(1),
+            "example.com",
+            80,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), ());
+    }
+
+    #[tokio::test]
+    async fn connect_with_timeout_maps_connection_errors() {
+        let result = connect_with_timeout(
+            futures::future::ready(Err::<(), _>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "refused",
+            ))),
+            Duration::from_secs(1),
+            "example.com",
+            443,
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.code, error_code::INTERNAL_ERROR);
+        assert!(err.message.contains("failed to connect to example.com:443"));
+        assert!(err.message.contains("refused"));
+    }
+
+    #[tokio::test]
+    async fn connect_with_timeout_fails_when_connection_attempt_hangs() {
+        let result = connect_with_timeout(
+            futures::future::pending::<Result<(), std::io::Error>>(),
+            Duration::from_millis(0),
+            "example.com",
+            80,
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.code, error_code::INTERNAL_ERROR);
+        assert!(
+            err.message
+                .contains("timed out connecting to example.com:80")
+        );
+    }
+
     #[test]
     fn response_subprotocol_matches_recognises_a2a_v1() {
         let response = http::Response::builder()
@@ -803,7 +896,7 @@ mod tests {
             .unwrap()
             .fail_all(A2AError::internal("dropped"));
 
-        let (outbound, _outbound_rx) = mpsc::unbounded_channel::<OutboundClient>();
+        let (outbound, _outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
         let inner = ConnectionInner {
             outbound,
             pending: pending.clone(),
@@ -814,6 +907,135 @@ mod tests {
 
         let streaming_err = inner.register_streaming("y").unwrap_err();
         assert_eq!(streaming_err.code, error_code::INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn connection_closed_error_uses_default_when_no_close_error_is_set() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let err = connection_closed_error(&pending);
+        assert_eq!(err.code, error_code::INTERNAL_ERROR);
+        assert_eq!(err.message, "websocket connection closed");
+    }
+
+    #[test]
+    fn connection_closed_error_preserves_recorded_close_error() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        pending
+            .lock()
+            .unwrap()
+            .fail_all(A2AError::invalid_request("bad close"));
+        let err = connection_closed_error(&pending);
+        assert_eq!(err.code, error_code::INVALID_REQUEST);
+        assert_eq!(err.message, "bad close");
+    }
+
+    #[tokio::test]
+    async fn connection_inner_send_outbound_succeeds_while_receiver_is_open() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (outbound, mut outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
+        let inner = ConnectionInner { outbound, pending };
+
+        inner
+            .send_outbound(OutboundClient::Frame("{}".into()))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outbound_rx.try_recv(),
+            Ok(OutboundClient::Frame(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn connection_inner_send_outbound_returns_close_error_when_receiver_is_dropped() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        pending.lock().unwrap().close_error = Some(A2AError::internal("closed earlier"));
+        let (outbound, outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
+        drop(outbound_rx);
+        let inner = ConnectionInner { outbound, pending };
+
+        let err = inner
+            .send_outbound(OutboundClient::Close)
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "closed earlier");
+    }
+
+    #[test]
+    fn register_and_deregister_streaming_updates_pending_map() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (outbound, _outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
+        let inner = ConnectionInner {
+            outbound,
+            pending: pending.clone(),
+        };
+
+        let _rx = inner.register_streaming("stream-1").unwrap();
+        assert!(pending.lock().unwrap().streaming.contains_key("stream-1"));
+
+        inner.deregister_streaming("stream-1");
+        assert!(!pending.lock().unwrap().streaming.contains_key("stream-1"));
+    }
+
+    #[tokio::test]
+    async fn connection_inner_close_sends_close_message() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (outbound, mut outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
+        let inner = ConnectionInner { outbound, pending };
+
+        inner.close().await;
+
+        assert!(matches!(outbound_rx.try_recv(), Ok(OutboundClient::Close)));
+    }
+
+    #[test]
+    fn streaming_response_drop_sends_cancel_when_not_terminated() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (outbound, mut outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
+        let inner = Arc::new(ConnectionInner {
+            outbound,
+            pending: pending.clone(),
+        });
+        let (tx, receiver) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
+        pending.lock().unwrap().streaming.insert("s1".into(), tx);
+
+        let stream = StreamingResponse {
+            receiver,
+            inner,
+            id: "s1".into(),
+            cancel_sent: false,
+            terminated: false,
+        };
+        drop(stream);
+
+        assert!(!pending.lock().unwrap().streaming.contains_key("s1"));
+        match outbound_rx.try_recv().unwrap() {
+            OutboundClient::Frame(text) => {
+                let envelope: WsRequestEnvelope = serde_json::from_str(&text).unwrap();
+                assert_eq!(envelope.id, "s1");
+                assert_eq!(envelope.cancel_stream, Some(true));
+            }
+            OutboundClient::Close => panic!("expected cancel frame"),
+        }
+    }
+
+    #[test]
+    fn streaming_response_drop_does_not_cancel_after_termination() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (outbound, mut outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
+        let inner = Arc::new(ConnectionInner { outbound, pending });
+        let (_tx, receiver) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
+
+        let stream = StreamingResponse {
+            receiver,
+            inner,
+            id: "s1".into(),
+            cancel_sent: false,
+            terminated: true,
+        };
+        drop(stream);
+
+        assert!(outbound_rx.try_recv().is_err());
     }
 
     #[test]
@@ -854,14 +1076,51 @@ mod tests {
     }
 
     #[test]
+    fn handle_incoming_text_dispatches_streaming_error_and_removes_sink() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
+        pending.lock().unwrap().streaming.insert("req-2".into(), tx);
+
+        let response = WsResponseEnvelope::error(
+            Some("req-2".into()),
+            crate::common::WsErrorObject {
+                error_type: crate::common::error_types::INVALID_PARAMS.to_string(),
+                message: "bad params".into(),
+                details: None,
+            },
+        );
+        let json = serde_json::to_vec(&response).unwrap();
+        handle_incoming_text(&json, &pending);
+
+        let err = rx.try_recv().unwrap().unwrap_err();
+        assert_eq!(err.code, error_code::INVALID_PARAMS);
+        assert!(!pending.lock().unwrap().streaming.contains_key("req-2"));
+    }
+
+    #[test]
+    fn handle_incoming_text_ignores_error_for_unknown_id() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let response = WsResponseEnvelope::error(
+            Some("unknown".into()),
+            crate::common::WsErrorObject {
+                error_type: crate::common::error_types::INTERNAL.to_string(),
+                message: "oops".into(),
+                details: None,
+            },
+        );
+        let json = serde_json::to_vec(&response).unwrap();
+
+        handle_incoming_text(&json, &pending);
+
+        assert!(pending.lock().unwrap().unary.is_empty());
+        assert!(pending.lock().unwrap().streaming.is_empty());
+    }
+
+    #[test]
     fn handle_incoming_text_routes_stream_event_to_streaming_sink() {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        pending
-            .lock()
-            .unwrap()
-            .streaming
-            .insert("req-2".into(), tx);
+        pending.lock().unwrap().streaming.insert("req-2".into(), tx);
 
         // Build a TaskStatusUpdateEvent to embed.
         let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
@@ -889,20 +1148,65 @@ mod tests {
     }
 
     #[test]
+    fn handle_incoming_text_routes_bad_stream_event_as_error() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
+        pending.lock().unwrap().streaming.insert("req-2".into(), tx);
+
+        let response = WsResponseEnvelope::event("req-2", serde_json::json!({"unknown": {}}));
+        let json = serde_json::to_vec(&response).unwrap();
+        handle_incoming_text(&json, &pending);
+
+        let err = rx.try_recv().unwrap().unwrap_err();
+        assert_eq!(err.code, error_code::INTERNAL_ERROR);
+        assert!(err.message.contains("failed to deserialize event"));
+        assert!(pending.lock().unwrap().streaming.contains_key("req-2"));
+    }
+
+    #[test]
+    fn handle_incoming_text_ignores_event_for_unknown_id() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let response = WsResponseEnvelope::event("missing", serde_json::json!({"unknown": {}}));
+        let json = serde_json::to_vec(&response).unwrap();
+
+        handle_incoming_text(&json, &pending);
+
+        assert!(pending.lock().unwrap().streaming.is_empty());
+    }
+
+    #[test]
     fn handle_incoming_text_stream_end_removes_streaming_sink() {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (tx, _rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        pending
-            .lock()
-            .unwrap()
-            .streaming
-            .insert("req-2".into(), tx);
+        pending.lock().unwrap().streaming.insert("req-2".into(), tx);
 
         let response = WsResponseEnvelope::stream_end("req-2");
         let json = serde_json::to_vec(&response).unwrap();
         handle_incoming_text(&json, &pending);
 
         assert!(!pending.lock().unwrap().streaming.contains_key("req-2"));
+    }
+
+    #[test]
+    fn handle_incoming_text_stream_end_unknown_id_is_noop() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let response = WsResponseEnvelope::stream_end("missing");
+        let json = serde_json::to_vec(&response).unwrap();
+
+        handle_incoming_text(&json, &pending);
+
+        assert!(pending.lock().unwrap().streaming.is_empty());
+    }
+
+    #[test]
+    fn handle_incoming_text_result_for_unknown_id_is_noop() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let response = WsResponseEnvelope::result("missing", serde_json::json!({"ok": true}));
+        let json = serde_json::to_vec(&response).unwrap();
+
+        handle_incoming_text(&json, &pending);
+
+        assert!(pending.lock().unwrap().unary.is_empty());
     }
 
     #[test]

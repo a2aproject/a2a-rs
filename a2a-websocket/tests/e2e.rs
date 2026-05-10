@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use a2a::*;
 use a2a_client::transport::{ServiceParams, Transport};
-use a2a_server::handler::DefaultRequestHandler;
-use a2a_server::task_store::InMemoryTaskStore;
 use a2a_server::AgentExecutor;
 use a2a_server::executor::ExecutorContext;
+use a2a_server::handler::DefaultRequestHandler;
+use a2a_server::task_store::InMemoryTaskStore;
 use a2a_websocket::{WebSocketTransport, server::websocket_router};
 use futures::stream::{self, BoxStream, StreamExt};
 use tokio::net::TcpListener;
@@ -41,10 +41,7 @@ impl AgentExecutor for EchoExecutor {
         Box::pin(stream::once(async move { Ok(StreamResponse::Task(task)) }))
     }
 
-    fn cancel(
-        &self,
-        ctx: ExecutorContext,
-    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let task = Task {
             id: ctx.task_id.clone(),
             context_id: ctx.context_id.clone(),
