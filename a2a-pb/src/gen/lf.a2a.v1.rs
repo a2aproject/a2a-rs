@@ -221,7 +221,7 @@ pub struct AgentInterface {
     pub url: ::prost::alloc::string::String,
     /// The protocol binding supported at this URL. This is an open form string, to be
     /// easily extended for other protocol bindings. The core ones officially
-    /// supported are `JSONRPC`, `GRPC` and `HTTP+JSON`.
+    /// supported are `JSONRPC`, `GRPC`, `HTTP+JSON`, `SLIMRPC`, and `WEBSOCKET`.
     #[prost(string, tag = "2")]
     pub protocol_binding: ::prost::alloc::string::String,
     /// Tenant ID to be used in the request when calling the agent.

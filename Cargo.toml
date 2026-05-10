@@ -63,10 +63,6 @@ http = "1"
 hyper = "1"
 axum-server = {version = "0.8", default-features = false }
 rustls = "0.23"
-fastwebsockets = { version = "0.10", features = ["upgrade", "with_axum"] }
-http-body-util = "0.1"
-hyper-util = { version = "0.1", features = ["tokio"] }
-bytes = "1"
 
 # gRPC + protobuf
 tonic = "0.14"
@@ -86,6 +82,12 @@ slim_service = { package = "agntcy-slim-service", version = "0.12.6", features =
 ] }
 slim_datapath = { package = "agntcy-slim-datapath", version = "0.18.2" }
 slim_auth = { package = "agntcy-slim-auth", version = "0.14.6" }
+
+# WebSocket
+fastwebsockets = { version = "0.10", features = ["upgrade", "with_axum"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+bytes = "1"
 
 # Utilities
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
