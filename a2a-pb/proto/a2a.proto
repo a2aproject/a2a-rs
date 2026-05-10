@@ -339,7 +339,7 @@ message AgentInterface {
   string url = 1 [(google.api.field_behavior) = REQUIRED];
   // The protocol binding supported at this URL. This is an open form string, to be
   // easily extended for other protocol bindings. The core ones officially
-  // supported are `JSONRPC`, `GRPC` and `HTTP+JSON`.
+  // supported are `JSONRPC`, `GRPC`, `HTTP+JSON`, `SLIMRPC`, and `WEBSOCKET`.
   string protocol_binding = 2 [(google.api.field_behavior) = REQUIRED];
   // Tenant ID to be used in the request when calling the agent.
   string tenant = 3;
