@@ -962,6 +962,23 @@ mod tests {
     }
 
     #[test]
+    fn connection_inner_try_send_outbound_returns_error_when_buffer_is_full() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (outbound, _outbound_rx) = mpsc::channel::<OutboundClient>(1);
+        let inner = ConnectionInner { outbound, pending };
+
+        inner
+            .try_send_outbound(OutboundClient::Frame("one".into()))
+            .unwrap();
+        let err = inner
+            .try_send_outbound(OutboundClient::Frame("two".into()))
+            .unwrap_err();
+
+        assert_eq!(err.code, error_code::INTERNAL_ERROR);
+        assert_eq!(err.message, "websocket connection closed");
+    }
+
+    #[test]
     fn register_and_deregister_streaming_updates_pending_map() {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (outbound, _outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
