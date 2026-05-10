@@ -9,7 +9,7 @@ use serde_json::Value;
 ///
 /// Matches the `protocolBinding` value defined in the A2A WebSocket binding
 /// specification (Section 1).
-pub const TRANSPORT_PROTOCOL_WEBSOCKET: &str = "WEBSOCKET";
+pub use a2a::TRANSPORT_PROTOCOL_WEBSOCKET;
 
 /// WebSocket sub-protocol negotiated via `Sec-WebSocket-Protocol`.
 pub const SUBPROTOCOL: &str = "a2a.v1";
@@ -142,11 +142,7 @@ pub struct WsResponseEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<Value>,
 
-    #[serde(
-        default,
-        rename = "streamEnd",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, rename = "streamEnd", skip_serializing_if = "Option::is_none")]
     pub stream_end: Option<bool>,
 }
 
@@ -203,9 +199,7 @@ impl WsResponseEnvelope {
 /// Convert a flat per-request `serviceParams` map (as carried on the wire)
 /// into the multi-valued `a2a_client::transport::ServiceParams` representation
 /// used internally.
-pub fn service_params_from_envelope(
-    map: &HashMap<String, String>,
-) -> HashMap<String, Vec<String>> {
+pub fn service_params_from_envelope(map: &HashMap<String, String>) -> HashMap<String, Vec<String>> {
     map.iter()
         .map(|(k, v)| (k.clone(), vec![v.clone()]))
         .collect()
@@ -269,9 +263,7 @@ mod tests {
             id: "req-1".into(),
             method: Some(methods::SEND_MESSAGE.into()),
             params: Some(serde_json::json!({"message": {"messageId": "m1"}})),
-            service_params: Some(HashMap::from([
-                ("a2a-version".into(), "1.0".into()),
-            ])),
+            service_params: Some(HashMap::from([("a2a-version".into(), "1.0".into())])),
             cancel_stream: None,
         };
         let value = serde_json::to_value(&req).unwrap();
@@ -352,7 +344,10 @@ mod tests {
     fn service_params_envelope_round_trip_preserves_key_value_pairs() {
         let mut map = HashMap::new();
         map.insert("a2a-version".to_string(), vec!["1.0".to_string()]);
-        map.insert("x-multi".to_string(), vec!["a".to_string(), "b".to_string()]);
+        map.insert(
+            "x-multi".to_string(),
+            vec!["a".to_string(), "b".to_string()],
+        );
 
         let envelope = service_params_to_envelope(&map).unwrap();
         assert_eq!(envelope.get("a2a-version"), Some(&"1.0".to_string()));
