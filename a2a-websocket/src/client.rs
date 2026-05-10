@@ -1055,6 +1055,47 @@ mod tests {
         assert!(outbound_rx.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn call_unary_raw_sends_envelope_and_routes_result() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (outbound, mut outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
+        let transport = WebSocketTransport {
+            inner: Arc::new(ConnectionInner {
+                outbound,
+                pending: pending.clone(),
+            }),
+        };
+        let params = HashMap::from([(
+            "x-trace".to_string(),
+            vec!["a".to_string(), "b".to_string()],
+        )]);
+
+        let task = tokio::spawn(async move {
+            transport
+                .call_unary_raw(methods::GET_TASK, &params, serde_json::json!({"id": "t1"}))
+                .await
+        });
+
+        let envelope = match outbound_rx.recv().await.unwrap() {
+            OutboundClient::Frame(text) => {
+                serde_json::from_str::<WsRequestEnvelope>(&text).unwrap()
+            }
+            OutboundClient::Close => panic!("expected request frame"),
+        };
+        assert_eq!(envelope.method.as_deref(), Some(methods::GET_TASK));
+        assert_eq!(envelope.params.unwrap()["id"], "t1");
+        assert_eq!(
+            envelope.service_params.unwrap().get("x-trace").unwrap(),
+            "a, b"
+        );
+
+        let tx = pending.lock().unwrap().unary.remove(&envelope.id).unwrap();
+        tx.send(Ok(serde_json::json!({"ok": true}))).unwrap();
+
+        let value = task.await.unwrap().unwrap();
+        assert_eq!(value["ok"], true);
+    }
+
     #[test]
     fn handle_incoming_text_dispatches_unary_result() {
         let pending = Arc::new(Mutex::new(Pending::default()));
