@@ -1,38 +1,47 @@
 # a2a-websocket
 
-WebSocket bindings for A2A v1 client and server implementations.
+WebSocket custom protocol bindings for A2A v1 client and server
+implementations.
 
-This crate is published as `a2a-websocket` and imported in Rust as `a2a_websocket`.
+This crate is published as `a2a-websocket` and imported in Rust as
+`a2a_websocket`.
 
 ## What It Provides
 
-- A `WebSocketTransport` implementing the [`a2a_client::Transport`] trait,
-  multiplexing requests and streaming responses over a single WebSocket
-  connection.
-- A `WebSocketTransportFactory` for use with `A2AClientFactory`.
-- An `axum::Router` builder that adapts an `a2a_server::RequestHandler` to
-  serve A2A operations over a persistent WebSocket connection, including
-  full bidirectional streaming and multiplexing.
-- Mapping between A2A error types/codes and the canonical
-  [WebSocket binding error type strings](../../websocket/websocket-spec.md).
+- `Transport` implementation for A2A over a single multiplexed WebSocket
+  connection (`WebSocketTransport`).
+- `TransportFactory` integration for agent cards that advertise
+  `WEBSOCKET` (`WebSocketTransportFactory`).
+- An `axum::Router` builder (`websocket_router`) that adapts an
+  `a2a_server::RequestHandler` to serve A2A operations over a
+  persistent WebSocket connection with bidirectional streaming.
+- Mapping between `a2a::A2AError` codes and the canonical WebSocket
+  binding error type strings, including close-code selection for
+  fatal failures.
 
-The wire format follows the [A2A WebSocket Custom Protocol Binding
-specification](../../websocket/websocket-spec.md):
+The wire format follows the A2A WebSocket Custom Protocol Binding
+specification:
 
 - Sub-protocol: `a2a.v1` (negotiated via `Sec-WebSocket-Protocol`).
 - All A2A messages travel as UTF-8 JSON envelopes inside text frames.
-- Streaming methods deliver `event` frames terminated by a `streamEnd: true`
-  sentinel; clients can cancel an in-progress stream by sending a
-  `cancelStream: true` envelope.
+- Streaming methods deliver `event` frames terminated by a
+  `streamEnd: true` sentinel; clients can cancel an in-progress stream
+  by sending a `cancelStream: true` envelope.
 
-## Endpoint Format
+## Agent Card Endpoint Format
 
-`WebSocketTransport::connect` and `WebSocketTransportFactory` accept
-`ws://host:port[/path]` endpoints. URLs that omit the scheme are normalized to
-`ws://`. `wss://` is reserved for a future TLS-enabled feature flag — for now,
+The existing `AgentInterface` model only carries a string target, so the
+WebSocket binding interprets `supportedInterfaces[].url` as an absolute
+WebSocket endpoint. Accepted forms are:
+
+- `ws://host:port[/path]`
+- `host:port[/path]` (normalized to `ws://`)
+
+`wss://` is reserved for a future TLS-enabled feature flag — for now,
 terminate TLS at a reverse proxy in front of the agent.
 
-The transport identifier in agent cards is `WEBSOCKET`.
+The transport identifier in agent cards is `WEBSOCKET`, exposed as the
+`a2a::TRANSPORT_PROTOCOL_WEBSOCKET` constant.
 
 ## Example: server
 
