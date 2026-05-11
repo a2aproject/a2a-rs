@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.2.7...a2a-server-lf-v0.3.0) - 2026-05-11
+
+### Fixed
+
+- use TaskPushNotificationConfig v1.0.0 ([#66](https://github.com/a2aproject/a2a-rs/pull/66))
+- align error code mappings with upstream spec fix (A2A#1627) ([#58](https://github.com/a2aproject/a2a-rs/pull/58))
+
 ## [0.2.7](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.2.6...a2a-server-lf-v0.2.7) - 2026-04-30
 
 ### Added
