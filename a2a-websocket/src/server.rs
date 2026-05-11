@@ -671,11 +671,27 @@ mod tests {
         ))
     }
 
-    struct StubHandler;
+    #[derive(Default)]
+    struct StubHandler {
+        send_message_error: Option<A2AError>,
+        streaming_pending: bool,
+    }
 
-    struct FatalHandler;
+    impl StubHandler {
+        fn fatal_send_message() -> Self {
+            Self {
+                send_message_error: Some(A2AError::new(error_code::PARSE_ERROR, "fatal parse")),
+                streaming_pending: false,
+            }
+        }
 
-    struct PendingStreamHandler;
+        fn pending_stream() -> Self {
+            Self {
+                send_message_error: None,
+                streaming_pending: true,
+            }
+        }
+    }
 
     fn sample_task(id: &str) -> Task {
         Task {
@@ -741,6 +757,10 @@ mod tests {
             _params: &ServiceParams,
             _req: SendMessageRequest,
         ) -> Result<SendMessageResponse, A2AError> {
+            if let Some(error) = &self.send_message_error {
+                return Err(error.clone());
+            }
+
             Ok(SendMessageResponse::Task(sample_task("send")))
         }
 
@@ -749,6 +769,10 @@ mod tests {
             _params: &ServiceParams,
             _req: SendMessageRequest,
         ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+            if self.streaming_pending {
+                return Ok(Box::pin(futures::stream::pending()));
+            }
+
             Ok(Box::pin(futures::stream::iter(vec![Ok(
                 StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
                     task_id: "stream".into(),
@@ -856,188 +880,6 @@ mod tests {
             _req: GetExtendedAgentCardRequest,
         ) -> Result<AgentCard, A2AError> {
             Ok(sample_agent_card())
-        }
-    }
-
-    #[async_trait]
-    impl RequestHandler for FatalHandler {
-        async fn send_message(
-            &self,
-            _params: &ServiceParams,
-            _req: SendMessageRequest,
-        ) -> Result<SendMessageResponse, A2AError> {
-            Err(A2AError::new(error_code::PARSE_ERROR, "fatal parse"))
-        }
-
-        async fn send_streaming_message(
-            &self,
-            _params: &ServiceParams,
-            _req: SendMessageRequest,
-        ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-            unreachable!()
-        }
-
-        async fn get_task(
-            &self,
-            _params: &ServiceParams,
-            _req: GetTaskRequest,
-        ) -> Result<Task, A2AError> {
-            unreachable!()
-        }
-
-        async fn list_tasks(
-            &self,
-            _params: &ServiceParams,
-            _req: ListTasksRequest,
-        ) -> Result<ListTasksResponse, A2AError> {
-            unreachable!()
-        }
-
-        async fn cancel_task(
-            &self,
-            _params: &ServiceParams,
-            _req: CancelTaskRequest,
-        ) -> Result<Task, A2AError> {
-            unreachable!()
-        }
-
-        async fn subscribe_to_task(
-            &self,
-            _params: &ServiceParams,
-            _req: SubscribeToTaskRequest,
-        ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-            unreachable!()
-        }
-
-        async fn create_push_config(
-            &self,
-            _params: &ServiceParams,
-            _req: CreateTaskPushNotificationConfigRequest,
-        ) -> Result<TaskPushNotificationConfig, A2AError> {
-            unreachable!()
-        }
-
-        async fn get_push_config(
-            &self,
-            _params: &ServiceParams,
-            _req: GetTaskPushNotificationConfigRequest,
-        ) -> Result<TaskPushNotificationConfig, A2AError> {
-            unreachable!()
-        }
-
-        async fn list_push_configs(
-            &self,
-            _params: &ServiceParams,
-            _req: ListTaskPushNotificationConfigsRequest,
-        ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-            unreachable!()
-        }
-
-        async fn delete_push_config(
-            &self,
-            _params: &ServiceParams,
-            _req: DeleteTaskPushNotificationConfigRequest,
-        ) -> Result<(), A2AError> {
-            unreachable!()
-        }
-
-        async fn get_extended_agent_card(
-            &self,
-            _params: &ServiceParams,
-            _req: GetExtendedAgentCardRequest,
-        ) -> Result<AgentCard, A2AError> {
-            unreachable!()
-        }
-    }
-
-    #[async_trait]
-    impl RequestHandler for PendingStreamHandler {
-        async fn send_message(
-            &self,
-            _params: &ServiceParams,
-            _req: SendMessageRequest,
-        ) -> Result<SendMessageResponse, A2AError> {
-            unreachable!()
-        }
-
-        async fn send_streaming_message(
-            &self,
-            _params: &ServiceParams,
-            _req: SendMessageRequest,
-        ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-            Ok(Box::pin(futures::stream::pending()))
-        }
-
-        async fn get_task(
-            &self,
-            _params: &ServiceParams,
-            _req: GetTaskRequest,
-        ) -> Result<Task, A2AError> {
-            unreachable!()
-        }
-
-        async fn list_tasks(
-            &self,
-            _params: &ServiceParams,
-            _req: ListTasksRequest,
-        ) -> Result<ListTasksResponse, A2AError> {
-            unreachable!()
-        }
-
-        async fn cancel_task(
-            &self,
-            _params: &ServiceParams,
-            _req: CancelTaskRequest,
-        ) -> Result<Task, A2AError> {
-            unreachable!()
-        }
-
-        async fn subscribe_to_task(
-            &self,
-            _params: &ServiceParams,
-            _req: SubscribeToTaskRequest,
-        ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-            unreachable!()
-        }
-
-        async fn create_push_config(
-            &self,
-            _params: &ServiceParams,
-            _req: CreateTaskPushNotificationConfigRequest,
-        ) -> Result<TaskPushNotificationConfig, A2AError> {
-            unreachable!()
-        }
-
-        async fn get_push_config(
-            &self,
-            _params: &ServiceParams,
-            _req: GetTaskPushNotificationConfigRequest,
-        ) -> Result<TaskPushNotificationConfig, A2AError> {
-            unreachable!()
-        }
-
-        async fn list_push_configs(
-            &self,
-            _params: &ServiceParams,
-            _req: ListTaskPushNotificationConfigsRequest,
-        ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-            unreachable!()
-        }
-
-        async fn delete_push_config(
-            &self,
-            _params: &ServiceParams,
-            _req: DeleteTaskPushNotificationConfigRequest,
-        ) -> Result<(), A2AError> {
-            unreachable!()
-        }
-
-        async fn get_extended_agent_card(
-            &self,
-            _params: &ServiceParams,
-            _req: GetExtendedAgentCardRequest,
-        ) -> Result<AgentCard, A2AError> {
-            unreachable!()
         }
     }
 
@@ -1230,7 +1072,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_text_frame_invalid_json_sends_error_and_close() {
-        let handler = Arc::new(StubHandler);
+        let handler = Arc::new(StubHandler::default());
         let params = Arc::new(ServiceParams::new());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
@@ -1252,7 +1094,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_text_frame_empty_id_sends_invalid_request() {
-        let handler = Arc::new(StubHandler);
+        let handler = Arc::new(StubHandler::default());
         let params = Arc::new(ServiceParams::new());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
@@ -1275,7 +1117,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_text_frame_missing_method_sends_invalid_request() {
-        let handler = Arc::new(StubHandler);
+        let handler = Arc::new(StubHandler::default());
         let params = Arc::new(ServiceParams::new());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
@@ -1297,7 +1139,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_text_frame_unknown_method_sends_method_not_found() {
-        let handler = Arc::new(StubHandler);
+        let handler = Arc::new(StubHandler::default());
         let params = Arc::new(ServiceParams::new());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
@@ -1320,7 +1162,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_text_frame_cancel_stream_removes_registered_stream() {
-        let handler = Arc::new(StubHandler);
+        let handler = Arc::new(StubHandler::default());
         let params = Arc::new(ServiceParams::new());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -1342,7 +1184,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_text_frame_cancel_unknown_stream_does_not_emit_stream_end() {
-        let handler = Arc::new(StubHandler);
+        let handler = Arc::new(StubHandler::default());
         let params = Arc::new(ServiceParams::new());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
@@ -1361,7 +1203,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_unary_covers_all_supported_methods() {
-        let handler = Arc::new(StubHandler);
+        let handler = Arc::new(StubHandler::default());
         let params = ServiceParams::new();
         let msg_req = SendMessageRequest {
             message: sample_message(),
@@ -1510,7 +1352,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_unary_unknown_method_returns_method_not_found() {
-        let handler = Arc::new(StubHandler);
+        let handler = Arc::new(StubHandler::default());
         let err = dispatch_unary("Nope", &handler, &ServiceParams::new(), Value::Null)
             .await
             .unwrap_err();
@@ -1519,7 +1361,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_unary_request_emits_error_for_bad_params() {
-        let handler = Arc::new(StubHandler);
+        let handler = Arc::new(StubHandler::default());
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
 
         run_unary_request(
@@ -1542,7 +1384,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_unary_request_emits_close_for_fatal_error() {
-        let handler = Arc::new(FatalHandler);
+        let handler = Arc::new(StubHandler::fatal_send_message());
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
         let req = SendMessageRequest {
             message: sample_message(),
@@ -1576,7 +1418,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_streaming_request_emits_event_and_stream_end() {
-        let handler = Arc::new(StubHandler);
+        let handler = Arc::new(StubHandler::default());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
         let req = SendMessageRequest {
@@ -1607,7 +1449,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_streaming_request_emits_stream_end_after_cancellation() {
-        let handler = Arc::new(PendingStreamHandler);
+        let handler = Arc::new(StubHandler::pending_stream());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
         let req = SendMessageRequest {
@@ -1649,7 +1491,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_streaming_request_emits_error_for_stream_item_error() {
-        let handler = Arc::new(StubHandler);
+        let handler = Arc::new(StubHandler::default());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
 
@@ -1677,7 +1519,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_streaming_request_emits_error_for_bad_stream_params() {
-        let handler = Arc::new(StubHandler);
+        let handler = Arc::new(StubHandler::default());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
 
