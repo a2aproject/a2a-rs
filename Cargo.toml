@@ -95,6 +95,7 @@ rustls-pemfile = "2"
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 thiserror = "2"
+parking_lot = "0.12"
 uuid = { version = "1", features = ["v7"] }
 semver = "1"
 tracing = "0.1"
