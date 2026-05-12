@@ -1664,7 +1664,10 @@ mod tests {
         };
         let combined = combine_service_params(&connection, &envelope);
         assert_eq!(combined.len(), 1);
-        assert_eq!(combined.get("a2a-version").unwrap(), &vec!["1.0".to_string()]);
+        assert_eq!(
+            combined.get("a2a-version").unwrap(),
+            &vec!["1.0".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -1674,10 +1677,7 @@ mod tests {
         use tower::ServiceExt;
 
         let router = websocket_router(make_handler());
-        let request = Request::builder()
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
+        let request = Request::builder().uri("/").body(Body::empty()).unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
