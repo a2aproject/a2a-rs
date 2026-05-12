@@ -1289,4 +1289,427 @@ mod tests {
         // Should silently drop malformed payload.
         handle_incoming_text(b"not json", &pending);
     }
+
+    // ---------------------------------------------------------------------
+    // Helpers for exercising the `Transport` trait methods without a real
+    // websocket connection: we mock `ConnectionInner` and a background task
+    // that listens for outbound envelopes and injects pre-canned results.
+    // ---------------------------------------------------------------------
+
+    fn make_mock_transport() -> (
+        WebSocketTransport,
+        Arc<Mutex<Pending>>,
+        mpsc::Receiver<OutboundClient>,
+    ) {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (outbound, outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
+        let transport = WebSocketTransport {
+            inner: Arc::new(ConnectionInner {
+                outbound,
+                pending: pending.clone(),
+            }),
+        };
+        (transport, pending, outbound_rx)
+    }
+
+    async fn respond_unary(
+        outbound_rx: &mut mpsc::Receiver<OutboundClient>,
+        pending: &Arc<Mutex<Pending>>,
+        result: Value,
+    ) -> WsRequestEnvelope {
+        let envelope = match outbound_rx.recv().await.unwrap() {
+            OutboundClient::Frame(text) => {
+                serde_json::from_str::<WsRequestEnvelope>(&text).unwrap()
+            }
+            OutboundClient::Close => panic!("expected request frame"),
+        };
+        let tx = pending.lock().unwrap().unary.remove(&envelope.id).unwrap();
+        tx.send(Ok(result)).unwrap();
+        envelope
+    }
+
+    #[tokio::test]
+    async fn transport_send_message_dispatches_send_message_method() {
+        let (transport, pending, mut outbound_rx) = make_mock_transport();
+        let task_resp = SendMessageResponse::Task(Task {
+            id: "t1".into(),
+            context_id: "ctx".into(),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        });
+        let result_value = protojson_conv::to_value(&task_resp).unwrap();
+
+        let handle = tokio::spawn(async move {
+            let req = SendMessageRequest {
+                message: Message::new(Role::User, vec![Part::text("hi")]),
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            };
+            transport
+                .send_message(&ServiceParams::new(), &req)
+                .await
+                .unwrap()
+        });
+
+        let envelope = respond_unary(&mut outbound_rx, &pending, result_value).await;
+        assert_eq!(envelope.method.as_deref(), Some(methods::SEND_MESSAGE));
+        let resp = handle.await.unwrap();
+        match resp {
+            SendMessageResponse::Task(t) => assert_eq!(t.id, "t1"),
+            _ => panic!("expected Task"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_list_tasks_dispatches_list_tasks_method() {
+        let (transport, pending, mut outbound_rx) = make_mock_transport();
+        let listed = ListTasksResponse {
+            tasks: vec![],
+            next_page_token: "".into(),
+            page_size: 0,
+            total_size: 0,
+        };
+        let result_value = protojson_conv::to_value(&listed).unwrap();
+
+        let handle = tokio::spawn(async move {
+            let req = ListTasksRequest {
+                context_id: None,
+                status: None,
+                page_size: None,
+                page_token: None,
+                history_length: None,
+                status_timestamp_after: None,
+                include_artifacts: None,
+                tenant: None,
+            };
+            transport
+                .list_tasks(&ServiceParams::new(), &req)
+                .await
+                .unwrap()
+        });
+
+        let envelope = respond_unary(&mut outbound_rx, &pending, result_value).await;
+        assert_eq!(envelope.method.as_deref(), Some(methods::LIST_TASKS));
+        let resp = handle.await.unwrap();
+        assert_eq!(resp.total_size, 0);
+    }
+
+    #[tokio::test]
+    async fn transport_cancel_task_dispatches_cancel_task_method() {
+        let (transport, pending, mut outbound_rx) = make_mock_transport();
+        let task = Task {
+            id: "cancel".into(),
+            context_id: "ctx".into(),
+            status: TaskStatus {
+                state: TaskState::Canceled,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let result_value = protojson_conv::to_value(&task).unwrap();
+
+        let handle = tokio::spawn(async move {
+            let req = CancelTaskRequest {
+                id: "cancel".into(),
+                metadata: None,
+                tenant: None,
+            };
+            transport
+                .cancel_task(&ServiceParams::new(), &req)
+                .await
+                .unwrap()
+        });
+
+        let envelope = respond_unary(&mut outbound_rx, &pending, result_value).await;
+        assert_eq!(envelope.method.as_deref(), Some(methods::CANCEL_TASK));
+        let resp = handle.await.unwrap();
+        assert_eq!(resp.id, "cancel");
+    }
+
+    #[tokio::test]
+    async fn transport_create_push_config_dispatches_create_push_config_method() {
+        let (transport, pending, mut outbound_rx) = make_mock_transport();
+        let cfg = TaskPushNotificationConfig {
+            task_id: "t1".into(),
+            config: PushNotificationConfig {
+                url: "https://hook.example.test".into(),
+                id: Some("cfg".into()),
+                token: None,
+                authentication: None,
+            },
+            tenant: None,
+        };
+        let result_value = protojson_conv::to_value(&cfg).unwrap();
+
+        let handle = tokio::spawn(async move {
+            let req = CreateTaskPushNotificationConfigRequest {
+                task_id: "t1".into(),
+                config: PushNotificationConfig {
+                    url: "https://hook.example.test".into(),
+                    id: Some("cfg".into()),
+                    token: None,
+                    authentication: None,
+                },
+                tenant: None,
+            };
+            transport
+                .create_push_config(&ServiceParams::new(), &req)
+                .await
+                .unwrap()
+        });
+
+        let envelope = respond_unary(&mut outbound_rx, &pending, result_value).await;
+        assert_eq!(
+            envelope.method.as_deref(),
+            Some(methods::CREATE_PUSH_CONFIG)
+        );
+        let resp = handle.await.unwrap();
+        assert_eq!(resp.task_id, "t1");
+    }
+
+    #[tokio::test]
+    async fn transport_get_push_config_dispatches_get_push_config_method() {
+        let (transport, pending, mut outbound_rx) = make_mock_transport();
+        let cfg = TaskPushNotificationConfig {
+            task_id: "t1".into(),
+            config: PushNotificationConfig {
+                url: "https://hook.example.test".into(),
+                id: Some("cfg".into()),
+                token: None,
+                authentication: None,
+            },
+            tenant: None,
+        };
+        let result_value = protojson_conv::to_value(&cfg).unwrap();
+
+        let handle = tokio::spawn(async move {
+            let req = GetTaskPushNotificationConfigRequest {
+                task_id: "t1".into(),
+                id: "cfg".into(),
+                tenant: None,
+            };
+            transport
+                .get_push_config(&ServiceParams::new(), &req)
+                .await
+                .unwrap()
+        });
+
+        let envelope = respond_unary(&mut outbound_rx, &pending, result_value).await;
+        assert_eq!(envelope.method.as_deref(), Some(methods::GET_PUSH_CONFIG));
+        let resp = handle.await.unwrap();
+        assert_eq!(resp.task_id, "t1");
+    }
+
+    #[tokio::test]
+    async fn transport_list_push_configs_dispatches_list_push_configs_method() {
+        let (transport, pending, mut outbound_rx) = make_mock_transport();
+        let listed = ListTaskPushNotificationConfigsResponse {
+            configs: vec![],
+            next_page_token: None,
+        };
+        let result_value = protojson_conv::to_value(&listed).unwrap();
+
+        let handle = tokio::spawn(async move {
+            let req = ListTaskPushNotificationConfigsRequest {
+                task_id: "t1".into(),
+                page_size: None,
+                page_token: None,
+                tenant: None,
+            };
+            transport
+                .list_push_configs(&ServiceParams::new(), &req)
+                .await
+                .unwrap()
+        });
+
+        let envelope = respond_unary(&mut outbound_rx, &pending, result_value).await;
+        assert_eq!(envelope.method.as_deref(), Some(methods::LIST_PUSH_CONFIGS));
+        let resp = handle.await.unwrap();
+        assert!(resp.configs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn transport_delete_push_config_dispatches_delete_push_config_method() {
+        let (transport, pending, mut outbound_rx) = make_mock_transport();
+
+        let handle = tokio::spawn(async move {
+            let req = DeleteTaskPushNotificationConfigRequest {
+                task_id: "t1".into(),
+                id: "cfg".into(),
+                tenant: None,
+            };
+            transport
+                .delete_push_config(&ServiceParams::new(), &req)
+                .await
+                .unwrap();
+        });
+
+        let envelope = respond_unary(
+            &mut outbound_rx,
+            &pending,
+            Value::Object(Default::default()),
+        )
+        .await;
+        assert_eq!(
+            envelope.method.as_deref(),
+            Some(methods::DELETE_PUSH_CONFIG)
+        );
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_subscribe_to_task_dispatches_subscribe_method_and_streams_events() {
+        use futures::StreamExt as _;
+        let (transport, pending, mut outbound_rx) = make_mock_transport();
+
+        let handle = tokio::spawn(async move {
+            let req = SubscribeToTaskRequest {
+                id: "t1".into(),
+                tenant: None,
+            };
+            let mut stream = transport
+                .subscribe_to_task(&ServiceParams::new(), &req)
+                .await
+                .unwrap();
+            let first = stream.next().await.unwrap().unwrap();
+            // Drop the stream to exercise cancel-on-drop path.
+            drop(stream);
+            first
+        });
+
+        let envelope = match outbound_rx.recv().await.unwrap() {
+            OutboundClient::Frame(text) => {
+                serde_json::from_str::<WsRequestEnvelope>(&text).unwrap()
+            }
+            OutboundClient::Close => panic!("expected request frame"),
+        };
+        assert_eq!(envelope.method.as_deref(), Some(methods::SUBSCRIBE_TO_TASK));
+        // Inject a stream event.
+        let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "t1".into(),
+            context_id: "ctx".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        {
+            let p = pending.lock().unwrap();
+            let tx = p.streaming.get(&envelope.id).unwrap();
+            tx.send(Ok(event)).unwrap();
+        }
+
+        let first = handle.await.unwrap();
+        match first {
+            StreamResponse::StatusUpdate(_) => {}
+            _ => panic!("expected StatusUpdate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_destroy_emits_close_message() {
+        let (transport, _pending, mut outbound_rx) = make_mock_transport();
+        transport.destroy().await.unwrap();
+        assert!(matches!(outbound_rx.try_recv(), Ok(OutboundClient::Close)));
+    }
+
+    #[tokio::test]
+    async fn websocket_transport_factory_create_fails_for_unreachable_url() {
+        let factory = WebSocketTransportFactory;
+        let card = AgentCard {
+            name: "x".into(),
+            description: "".into(),
+            version: "1".into(),
+            supported_interfaces: vec![],
+            capabilities: AgentCapabilities::default(),
+            default_input_modes: vec![],
+            default_output_modes: vec![],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        };
+        let iface = AgentInterface::new("ws://127.0.0.1:1", TRANSPORT_PROTOCOL_WEBSOCKET);
+        let result = factory.create(&card, &iface).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn streaming_response_poll_after_termination_returns_ready_none() {
+        use futures::task::noop_waker;
+        use std::task::{Context, Poll};
+
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (outbound, _outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
+        let inner = Arc::new(ConnectionInner { outbound, pending });
+        let (_tx, receiver) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
+        let mut stream = StreamingResponse {
+            receiver,
+            inner,
+            id: "s1".into(),
+            cancel_sent: true,
+            terminated: true,
+        };
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[test]
+    fn streaming_response_marks_terminated_when_receiver_closes() {
+        use futures::task::noop_waker;
+        use std::task::{Context, Poll};
+
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (outbound, _outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
+        let inner = Arc::new(ConnectionInner { outbound, pending });
+        let (tx, receiver) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
+        drop(tx);
+        let mut stream = StreamingResponse {
+            receiver,
+            inner,
+            id: "s1".into(),
+            cancel_sent: false,
+            terminated: false,
+        };
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+        assert!(stream.terminated);
+    }
+
+    #[test]
+    fn spawn_executor_executes_future_on_tokio_runtime() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (tx, rx) = oneshot::channel::<u32>();
+            <SpawnExecutor as hyper::rt::Executor<_>>::execute(&SpawnExecutor, async move {
+                tx.send(7).unwrap();
+            });
+            assert_eq!(rx.await.unwrap(), 7);
+        });
+    }
 }
