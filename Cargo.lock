@@ -169,6 +169,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokio",
