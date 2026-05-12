@@ -432,7 +432,7 @@ async fn dispatch_unary<H: RequestHandler>(
             to_value(&resp)
         }
         methods::CREATE_PUSH_CONFIG => {
-            let req: CreateTaskPushNotificationConfigRequest = parse_params(raw_params)?;
+            let req: TaskPushNotificationConfig = parse_params(raw_params)?;
             let resp = handler.create_push_config(params, req).await?;
             to_value(&resp)
         }
@@ -829,13 +829,9 @@ mod tests {
         async fn create_push_config(
             &self,
             _params: &ServiceParams,
-            req: CreateTaskPushNotificationConfigRequest,
+            req: TaskPushNotificationConfig,
         ) -> Result<TaskPushNotificationConfig, A2AError> {
-            Ok(TaskPushNotificationConfig {
-                task_id: req.task_id,
-                config: req.config,
-                tenant: req.tenant,
-            })
+            Ok(req)
         }
 
         async fn get_push_config(
@@ -844,13 +840,11 @@ mod tests {
             req: GetTaskPushNotificationConfigRequest,
         ) -> Result<TaskPushNotificationConfig, A2AError> {
             Ok(TaskPushNotificationConfig {
+                url: "https://hook.example.test".into(),
+                id: Some(req.id),
                 task_id: req.task_id,
-                config: PushNotificationConfig {
-                    url: "https://hook.example.test".into(),
-                    id: Some(req.id),
-                    token: None,
-                    authentication: None,
-                },
+                token: None,
+                authentication: None,
                 tenant: req.tenant,
             })
         }
@@ -1272,22 +1266,19 @@ mod tests {
         .unwrap();
         assert_eq!(canceled["id"], "cancel-1");
 
-        let push_config = PushNotificationConfig {
+        let push_config = TaskPushNotificationConfig {
             url: "https://hook.example.test".into(),
             id: Some("cfg-1".into()),
+            task_id: "task-1".into(),
             token: None,
             authentication: None,
+            tenant: None,
         };
         let created = dispatch_unary(
             methods::CREATE_PUSH_CONFIG,
             &handler,
             &params,
-            protojson_conv::to_value(&CreateTaskPushNotificationConfigRequest {
-                task_id: "task-1".into(),
-                config: push_config,
-                tenant: None,
-            })
-            .unwrap(),
+            protojson_conv::to_value(&push_config).unwrap(),
         )
         .await
         .unwrap();
