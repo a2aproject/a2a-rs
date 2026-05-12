@@ -621,7 +621,7 @@ impl Transport for WebSocketTransport {
     async fn create_push_config(
         &self,
         params: &ServiceParams,
-        req: &CreateTaskPushNotificationConfigRequest,
+        req: &TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         self.call_unary(methods::CREATE_PUSH_CONFIG, params, req)
             .await
@@ -1440,26 +1440,22 @@ mod tests {
     async fn transport_create_push_config_dispatches_create_push_config_method() {
         let (transport, pending, mut outbound_rx) = make_mock_transport();
         let cfg = TaskPushNotificationConfig {
+            url: "https://hook.example.test".into(),
+            id: Some("cfg".into()),
             task_id: "t1".into(),
-            config: PushNotificationConfig {
-                url: "https://hook.example.test".into(),
-                id: Some("cfg".into()),
-                token: None,
-                authentication: None,
-            },
+            token: None,
+            authentication: None,
             tenant: None,
         };
         let result_value = protojson_conv::to_value(&cfg).unwrap();
 
         let handle = tokio::spawn(async move {
-            let req = CreateTaskPushNotificationConfigRequest {
+            let req = TaskPushNotificationConfig {
+                url: "https://hook.example.test".into(),
+                id: Some("cfg".into()),
                 task_id: "t1".into(),
-                config: PushNotificationConfig {
-                    url: "https://hook.example.test".into(),
-                    id: Some("cfg".into()),
-                    token: None,
-                    authentication: None,
-                },
+                token: None,
+                authentication: None,
                 tenant: None,
             };
             transport
@@ -1481,13 +1477,11 @@ mod tests {
     async fn transport_get_push_config_dispatches_get_push_config_method() {
         let (transport, pending, mut outbound_rx) = make_mock_transport();
         let cfg = TaskPushNotificationConfig {
+            url: "https://hook.example.test".into(),
+            id: Some("cfg".into()),
             task_id: "t1".into(),
-            config: PushNotificationConfig {
-                url: "https://hook.example.test".into(),
-                id: Some("cfg".into()),
-                token: None,
-                authentication: None,
-            },
+            token: None,
+            authentication: None,
             tenant: None,
         };
         let result_value = protojson_conv::to_value(&cfg).unwrap();
