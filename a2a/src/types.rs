@@ -1243,12 +1243,10 @@ mod tests {
     fn test_task_push_notification_config_serde() {
         let cfg = TaskPushNotificationConfig {
             task_id: "t1".into(),
-            config: PushNotificationConfig {
-                url: "https://example.com/hook".into(),
-                id: Some("cfg1".into()),
-                token: None,
-                authentication: None,
-            },
+            url: "https://example.com/hook".into(),
+            id: Some("cfg1".into()),
+            token: None,
+            authentication: None,
             tenant: Some("ten".into()),
         };
         let json = serde_json::to_string(&cfg).unwrap();
@@ -1293,19 +1291,17 @@ mod tests {
     }
 
     #[test]
-    fn test_create_task_push_notification_config_request_serde() {
-        let req = CreateTaskPushNotificationConfigRequest {
+    fn test_create_task_push_notification_config_serde() {
+        let req = TaskPushNotificationConfig {
             task_id: "t1".into(),
-            config: PushNotificationConfig {
-                url: "https://x.com/hook".into(),
-                id: None,
-                token: None,
-                authentication: None,
-            },
+            url: "https://x.com/hook".into(),
+            id: None,
+            token: None,
+            authentication: None,
             tenant: None,
         };
         let json = serde_json::to_string(&req).unwrap();
-        let back: CreateTaskPushNotificationConfigRequest = serde_json::from_str(&json).unwrap();
+        let back: TaskPushNotificationConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }
 
@@ -1400,7 +1396,7 @@ mod tests {
     fn test_send_message_configuration_all_none() {
         let cfg = SendMessageConfiguration {
             accepted_output_modes: None,
-            push_notification_config: None,
+            task_push_notification_config: None,
             history_length: None,
             return_immediately: None,
         };
@@ -1414,11 +1410,13 @@ mod tests {
     fn test_send_message_configuration_full_serde() {
         let cfg = SendMessageConfiguration {
             accepted_output_modes: Some(vec!["text/plain".into(), "application/json".into()]),
-            push_notification_config: Some(PushNotificationConfig {
+            task_push_notification_config: Some(TaskPushNotificationConfig {
                 url: "https://hook.example.com".into(),
                 id: None,
+                task_id: "t1".into(),
                 token: None,
                 authentication: None,
+                tenant: None,
             }),
             history_length: Some(20),
             return_immediately: Some(false),
@@ -1774,26 +1772,28 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PushNotificationConfig field name: "pushNotificationConfig"
+    // TaskPushNotificationConfig field name: "taskPushNotificationConfig"
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_send_message_configuration_push_notification_config_field_name() {
+    fn test_send_message_configuration_task_push_notification_config_field_name() {
         let cfg = SendMessageConfiguration {
             accepted_output_modes: None,
-            push_notification_config: Some(PushNotificationConfig {
+            task_push_notification_config: Some(TaskPushNotificationConfig {
                 url: "https://hook.example.com".into(),
                 id: None,
+                task_id: "t1".into(),
                 token: None,
                 authentication: None,
+                tenant: None,
             }),
             history_length: None,
             return_immediately: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
-        // Verify the explicit rename to "pushNotificationConfig"
-        assert!(v.get("pushNotificationConfig").is_some());
+        // Verify the explicit rename to "taskPushNotificationConfig"
+        assert!(v.get("taskPushNotificationConfig").is_some());
     }
 
     // -----------------------------------------------------------------------
@@ -1859,23 +1859,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PushNotificationConfig minimal (all optional None)
+    // TaskPushNotificationConfig minimal (all optional None)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_push_notification_config_minimal_serde() {
-        let cfg = PushNotificationConfig {
+    fn test_task_push_notification_config_minimal_serde() {
+        let cfg = TaskPushNotificationConfig {
             url: "https://hook.test".into(),
             id: None,
+            task_id: "t1".into(),
             token: None,
             authentication: None,
+            tenant: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
         assert!(v.get("id").is_none());
         assert!(v.get("token").is_none());
         assert!(v.get("authentication").is_none());
-        let back: PushNotificationConfig = serde_json::from_str(&json).unwrap();
+        let back: TaskPushNotificationConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
     }
 
