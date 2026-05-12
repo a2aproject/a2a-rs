@@ -1540,4 +1540,173 @@ mod tests {
             error_types::INVALID_PARAMS
         );
     }
+
+    #[tokio::test]
+    async fn run_streaming_request_unknown_method_emits_method_not_found() {
+        let handler = Arc::new(StubHandler::default());
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+
+        run_streaming_request(
+            "Bogus".into(),
+            "stream-x".into(),
+            Value::Null,
+            ServiceParams::new(),
+            handler,
+            streams.clone(),
+            out_tx,
+        )
+        .await;
+
+        let response = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(response.id.as_deref(), Some("stream-x"));
+        assert_eq!(
+            response.error.unwrap().error_type,
+            error_types::METHOD_NOT_FOUND
+        );
+        assert!(streams.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_streaming_request_subscribe_to_task_dispatches_method() {
+        // StubHandler::subscribe_to_task yields an error item; this exercises
+        // the SUBSCRIBE_TO_TASK match arm and the stream-item error pathway.
+        let handler = Arc::new(StubHandler::default());
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+
+        run_streaming_request(
+            methods::SUBSCRIBE_TO_TASK.into(),
+            "sub-2".into(),
+            protojson_conv::to_value(&SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+            })
+            .unwrap(),
+            ServiceParams::new(),
+            handler,
+            streams.clone(),
+            out_tx,
+        )
+        .await;
+
+        let response = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(response.id.as_deref(), Some("sub-2"));
+        assert!(response.error.is_some());
+        assert!(streams.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_streaming_request_subscribe_to_task_emits_error_for_bad_params() {
+        let handler = Arc::new(StubHandler::default());
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+
+        run_streaming_request(
+            methods::SUBSCRIBE_TO_TASK.into(),
+            "sub-bad".into(),
+            serde_json::json!({"bad": 1}),
+            ServiceParams::new(),
+            handler,
+            streams,
+            out_tx,
+        )
+        .await;
+
+        let response = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(
+            response.error.unwrap().error_type,
+            error_types::INVALID_PARAMS
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_unary_send_message_propagates_handler_error() {
+        let handler = Arc::new(StubHandler::fatal_send_message());
+        let req = SendMessageRequest {
+            message: sample_message(),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        let err = dispatch_unary(
+            methods::SEND_MESSAGE,
+            &handler,
+            &ServiceParams::new(),
+            protojson_conv::to_value(&req).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, error_code::PARSE_ERROR);
+    }
+
+    #[test]
+    fn to_value_serializes_protojson_payloads() {
+        let req = GetTaskRequest {
+            id: "t".into(),
+            history_length: None,
+            tenant: None,
+        };
+        let value = to_value(&req).unwrap();
+        assert_eq!(value["id"], "t");
+    }
+
+    #[test]
+    fn bytes_as_str_returns_utf8_or_none() {
+        let bytes = Bytes::from_static(b"hello");
+        assert_eq!(bytes_as_str(&bytes), Some("hello"));
+
+        let invalid = Bytes::from_static(&[0xff, 0xfe, 0xfd]);
+        assert_eq!(bytes_as_str(&invalid), None);
+    }
+
+    #[test]
+    fn combine_service_params_with_no_per_request_overrides_returns_connection_scope() {
+        let mut connection: ServiceParams = HashMap::new();
+        connection.insert("a2a-version".into(), vec!["1.0".into()]);
+        let envelope = WsRequestEnvelope {
+            id: "req".into(),
+            method: Some(methods::SEND_MESSAGE.into()),
+            params: None,
+            service_params: None,
+            cancel_stream: None,
+        };
+        let combined = combine_service_params(&connection, &envelope);
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined.get("a2a-version").unwrap(), &vec!["1.0".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn websocket_router_rejects_requests_without_subprotocol() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let router = websocket_router(make_handler());
+        let request = Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn websocket_router_rejects_when_upgrade_fails_due_to_missing_headers() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let router = websocket_router(make_handler());
+        // Provides the right subprotocol but no actual upgrade headers,
+        // forcing IncomingUpgrade::upgrade() to error out and exercising the
+        // "websocket upgrade failed" path in handle_upgrade.
+        let request = Request::builder()
+            .uri("/")
+            .header(header::SEC_WEBSOCKET_PROTOCOL, "a2a.v1")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }
