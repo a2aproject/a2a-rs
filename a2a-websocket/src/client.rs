@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use a2a::*;
@@ -20,6 +20,7 @@ use http_body_util::Empty;
 use hyper::body::Bytes;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
+use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -85,7 +86,7 @@ impl ConnectionInner {
         id: &str,
     ) -> Result<oneshot::Receiver<Result<Value, A2AError>>, A2AError> {
         let (tx, rx) = oneshot::channel();
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock();
         if pending.closed {
             let err = pending
                 .close_error
@@ -102,7 +103,7 @@ impl ConnectionInner {
         id: &str,
     ) -> Result<mpsc::UnboundedReceiver<Result<StreamResponse, A2AError>>, A2AError> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock();
         if pending.closed {
             let err = pending
                 .close_error
@@ -115,7 +116,7 @@ impl ConnectionInner {
     }
 
     fn deregister_streaming(&self, id: &str) {
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock();
         pending.streaming.remove(id);
     }
 
@@ -125,7 +126,7 @@ impl ConnectionInner {
 }
 
 fn connection_closed_error(pending: &Arc<Mutex<Pending>>) -> A2AError {
-    let pending = pending.lock().unwrap();
+    let pending = pending.lock();
     pending
         .close_error
         .clone()
@@ -503,7 +504,7 @@ async fn run_connection(
         }
     }
 
-    let mut pending = pending.lock().unwrap();
+    let mut pending = pending.lock();
     pending.fail_all(A2AError::internal("websocket connection closed"));
 }
 
@@ -526,7 +527,7 @@ fn handle_incoming_text(payload: &[u8], pending: &Arc<Mutex<Pending>>) {
 
     if let Some(error) = envelope.error {
         let a2a_error = ws_error_to_a2a_error(&error);
-        let mut pending = pending.lock().unwrap();
+        let mut pending = pending.lock();
         if let Some(tx) = pending.unary.remove(&id) {
             let _ = tx.send(Err(a2a_error));
         } else if let Some(tx) = pending.streaming.remove(&id) {
@@ -536,7 +537,7 @@ fn handle_incoming_text(payload: &[u8], pending: &Arc<Mutex<Pending>>) {
     }
 
     if let Some(value) = envelope.event {
-        let pending = pending.lock().unwrap();
+        let pending = pending.lock();
         if let Some(tx) = pending.streaming.get(&id) {
             match protojson_conv::from_value::<StreamResponse>(value) {
                 Ok(sr) => {
@@ -553,13 +554,13 @@ fn handle_incoming_text(payload: &[u8], pending: &Arc<Mutex<Pending>>) {
     }
 
     if envelope.stream_end.unwrap_or(false) {
-        let mut pending = pending.lock().unwrap();
+        let mut pending = pending.lock();
         pending.streaming.remove(&id);
         return;
     }
 
     if let Some(value) = envelope.result {
-        let mut pending = pending.lock().unwrap();
+        let mut pending = pending.lock();
         if let Some(tx) = pending.unary.remove(&id) {
             let _ = tx.send(Ok(value));
         }
@@ -891,10 +892,7 @@ mod tests {
     #[test]
     fn pending_register_after_close_fails() {
         let pending = Arc::new(Mutex::new(Pending::default()));
-        pending
-            .lock()
-            .unwrap()
-            .fail_all(A2AError::internal("dropped"));
+        pending.lock().fail_all(A2AError::internal("dropped"));
 
         let (outbound, _outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
         let inner = ConnectionInner {
@@ -922,7 +920,6 @@ mod tests {
         let pending = Arc::new(Mutex::new(Pending::default()));
         pending
             .lock()
-            .unwrap()
             .fail_all(A2AError::invalid_request("bad close"));
         let err = connection_closed_error(&pending);
         assert_eq!(err.code, error_code::INVALID_REQUEST);
@@ -949,7 +946,7 @@ mod tests {
     #[tokio::test]
     async fn connection_inner_send_outbound_returns_close_error_when_receiver_is_dropped() {
         let pending = Arc::new(Mutex::new(Pending::default()));
-        pending.lock().unwrap().close_error = Some(A2AError::internal("closed earlier"));
+        pending.lock().close_error = Some(A2AError::internal("closed earlier"));
         let (outbound, outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
         drop(outbound_rx);
         let inner = ConnectionInner { outbound, pending };
@@ -988,10 +985,10 @@ mod tests {
         };
 
         let _rx = inner.register_streaming("stream-1").unwrap();
-        assert!(pending.lock().unwrap().streaming.contains_key("stream-1"));
+        assert!(pending.lock().streaming.contains_key("stream-1"));
 
         inner.deregister_streaming("stream-1");
-        assert!(!pending.lock().unwrap().streaming.contains_key("stream-1"));
+        assert!(!pending.lock().streaming.contains_key("stream-1"));
     }
 
     #[tokio::test]
@@ -1014,7 +1011,7 @@ mod tests {
             pending: pending.clone(),
         });
         let (tx, receiver) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        pending.lock().unwrap().streaming.insert("s1".into(), tx);
+        pending.lock().streaming.insert("s1".into(), tx);
 
         let stream = StreamingResponse {
             receiver,
@@ -1025,7 +1022,7 @@ mod tests {
         };
         drop(stream);
 
-        assert!(!pending.lock().unwrap().streaming.contains_key("s1"));
+        assert!(!pending.lock().streaming.contains_key("s1"));
         match outbound_rx.try_recv().unwrap() {
             OutboundClient::Frame(text) => {
                 let envelope: WsRequestEnvelope = serde_json::from_str(&text).unwrap();
@@ -1089,7 +1086,7 @@ mod tests {
             "a, b"
         );
 
-        let tx = pending.lock().unwrap().unary.remove(&envelope.id).unwrap();
+        let tx = pending.lock().unary.remove(&envelope.id).unwrap();
         tx.send(Ok(serde_json::json!({"ok": true}))).unwrap();
 
         let value = task.await.unwrap().unwrap();
@@ -1100,7 +1097,7 @@ mod tests {
     fn handle_incoming_text_dispatches_unary_result() {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (tx, rx) = oneshot::channel::<Result<Value, A2AError>>();
-        pending.lock().unwrap().unary.insert("req-1".into(), tx);
+        pending.lock().unary.insert("req-1".into(), tx);
 
         let response = WsResponseEnvelope::result("req-1", serde_json::json!({"ok": 1}));
         let json = serde_json::to_vec(&response).unwrap();
@@ -1108,14 +1105,14 @@ mod tests {
 
         let value = futures::executor::block_on(rx).unwrap().unwrap();
         assert_eq!(value["ok"], 1);
-        assert!(pending.lock().unwrap().unary.is_empty());
+        assert!(pending.lock().unary.is_empty());
     }
 
     #[test]
     fn handle_incoming_text_dispatches_unary_error() {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (tx, rx) = oneshot::channel::<Result<Value, A2AError>>();
-        pending.lock().unwrap().unary.insert("req-1".into(), tx);
+        pending.lock().unary.insert("req-1".into(), tx);
 
         let response = WsResponseEnvelope::error(
             Some("req-1".into()),
@@ -1137,7 +1134,7 @@ mod tests {
     fn handle_incoming_text_dispatches_streaming_error_and_removes_sink() {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        pending.lock().unwrap().streaming.insert("req-2".into(), tx);
+        pending.lock().streaming.insert("req-2".into(), tx);
 
         let response = WsResponseEnvelope::error(
             Some("req-2".into()),
@@ -1152,7 +1149,7 @@ mod tests {
 
         let err = rx.try_recv().unwrap().unwrap_err();
         assert_eq!(err.code, error_code::INVALID_PARAMS);
-        assert!(!pending.lock().unwrap().streaming.contains_key("req-2"));
+        assert!(!pending.lock().streaming.contains_key("req-2"));
     }
 
     #[test]
@@ -1170,15 +1167,15 @@ mod tests {
 
         handle_incoming_text(&json, &pending);
 
-        assert!(pending.lock().unwrap().unary.is_empty());
-        assert!(pending.lock().unwrap().streaming.is_empty());
+        assert!(pending.lock().unary.is_empty());
+        assert!(pending.lock().streaming.is_empty());
     }
 
     #[test]
     fn handle_incoming_text_routes_stream_event_to_streaming_sink() {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        pending.lock().unwrap().streaming.insert("req-2".into(), tx);
+        pending.lock().streaming.insert("req-2".into(), tx);
 
         // Build a TaskStatusUpdateEvent to embed.
         let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
@@ -1202,14 +1199,14 @@ mod tests {
             _ => panic!("expected StatusUpdate"),
         }
         // Streaming sink stays registered until streamEnd or error.
-        assert!(pending.lock().unwrap().streaming.contains_key("req-2"));
+        assert!(pending.lock().streaming.contains_key("req-2"));
     }
 
     #[test]
     fn handle_incoming_text_routes_bad_stream_event_as_error() {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        pending.lock().unwrap().streaming.insert("req-2".into(), tx);
+        pending.lock().streaming.insert("req-2".into(), tx);
 
         let response = WsResponseEnvelope::event("req-2", serde_json::json!({"unknown": {}}));
         let json = serde_json::to_vec(&response).unwrap();
@@ -1218,7 +1215,7 @@ mod tests {
         let err = rx.try_recv().unwrap().unwrap_err();
         assert_eq!(err.code, error_code::INTERNAL_ERROR);
         assert!(err.message.contains("failed to deserialize event"));
-        assert!(pending.lock().unwrap().streaming.contains_key("req-2"));
+        assert!(pending.lock().streaming.contains_key("req-2"));
     }
 
     #[test]
@@ -1229,20 +1226,20 @@ mod tests {
 
         handle_incoming_text(&json, &pending);
 
-        assert!(pending.lock().unwrap().streaming.is_empty());
+        assert!(pending.lock().streaming.is_empty());
     }
 
     #[test]
     fn handle_incoming_text_stream_end_removes_streaming_sink() {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (tx, _rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        pending.lock().unwrap().streaming.insert("req-2".into(), tx);
+        pending.lock().streaming.insert("req-2".into(), tx);
 
         let response = WsResponseEnvelope::stream_end("req-2");
         let json = serde_json::to_vec(&response).unwrap();
         handle_incoming_text(&json, &pending);
 
-        assert!(!pending.lock().unwrap().streaming.contains_key("req-2"));
+        assert!(!pending.lock().streaming.contains_key("req-2"));
     }
 
     #[test]
@@ -1253,7 +1250,7 @@ mod tests {
 
         handle_incoming_text(&json, &pending);
 
-        assert!(pending.lock().unwrap().streaming.is_empty());
+        assert!(pending.lock().streaming.is_empty());
     }
 
     #[test]
@@ -1264,7 +1261,7 @@ mod tests {
 
         handle_incoming_text(&json, &pending);
 
-        assert!(pending.lock().unwrap().unary.is_empty());
+        assert!(pending.lock().unary.is_empty());
     }
 
     #[test]
@@ -1323,7 +1320,7 @@ mod tests {
             }
             OutboundClient::Close => panic!("expected request frame"),
         };
-        let tx = pending.lock().unwrap().unary.remove(&envelope.id).unwrap();
+        let tx = pending.lock().unary.remove(&envelope.id).unwrap();
         tx.send(Ok(result)).unwrap();
         envelope
     }
@@ -1600,7 +1597,7 @@ mod tests {
             metadata: None,
         });
         {
-            let p = pending.lock().unwrap();
+            let p = pending.lock();
             let tx = p.streaming.get(&envelope.id).unwrap();
             tx.send(Ok(event)).unwrap();
         }
