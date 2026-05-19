@@ -4,12 +4,17 @@ use std::sync::Arc;
 
 use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
 use futures::{StreamExt, stream::BoxStream};
 use serde_json::Value;
 
 use crate::handler::RequestHandler;
-use crate::middleware::ServiceParams;
+use crate::middleware::{ServiceParams, extract_service_params};
 use crate::sse;
 
 /// Shared state for the JSON-RPC handler.
@@ -38,9 +43,10 @@ pub fn jsonrpc_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
 
 async fn handle_jsonrpc<H: RequestHandler>(
     State(state): State<JsonRpcState<H>>,
+    headers: HeaderMap,
     Json(request): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
-    let params = ServiceParams::new();
+    let params = extract_service_params(&headers);
     let id = request.id.clone();
     let method = request.method.as_str();
 
@@ -241,7 +247,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
 
-    use crate::test_util::install_crypto_provider;
+    use crate::test_util::{CapturingHandler, assert_header_captured, install_crypto_provider};
     use futures::stream::BoxStream;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -579,6 +585,169 @@ mod tests {
             rpc_resp.result
         );
         assert_eq!(rpc_resp.error.unwrap().code, error_code::METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = jsonrpc_router(handler);
+
+        let rpc = JsonRpcRequest::new(
+            JsonRpcId::Number(1),
+            methods::SEND_MESSAGE,
+            Some(serde_json::json!({
+                "message": {
+                    "messageId": "m1",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "hi"}]
+                }
+            })),
+        );
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer jsonrpc-token")
+            .header("x-tenant-id", "acme")
+            .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_header_captured(
+            &captured,
+            "send_message",
+            "authorization",
+            "Bearer jsonrpc-token",
+        );
+        assert_header_captured(&captured, "send_message", "x-tenant-id", "acme");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_send_message_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = jsonrpc_router(handler);
+
+        let rpc = JsonRpcRequest::new(
+            JsonRpcId::Number(1),
+            methods::SEND_STREAMING_MESSAGE,
+            Some(serde_json::json!({
+                "message": {
+                    "messageId": "m1",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "hi"}]
+                }
+            })),
+        );
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .header("authorization", "Bearer jsonrpc-streaming-token")
+            .header("x-tenant-id", "acme")
+            .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Drain the SSE body so the handler is driven to completion.
+        let _ = resp.into_body().collect().await.unwrap().to_bytes();
+
+        assert_header_captured(
+            &captured,
+            "send_streaming_message",
+            "authorization",
+            "Bearer jsonrpc-streaming-token",
+        );
+        assert_header_captured(&captured, "send_streaming_message", "x-tenant-id", "acme");
+    }
+
+    #[tokio::test]
+    async fn test_jsonrpc_unary_methods_propagate_headers_as_service_params() {
+        // Exercise every unary JSON-RPC method to lock in header propagation
+        // across the full match arm in handle_unary_request.
+        let cases: &[(&'static str, &'static str, serde_json::Value)] = &[
+            (
+                methods::GET_TASK,
+                "get_task",
+                serde_json::json!({"id": "t1"}),
+            ),
+            (methods::LIST_TASKS, "list_tasks", serde_json::json!({})),
+            (
+                methods::CANCEL_TASK,
+                "cancel_task",
+                serde_json::json!({"id": "t1"}),
+            ),
+            (
+                methods::CREATE_PUSH_CONFIG,
+                "create_push_config",
+                serde_json::json!({"taskId": "t1", "url": "http://example.com/cb"}),
+            ),
+            (
+                methods::GET_PUSH_CONFIG,
+                "get_push_config",
+                serde_json::json!({"taskId": "t1", "id": "cfg1"}),
+            ),
+            (
+                methods::LIST_PUSH_CONFIGS,
+                "list_push_configs",
+                serde_json::json!({"taskId": "t1"}),
+            ),
+            (
+                methods::DELETE_PUSH_CONFIG,
+                "delete_push_config",
+                serde_json::json!({"taskId": "t1", "id": "cfg1"}),
+            ),
+            (
+                methods::GET_EXTENDED_AGENT_CARD,
+                "get_extended_agent_card",
+                serde_json::json!({}),
+            ),
+        ];
+
+        for (rpc_method, handler_method, params) in cases {
+            let (handler, captured) = CapturingHandler::new();
+            let app = jsonrpc_router(handler);
+            let rpc = JsonRpcRequest::new(JsonRpcId::Number(1), *rpc_method, Some(params.clone()));
+            let token = format!("Bearer token-for-{handler_method}");
+            let req = Request::builder()
+                .uri("/")
+                .method("POST")
+                .header("content-type", "application/json")
+                .header("authorization", &token)
+                .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_header_captured(&captured, handler_method, "authorization", &token);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_jsonrpc_subscribe_to_task_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = jsonrpc_router(handler);
+        let rpc = JsonRpcRequest::new(
+            JsonRpcId::Number(1),
+            methods::SUBSCRIBE_TO_TASK,
+            Some(serde_json::json!({"id": "t1"})),
+        );
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer subscribe-token")
+            .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_header_captured(
+            &captured,
+            "subscribe_to_task",
+            "authorization",
+            "Bearer subscribe-token",
+        );
     }
 
     #[tokio::test]

@@ -2,11 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0
 use a2a::A2AError;
 use async_trait::async_trait;
+use axum::http::HeaderMap;
 use serde_json::Value;
 use std::collections::HashMap;
 
 /// Service parameters — metadata from HTTP headers or gRPC metadata.
 pub type ServiceParams = HashMap<String, Vec<String>>;
+
+/// Build [`ServiceParams`] from an axum [`HeaderMap`].
+///
+/// Header names are normalized to lowercase (axum does this for us), values
+/// that aren't valid ASCII are silently skipped, and multi-valued headers
+/// produce a `Vec<String>` in insertion order.
+pub(crate) fn extract_service_params(headers: &HeaderMap) -> ServiceParams {
+    let mut params = ServiceParams::new();
+    for (name, value) in headers {
+        if let Ok(v) = value.to_str() {
+            params
+                .entry(name.as_str().to_owned())
+                .or_default()
+                .push(v.to_owned());
+        }
+    }
+    params
+}
 
 /// Authenticated user information.
 #[derive(Debug, Clone)]
@@ -109,6 +128,77 @@ impl CallInterceptor for LoggingInterceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn test_extract_service_params_empty() {
+        let headers = HeaderMap::new();
+        let params = extract_service_params(&headers);
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_extract_service_params_basic() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer token-abc"),
+        );
+        headers.insert("x-tenant-id", HeaderValue::from_static("acme"));
+
+        let params = extract_service_params(&headers);
+
+        assert_eq!(
+            params.get("authorization"),
+            Some(&vec!["Bearer token-abc".to_string()])
+        );
+        assert_eq!(params.get("x-tenant-id"), Some(&vec!["acme".to_string()]));
+    }
+
+    #[test]
+    fn test_extract_service_params_multi_value() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("10.0.0.2"));
+
+        let params = extract_service_params(&headers);
+
+        assert_eq!(
+            params.get("x-forwarded-for"),
+            Some(&vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()]),
+        );
+    }
+
+    #[test]
+    fn test_extract_service_params_lowercases_names() {
+        let mut headers = HeaderMap::new();
+        // HeaderMap normalizes the name to lowercase regardless of casing here.
+        headers.insert("Authorization", HeaderValue::from_static("Bearer cased"));
+        let params = extract_service_params(&headers);
+        assert_eq!(
+            params.get("authorization"),
+            Some(&vec!["Bearer cased".to_string()])
+        );
+        assert!(!params.contains_key("Authorization"));
+    }
+
+    #[test]
+    fn test_extract_service_params_skips_non_ascii_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ascii", HeaderValue::from_static("ok"));
+        headers.insert(
+            "x-binary",
+            HeaderValue::from_bytes(&[0xff, 0xfe, 0xfd]).unwrap(),
+        );
+
+        let params = extract_service_params(&headers);
+
+        assert_eq!(params.get("x-ascii"), Some(&vec!["ok".to_string()]));
+        assert!(
+            !params.contains_key("x-binary"),
+            "non-ASCII value should be skipped, not produce an empty entry"
+        );
+    }
 
     #[test]
     fn test_user_authenticated() {

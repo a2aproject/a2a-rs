@@ -7,7 +7,7 @@ use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use chrono::{DateTime, Utc};
@@ -17,7 +17,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::handler::RequestHandler;
-use crate::middleware::ServiceParams;
+use crate::middleware::{ServiceParams, extract_service_params};
 use crate::sse;
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
@@ -120,13 +120,14 @@ pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
 
 async fn handle_send_message<H: RequestHandler>(
     State(state): State<RestState<H>>,
+    headers: HeaderMap,
     Json(raw_req): Json<Value>,
 ) -> impl IntoResponse {
     let req = match protojson_conv::from_value::<SendMessageRequest>(raw_req) {
         Ok(req) => req,
         Err(e) => return rest_payload_error_response(e),
     };
-    let params = ServiceParams::new();
+    let params = extract_service_params(&headers);
     match state.handler.send_message(&params, req).await {
         Ok(resp) => protojson_json_response(&resp),
         Err(e) => rest_error_response(e),
@@ -135,13 +136,14 @@ async fn handle_send_message<H: RequestHandler>(
 
 async fn handle_stream_message<H: RequestHandler>(
     State(state): State<RestState<H>>,
+    headers: HeaderMap,
     Json(raw_req): Json<Value>,
 ) -> impl IntoResponse {
     let req = match protojson_conv::from_value::<SendMessageRequest>(raw_req) {
         Ok(req) => req,
         Err(e) => return rest_payload_error_response(e),
     };
-    let params = ServiceParams::new();
+    let params = extract_service_params(&headers);
     match state.handler.send_streaming_message(&params, req).await {
         Ok(stream) => sse::sse_from_stream(protojson_stream(stream)).into_response(),
         Err(e) => rest_error_response(e),
@@ -156,10 +158,10 @@ pub struct GetTaskQuery {
 
 async fn handle_get_task_inner<H: RequestHandler>(
     state: RestState<H>,
+    params: ServiceParams,
     id: String,
     query: GetTaskQuery,
 ) -> axum::response::Response {
-    let params = ServiceParams::new();
     let req = GetTaskRequest {
         id,
         history_length: query.history_length,
@@ -175,12 +177,14 @@ async fn handle_get_task_or_subscribe<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(id): Path<String>,
     Query(query): Query<GetTaskQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let params = extract_service_params(&headers);
     if let Some(task_id) = id.strip_suffix(":subscribe") {
-        return handle_subscribe_to_task_inner(state, task_id.to_string()).await;
+        return handle_subscribe_to_task_inner(state, params, task_id.to_string()).await;
     }
 
-    handle_get_task_inner(state, id, query).await
+    handle_get_task_inner(state, params, id, query).await
 }
 
 #[derive(Deserialize)]
@@ -206,8 +210,9 @@ pub struct ListTasksQuery {
 async fn handle_list_tasks<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Query(query): Query<ListTasksQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let params = ServiceParams::new();
+    let params = extract_service_params(&headers);
     let status = query
         .status
         .and_then(|s| serde_json::from_value::<TaskState>(serde_json::Value::String(s)).ok());
@@ -229,9 +234,9 @@ async fn handle_list_tasks<H: RequestHandler>(
 
 async fn handle_cancel_task_inner<H: RequestHandler>(
     state: RestState<H>,
+    params: ServiceParams,
     id: String,
 ) -> axum::response::Response {
-    let params = ServiceParams::new();
     let req = CancelTaskRequest {
         id,
         metadata: None,
@@ -246,12 +251,14 @@ async fn handle_cancel_task_inner<H: RequestHandler>(
 async fn handle_post_task_action<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let params = extract_service_params(&headers);
     if let Some(task_id) = id.strip_suffix(":cancel") {
-        return handle_cancel_task_inner(state, task_id.to_string()).await;
+        return handle_cancel_task_inner(state, params, task_id.to_string()).await;
     }
     if let Some(task_id) = id.strip_suffix(":subscribe") {
-        return handle_subscribe_to_task_inner(state, task_id.to_string()).await;
+        return handle_subscribe_to_task_inner(state, params, task_id.to_string()).await;
     }
 
     rest_error_response(A2AError::invalid_request("unsupported task action"))
@@ -260,15 +267,17 @@ async fn handle_post_task_action<H: RequestHandler>(
 async fn handle_cancel_task_legacy<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    handle_cancel_task_inner(state, id).await
+    let params = extract_service_params(&headers);
+    handle_cancel_task_inner(state, params, id).await
 }
 
 async fn handle_subscribe_to_task_inner<H: RequestHandler>(
     state: RestState<H>,
+    params: ServiceParams,
     id: String,
 ) -> axum::response::Response {
-    let params = ServiceParams::new();
     let req = SubscribeToTaskRequest { id, tenant: None };
     match state.handler.subscribe_to_task(&params, req).await {
         Ok(stream) => sse::sse_from_stream(protojson_stream(stream)).into_response(),
@@ -279,8 +288,10 @@ async fn handle_subscribe_to_task_inner<H: RequestHandler>(
 async fn handle_subscribe_to_task_legacy<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    handle_subscribe_to_task_inner(state, id).await
+    let params = extract_service_params(&headers);
+    handle_subscribe_to_task_inner(state, params, id).await
 }
 
 #[derive(Deserialize)]
@@ -295,13 +306,14 @@ pub struct ListPushConfigsQuery {
 async fn handle_create_push_config<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(raw_config): Json<Value>,
 ) -> impl IntoResponse {
     let req = match parse_create_push_config_request(id, raw_config) {
         Ok(req) => req,
         Err(e) => return rest_payload_error_response(e),
     };
-    let params = ServiceParams::new();
+    let params = extract_service_params(&headers);
     match state.handler.create_push_config(&params, req).await {
         Ok(resp) => protojson_json_response(&resp),
         Err(e) => rest_error_response(e),
@@ -311,8 +323,9 @@ async fn handle_create_push_config<H: RequestHandler>(
 async fn handle_get_push_config<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path((id, config_id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let params = ServiceParams::new();
+    let params = extract_service_params(&headers);
     let req = GetTaskPushNotificationConfigRequest {
         task_id: id,
         id: config_id,
@@ -328,8 +341,9 @@ async fn handle_list_push_configs<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(id): Path<String>,
     Query(query): Query<ListPushConfigsQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let params = ServiceParams::new();
+    let params = extract_service_params(&headers);
     let req = ListTaskPushNotificationConfigsRequest {
         task_id: id,
         page_size: query.page_size,
@@ -345,8 +359,9 @@ async fn handle_list_push_configs<H: RequestHandler>(
 async fn handle_delete_push_config<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path((id, config_id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let params = ServiceParams::new();
+    let params = extract_service_params(&headers);
     let req = DeleteTaskPushNotificationConfigRequest {
         task_id: id,
         id: config_id,
@@ -360,8 +375,9 @@ async fn handle_delete_push_config<H: RequestHandler>(
 
 async fn handle_get_extended_agent_card<H: RequestHandler>(
     State(state): State<RestState<H>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let params = ServiceParams::new();
+    let params = extract_service_params(&headers);
     let req = GetExtendedAgentCardRequest { tenant: None };
     match state.handler.get_extended_agent_card(&params, req).await {
         Ok(card) => protojson_json_response(&card),
@@ -494,7 +510,7 @@ mod tests {
     use futures::stream::BoxStream;
     use http_body_util::BodyExt;
 
-    use crate::test_util::install_crypto_provider;
+    use crate::test_util::{CapturingHandler, assert_header_captured, install_crypto_provider};
     use tower::ServiceExt;
 
     struct EchoExecutor;
@@ -938,6 +954,289 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+
+        let body = serde_json::json!({
+            "message": {
+                "messageId": "m1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hi"}]
+            }
+        });
+        let req = Request::builder()
+            .uri(REST_SEND_MESSAGE_PATH)
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-token-abc")
+            .header("x-tenant-id", "acme")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+
+        assert_header_captured(
+            &captured,
+            "send_message",
+            "authorization",
+            "Bearer test-token-abc",
+        );
+        assert_header_captured(&captured, "send_message", "x-tenant-id", "acme");
+    }
+
+    #[tokio::test]
+    async fn test_stream_message_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+
+        let body = serde_json::json!({
+            "message": {
+                "messageId": "m1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hi"}]
+            }
+        });
+        let req = Request::builder()
+            .uri(REST_STREAM_MESSAGE_PATH)
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .header("authorization", "Bearer streaming-token")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // Drain the SSE body to ensure the handler has been fully driven.
+        let _ = resp.into_body().collect().await.unwrap().to_bytes();
+
+        assert_header_captured(
+            &captured,
+            "send_streaming_message",
+            "authorization",
+            "Bearer streaming-token",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_task_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+        let req = Request::builder()
+            .uri("/tasks/some-id")
+            .method("GET")
+            .header("authorization", "Bearer get-task-token")
+            .header("x-tenant-id", "acme")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+        assert_header_captured(
+            &captured,
+            "get_task",
+            "authorization",
+            "Bearer get-task-token",
+        );
+        assert_header_captured(&captured, "get_task", "x-tenant-id", "acme");
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+        let req = Request::builder()
+            .uri("/tasks")
+            .method("GET")
+            .header("authorization", "Bearer list-tasks-token")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+        assert_header_captured(
+            &captured,
+            "list_tasks",
+            "authorization",
+            "Bearer list-tasks-token",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+        let req = Request::builder()
+            .uri("/tasks/some-id:cancel")
+            .method("POST")
+            .header("authorization", "Bearer cancel-token")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+        assert_header_captured(
+            &captured,
+            "cancel_task",
+            "authorization",
+            "Bearer cancel-token",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_legacy_propagates_headers_as_service_params() {
+        // /tasks/{id}/cancel routes through handle_cancel_task_legacy.
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+        let req = Request::builder()
+            .uri("/tasks/some-id/cancel")
+            .method("POST")
+            .header("authorization", "Bearer cancel-legacy-token")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+        assert_header_captured(
+            &captured,
+            "cancel_task",
+            "authorization",
+            "Bearer cancel-legacy-token",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_push_config_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+        let body = serde_json::json!({
+            "id": "cfg1",
+            "url": "http://example.com/callback"
+        });
+        let req = Request::builder()
+            .uri("/tasks/t1/pushNotificationConfigs")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer push-create-token")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+        assert_header_captured(
+            &captured,
+            "create_push_config",
+            "authorization",
+            "Bearer push-create-token",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_push_configs_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+        let req = Request::builder()
+            .uri("/tasks/t1/pushNotificationConfigs")
+            .method("GET")
+            .header("authorization", "Bearer push-list-token")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+        assert_header_captured(
+            &captured,
+            "list_push_configs",
+            "authorization",
+            "Bearer push-list-token",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_push_config_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+        let req = Request::builder()
+            .uri("/tasks/t1/pushNotificationConfigs/cfg1")
+            .method("GET")
+            .header("authorization", "Bearer push-get-token")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+        assert_header_captured(
+            &captured,
+            "get_push_config",
+            "authorization",
+            "Bearer push-get-token",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_push_config_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+        let req = Request::builder()
+            .uri("/tasks/t1/pushNotificationConfigs/cfg1")
+            .method("DELETE")
+            .header("authorization", "Bearer push-delete-token")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+        assert_header_captured(
+            &captured,
+            "delete_push_config",
+            "authorization",
+            "Bearer push-delete-token",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_extended_agent_card_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+        let req = Request::builder()
+            .uri(REST_EXTENDED_AGENT_CARD_PATH)
+            .method("GET")
+            .header("authorization", "Bearer card-token")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+        assert_header_captured(
+            &captured,
+            "get_extended_agent_card",
+            "authorization",
+            "Bearer card-token",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_task_propagates_headers_as_service_params() {
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+        let req = Request::builder()
+            .uri("/tasks/some-id:subscribe")
+            .method("GET")
+            .header("authorization", "Bearer subscribe-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let _ = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_header_captured(
+            &captured,
+            "subscribe_to_task",
+            "authorization",
+            "Bearer subscribe-token",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_task_legacy_propagates_headers_as_service_params() {
+        // /tasks/{id}/subscribe routes through handle_subscribe_to_task_legacy.
+        let (handler, captured) = CapturingHandler::new();
+        let app = rest_router(handler);
+        let req = Request::builder()
+            .uri("/tasks/some-id/subscribe")
+            .method("GET")
+            .header("authorization", "Bearer subscribe-legacy-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let _ = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_header_captured(
+            &captured,
+            "subscribe_to_task",
+            "authorization",
+            "Bearer subscribe-legacy-token",
+        );
     }
 
     #[tokio::test]
