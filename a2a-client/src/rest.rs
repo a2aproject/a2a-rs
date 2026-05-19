@@ -40,6 +40,7 @@ pub struct RestTransport {
 }
 
 impl RestTransport {
+    /// Build a `RestTransport` from a pre-constructed `reqwest::Client`.
     pub fn new(client: Client, base_url: String) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
         RestTransport { client, base_url }
@@ -416,14 +417,15 @@ pub struct RestTransportFactory {
 impl RestTransportFactory {
     pub fn new(client: Option<Client>) -> Self {
         RestTransportFactory {
-            client: client.unwrap_or_default(),
+            client: client
+                .unwrap_or_else(|| crate::default_reqwest_client(None).expect("default client")),
         }
     }
 
     #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
     pub fn with_root_certificates_pem(pem: &[u8]) -> Result<Self, A2AError> {
         Ok(Self {
-            client: crate::build_reqwest_client_with_root_pem(pem)?,
+            client: crate::default_reqwest_client(Some(pem))?,
         })
     }
 }
@@ -454,13 +456,19 @@ mod tests {
 
     #[test]
     fn test_rest_transport_new_strips_trailing_slash() {
-        let t = RestTransport::new(Client::new(), "http://localhost:8080/".into());
+        let t = RestTransport::new(
+            crate::default_reqwest_client(None).unwrap(),
+            "http://localhost:8080/".into(),
+        );
         assert_eq!(t.base_url, "http://localhost:8080");
     }
 
     #[test]
     fn test_rest_transport_new_no_trailing_slash() {
-        let t = RestTransport::new(Client::new(), "http://localhost:8080".into());
+        let t = RestTransport::new(
+            crate::default_reqwest_client(None).unwrap(),
+            "http://localhost:8080".into(),
+        );
         assert_eq!(t.base_url, "http://localhost:8080");
     }
 
@@ -496,7 +504,10 @@ mod tests {
 
     #[test]
     fn test_build_request_adds_params() {
-        let t = RestTransport::new(Client::new(), "http://localhost:8080".into());
+        let t = RestTransport::new(
+            crate::default_reqwest_client(None).unwrap(),
+            "http://localhost:8080".into(),
+        );
         let mut params = ServiceParams::new();
         params.insert("X-Custom".into(), vec!["val1".into(), "val2".into()]);
         let builder = t.build_request(reqwest::Method::GET, "/test", &params);

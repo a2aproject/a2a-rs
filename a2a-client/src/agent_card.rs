@@ -11,7 +11,8 @@ pub struct AgentCardResolver {
 impl AgentCardResolver {
     pub fn new(client: Option<Client>) -> Self {
         AgentCardResolver {
-            client: client.unwrap_or_default(),
+            client: client
+                .unwrap_or_else(|| crate::default_reqwest_client(None).expect("default client")),
         }
     }
 

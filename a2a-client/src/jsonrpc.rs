@@ -43,6 +43,7 @@ pub struct JsonRpcTransport {
 }
 
 impl JsonRpcTransport {
+    /// Build a `JsonRpcTransport` from a pre-constructed `reqwest::Client`.
     pub fn new(client: Client, endpoint: String) -> Self {
         JsonRpcTransport { client, endpoint }
     }
@@ -458,14 +459,15 @@ pub struct JsonRpcTransportFactory {
 impl JsonRpcTransportFactory {
     pub fn new(client: Option<Client>) -> Self {
         JsonRpcTransportFactory {
-            client: client.unwrap_or_default(),
+            client: client
+                .unwrap_or_else(|| crate::default_reqwest_client(None).expect("default client")),
         }
     }
 
     #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
     pub fn with_root_certificates_pem(pem: &[u8]) -> Result<Self, A2AError> {
         Ok(Self {
-            client: crate::build_reqwest_client_with_root_pem(pem)?,
+            client: crate::default_reqwest_client(Some(pem))?,
         })
     }
 }
@@ -1014,7 +1016,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let err = reqwest::get(format!("http://{addr}/"))
+        let err = crate::default_reqwest_client(None)
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
             .await
             .expect_err("connection should fail");
 
@@ -1034,7 +1039,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let err = reqwest::get(format!("http://{addr}/"))
+        let err = crate::default_reqwest_client(None)
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
             .await
             .expect_err("connection should fail");
 
@@ -1117,7 +1125,10 @@ mod tests {
 
     #[test]
     fn test_jsonrpc_transport_new() {
-        let t = JsonRpcTransport::new(Client::new(), "http://localhost:8080".into());
+        let t = JsonRpcTransport::new(
+            crate::default_reqwest_client(None).unwrap(),
+            "http://localhost:8080".into(),
+        );
         assert_eq!(t.endpoint, "http://localhost:8080");
     }
 
@@ -1171,7 +1182,8 @@ mod tests {
         })
         .to_string();
         let (endpoint, request_rx) = spawn_jsonrpc_server(response).await;
-        let transport = JsonRpcTransport::new(Client::new(), endpoint);
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
         let mut params = ServiceParams::new();
         params.insert("x-trace".into(), vec!["alpha".into(), "beta".into()]);
 
@@ -1220,7 +1232,8 @@ mod tests {
         })
         .to_string();
         let (endpoint, _request_rx) = spawn_jsonrpc_server(response).await;
-        let transport = JsonRpcTransport::new(Client::new(), endpoint);
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let error = transport
             .create_push_config(&ServiceParams::new(), &sample_create_push_config_request())
@@ -1239,7 +1252,8 @@ mod tests {
         })
         .to_string();
         let (endpoint, _request_rx) = spawn_jsonrpc_server(response).await;
-        let transport = JsonRpcTransport::new(Client::new(), endpoint);
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let error = transport
             .create_push_config(&ServiceParams::new(), &sample_create_push_config_request())
@@ -1265,7 +1279,8 @@ mod tests {
         })
         .to_string();
         let (endpoint, request_rx) = spawn_jsonrpc_server(response).await;
-        let transport = JsonRpcTransport::new(Client::new(), endpoint);
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let result = transport
             .get_push_config(
