@@ -1,6 +1,6 @@
 [package]
 name = "a2a-cli"
-version = "0.1.3"
+version = "0.1.4"
 description = "Standalone A2A CLI client"
 readme = "README.md"
 edition.workspace = true

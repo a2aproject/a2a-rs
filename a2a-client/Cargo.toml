@@ -3,7 +3,7 @@
 
 [package]
 name = "a2a-client-lf"
-version = "0.1.16"
+version = "0.1.17"
 description = "A2A v1 async client with protocol binding factory"
 readme = "README.md"
 edition.workspace = true

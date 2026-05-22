@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.1.16...a2a-client-lf-v0.1.17) - 2026-05-22
+
+### Fixed
+
+- *(a2a-client)* unify reqwest client constructor with custom PEM support ([#68](https://github.com/a2aproject/a2a-rs/pull/68))
+
 ## [0.1.16](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.1.15...a2a-client-lf-v0.1.16) - 2026-05-11
 
 ### Fixed
