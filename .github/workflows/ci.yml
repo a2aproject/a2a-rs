@@ -25,7 +25,9 @@ jobs:
           components: clippy, rustfmt
 
       - name: Check compilation
-        run: cargo check --workspace
+        run: |
+            cargo check --workspace
+            cargo check --workspace --no-default-features
 
       - name: Check formatting
         if: runner.os == 'Linux'

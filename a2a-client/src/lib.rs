@@ -15,6 +15,9 @@ pub use factory::A2AClientFactory;
 pub use futures::stream::BoxStream;
 pub use transport::{ServiceParams, Transport, TransportFactory};
 
+#[cfg(feature = "rustls-tls")]
+pub use rustls;
+
 /// Build a `reqwest::Client` whose TLS layer matches this crate's feature
 /// selection, optionally adding extra root certificates from a PEM bundle.
 ///
@@ -32,14 +35,14 @@ pub use transport::{ServiceParams, Transport, TransportFactory};
 /// - When the rustls features are off (e.g. only `native-tls`), extra
 ///   certificates are added via `reqwest::ClientBuilder::add_root_certificate`.
 pub fn default_reqwest_client(
-    extra_root_pem: Option<&[u8]>,
+    #[allow(unused_variables)] extra_root_pem: Option<&[u8]>,
 ) -> Result<reqwest::Client, a2a::A2AError> {
     let builder = reqwest::Client::builder();
 
     #[cfg(any(feature = "rustls-tls-aws-lc-rs", feature = "rustls-tls-ring"))]
     let builder = builder.use_preconfigured_tls(rustls_client_config(extra_root_pem)?);
 
-    #[cfg(not(any(feature = "rustls-tls-aws-lc-rs", feature = "rustls-tls-ring")))]
+    #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
     let builder = match extra_root_pem {
         Some(pem) => {
             let cert = reqwest::Certificate::from_pem(pem)

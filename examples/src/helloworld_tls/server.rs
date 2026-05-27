@@ -44,9 +44,9 @@ fn load_rustls_config() -> Arc<rustls::ServerConfig> {
     )
 }
 
-fn load_grpc_tls_config() -> Arc<tokio_rustls::rustls::ServerConfig> {
+fn load_grpc_tls_config() -> Arc<rustls::ServerConfig> {
     let (certs, key) = load_cert_and_key();
-    let mut config = tokio_rustls::rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .expect("invalid cert/key");
@@ -61,6 +61,11 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // Install rustls crypto provider
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install default crypto provider");
 
     let handler = Arc::new(DefaultRequestHandler::new(
         EchoExecutor,

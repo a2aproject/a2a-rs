@@ -263,20 +263,20 @@ impl Transport for GrpcTransport {
 /// Use [`GrpcTransportFactory::new()`] for plain connections, or
 /// [`GrpcTransportFactory::with_rustls_config()`] to enable TLS.
 pub struct GrpcTransportFactory {
-    #[cfg(feature = "rustls")]
-    tls_config: Option<std::sync::Arc<tokio_rustls::rustls::ClientConfig>>,
+    #[cfg(feature = "rustls-tls")]
+    tls_config: Option<std::sync::Arc<rustls::ClientConfig>>,
 }
 
 impl GrpcTransportFactory {
     pub fn new() -> Self {
         GrpcTransportFactory {
-            #[cfg(feature = "rustls")]
+            #[cfg(feature = "rustls-tls")]
             tls_config: None,
         }
     }
 
-    #[cfg(feature = "rustls")]
-    pub fn with_rustls_config(config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>) -> Self {
+    #[cfg(feature = "rustls-tls")]
+    pub fn with_rustls_config(config: std::sync::Arc<rustls::ClientConfig>) -> Self {
         GrpcTransportFactory {
             tls_config: Some(config),
         }
@@ -289,10 +289,8 @@ impl Default for GrpcTransportFactory {
     }
 }
 
-#[cfg(feature = "rustls")]
-fn server_name_from_url(
-    url: &str,
-) -> Result<tokio_rustls::rustls::pki_types::ServerName<'static>, A2AError> {
+#[cfg(feature = "rustls-tls")]
+fn server_name_from_url(url: &str) -> Result<rustls::pki_types::ServerName<'static>, A2AError> {
     let uri: http::Uri = url
         .parse()
         .map_err(|e| A2AError::internal(format!("invalid URL: {e}")))?;
@@ -300,15 +298,15 @@ fn server_name_from_url(
         .host()
         .ok_or_else(|| A2AError::internal("URL has no host"))?
         .to_string();
-    tokio_rustls::rustls::pki_types::ServerName::try_from(host)
+    rustls::pki_types::ServerName::try_from(host)
         .map_err(|e| A2AError::internal(format!("invalid server name: {e}")))
 }
 
-#[cfg(feature = "rustls")]
+#[cfg(feature = "rustls-tls")]
 impl GrpcTransportFactory {
     async fn connect_tls(
         url: &str,
-        tls_config: &std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+        tls_config: &std::sync::Arc<rustls::ClientConfig>,
     ) -> Result<GrpcTransport, A2AError> {
         let url = normalize_grpc_endpoint(url);
         let server_name = server_name_from_url(&url)?;
@@ -336,7 +334,7 @@ impl TransportFactory for GrpcTransportFactory {
         _card: &AgentCard,
         iface: &AgentInterface,
     ) -> Result<Box<dyn Transport>, A2AError> {
-        #[cfg(feature = "rustls")]
+        #[cfg(feature = "rustls-tls")]
         if let Some(tls_config) = &self.tls_config {
             return Ok(Box::new(Self::connect_tls(&iface.url, tls_config).await?));
         }
@@ -427,7 +425,7 @@ mod tests {
         assert_eq!(f.protocol(), a2a::TRANSPORT_PROTOCOL_GRPC);
     }
 
-    #[cfg(feature = "rustls")]
+    #[cfg(feature = "rustls-tls")]
     mod tls_tests {
         use super::*;
         use std::sync::Arc;
@@ -443,15 +441,15 @@ mod tests {
             cert.pem().into_bytes()
         }
 
-        fn build_test_tls_config(ca_pem: &[u8]) -> Arc<tokio_rustls::rustls::ClientConfig> {
-            let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        fn build_test_tls_config(ca_pem: &[u8]) -> Arc<rustls::ClientConfig> {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             let ca_cert = rustls_pemfile::certs(&mut &ca_pem[..])
                 .next()
                 .expect("should have at least one cert in ca.pem")
                 .expect("cert should be valid");
-            let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+            let mut root_store = rustls::RootCertStore::empty();
             root_store.add(ca_cert).unwrap();
-            let mut config = tokio_rustls::rustls::ClientConfig::builder()
+            let mut config = rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
             config.alpn_protocols = vec![tonic_tls::ALPN_H2.to_vec()];
@@ -478,7 +476,7 @@ mod tests {
             let name = server_name_from_url("https://example.com:443").unwrap();
             assert_eq!(
                 name,
-                tokio_rustls::rustls::pki_types::ServerName::try_from("example.com").unwrap()
+                rustls::pki_types::ServerName::try_from("example.com").unwrap()
             );
         }
 
@@ -487,7 +485,7 @@ mod tests {
             let name = server_name_from_url("https://localhost:50052").unwrap();
             assert_eq!(
                 name,
-                tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap()
+                rustls::pki_types::ServerName::try_from("localhost").unwrap()
             );
         }
 
@@ -496,7 +494,7 @@ mod tests {
             let name = server_name_from_url("https://127.0.0.1:50052").unwrap();
             assert_eq!(
                 name,
-                tokio_rustls::rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap()
+                rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap()
             );
         }
 

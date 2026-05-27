@@ -29,13 +29,12 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 axum-server = { workspace = true, features = ["tls-rustls-no-provider"], optional = true }
-rustls = { workspace = true, optional = true, features = ["aws-lc-rs"] }
+rustls = { workspace = true, optional = true }
 
 [features]
 default = ["rustls-tls"]
 native-tls = ["reqwest/native-tls"]
-rustls-tls = ["reqwest/rustls-tls-webpki-roots-no-provider", "dep:rustls"]
-rustls = ["dep:axum-server", "dep:rustls", "rustls-tls"]
+rustls-tls = ["reqwest/rustls-tls-webpki-roots-no-provider", "dep:rustls", "dep:axum-server"]
 
 [dev-dependencies]
 http-body-util = "0.1"
