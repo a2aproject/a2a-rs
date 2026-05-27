@@ -451,7 +451,6 @@ impl TransportFactory for RestTransportFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::rcgen_self_signed_ca_pem;
     use serde_json::json;
 
     #[test]
@@ -645,16 +644,18 @@ mod tests {
         assert_eq!(err.code, error_code::INVALID_PARAMS);
     }
 
+    #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
     #[test]
     fn test_with_root_certificates_pem_valid() {
-        let pem = rcgen_self_signed_ca_pem();
+        let pem = crate::test_utils::rcgen_self_signed_ca_pem();
         let f = RestTransportFactory::with_root_certificates_pem(&pem).unwrap();
         assert_eq!(f.protocol(), TRANSPORT_PROTOCOL_HTTP_JSON);
     }
 
+    #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
     #[tokio::test]
     async fn test_with_root_certificates_pem_factory_create() {
-        let pem = rcgen_self_signed_ca_pem();
+        let pem = crate::test_utils::rcgen_self_signed_ca_pem();
         let f = RestTransportFactory::with_root_certificates_pem(&pem).unwrap();
         let card = AgentCard {
             name: "Test".into(),

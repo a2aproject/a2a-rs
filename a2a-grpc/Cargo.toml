@@ -24,8 +24,8 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 http = { workspace = true }
-tonic-tls = { workspace = true, features = ["rustls"], optional = true }
-tokio-rustls = { workspace = true, optional = true }
+tonic-tls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
@@ -33,6 +33,14 @@ rustls-pemfile = { workspace = true }
 
 [features]
 default = ["rustls-tls"]
-native-tls = ["a2a-client/native-tls", "a2a-server/native-tls"]
-rustls-tls = ["a2a-client/rustls-tls", "a2a-server/rustls-tls"]
-rustls = ["dep:tonic-tls", "dep:tokio-rustls", "rustls-tls"]
+native-tls = [
+    "a2a-client/native-tls",
+    "a2a-server/native-tls",
+    "tonic-tls/native"
+]
+rustls-tls = [
+    "a2a-client/rustls-tls",
+    "a2a-server/rustls-tls",
+    "dep:rustls",
+    "tonic-tls/rustls",
+]

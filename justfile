@@ -2,7 +2,14 @@
 # See https://just.systems for installation
 
 # Default recipe: build + test
-default: build test
+default: fmt-check lint build test
+
+# Install cargo hack for workspace-aware builds
+cargo-hack:
+    @command -v cargo-hack >/dev/null 2>&1 || cargo install cargo-hack --locked
+
+check-compile: cargo-hack
+    cargo hack check --workspace --all-targets --each-feature
 
 # Build all workspace crates
 build:
@@ -21,8 +28,8 @@ test-verbose:
     cargo test --workspace -- --nocapture
 
 # Run clippy lints
-lint:
-    cargo clippy --workspace --all-targets -- -D warnings
+lint: cargo-hack
+    cargo hack clippy --workspace --all-targets --each-feature -- -D warnings
 
 # Check formatting
 fmt-check:
@@ -59,10 +66,6 @@ example:
 # Clean build artifacts
 clean:
     cargo clean
-
-# Check that the project compiles without producing binaries
-check-compile:
-    cargo check --workspace
 
 # Verify copyright headers on all Rust source files
 check-headers:

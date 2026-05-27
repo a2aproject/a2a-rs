@@ -7,5 +7,5 @@ pub mod server;
 pub use client::{GrpcTransport, GrpcTransportFactory};
 pub use server::GrpcHandler;
 
-#[cfg(feature = "rustls")]
-pub use tokio_rustls::rustls;
+#[cfg(feature = "rustls-tls")]
+pub use rustls;

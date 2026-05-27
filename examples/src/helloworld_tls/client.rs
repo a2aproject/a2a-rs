@@ -15,8 +15,8 @@ use a2a_client::A2AClientFactory;
 use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::jsonrpc::JsonRpcTransportFactory;
 use a2a_client::rest::RestTransportFactory;
+use a2a_client::rustls;
 use a2a_grpc::GrpcTransportFactory;
-use a2a_grpc::rustls;
 use examples_lib::exercise_client;
 
 const SERVER_URLS: &[&str] = &["https://localhost:3443"];
@@ -54,8 +54,13 @@ async fn main() {
         )
         .init();
 
-    let grpc_tls_config = build_grpc_tls_config();
+    // Install rustls crypto provider
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install default crypto provider");
+
     let tls_reqwest = build_tls_reqwest_client();
+    let grpc_tls_config = build_grpc_tls_config();
     let resolver = AgentCardResolver::new(Some(tls_reqwest));
 
     let protocols: &[&str] = &[

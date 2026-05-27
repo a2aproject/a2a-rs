@@ -493,7 +493,6 @@ impl TransportFactory for JsonRpcTransportFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::rcgen_self_signed_ca_pem;
     use a2a_pb::protojson_conv;
     use futures::StreamExt;
     use serde_json::{Value, json};
@@ -1311,16 +1310,18 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
     #[test]
     fn test_with_root_certificates_pem_valid() {
-        let pem = rcgen_self_signed_ca_pem();
+        let pem = crate::test_utils::rcgen_self_signed_ca_pem();
         let f = JsonRpcTransportFactory::with_root_certificates_pem(&pem).unwrap();
         assert_eq!(f.protocol(), TRANSPORT_PROTOCOL_JSONRPC);
     }
 
+    #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
     #[tokio::test]
     async fn test_with_root_certificates_pem_factory_create() {
-        let pem = rcgen_self_signed_ca_pem();
+        let pem = crate::test_utils::rcgen_self_signed_ca_pem();
         let f = JsonRpcTransportFactory::with_root_certificates_pem(&pem).unwrap();
         let card = AgentCard {
             name: "Test".into(),

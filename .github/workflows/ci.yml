@@ -24,18 +24,23 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install just
+        uses: taiki-e/install-action@80779d0b81222e7a5d0c5751d3c2537d4a36f556 # v2
+        with:
+          tool: just
+
       - name: Check compilation
-        run: cargo check --workspace
+        run: just check-compile
 
       - name: Check formatting
         if: runner.os == 'Linux'
-        run: cargo fmt --all -- --check
+        run: just fmt-check
 
       - name: Clippy lints
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: just lint
 
       - name: Run tests
-        run: cargo test --workspace
+        run: just test
 
       - name: Check copyright headers
         if: matrix.os != 'windows-latest'
