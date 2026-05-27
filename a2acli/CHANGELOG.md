@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.1.4...a2a-cli-v0.1.5) - 2026-05-27
+
+### Fixed
+
+- Upgrade to reqwest 0.13 and refactor TLS feature flags ([#78](https://github.com/a2aproject/a2a-rs/pull/78))
+
 ## [0.1.4](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.1.3...a2a-cli-v0.1.4) - 2026-05-22
 
 ### Other

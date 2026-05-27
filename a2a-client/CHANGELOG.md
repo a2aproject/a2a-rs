@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.1.17...a2a-client-lf-v0.2.0) - 2026-05-27
+
+### Fixed
+
+- Upgrade to reqwest 0.13 and refactor TLS feature flags ([#78](https://github.com/a2aproject/a2a-rs/pull/78))
+- a2a-client-lf fails to compile with --no-default-features ([#75](https://github.com/a2aproject/a2a-rs/pull/75))
+
 ## [0.1.17](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.1.16...a2a-client-lf-v0.1.17) - 2026-05-22
 
 ### Fixed
