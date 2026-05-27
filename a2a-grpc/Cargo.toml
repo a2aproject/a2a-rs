@@ -33,14 +33,23 @@ rustls-pemfile = { workspace = true }
 
 [features]
 default = ["rustls-tls"]
+
 native-tls = [
     "a2a-client/native-tls",
     "a2a-server/native-tls",
     "tonic-tls/native"
 ]
+
 rustls-tls = [
     "a2a-client/rustls-tls",
     "a2a-server/rustls-tls",
-    "dep:rustls",
     "tonic-tls/rustls",
+    "dep:rustls",
+]
+
+rustls-no-provider = [
+    "a2a-client/rustls-no-provider",
+    "a2a-server/rustls-no-provider",
+    "tonic-tls/rustls",
+    "dep:rustls",
 ]

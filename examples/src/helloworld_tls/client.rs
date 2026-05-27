@@ -39,9 +39,9 @@ fn build_grpc_tls_config() -> Arc<rustls::ClientConfig> {
 }
 
 fn build_tls_reqwest_client() -> reqwest::Client {
-    let cert = reqwest::Certificate::from_pem(CA_PEM).expect("parse CA cert for reqwest");
+    let certs = reqwest::Certificate::from_pem_bundle(CA_PEM).expect("parse CA cert for reqwest");
     reqwest::Client::builder()
-        .add_root_certificate(cert)
+        .tls_certs_merge(certs)
         .build()
         .expect("build reqwest client")
 }

@@ -31,32 +31,24 @@ uuid = { workspace = true }
 semver = { workspace = true }
 pin-project-lite = { workspace = true }
 rustls = { workspace = true, optional = true }
-rustls-pemfile = { version = "2", optional = true }
-webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
 
 [features]
 # By default we will use aws-lc-rs as crypto provider.
-default = ["rustls-tls-aws-lc-rs"]
+default = ["rustls-tls"]
 
-# For application setting their own provider, we use rustls
-# with NO crypto provider compiled in.
-# Consumers selecting only this feature are responsible for installing a
-# process-wide `CryptoProvider` (via `install_default()`) in their
-# main function. If they don't do it, `reqwest::Client::new()` will panic with
-# "no process-level CryptoProvider available".
 rustls-tls = [
-    "reqwest/rustls-tls-webpki-roots-no-provider",
+    "reqwest/rustls",
     "dep:rustls",
-    "dep:rustls-pemfile",
-    "dep:webpki-roots",
 ]
 
-# If the consumer wants, a2a-client can also pull in a crypto provider and use it
-# when creating the reqwest client.
-rustls-tls-aws-lc-rs = ["rustls-tls", "rustls/aws-lc-rs"]
-rustls-tls-ring = ["rustls-tls", "rustls/ring"]
+rustls-no-provider = [
+    "reqwest/rustls-no-provider",
+    "dep:rustls",
+]
 
-native-tls = ["reqwest/native-tls"]
+native-tls = [
+    "reqwest/native-tls"
+]

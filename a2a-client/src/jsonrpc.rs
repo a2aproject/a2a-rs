@@ -464,7 +464,11 @@ impl JsonRpcTransportFactory {
         }
     }
 
-    #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
+    #[cfg(any(
+        feature = "rustls-tls",
+        feature = "rustls-no-provider",
+        feature = "native-tls"
+    ))]
     pub fn with_root_certificates_pem(pem: &[u8]) -> Result<Self, A2AError> {
         Ok(Self {
             client: crate::default_reqwest_client(Some(pem))?,

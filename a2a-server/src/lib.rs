@@ -9,7 +9,8 @@ pub mod push;
 pub mod rest;
 pub mod sse;
 pub mod task_store;
-#[cfg(feature = "rustls-tls")]
+
+#[cfg(any(feature = "rustls-tls", feature = "rustls-no-provider"))]
 pub mod tls;
 
 pub use agent_card::{AgentCardProducer, StaticAgentCard, WELL_KNOWN_AGENT_CARD_PATH};

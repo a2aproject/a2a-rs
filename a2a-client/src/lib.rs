@@ -15,40 +15,26 @@ pub use factory::A2AClientFactory;
 pub use futures::stream::BoxStream;
 pub use transport::{ServiceParams, Transport, TransportFactory};
 
-#[cfg(feature = "rustls-tls")]
+#[cfg(any(feature = "rustls-tls", feature = "rustls-no-provider"))]
 pub use rustls;
 
 /// Build a `reqwest::Client` whose TLS layer matches this crate's feature
 /// selection, optionally adding extra root certificates from a PEM bundle.
-///
-/// - When `rustls-tls-aws-lc-rs` or `rustls-tls-ring` is enabled, a
-///   `rustls::ClientConfig` is constructed with the corresponding provider
-///   and handed to `reqwest::ClientBuilder::use_preconfigured_tls`. Custom
-///   PEM certificates are parsed and added to the rustls root store
-///   alongside the webpki roots. No process-global `CryptoProvider` is
-///   installed.
-/// - When only `rustls-tls` is enabled (no provider variant), reqwest
-///   falls back to whatever `CryptoProvider` the application installed via
-///   `install_default()`. If none is installed, `reqwest::Client::new()`
-///   panics; that is the contract the consumer accepted by disabling the
-///   provider variants.
-/// - When the rustls features are off (e.g. only `native-tls`), extra
-///   certificates are added via `reqwest::ClientBuilder::add_root_certificate`.
 pub fn default_reqwest_client(
     #[allow(unused_variables)] extra_root_pem: Option<&[u8]>,
 ) -> Result<reqwest::Client, a2a::A2AError> {
     let builder = reqwest::Client::builder();
 
-    #[cfg(any(feature = "rustls-tls-aws-lc-rs", feature = "rustls-tls-ring"))]
-    let builder = builder.use_preconfigured_tls(rustls_client_config(extra_root_pem)?);
-
-    #[cfg(not(any(feature = "rustls-tls-aws-lc-rs", feature = "rustls-tls-ring")))]
-    #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
+    #[cfg(any(
+        feature = "rustls-tls",
+        feature = "rustls-no-provider",
+        feature = "native-tls"
+    ))]
     let builder = match extra_root_pem {
         Some(pem) => {
-            let cert = reqwest::Certificate::from_pem(pem)
+            let certs = reqwest::Certificate::from_pem_bundle(pem)
                 .map_err(|e| a2a::A2AError::internal(format!("invalid PEM certificate: {e}")))?;
-            builder.add_root_certificate(cert)
+            builder.tls_certs_merge(certs)
         }
         None => builder,
     };
@@ -56,39 +42,6 @@ pub fn default_reqwest_client(
     builder
         .build()
         .map_err(|e| a2a::A2AError::internal(format!("failed to build HTTP client: {e}")))
-}
-
-#[cfg(any(feature = "rustls-tls-aws-lc-rs", feature = "rustls-tls-ring"))]
-fn rustls_client_config(
-    extra_root_pem: Option<&[u8]>,
-) -> Result<rustls::ClientConfig, a2a::A2AError> {
-    let provider = std::sync::Arc::new(selected_crypto_provider());
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    if let Some(pem) = extra_root_pem {
-        for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(pem)) {
-            let der =
-                cert.map_err(|e| a2a::A2AError::internal(format!("invalid PEM certificate: {e}")))?;
-            roots
-                .add(der)
-                .map_err(|e| a2a::A2AError::internal(format!("failed to add CA: {e}")))?;
-        }
-    }
-    Ok(rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("safe default protocol versions are supported")
-        .with_root_certificates(roots)
-        .with_no_client_auth())
-}
-
-#[cfg(feature = "rustls-tls-aws-lc-rs")]
-fn selected_crypto_provider() -> rustls::crypto::CryptoProvider {
-    rustls::crypto::aws_lc_rs::default_provider()
-}
-
-#[cfg(all(feature = "rustls-tls-ring", not(feature = "rustls-tls-aws-lc-rs")))]
-fn selected_crypto_provider() -> rustls::crypto::CryptoProvider {
-    rustls::crypto::ring::default_provider()
 }
 
 pub(crate) fn a2a_error_from_details(

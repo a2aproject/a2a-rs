@@ -34,7 +34,7 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic-tls = { workspace = true, features = ["rustls"] }
 async-trait = { workspace = true }
-reqwest = { workspace = true, default-features = false, features = ["rustls-tls-webpki-roots-no-provider"] }
+reqwest = { workspace = true, features = ["rustls"] }
 futures = { workspace = true }
 axum = { workspace = true }
 tonic = { workspace = true }
@@ -45,6 +45,7 @@ chrono = { workspace = true }
 
 [build-dependencies]
 rcgen = { workspace = true }
+time = { version = "0.3", features = ["std"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
