@@ -100,9 +100,15 @@ impl A2AClientFactory {
         for (_prio, iface, factory) in &candidates {
             match factory.create(card, iface).await {
                 Ok(transport) => {
-                    return Ok(
-                        A2AClient::new(transport).with_interceptors(self.interceptors.clone())
-                    );
+                    let mut client =
+                        A2AClient::new(transport).with_interceptors(self.interceptors.clone());
+                    // Spec §8.3.2 rule 4: echo the tenant declared by the
+                    // selected interface on every request. An empty string
+                    // means "not declared" (proto3 default).
+                    if let Some(tenant) = iface.tenant.as_deref().filter(|t| !t.is_empty()) {
+                        client = client.with_tenant(tenant);
+                    }
+                    return Ok(client);
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -244,14 +250,12 @@ mod tests {
         assert_eq!(factory.interceptors.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_create_from_card_no_matching_transport() {
-        let factory = A2AClientFactory::builder().no_defaults().build();
-        let card = AgentCard {
+    fn card_with_interface(iface: AgentInterface) -> AgentCard {
+        AgentCard {
             name: "test".into(),
             description: "test agent".into(),
             version: "1.0".into(),
-            supported_interfaces: vec![AgentInterface::new("http://localhost", "unknown")],
+            supported_interfaces: vec![iface],
             capabilities: AgentCapabilities::default(),
             default_input_modes: vec!["text".into()],
             default_output_modes: vec!["text".into()],
@@ -262,8 +266,54 @@ mod tests {
             security_schemes: None,
             security_requirements: None,
             signatures: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_from_card_no_matching_transport() {
+        let factory = A2AClientFactory::builder().no_defaults().build();
+        let card = card_with_interface(AgentInterface::new("http://localhost", "unknown"));
         let result = factory.create_from_card(&card).await;
         assert!(result.is_err());
+    }
+
+    /// Spec §8.3.2 rule 4: the tenant declared by the selected interface is
+    /// propagated to the constructed client.
+    #[tokio::test]
+    async fn test_create_from_card_propagates_interface_tenant() {
+        let factory = A2AClientFactory::builder().build();
+        let mut iface = AgentInterface::new("http://localhost:8080", TRANSPORT_PROTOCOL_JSONRPC);
+        iface.tenant = Some("tenant-1".into());
+        let client = factory
+            .create_from_card(&card_with_interface(iface))
+            .await
+            .unwrap();
+        assert_eq!(client.tenant(), Some("tenant-1"));
+    }
+
+    /// An interface without a declared tenant leaves the client tenant unset.
+    #[tokio::test]
+    async fn test_create_from_card_without_interface_tenant() {
+        let factory = A2AClientFactory::builder().build();
+        let iface = AgentInterface::new("http://localhost:8080", TRANSPORT_PROTOCOL_JSONRPC);
+        let client = factory
+            .create_from_card(&card_with_interface(iface))
+            .await
+            .unwrap();
+        assert_eq!(client.tenant(), None);
+    }
+
+    /// An empty-string tenant means "not declared" (proto3 default) and must
+    /// not be echoed.
+    #[tokio::test]
+    async fn test_create_from_card_treats_empty_tenant_as_unset() {
+        let factory = A2AClientFactory::builder().build();
+        let mut iface = AgentInterface::new("http://localhost:8080", TRANSPORT_PROTOCOL_JSONRPC);
+        iface.tenant = Some(String::new());
+        let client = factory
+            .create_from_card(&card_with_interface(iface))
+            .await
+            .unwrap();
+        assert_eq!(client.tenant(), None);
     }
 }

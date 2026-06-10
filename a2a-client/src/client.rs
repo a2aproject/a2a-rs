@@ -4,6 +4,7 @@ use a2a::jsonrpc::methods;
 use a2a::*;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::middleware::CallInterceptor;
@@ -14,6 +15,7 @@ pub struct A2AClient<T: Transport> {
     transport: T,
     interceptors: Vec<Arc<dyn CallInterceptor>>,
     default_params: ServiceParams,
+    tenant: Option<String>,
 }
 
 impl<T: Transport> A2AClient<T> {
@@ -24,12 +26,47 @@ impl<T: Transport> A2AClient<T> {
             transport,
             interceptors: Vec::new(),
             default_params,
+            tenant: None,
         }
     }
 
     pub fn with_interceptors(mut self, interceptors: Vec<Arc<dyn CallInterceptor>>) -> Self {
         self.interceptors = interceptors;
         self
+    }
+
+    /// Set the tenant declared by the selected [`AgentInterface`].
+    ///
+    /// When set, the tenant is filled into every outgoing request whose
+    /// `tenant` field is unset, as required by spec §8.3.2 (rule 4). A
+    /// tenant explicitly set on a request is never overridden.
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
+    }
+
+    /// The tenant filled into outgoing requests, if configured.
+    pub fn tenant(&self) -> Option<&str> {
+        self.tenant.as_deref()
+    }
+
+    /// Fill the request's `tenant` field from the client's configured tenant
+    /// (spec §8.3.2 rule 4), without overriding an explicitly set tenant.
+    fn apply_tenant<'a, R: Clone>(
+        &self,
+        req: &'a R,
+        tenant_field: impl FnOnce(&mut R) -> &mut Option<String>,
+    ) -> Cow<'a, R> {
+        let Some(tenant) = &self.tenant else {
+            return Cow::Borrowed(req);
+        };
+        let mut filled = req.clone();
+        let field = tenant_field(&mut filled);
+        if field.is_some() {
+            return Cow::Borrowed(req);
+        }
+        *field = Some(tenant.clone());
+        Cow::Owned(filled)
     }
 
     fn params(&self) -> ServiceParams {
@@ -75,7 +112,8 @@ impl<T: Transport> A2AClient<T> {
         req: &SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
         let params = self.apply_before(methods::SEND_MESSAGE).await?;
-        let result = self.transport.send_message(&params, req).await;
+        let req = self.apply_tenant(req, |r| &mut r.tenant);
+        let result = self.transport.send_message(&params, &req).await;
         self.finish_call(methods::SEND_MESSAGE, result).await
     }
 
@@ -84,26 +122,30 @@ impl<T: Transport> A2AClient<T> {
         req: &SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let params = self.apply_before(methods::SEND_STREAMING_MESSAGE).await?;
-        let result = self.transport.send_streaming_message(&params, req).await;
+        let req = self.apply_tenant(req, |r| &mut r.tenant);
+        let result = self.transport.send_streaming_message(&params, &req).await;
         self.finish_call(methods::SEND_STREAMING_MESSAGE, result)
             .await
     }
 
     pub async fn get_task(&self, req: &GetTaskRequest) -> Result<Task, A2AError> {
         let params = self.apply_before(methods::GET_TASK).await?;
-        let result = self.transport.get_task(&params, req).await;
+        let req = self.apply_tenant(req, |r| &mut r.tenant);
+        let result = self.transport.get_task(&params, &req).await;
         self.finish_call(methods::GET_TASK, result).await
     }
 
     pub async fn list_tasks(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
         let params = self.apply_before(methods::LIST_TASKS).await?;
-        let result = self.transport.list_tasks(&params, req).await;
+        let req = self.apply_tenant(req, |r| &mut r.tenant);
+        let result = self.transport.list_tasks(&params, &req).await;
         self.finish_call(methods::LIST_TASKS, result).await
     }
 
     pub async fn cancel_task(&self, req: &CancelTaskRequest) -> Result<Task, A2AError> {
         let params = self.apply_before(methods::CANCEL_TASK).await?;
-        let result = self.transport.cancel_task(&params, req).await;
+        let req = self.apply_tenant(req, |r| &mut r.tenant);
+        let result = self.transport.cancel_task(&params, &req).await;
         self.finish_call(methods::CANCEL_TASK, result).await
     }
 
@@ -112,7 +154,8 @@ impl<T: Transport> A2AClient<T> {
         req: &SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let params = self.apply_before(methods::SUBSCRIBE_TO_TASK).await?;
-        let result = self.transport.subscribe_to_task(&params, req).await;
+        let req = self.apply_tenant(req, |r| &mut r.tenant);
+        let result = self.transport.subscribe_to_task(&params, &req).await;
         self.finish_call(methods::SUBSCRIBE_TO_TASK, result).await
     }
 
@@ -121,7 +164,8 @@ impl<T: Transport> A2AClient<T> {
         req: &TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let params = self.apply_before(methods::CREATE_PUSH_CONFIG).await?;
-        let result = self.transport.create_push_config(&params, req).await;
+        let req = self.apply_tenant(req, |r| &mut r.tenant);
+        let result = self.transport.create_push_config(&params, &req).await;
         self.finish_call(methods::CREATE_PUSH_CONFIG, result).await
     }
 
@@ -130,7 +174,8 @@ impl<T: Transport> A2AClient<T> {
         req: &GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let params = self.apply_before(methods::GET_PUSH_CONFIG).await?;
-        let result = self.transport.get_push_config(&params, req).await;
+        let req = self.apply_tenant(req, |r| &mut r.tenant);
+        let result = self.transport.get_push_config(&params, &req).await;
         self.finish_call(methods::GET_PUSH_CONFIG, result).await
     }
 
@@ -139,7 +184,8 @@ impl<T: Transport> A2AClient<T> {
         req: &ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
         let params = self.apply_before(methods::LIST_PUSH_CONFIGS).await?;
-        let result = self.transport.list_push_configs(&params, req).await;
+        let req = self.apply_tenant(req, |r| &mut r.tenant);
+        let result = self.transport.list_push_configs(&params, &req).await;
         self.finish_call(methods::LIST_PUSH_CONFIGS, result).await
     }
 
@@ -148,7 +194,8 @@ impl<T: Transport> A2AClient<T> {
         req: &DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
         let params = self.apply_before(methods::DELETE_PUSH_CONFIG).await?;
-        let result = self.transport.delete_push_config(&params, req).await;
+        let req = self.apply_tenant(req, |r| &mut r.tenant);
+        let result = self.transport.delete_push_config(&params, &req).await;
         self.finish_call(methods::DELETE_PUSH_CONFIG, result).await
     }
 
@@ -157,7 +204,8 @@ impl<T: Transport> A2AClient<T> {
         req: &GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
         let params = self.apply_before(methods::GET_EXTENDED_AGENT_CARD).await?;
-        let result = self.transport.get_extended_agent_card(&params, req).await;
+        let req = self.apply_tenant(req, |r| &mut r.tenant);
+        let result = self.transport.get_extended_agent_card(&params, &req).await;
         self.finish_call(methods::GET_EXTENDED_AGENT_CARD, result)
             .await
     }
@@ -202,7 +250,7 @@ mod tests {
 
     #[derive(Default)]
     struct MockTransportState {
-        calls: Mutex<Vec<(String, ServiceParams)>>,
+        calls: Mutex<Vec<(String, ServiceParams, Option<String>)>>,
         send_message_error: Mutex<Option<A2AError>>,
     }
 
@@ -222,12 +270,12 @@ mod tests {
             )
         }
 
-        fn record(&self, method: &str, params: &ServiceParams) {
-            self.state
-                .calls
-                .lock()
-                .unwrap()
-                .push((method.to_string(), params.clone()));
+        fn record(&self, method: &str, params: &ServiceParams, tenant: &Option<String>) {
+            self.state.calls.lock().unwrap().push((
+                method.to_string(),
+                params.clone(),
+                tenant.clone(),
+            ));
         }
     }
 
@@ -236,9 +284,9 @@ mod tests {
         async fn send_message(
             &self,
             params: &ServiceParams,
-            _req: &SendMessageRequest,
+            req: &SendMessageRequest,
         ) -> Result<SendMessageResponse, A2AError> {
-            self.record(methods::SEND_MESSAGE, params);
+            self.record(methods::SEND_MESSAGE, params, &req.tenant);
             if let Some(error) = self.state.send_message_error.lock().unwrap().clone() {
                 return Err(error);
             }
@@ -259,9 +307,9 @@ mod tests {
         async fn send_streaming_message(
             &self,
             params: &ServiceParams,
-            _req: &SendMessageRequest,
+            req: &SendMessageRequest,
         ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-            self.record(methods::SEND_STREAMING_MESSAGE, params);
+            self.record(methods::SEND_STREAMING_MESSAGE, params, &req.tenant);
             Ok(Box::pin(stream::once(async {
                 Ok(StreamResponse::StatusUpdate(
                     a2a::event::TaskStatusUpdateEvent {
@@ -283,7 +331,7 @@ mod tests {
             params: &ServiceParams,
             req: &GetTaskRequest,
         ) -> Result<Task, A2AError> {
-            self.record(methods::GET_TASK, params);
+            self.record(methods::GET_TASK, params, &req.tenant);
             Ok(Task {
                 id: req.id.clone(),
                 context_id: "c1".into(),
@@ -301,9 +349,9 @@ mod tests {
         async fn list_tasks(
             &self,
             params: &ServiceParams,
-            _req: &ListTasksRequest,
+            req: &ListTasksRequest,
         ) -> Result<ListTasksResponse, A2AError> {
-            self.record(methods::LIST_TASKS, params);
+            self.record(methods::LIST_TASKS, params, &req.tenant);
             Ok(ListTasksResponse {
                 tasks: vec![],
                 next_page_token: String::new(),
@@ -317,7 +365,7 @@ mod tests {
             params: &ServiceParams,
             req: &CancelTaskRequest,
         ) -> Result<Task, A2AError> {
-            self.record(methods::CANCEL_TASK, params);
+            self.record(methods::CANCEL_TASK, params, &req.tenant);
             Ok(Task {
                 id: req.id.clone(),
                 context_id: "c1".into(),
@@ -335,9 +383,9 @@ mod tests {
         async fn subscribe_to_task(
             &self,
             params: &ServiceParams,
-            _req: &SubscribeToTaskRequest,
+            req: &SubscribeToTaskRequest,
         ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-            self.record(methods::SUBSCRIBE_TO_TASK, params);
+            self.record(methods::SUBSCRIBE_TO_TASK, params, &req.tenant);
             Ok(Box::pin(stream::empty()))
         }
 
@@ -346,7 +394,7 @@ mod tests {
             params: &ServiceParams,
             req: &TaskPushNotificationConfig,
         ) -> Result<TaskPushNotificationConfig, A2AError> {
-            self.record(methods::CREATE_PUSH_CONFIG, params);
+            self.record(methods::CREATE_PUSH_CONFIG, params, &req.tenant);
             Ok(req.clone())
         }
 
@@ -355,7 +403,7 @@ mod tests {
             params: &ServiceParams,
             req: &GetTaskPushNotificationConfigRequest,
         ) -> Result<TaskPushNotificationConfig, A2AError> {
-            self.record(methods::GET_PUSH_CONFIG, params);
+            self.record(methods::GET_PUSH_CONFIG, params, &req.tenant);
             Ok(TaskPushNotificationConfig {
                 task_id: req.task_id.clone(),
                 url: "http://example.com".into(),
@@ -369,9 +417,9 @@ mod tests {
         async fn list_push_configs(
             &self,
             params: &ServiceParams,
-            _req: &ListTaskPushNotificationConfigsRequest,
+            req: &ListTaskPushNotificationConfigsRequest,
         ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-            self.record(methods::LIST_PUSH_CONFIGS, params);
+            self.record(methods::LIST_PUSH_CONFIGS, params, &req.tenant);
             Ok(ListTaskPushNotificationConfigsResponse {
                 configs: vec![],
                 next_page_token: None,
@@ -381,18 +429,18 @@ mod tests {
         async fn delete_push_config(
             &self,
             params: &ServiceParams,
-            _req: &DeleteTaskPushNotificationConfigRequest,
+            req: &DeleteTaskPushNotificationConfigRequest,
         ) -> Result<(), A2AError> {
-            self.record(methods::DELETE_PUSH_CONFIG, params);
+            self.record(methods::DELETE_PUSH_CONFIG, params, &req.tenant);
             Ok(())
         }
 
         async fn get_extended_agent_card(
             &self,
             params: &ServiceParams,
-            _req: &GetExtendedAgentCardRequest,
+            req: &GetExtendedAgentCardRequest,
         ) -> Result<AgentCard, A2AError> {
-            self.record(methods::GET_EXTENDED_AGENT_CARD, params);
+            self.record(methods::GET_EXTENDED_AGENT_CARD, params, &req.tenant);
             Ok(AgentCard {
                 name: "Test".into(),
                 description: "Test agent".into(),
@@ -680,5 +728,157 @@ mod tests {
     async fn test_destroy() {
         let client = make_client();
         client.destroy().await.unwrap();
+    }
+
+    /// Spec §8.3.2 rule 4: a client configured with the selected interface's
+    /// tenant must fill it into every outgoing request whose tenant is unset.
+    #[tokio::test]
+    async fn test_with_tenant_fills_unset_request_tenant_on_all_methods() {
+        let (transport, state) = MockTransport::new();
+        let client = A2AClient::new(transport).with_tenant("tenant-1");
+        assert_eq!(client.tenant(), Some("tenant-1"));
+
+        client
+            .send_message(&SendMessageRequest {
+                message: Message::new(Role::User, vec![Part::text("hi")]),
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        let _stream = client
+            .send_streaming_message(&SendMessageRequest {
+                message: Message::new(Role::User, vec![Part::text("hi")]),
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        client
+            .get_task(&GetTaskRequest {
+                id: "t1".into(),
+                history_length: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        client
+            .list_tasks(&ListTasksRequest {
+                context_id: None,
+                status: None,
+                page_size: None,
+                page_token: None,
+                history_length: None,
+                status_timestamp_after: None,
+                include_artifacts: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        client
+            .cancel_task(&CancelTaskRequest {
+                id: "t1".into(),
+                metadata: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        let _stream = client
+            .subscribe_to_task(&SubscribeToTaskRequest {
+                id: "t1".into(),
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        client
+            .create_push_config(&TaskPushNotificationConfig {
+                task_id: "t1".into(),
+                url: "http://example.com".into(),
+                id: None,
+                token: None,
+                authentication: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        client
+            .get_push_config(&GetTaskPushNotificationConfigRequest {
+                task_id: "t1".into(),
+                id: "cfg1".into(),
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        client
+            .list_push_configs(&ListTaskPushNotificationConfigsRequest {
+                task_id: "t1".into(),
+                page_size: None,
+                page_token: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        client
+            .delete_push_config(&DeleteTaskPushNotificationConfigRequest {
+                task_id: "t1".into(),
+                id: "cfg1".into(),
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        client
+            .get_extended_agent_card(&GetExtendedAgentCardRequest { tenant: None })
+            .await
+            .unwrap();
+
+        let calls = state.calls.lock().unwrap();
+        assert_eq!(calls.len(), 11);
+        for (method, _, tenant) in calls.iter() {
+            assert_eq!(
+                tenant.as_deref(),
+                Some("tenant-1"),
+                "request for {method} must carry the client tenant",
+            );
+        }
+    }
+
+    /// A tenant explicitly set on a request must never be overridden by the
+    /// client's configured tenant.
+    #[tokio::test]
+    async fn test_explicit_request_tenant_is_not_overridden() {
+        let (transport, state) = MockTransport::new();
+        let client = A2AClient::new(transport).with_tenant("tenant-1");
+
+        let req = SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("hi")]),
+            configuration: None,
+            metadata: None,
+            tenant: Some("explicit-tenant".into()),
+        };
+        client.send_message(&req).await.unwrap();
+
+        let calls = state.calls.lock().unwrap();
+        assert_eq!(calls[0].2.as_deref(), Some("explicit-tenant"));
+    }
+
+    /// Without a configured client tenant, requests are forwarded unchanged.
+    #[tokio::test]
+    async fn test_no_client_tenant_leaves_request_tenant_unset() {
+        let (transport, state) = MockTransport::new();
+        let client = A2AClient::new(transport);
+        assert_eq!(client.tenant(), None);
+
+        let req = SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("hi")]),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        client.send_message(&req).await.unwrap();
+
+        let calls = state.calls.lock().unwrap();
+        assert_eq!(calls[0].2, None);
     }
 }
