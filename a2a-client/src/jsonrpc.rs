@@ -172,6 +172,27 @@ fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+/// Interpret a residual, non-SSE-framed response body as a plain JSON-RPC
+/// response envelope.
+///
+/// Some servers answer a streaming call that fails before any stream is
+/// produced (e.g. `-32004 UnsupportedOperation`) with a plain
+/// `application/json` JSON-RPC envelope instead of SSE framing. Such a body
+/// contains no event boundary, so without this fallback it would be
+/// discarded at end-of-stream and the caller would see an empty,
+/// successfully-closed stream instead of the error.
+fn parse_plain_json_tail(buf: &[u8]) -> Option<Result<StreamResponse, A2AError>> {
+    let rpc_resp: JsonRpcResponse = serde_json::from_slice(buf).ok()?;
+    if let Some(err) = rpc_resp.error {
+        return Some(Err(parse_jsonrpc_error(err)));
+    }
+    let result = rpc_resp.result?;
+    match protojson_conv::from_value::<StreamResponse>(result) {
+        Ok(sr) => Some(Ok(sr)),
+        Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
+    }
+}
+
 /// Shared SSE byte-stream parser that abstracts over the event-parse callback.
 ///
 /// `parse_event` is invoked on each complete `\n\n`/`\r\r`/`\r\n\r\n`-delimited
@@ -185,24 +206,26 @@ where
 {
     let mapped = stream::unfold(
         (
-            Box::pin(stream),
+            Box::pin(stream.fuse()),
             Vec::<u8>::new(),
             VecDeque::new(),
+            false,
             parse_event,
         ),
-        |(mut stream, mut buf, mut pending, parse_event)| async move {
+        |(mut stream, mut buf, mut pending, mut saw_sse_event, parse_event)| async move {
             loop {
                 // Drain already-parsed events before reading more bytes.
                 // Ensures all events from a single chunk are delivered before
                 // polling the stream again.
                 if let Some(item) = pending.pop_front() {
-                    return Some((item, (stream, buf, pending, parse_event)));
+                    return Some((item, (stream, buf, pending, saw_sse_event, parse_event)));
                 }
                 match stream.next().await {
                     Some(Ok(chunk)) => {
                         // Keep the buffer as raw bytes; defer UTF-8 decoding to event boundaries.
                         buf.extend_from_slice(&chunk);
                         while let Some((start, end)) = find_event_boundary(&buf) {
+                            saw_sse_event = true;
                             let event_bytes: Vec<u8> = buf.drain(..end).collect();
                             let event_text = match std::str::from_utf8(&event_bytes[..start]) {
                                 Ok(s) => s,
@@ -223,7 +246,19 @@ where
                         pending
                             .push_back(Err(A2AError::internal(format!("SSE stream error: {e}"))));
                     }
-                    None => return None,
+                    None => {
+                        // End of stream. If the response never carried SSE
+                        // framing, the server may have answered the streaming
+                        // call with a plain JSON-RPC envelope; surface it
+                        // instead of discarding the buffer.
+                        if !saw_sse_event && !buf.is_empty() {
+                            if let Some(item) = parse_plain_json_tail(&buf) {
+                                buf.clear();
+                                return Some((item, (stream, buf, pending, true, parse_event)));
+                            }
+                        }
+                        return None;
+                    }
                 }
             }
         },
@@ -642,6 +677,114 @@ mod tests {
         let mut parsed = parse_sse_stream(stream);
         let item = parsed.next().await.unwrap();
         assert!(item.is_err());
+    }
+
+    /// Regression: a server answering a streaming call with a plain JSON-RPC
+    /// error envelope (Content-Type `application/json`, no SSE framing) must
+    /// surface the error instead of producing an empty, successfully-closed
+    /// stream.
+    #[tokio::test]
+    async fn test_parse_sse_stream_plain_json_error_envelope() {
+        let rpc_resp = JsonRpcResponse::error(
+            JsonRpcId::Number(1),
+            JsonRpcError {
+                code: error_code::UNSUPPORTED_OPERATION,
+                message: "streaming not supported".into(),
+                data: None,
+            },
+        );
+        let body = serde_json::to_string(&rpc_resp).unwrap();
+
+        let stream = byte_stream(vec![body]);
+        let items: Vec<_> = parse_sse_stream(stream).collect().await;
+        assert_eq!(items.len(), 1, "expected one error item, got {items:?}");
+        let err = items.into_iter().next().unwrap().expect_err("should error");
+        assert_eq!(err.code, error_code::UNSUPPORTED_OPERATION);
+        assert_eq!(err.message, "streaming not supported");
+    }
+
+    /// Plain JSON-RPC error envelopes must surface even when the body is
+    /// split across multiple byte chunks.
+    #[tokio::test]
+    async fn test_parse_sse_stream_plain_json_error_envelope_chunked() {
+        let rpc_resp = JsonRpcResponse::error(
+            JsonRpcId::Number(1),
+            JsonRpcError {
+                code: error_code::TASK_NOT_FOUND,
+                message: "task not found".into(),
+                data: None,
+            },
+        );
+        let body = serde_json::to_string(&rpc_resp).unwrap();
+        let mid = body.len() / 2;
+        let chunk1 = body[..mid].to_string();
+        let chunk2 = body[mid..].to_string();
+
+        let stream = byte_stream(vec![chunk1, chunk2]);
+        let items: Vec<_> = parse_sse_stream(stream).collect().await;
+        assert_eq!(items.len(), 1, "expected one error item, got {items:?}");
+        let err = items.into_iter().next().unwrap().expect_err("should error");
+        assert_eq!(err.code, error_code::TASK_NOT_FOUND);
+    }
+
+    /// A plain JSON-RPC success envelope (no SSE framing) carrying a
+    /// `StreamResponse` result is delivered as a normal event.
+    #[tokio::test]
+    async fn test_parse_sse_stream_plain_json_result_envelope() {
+        let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "t1".into(),
+            context_id: "c1".into(),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        let result = protojson_conv::to_value(&sr).unwrap();
+        let rpc_resp = JsonRpcResponse::success(JsonRpcId::Number(1), result);
+        let body = serde_json::to_string(&rpc_resp).unwrap();
+
+        let stream = byte_stream(vec![body]);
+        let items: Vec<_> = parse_sse_stream(stream).collect().await;
+        assert_eq!(items.len(), 1, "expected one event, got {items:?}");
+        let item = items.into_iter().next().unwrap().expect("event");
+        assert!(matches!(item, StreamResponse::StatusUpdate(_)));
+    }
+
+    /// Residual bytes that are not a JSON-RPC envelope keep the current
+    /// behavior: the stream ends cleanly without emitting anything.
+    #[tokio::test]
+    async fn test_parse_sse_stream_trailing_garbage_ends_cleanly() {
+        let stream = byte_stream(vec!["not json at all".to_string()]);
+        let items: Vec<_> = parse_sse_stream(stream).collect().await;
+        assert!(items.is_empty(), "expected clean end, got {items:?}");
+    }
+
+    /// Once SSE framing has been observed, an unterminated trailing partial
+    /// event is still discarded at end-of-stream (normal SSE flow unchanged).
+    #[tokio::test]
+    async fn test_parse_sse_stream_sse_framed_trailing_partial_discarded() {
+        let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "t1".into(),
+            context_id: "c1".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        let result = protojson_conv::to_value(&sr).unwrap();
+        let rpc_resp = JsonRpcResponse::success(JsonRpcId::Number(1), result);
+        let data = serde_json::to_string(&rpc_resp).unwrap();
+        // One complete event followed by an unterminated partial event.
+        let chunk = format!("data: {data}\n\ndata: {{\"jsonrpc\"");
+
+        let stream = byte_stream(vec![chunk]);
+        let items: Vec<_> = parse_sse_stream(stream).collect().await;
+        assert_eq!(items.len(), 1, "expected one event, got {items:?}");
+        assert!(items[0].is_ok());
     }
 
     #[tokio::test]
