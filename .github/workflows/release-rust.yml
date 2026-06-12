@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'itk/**'
   workflow_dispatch:
 
 jobs:

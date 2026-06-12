@@ -3,8 +3,12 @@ name: Publish Project Coverage to Codecov
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'itk/**'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'itk/**'
 
 env:
   CARGO_TERM_COLOR: always
