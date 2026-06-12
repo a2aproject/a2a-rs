@@ -9,7 +9,7 @@ rust-version = "1.85.0"
 
 [[bin]]
 name = "itk-rust-current-agent"
-path = "src/main.rs"
+path = "a2a-itk/agents/rust/v10/src/main.rs"
 
 [dependencies]
 a2a        = { package = "a2a-lf",        path = "../a2a" }
