@@ -1,0 +1,728 @@
+// Copyright AGNTCY Contributors (https://github.com/agntcy)
+// SPDX-License-Identifier: Apache-2.0
+//
+// Derived from a2a-itk agents/rust/v10/src/main.rs.
+// Local copy required to serve /.well-known/agent-card.json at the HTTP root
+// in addition to /jsonrpc and /rest sub-paths, as required by the ITK
+// readiness check (testlib.py polls the root path before starting tests).
+
+use std::env;
+use std::sync::Arc;
+use std::time::Duration;
+
+use a2a::*;
+use a2a_client::A2AClientFactory;
+use a2a_client::agent_card::AgentCardResolver;
+use a2a_grpc::{GrpcHandler, GrpcTransportFactory};
+use a2a_pb::proto::a2a_service_server::A2aServiceServer;
+use a2a_server::{
+    DefaultRequestHandler, InMemoryPushConfigStore, InMemoryTaskStore, StaticAgentCard,
+};
+use async_trait::async_trait;
+use axum::Router;
+use futures::StreamExt;
+use futures::stream::{self, BoxStream};
+use futures::FutureExt;
+use prost::Message as _;
+use tokio::net::TcpListener;
+use tokio::time::sleep;
+use tonic::transport::Server;
+use tracing::info;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+
+mod itk_proto {
+    include!(concat!(env!("OUT_DIR"), "/itk.rs"));
+}
+
+use itk_proto::{Instruction, instruction::Step, call_agent::Behavior};
+
+// ---------------------------------------------------------------------------
+// Agent card
+// ---------------------------------------------------------------------------
+
+fn build_agent_card(http_port: u16, grpc_port: u16) -> AgentCard {
+    AgentCard {
+        name: "ITK Rust v1.0 Agent".to_string(),
+        description: "Multi-transport Rust agent for ITK traversal verification.".to_string(),
+        version: "1.0.0".to_string(),
+        supported_interfaces: vec![
+            AgentInterface::new(
+                format!("http://127.0.0.1:{http_port}/jsonrpc"),
+                TRANSPORT_PROTOCOL_JSONRPC,
+            ),
+            AgentInterface::new(
+                format!("http://127.0.0.1:{http_port}/rest"),
+                TRANSPORT_PROTOCOL_HTTP_JSON,
+            ),
+            AgentInterface::new(
+                format!("http://127.0.0.1:{grpc_port}"),
+                TRANSPORT_PROTOCOL_GRPC,
+            ),
+        ],
+        capabilities: AgentCapabilities {
+            streaming: Some(true),
+            push_notifications: Some(true),
+            extensions: None,
+            extended_agent_card: None,
+        },
+        default_input_modes: vec!["text/plain".to_string()],
+        default_output_modes: vec!["text/plain".to_string()],
+        skills: vec![],
+        provider: None,
+        documentation_url: None,
+        icon_url: None,
+        security_schemes: None,
+        security_requirements: None,
+        signatures: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Instruction extraction
+// ---------------------------------------------------------------------------
+
+fn extract_instruction(message: &Message) -> Result<Instruction, String> {
+    if message.parts.is_empty() {
+        return Err("message has no parts".to_string());
+    }
+
+    for part in &message.parts {
+        let is_binary_hint = part.media_type.as_deref() == Some("application/x-protobuf")
+            || part.filename.as_deref() == Some("instruction.bin");
+
+        match &part.content {
+            a2a::PartContent::Raw(bytes) => {
+                if is_binary_hint || !bytes.is_empty() {
+                    if let Ok(inst) = Instruction::decode(bytes.as_slice()) {
+                        info!("Decoded instruction from raw binary part");
+                        return Ok(inst);
+                    }
+                }
+            }
+            a2a::PartContent::Text(text) => {
+                if let Ok(raw) = BASE64.decode(text.trim()) {
+                    if let Ok(inst) = Instruction::decode(raw.as_slice()) {
+                        info!("Decoded instruction from base64-encoded text part");
+                        return Ok(inst);
+                    }
+                }
+            }
+            a2a::PartContent::Url(_) | a2a::PartContent::Data(_) => {}
+        }
+    }
+
+    Err("no valid ITK instruction found in message parts".to_string())
+}
+
+fn wrap_instruction(inst: &Instruction) -> Result<Message, String> {
+    let mut bytes = Vec::new();
+    inst.encode(&mut bytes)
+        .map_err(|e| format!("proto encode failed: {e}"))?;
+    let mut part = Part::raw(bytes);
+    part.filename = Some("instruction.bin".to_string());
+    part.media_type = Some("application/x-protobuf".to_string());
+    Ok(Message::new(Role::User, vec![part]))
+}
+
+fn should_hold(inst: &Instruction) -> bool {
+    match &inst.step {
+        Some(Step::ReturnResponse(r)) => r.hold_task,
+        Some(Step::Steps(s)) => s.instructions.iter().any(should_hold),
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Traversal executor
+// ---------------------------------------------------------------------------
+
+struct ItkExecutor;
+
+impl ItkExecutor {
+    async fn handle_instruction(inst: &Instruction) -> Result<Vec<String>, String> {
+        Self::handle_instruction_inner(inst).await
+    }
+
+    fn handle_instruction_inner(inst: &Instruction) -> futures::future::BoxFuture<'_, Result<Vec<String>, String>> {
+        async move {
+            match &inst.step {
+                Some(Step::ReturnResponse(r)) => Ok(vec![r.response.clone()]),
+                Some(Step::CallAgent(call)) => Self::handle_call_agent(call).await,
+                Some(Step::Steps(series)) => {
+                    let mut all = Vec::new();
+                    for sub in &series.instructions {
+                        let mut results = Self::handle_instruction_inner(sub).await?;
+                        all.append(&mut results);
+                    }
+                    Ok(all)
+                }
+                None => Err("empty instruction step".to_string()),
+            }
+        }.boxed()
+    }
+
+    async fn handle_call_agent(call: &itk_proto::CallAgent) -> Result<Vec<String>, String> {
+        info!(agent_card_uri = %call.agent_card_uri, transport = %call.transport, "Calling agent");
+
+        let resolver = AgentCardResolver::new(None);
+        let card = resolver
+            .resolve(&call.agent_card_uri)
+            .await
+            .map_err(|e| format!("agent card resolution failed for {}: {e}", call.agent_card_uri))?;
+
+        let client = A2AClientFactory::builder()
+            .register(Arc::new(GrpcTransportFactory {}))
+            .preferred_bindings(Self::transport_preference(&call.transport))
+            .build()
+            .create_from_card(&card)
+            .await
+            .map_err(|e| format!("client creation failed: {e}"))?;
+
+        let sub_inst = call.instruction.as_deref()
+            .ok_or_else(|| "CallAgent has no nested instruction".to_string())?;
+        let msg = wrap_instruction(sub_inst)?;
+
+        match &call.behavior {
+            Some(Behavior::Resubscribe(_)) => Self::handle_resubscribe(client, msg).await,
+            Some(Behavior::PushNotification(pn)) => {
+                Self::handle_push(client, msg, &pn.url, call.streaming).await
+            }
+            _ => {
+                if call.streaming {
+                    Self::handle_streaming(client, msg).await
+                } else {
+                    Self::handle_unary(client, msg).await
+                }
+            }
+        }
+    }
+
+    fn transport_preference(transport: &str) -> Vec<String> {
+        match transport.to_uppercase().as_str() {
+            "GRPC" => vec![
+                TRANSPORT_PROTOCOL_GRPC.to_string(),
+                TRANSPORT_PROTOCOL_JSONRPC.to_string(),
+            ],
+            "HTTP_JSON" | "REST" => vec![
+                TRANSPORT_PROTOCOL_HTTP_JSON.to_string(),
+                TRANSPORT_PROTOCOL_JSONRPC.to_string(),
+            ],
+            _ => vec![
+                TRANSPORT_PROTOCOL_JSONRPC.to_string(),
+                TRANSPORT_PROTOCOL_HTTP_JSON.to_string(),
+            ],
+        }
+    }
+
+    async fn handle_unary(
+        client: a2a_client::client::A2AClient<impl a2a_client::Transport>,
+        msg: Message,
+    ) -> Result<Vec<String>, String> {
+        let req = SendMessageRequest {
+            message: msg,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        let resp = client
+            .send_message(&req)
+            .await
+            .map_err(|e| format!("send_message failed: {e}"))?;
+        Ok(Self::text_from_response(resp))
+    }
+
+    async fn handle_streaming(
+        client: a2a_client::client::A2AClient<impl a2a_client::Transport>,
+        msg: Message,
+    ) -> Result<Vec<String>, String> {
+        let req = SendMessageRequest {
+            message: msg,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        let mut stream = client
+            .send_streaming_message(&req)
+            .await
+            .map_err(|e| format!("send_streaming_message failed: {e}"))?;
+        let mut results = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.map_err(|e| format!("streaming event error: {e}"))?;
+            let mut texts = Self::text_from_stream_response(event);
+            results.append(&mut texts);
+        }
+        Ok(results)
+    }
+
+    async fn handle_push(
+        client: a2a_client::client::A2AClient<impl a2a_client::Transport>,
+        msg: Message,
+        push_url: &str,
+        streaming: bool,
+    ) -> Result<Vec<String>, String> {
+        let push_config = TaskPushNotificationConfig {
+            task_id: String::new(),
+            url: format!("{push_url}/notifications"),
+            id: Some("itk-push".to_string()),
+            token: Some("itk-token".to_string()),
+            authentication: None,
+            tenant: None,
+        };
+        let req = SendMessageRequest {
+            message: msg,
+            configuration: Some(SendMessageConfiguration {
+                accepted_output_modes: None,
+                task_push_notification_config: Some(push_config),
+                history_length: None,
+                return_immediately: None,
+            }),
+            metadata: None,
+            tenant: None,
+        };
+        if streaming {
+            let mut stream = client
+                .send_streaming_message(&req)
+                .await
+                .map_err(|e| format!("push streaming failed: {e}"))?;
+            let mut results = Vec::new();
+            while let Some(event) = stream.next().await {
+                let event = event.map_err(|e| format!("push streaming event error: {e}"))?;
+                let mut texts = Self::text_from_stream_response(event);
+                results.append(&mut texts);
+            }
+            Ok(results)
+        } else {
+            let resp = client
+                .send_message(&req)
+                .await
+                .map_err(|e| format!("push send_message failed: {e}"))?;
+            Ok(Self::text_from_response(resp))
+        }
+    }
+
+    async fn handle_resubscribe(
+        client: a2a_client::client::A2AClient<impl a2a_client::Transport>,
+        msg: Message,
+    ) -> Result<Vec<String>, String> {
+        info!("Executing resubscribe behavior");
+        let req = SendMessageRequest {
+            message: msg,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        let mut stream = client
+            .send_streaming_message(&req)
+            .await
+            .map_err(|e| format!("resubscribe initial streaming failed: {e}"))?;
+
+        let mut task_id: Option<String> = None;
+        if let Some(event) = stream.next().await {
+            let event = event.map_err(|e| format!("resubscribe initial event error: {e}"))?;
+            task_id = Self::task_id_from_stream_response(&event);
+        }
+        drop(stream);
+
+        let task_id = task_id.ok_or_else(|| "resubscribe: no task ID from initial event".to_string())?;
+        info!(task_id = %task_id, "Disconnected; resubscribing");
+
+        let mut resub = client
+            .subscribe_to_task(&SubscribeToTaskRequest {
+                id: task_id.clone(),
+                tenant: None,
+            })
+            .await
+            .map_err(|e| format!("subscribe_to_task failed: {e}"))?;
+
+        let mut results = Vec::new();
+        let mut finished = false;
+
+        while let Some(event) = resub.next().await {
+            let event = event.map_err(|e| format!("resubscribe event error: {e}"))?;
+            let texts = Self::text_from_stream_response(event);
+            for t in texts {
+                if t.contains("task-finished") {
+                    results.push(t.replace("task-finished", ""));
+                    finished = true;
+                    break;
+                }
+                results.push(t);
+            }
+            if finished {
+                break;
+            }
+        }
+        drop(resub);
+
+        info!(task_id = %task_id, "Canceling task after resubscribe");
+        client
+            .cancel_task(&CancelTaskRequest {
+                id: task_id.clone(),
+                metadata: None,
+                tenant: None,
+            })
+            .await
+            .map_err(|e| format!("cancel_task failed: {e}"))?;
+
+        Ok(results)
+    }
+
+    fn text_from_response(resp: SendMessageResponse) -> Vec<String> {
+        match resp {
+            SendMessageResponse::Task(t) => {
+                t.status.message.map_or_else(Vec::new, |m| Self::text_from_message(&m))
+            }
+            SendMessageResponse::Message(m) => Self::text_from_message(&m),
+        }
+    }
+
+    fn text_from_stream_response(resp: StreamResponse) -> Vec<String> {
+        match resp {
+            StreamResponse::Task(t) => {
+                t.status.message.map_or_else(Vec::new, |m| Self::text_from_message(&m))
+            }
+            StreamResponse::StatusUpdate(u) => {
+                u.status.message.map_or_else(Vec::new, |m| Self::text_from_message(&m))
+            }
+            StreamResponse::Message(m) => Self::text_from_message(&m),
+            StreamResponse::ArtifactUpdate(_) => Vec::new(),
+        }
+    }
+
+    fn task_id_from_stream_response(resp: &StreamResponse) -> Option<String> {
+        match resp {
+            StreamResponse::Task(t) => Some(t.id.clone()),
+            StreamResponse::StatusUpdate(u) => Some(u.task_id.clone()),
+            _ => None,
+        }
+    }
+
+    fn text_from_message(m: &Message) -> Vec<String> {
+        m.parts.iter().filter_map(Part::as_text).map(str::to_string).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// a2a_server::AgentExecutor impl
+// ---------------------------------------------------------------------------
+
+impl a2a_server::AgentExecutor for ItkExecutor {
+    fn execute(
+        &self,
+        ctx: a2a_server::ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        Box::pin(async_stream::try_stream! {
+            let msg = ctx.message.as_ref().ok_or_else(|| A2AError {
+                code: -32600,
+                message: "missing message".to_string(),
+                details: None,
+            })?;
+
+            let inst = extract_instruction(msg).map_err(|e| A2AError {
+                code: -32600,
+                message: e,
+                details: None,
+            })?;
+
+            let hold = should_hold(&inst);
+
+            let results = ItkExecutor::handle_instruction(&inst).await.map_err(|e| {
+                info!(error = %e, "instruction handling failed");
+                A2AError { code: -32000, message: e, details: None }
+            })?;
+
+            let response = results.join("\n");
+
+            if hold {
+                let working_text = format!("{response}\ntask-finished");
+                yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: ctx.task_id.clone(),
+                    context_id: ctx.context_id.clone(),
+                    status: TaskStatus {
+                        state: TaskState::Working,
+                        message: Some(Message::new(
+                            Role::Agent,
+                            vec![Part::text(working_text)],
+                        )),
+                        timestamp: None,
+                    },
+                    metadata: None,
+                });
+
+                for _ in 0..5 {
+                    sleep(Duration::from_secs(2)).await;
+                    yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                        task_id: ctx.task_id.clone(),
+                        context_id: ctx.context_id.clone(),
+                        status: TaskStatus {
+                            state: TaskState::Working,
+                            message: None,
+                            timestamp: None,
+                        },
+                        metadata: None,
+                    });
+                }
+
+                yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: ctx.task_id.clone(),
+                    context_id: ctx.context_id.clone(),
+                    status: TaskStatus {
+                        state: TaskState::Completed,
+                        message: Some(Message::new(Role::Agent, vec![Part::text(response)])),
+                        timestamp: None,
+                    },
+                    metadata: None,
+                });
+            } else {
+                yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: ctx.task_id.clone(),
+                    context_id: ctx.context_id.clone(),
+                    status: TaskStatus {
+                        state: TaskState::Completed,
+                        message: Some(Message::new(Role::Agent, vec![Part::text(response)])),
+                        timestamp: None,
+                    },
+                    metadata: None,
+                });
+            }
+        })
+    }
+
+    fn cancel(
+        &self,
+        ctx: a2a_server::ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        info!(task_id = %ctx.task_id, "Cancel requested");
+        Box::pin(stream::once(async move {
+            Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: ctx.task_id,
+                context_id: ctx.context_id,
+                status: TaskStatus {
+                    state: TaskState::Canceled,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            }))
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request handler
+// ---------------------------------------------------------------------------
+
+struct ItkHandler {
+    inner: DefaultRequestHandler,
+}
+
+impl ItkHandler {
+    fn new() -> Self {
+        Self {
+            inner: DefaultRequestHandler::new(ItkExecutor, InMemoryTaskStore::new())
+                .with_push_config_store(InMemoryPushConfigStore::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl a2a_server::RequestHandler for ItkHandler {
+    async fn send_message(
+        &self,
+        params: &a2a_server::ServiceParams,
+        req: SendMessageRequest,
+    ) -> Result<SendMessageResponse, A2AError> {
+        self.inner.send_message(params, req).await
+    }
+
+    async fn send_streaming_message(
+        &self,
+        params: &a2a_server::ServiceParams,
+        req: SendMessageRequest,
+    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        self.inner.send_streaming_message(params, req).await
+    }
+
+    async fn get_task(
+        &self,
+        params: &a2a_server::ServiceParams,
+        req: GetTaskRequest,
+    ) -> Result<Task, A2AError> {
+        self.inner.get_task(params, req).await
+    }
+
+    async fn list_tasks(
+        &self,
+        params: &a2a_server::ServiceParams,
+        req: ListTasksRequest,
+    ) -> Result<ListTasksResponse, A2AError> {
+        self.inner.list_tasks(params, req).await
+    }
+
+    async fn cancel_task(
+        &self,
+        params: &a2a_server::ServiceParams,
+        req: CancelTaskRequest,
+    ) -> Result<Task, A2AError> {
+        self.inner.cancel_task(params, req).await
+    }
+
+    async fn subscribe_to_task(
+        &self,
+        params: &a2a_server::ServiceParams,
+        req: SubscribeToTaskRequest,
+    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        self.inner.subscribe_to_task(params, req).await
+    }
+
+    async fn create_push_config(
+        &self,
+        params: &a2a_server::ServiceParams,
+        req: TaskPushNotificationConfig,
+    ) -> Result<TaskPushNotificationConfig, A2AError> {
+        self.inner.create_push_config(params, req).await
+    }
+
+    async fn get_push_config(
+        &self,
+        params: &a2a_server::ServiceParams,
+        req: GetTaskPushNotificationConfigRequest,
+    ) -> Result<TaskPushNotificationConfig, A2AError> {
+        self.inner.get_push_config(params, req).await
+    }
+
+    async fn list_push_configs(
+        &self,
+        params: &a2a_server::ServiceParams,
+        req: ListTaskPushNotificationConfigsRequest,
+    ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
+        self.inner.list_push_configs(params, req).await
+    }
+
+    async fn delete_push_config(
+        &self,
+        params: &a2a_server::ServiceParams,
+        req: DeleteTaskPushNotificationConfigRequest,
+    ) -> Result<(), A2AError> {
+        self.inner.delete_push_config(params, req).await
+    }
+
+    async fn get_extended_agent_card(
+        &self,
+        params: &a2a_server::ServiceParams,
+        req: GetExtendedAgentCardRequest,
+    ) -> Result<AgentCard, A2AError> {
+        self.inner.get_extended_agent_card(params, req).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+
+struct Args {
+    http_port: u16,
+    grpc_port: u16,
+}
+
+fn parse_args() -> Args {
+    let mut args = env::args().skip(1);
+    let mut http_port: u16 = 10104;
+    let mut grpc_port: u16 = 11004;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--httpPort" => {
+                http_port = args
+                    .next()
+                    .expect("--httpPort requires a value")
+                    .parse()
+                    .expect("--httpPort must be a valid port number");
+            }
+            "--grpcPort" => {
+                grpc_port = args
+                    .next()
+                    .expect("--grpcPort requires a value")
+                    .parse()
+                    .expect("--grpcPort must be a valid port number");
+            }
+            other => panic!("unknown argument: {other}"),
+        }
+    }
+
+    Args { http_port, grpc_port }
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() {
+    let log_level = env::var("ITK_LOG_LEVEL").unwrap_or_else(|_| "INFO".to_string());
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| log_level.to_lowercase().parse().unwrap_or_else(|_| "info".parse().unwrap())),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let args = parse_args();
+
+    let card = build_agent_card(args.http_port, args.grpc_port);
+    let handler = Arc::new(ItkHandler::new());
+    let card_producer = Arc::new(StaticAgentCard::new(card));
+
+    let jsonrpc_sub = Router::new()
+        .merge(a2a_server::jsonrpc::jsonrpc_router(handler.clone()))
+        .merge(a2a_server::agent_card::agent_card_router(card_producer.clone()));
+    let rest_sub = Router::new()
+        .merge(a2a_server::rest::rest_router(handler.clone()))
+        .merge(a2a_server::agent_card::agent_card_router(card_producer.clone()));
+
+    // Serve /.well-known/agent-card.json at the root so the ITK readiness
+    // check (testlib.py polls GET /<root>/.well-known/agent-card.json) passes,
+    // in addition to the sub-path mounts below.
+    let http_app = Router::new()
+        .merge(a2a_server::agent_card::agent_card_router(card_producer))
+        .nest("/jsonrpc", jsonrpc_sub)
+        .nest("/rest", rest_sub)
+        .layer(tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash());
+
+    let grpc_service = A2aServiceServer::new(GrpcHandler::new(handler));
+
+    let http_listener = TcpListener::bind(("127.0.0.1", args.http_port))
+        .await
+        .expect("HTTP listener should bind");
+
+    info!(http_port = args.http_port, grpc_port = args.grpc_port, "ITK Rust v1.0 agent starting");
+
+    let http_server = tokio::spawn(async move {
+        axum::serve(http_listener, http_app)
+            .await
+            .expect("HTTP server should run");
+    });
+
+    let grpc_listener = TcpListener::bind(("127.0.0.1", args.grpc_port))
+        .await
+        .expect("gRPC listener should bind");
+
+    let grpc_server = tokio::spawn(async move {
+        let stream = tokio_stream::wrappers::TcpListenerStream::new(grpc_listener);
+        Server::builder()
+            .add_service(grpc_service)
+            .serve_with_incoming(stream)
+            .await
+            .expect("gRPC server should run");
+    });
+
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to listen for ctrl-c");
+
+    info!("Shutdown signal received");
+    http_server.abort();
+    grpc_server.abort();
+}
