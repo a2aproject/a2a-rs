@@ -12,6 +12,9 @@ jobs:
   release-crates:
     name: Release crates
     runs-on: ubuntu-latest
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+      releases: ${{ steps.release-plz.outputs.releases }}
     permissions:
       contents: write
       pull-requests: read
@@ -26,6 +29,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
 
       - name: Run release-plz
+        id: release-plz
         uses: release-plz/action@1528104d2ca23787631a1c1f022abb64b34c1e11 # v0.5.128
         with:
           command: release
@@ -33,6 +37,161 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  resolve-a2acli-release:
+    name: Resolve a2acli release
+    needs: release-crates
+    if: ${{ needs.release-crates.outputs.releases_created == 'true' && contains(needs.release-crates.outputs.releases, '"package_name":"a2a-cli"') }}
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+    steps:
+      - name: Resolve CLI release tag
+        id: release
+        shell: bash
+        env:
+          RELEASES: ${{ needs.release-crates.outputs.releases }}
+        run: |
+          release_tag=$(python3 - <<'PY'
+          import json
+          import os
+
+          releases = json.loads(os.environ["RELEASES"])
+          for release in releases:
+              if release["package_name"] == "a2a-cli":
+                  print(release["tag"])
+                  break
+          else:
+              raise SystemExit("a2a-cli release not found in release-plz outputs")
+          PY
+          )
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+  release-a2acli-binaries:
+    name: Release a2acli binaries (${{ matrix.name }})
+    needs:
+      - release-crates
+      - resolve-a2acli-release
+    if: ${{ needs.release-crates.outputs.releases_created == 'true' && contains(needs.release-crates.outputs.releases, '"package_name":"a2a-cli"') }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macOS arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - name: macOS x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+          - name: Windows x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve release metadata
+        id: metadata
+        shell: bash
+        run: |
+          python scripts/resolve_a2acli_release_metadata.py \
+            --event-name release \
+            --release-tag "${{ needs.resolve-a2acli-release.outputs.release_tag }}" \
+            --target "${{ matrix.target }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Build a2acli
+        run: cargo build -p a2a-cli --release --locked --target ${{ matrix.target }}
+
+      - name: Package release archive
+        id: package
+        shell: bash
+        run: |
+          python scripts/package_a2acli_release.py \
+            --binary "${{ steps.metadata.outputs.binary_path }}" \
+            --target "${{ matrix.target }}" \
+            --version "${{ steps.metadata.outputs.version }}" \
+            --output-dir dist \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release upload "${{ steps.metadata.outputs.release_tag }}" \
+            "${{ steps.package.outputs.archive_path }}" \
+            "${{ steps.package.outputs.checksum_path }}" \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+  release-a2acli-winget:
+    name: Publish a2acli WinGet manifests
+    needs:
+      - release-crates
+      - resolve-a2acli-release
+      - release-a2acli-binaries
+    if: ${{ needs.release-crates.outputs.releases_created == 'true' && contains(needs.release-crates.outputs.releases, '"package_name":"a2a-cli"') }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      RELEASE_TAG: ${{ needs.resolve-a2acli-release.outputs.release_tag }}
+    steps:
+      - name: Trigger WinGet manifest workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run winget-manifests.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}" \
+            -f release_tag="$RELEASE_TAG"
+
+  release-a2acli-homebrew:
+    name: Publish a2acli Homebrew formula
+    needs:
+      - release-crates
+      - resolve-a2acli-release
+      - release-a2acli-binaries
+    if: ${{ needs.release-crates.outputs.releases_created == 'true' && contains(needs.release-crates.outputs.releases, '"package_name":"a2a-cli"') }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      RELEASE_TAG: ${{ needs.resolve-a2acli-release.outputs.release_tag }}
+    steps:
+      - name: Trigger Homebrew formula workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run homebrew-formula.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}" \
+            -f tag="$RELEASE_TAG"
 
   release-crates-pr:
     name: Release crates - PR
