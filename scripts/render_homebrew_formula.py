@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import textwrap
 import tomllib
+import urllib.error
 import urllib.request
 
 
@@ -64,12 +65,16 @@ def resolve_workspace_value(package: dict, workspace_package: dict, key: str) ->
 def fetch_sha256(url: str) -> str:
     request = urllib.request.Request(url, headers={"User-Agent": "a2aproject-release-automation"})
     digest = hashlib.sha256()
-    with urllib.request.urlopen(request, timeout=60) as response:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except urllib.error.URLError as error:
+        reason = f"HTTP {error.code}" if isinstance(error, urllib.error.HTTPError) else error.reason
+        raise SystemExit(f"failed to fetch {url}: {reason}") from error
     return digest.hexdigest()
 
 

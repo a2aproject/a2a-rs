@@ -15,7 +15,7 @@ from pathlib import Path
 import textwrap
 import tomllib
 import urllib.request
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -106,8 +106,9 @@ def fetch_bytes(url: str) -> bytes:
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             return response.read()
-    except HTTPError as error:
-        raise SystemExit(f"failed to fetch {url}: HTTP {error.code}") from error
+    except URLError as error:
+        reason = f"HTTP {error.code}" if isinstance(error, HTTPError) else error.reason
+        raise SystemExit(f"failed to fetch {url}: {reason}") from error
 
 
 def fetch_json(url: str) -> dict:
@@ -128,8 +129,9 @@ def sha256_for_url(url: str) -> str:
                 if not chunk:
                     break
                 digest.update(chunk)
-    except HTTPError as error:
-        raise SystemExit(f"failed to fetch {url}: HTTP {error.code}") from error
+    except URLError as error:
+        reason = f"HTTP {error.code}" if isinstance(error, HTTPError) else error.reason
+        raise SystemExit(f"failed to fetch {url}: {reason}") from error
     return digest.hexdigest().upper()
 
 

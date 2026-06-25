@@ -131,7 +131,7 @@ resolve_release_tag() {
     | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"a2a-cli-v[^"]*"' \
     | head -1 \
     | grep -oE '"a2a-cli-v[^"]*"' \
-    | tr -d '"')"
+    | tr -d '"' || true)"
   [[ -n "$tag" ]] || die "failed to resolve the latest a2acli release tag from $api_url"
   printf '%s\n' "$tag"
 }
@@ -250,7 +250,7 @@ mkdir -p "$install_dir" || die "could not create ${install_dir}; rerun with sudo
 [[ -w "$install_dir" ]] || die "could not write to ${install_dir}; rerun with sudo or set A2A_CLI_INSTALL_DIR"
 
 destination="${install_dir}/a2acli"
-staged_destination="${install_dir}/.a2acli.tmp.$$"
+staged_destination="$(mktemp "${install_dir}/.a2acli.tmp.XXXXXX")"
 
 install -m 0755 "$binary_path" "$staged_destination"
 mv "$staged_destination" "$destination"
