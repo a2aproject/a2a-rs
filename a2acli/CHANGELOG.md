@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.1.5...a2a-cli-v0.1.6) - 2026-06-25
+
+### Other
+
+- *(a2acli)* bump version to 0.1.6 ([#89](https://github.com/a2aproject/a2a-rs/pull/89))
+
 ## [0.1.5](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.1.4...a2a-cli-v0.1.5) - 2026-05-27
 
 ### Fixed
