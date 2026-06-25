@@ -1,0 +1,96 @@
+# Copyright AGNTCY Contributors (https://github.com/agntcy)
+# SPDX-License-Identifier: Apache-2.0
+
+name: Refresh Homebrew Formula
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: CLI release tag to render into Formula/a2acli.rb (e.g. a2a-cli-v0.1.5)
+        required: true
+        type: string
+
+jobs:
+  refresh-homebrew-formula:
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'a2a-cli-v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve release tag
+        id: release
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.event.release.tag_name }}"
+          fi
+
+          case "$tag" in
+            a2a-cli-v*)
+              version="${tag#a2a-cli-v}"
+              ;;
+            *)
+              echo "::error::expected an a2a-cli-v* tag, got $tag"
+              exit 1
+              ;;
+          esac
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Render Homebrew formula
+        run: python scripts/render_homebrew_formula.py --tag "${{ steps.release.outputs.tag }}" --output Formula/a2acli.rb
+
+      - name: Open formula refresh PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git diff --quiet -- Formula/a2acli.rb; then
+            echo "Formula already up to date for ${{ steps.release.outputs.tag }}"
+            exit 0
+          fi
+
+          branch="automation/homebrew-a2acli-${{ steps.release.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add Formula/a2acli.rb
+          git commit -m "release: update Homebrew formula for a2acli v${{ steps.release.outputs.version }}"
+          git push --force --set-upstream origin "$branch"
+
+          pr_number=$(gh pr list --repo a2aproject/a2a-rs --head "$branch" --base main --state open --json number --jq 'first(.[].number) // ""')
+          if [ -n "$pr_number" ]; then
+            echo "Updated existing PR #$pr_number"
+            exit 0
+          fi
+
+          cat > /tmp/homebrew-formula-pr-body.md <<EOF
+          Update Formula/a2acli.rb for ${{ steps.release.outputs.tag }}.
+
+          - refreshes the source tarball SHA256
+          - keeps the Homebrew install path aligned with the latest CLI release
+          EOF
+
+          gh pr create \
+            --repo a2aproject/a2a-rs \
+            --base main \
+            --head "$branch" \
+            --title "release: update Homebrew formula for a2acli v${{ steps.release.outputs.version }}" \
+            --body-file /tmp/homebrew-formula-pr-body.md
