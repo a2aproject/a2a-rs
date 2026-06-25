@@ -5,7 +5,7 @@ class A2acli < Formula
   desc "Standalone A2A CLI client"
   homepage "https://github.com/a2aproject/a2a-rs"
   url "https://github.com/a2aproject/a2a-rs/archive/refs/tags/a2a-cli-v0.1.5.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "82c99dced537c1550d6b0a61e858ea7bc1dc9d39f34860d88b5ab6447165c210"
   license "Apache-2.0"
   head "https://github.com/a2aproject/a2a-rs.git", branch: "main"
 
