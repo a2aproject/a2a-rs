@@ -6,6 +6,7 @@ class A2acli < Formula
   homepage "https://github.com/a2aproject/a2a-rs"
   version "0.1.6"
   license "Apache-2.0"
+  depends_on :macos
 
   on_macos do
     on_arm do

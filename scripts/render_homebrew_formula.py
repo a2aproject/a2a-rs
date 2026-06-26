@@ -69,9 +69,10 @@ def fetch_text(url: str) -> str:
 def fetch_release_sha256(tag: str, version: str, target: str) -> str:
     checksum_url = f"{RELEASE_BASE_URL}/{tag}/a2acli-v{version}-{target}.tar.gz.sha256"
     text = fetch_text(checksum_url)
-    sha = text.split()[0].lower()
-    if not sha:
+    parts = text.split()
+    if not parts:
         raise SystemExit(f"empty checksum from {checksum_url}")
+    sha = parts[0].lower()
     return sha
 
 
@@ -106,6 +107,7 @@ def render_formula(tag: str) -> str:
         f'  homepage "{ruby_string(homepage)}"\n'
         f'  version "{version}"\n'
         f'  license "{ruby_string(license_id)}"\n'
+        f"  depends_on :macos\n"
         f"\n"
         f"  on_macos do\n"
         f"    on_arm do\n"

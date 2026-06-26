@@ -124,7 +124,7 @@ resolve_release_tag() {
 
   local version
   version="$(fetch_text "$manifest_url" \
-    | grep -m1 '^version' \
+    | grep -m1 '^version[[:space:]]*=' \
     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
   [[ -n "$version" ]] || die "failed to resolve the latest a2acli version from $manifest_url"
   printf '%s\n' "${RELEASE_PREFIX}${version}"
