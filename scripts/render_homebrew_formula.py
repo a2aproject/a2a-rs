@@ -113,7 +113,7 @@ def render_formula(tag: str) -> str:
           depends_on \"rust\" => :build
 
           def install
-            system \"cargo\", \"install\", \"--locked\", \"--path\", \"a2acli\", *std_cargo_args
+            system \"cargo\", \"install\", \"--path\", \"a2acli\", *std_cargo_args
           end
 
           test do
