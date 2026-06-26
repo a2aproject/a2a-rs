@@ -5,10 +5,8 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 from pathlib import Path
 import re
-import textwrap
 import tomllib
 import urllib.error
 import urllib.request
@@ -19,13 +17,9 @@ WORKSPACE_MANIFEST = ROOT / "Cargo.toml"
 CLI_MANIFEST = ROOT / "a2acli" / "Cargo.toml"
 DEFAULT_OUTPUT = ROOT / "Formula" / "a2acli.rb"
 TAG_PATTERN = re.compile(r"^a2a-cli-v(?P<version>[0-9A-Za-z.+-]+)$")
-FORMULA_HEADER = textwrap.dedent(
-    """\
-    # Copyright AGNTCY Contributors (https://github.com/agntcy)
-    # SPDX-License-Identifier: Apache-2.0
-
-    """
-)
+MACOS_ARM64_TARGET = "aarch64-apple-darwin"
+MACOS_X86_64_TARGET = "x86_64-apple-darwin"
+RELEASE_BASE_URL = "https://github.com/a2aproject/a2a-rs/releases/download"
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,20 +56,23 @@ def resolve_workspace_value(package: dict, workspace_package: dict, key: str) ->
     return value
 
 
-def fetch_sha256(url: str) -> str:
+def fetch_text(url: str) -> str:
     request = urllib.request.Request(url, headers={"User-Agent": "a2aproject-release-automation"})
-    digest = hashlib.sha256()
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
+            return response.read().decode("utf-8")
     except urllib.error.URLError as error:
         reason = f"HTTP {error.code}" if isinstance(error, urllib.error.HTTPError) else error.reason
         raise SystemExit(f"failed to fetch {url}: {reason}") from error
-    return digest.hexdigest()
+
+
+def fetch_release_sha256(tag: str, version: str, target: str) -> str:
+    checksum_url = f"{RELEASE_BASE_URL}/{tag}/a2acli-v{version}-{target}.tar.gz.sha256"
+    text = fetch_text(checksum_url)
+    sha = text.split()[0].lower()
+    if not sha:
+        raise SystemExit(f"empty checksum from {checksum_url}")
+    return sha
 
 
 def ruby_string(value: str) -> str:
@@ -86,6 +83,7 @@ def render_formula(tag: str) -> str:
     match = TAG_PATTERN.match(tag)
     if not match:
         raise SystemExit(f"expected a2a-cli-v<version> tag, got: {tag}")
+    version = match.group("version")
 
     workspace = load_toml(WORKSPACE_MANIFEST)
     cli_manifest = load_toml(CLI_MANIFEST)
@@ -95,35 +93,41 @@ def render_formula(tag: str) -> str:
     description = package["description"]
     homepage = resolve_workspace_value(package, workspace_package, "repository")
     license_id = resolve_workspace_value(package, workspace_package, "license")
-    source_url = f"{homepage}/archive/refs/tags/{tag}.tar.gz"
-    source_sha256 = fetch_sha256(source_url)
-    git_url = homepage if homepage.endswith(".git") else f"{homepage}.git"
 
-    formula_body = textwrap.dedent(
-        f"""\
-        class A2acli < Formula
-          desc \"{ruby_string(description)}\"
-          homepage \"{ruby_string(homepage)}\"
-          url \"{ruby_string(source_url)}\"
-          sha256 \"{source_sha256}\"
-          license \"{ruby_string(license_id)}\"
-          head \"{ruby_string(git_url)}\", branch: \"main\"
+    arm64_sha256 = fetch_release_sha256(tag, version, MACOS_ARM64_TARGET)
+    x86_64_sha256 = fetch_release_sha256(tag, version, MACOS_X86_64_TARGET)
 
-          depends_on \"cmake\" => :build
-          depends_on \"rust\" => :build
-
-          def install
-            system \"cargo\", \"install\", *std_cargo_args(path: \"a2acli\")
-          end
-
-          test do
-            assert_match \"a2acli\", shell_output(\"#{{bin}}/a2acli --help\")
-          end
-        end
-        """
+    return (
+        f"# Copyright AGNTCY Contributors (https://github.com/agntcy)\n"
+        f"# SPDX-License-Identifier: Apache-2.0\n"
+        f"\n"
+        f'class A2acli < Formula\n'
+        f'  desc "{ruby_string(description)}"\n'
+        f'  homepage "{ruby_string(homepage)}"\n'
+        f'  version "{version}"\n'
+        f'  license "{ruby_string(license_id)}"\n'
+        f"\n"
+        f"  on_macos do\n"
+        f"    on_arm do\n"
+        f'      url "{RELEASE_BASE_URL}/a2a-cli-v#{{version}}/a2acli-v#{{version}}-{MACOS_ARM64_TARGET}.tar.gz"\n'
+        f'      sha256 "{arm64_sha256}"\n'
+        f"    end\n"
+        f"\n"
+        f"    on_intel do\n"
+        f'      url "{RELEASE_BASE_URL}/a2a-cli-v#{{version}}/a2acli-v#{{version}}-{MACOS_X86_64_TARGET}.tar.gz"\n'
+        f'      sha256 "{x86_64_sha256}"\n'
+        f"    end\n"
+        f"  end\n"
+        f"\n"
+        f"  def install\n"
+        f'    bin.install "a2acli"\n'
+        f"  end\n"
+        f"\n"
+        f"  test do\n"
+        f'    assert_match "a2acli", shell_output("#{{bin}}/a2acli --help")\n'
+        f"  end\n"
+        f"end\n"
     )
-
-    return f"{FORMULA_HEADER}{formula_body}"
 
 
 def main() -> int:
