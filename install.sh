@@ -11,7 +11,7 @@
 #   A2A_CLI_VERSION              Install a specific version such as 0.1.5,
 #                                v0.1.5, or a2a-cli-v0.1.5.
 #   A2A_CLI_INSTALL_DIR          Directory to place the a2acli binary.
-#   A2A_CLI_RELEASE_API_URL      Override the releases metadata API URL.
+#   A2A_CLI_CARGO_MANIFEST_URL   Override the Cargo.toml URL used to resolve the latest version.
 #   A2A_CLI_RELEASE_DOWNLOAD_BASE_URL  Override the release asset download base URL.
 
 set -euo pipefail
@@ -19,7 +19,7 @@ set -euo pipefail
 REPO_OWNER="a2aproject"
 REPO_NAME="a2a-rs"
 RELEASE_PREFIX="a2a-cli-v"
-DEFAULT_RELEASE_API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases"
+DEFAULT_CARGO_MANIFEST_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/a2acli/Cargo.toml"
 DEFAULT_RELEASE_DOWNLOAD_BASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download"
 TARGET_X86_64="x86_64-unknown-linux-gnu"
 TARGET_ARM64="aarch64-unknown-linux-gnu"
@@ -35,7 +35,7 @@ Environment overrides:
   A2A_CLI_VERSION                    Install a specific version such as 0.1.5,
                                      v0.1.5, or a2a-cli-v0.1.5.
   A2A_CLI_INSTALL_DIR                Directory to place the a2acli binary.
-  A2A_CLI_RELEASE_API_URL            Override the releases metadata API URL.
+  A2A_CLI_CARGO_MANIFEST_URL         Override the Cargo.toml URL used to resolve the latest version.
   A2A_CLI_RELEASE_DOWNLOAD_BASE_URL  Override the release asset download base URL.
 EOF
 }
@@ -82,12 +82,12 @@ fetch_text() {
   local url="$1"
 
   if have_cmd curl; then
-    curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' "$url"
+    curl -fsSL --retry 3 "$url"
     return
   fi
 
   if have_cmd wget; then
-    wget -qO- --header='Accept: application/vnd.github+json' "$url"
+    wget -qO- "$url"
     return
   fi
 
@@ -119,21 +119,15 @@ resolve_release_tag() {
     return
   fi
 
-  local api_url
-  api_url="${A2A_CLI_RELEASE_API_URL:-$DEFAULT_RELEASE_API_URL}"
+  local manifest_url
+  manifest_url="${A2A_CLI_CARGO_MANIFEST_URL:-$DEFAULT_CARGO_MANIFEST_URL}"
 
-  local response
-  response="$(fetch_text "$api_url")"
-
-  # Releases are returned newest-first; find the first a2a-cli-v* tag
-  local tag
-  tag="$(printf '%s\n' "$response" \
-    | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"a2a-cli-v[^"]*"' \
-    | head -1 \
-    | grep -oE '"a2a-cli-v[^"]*"' \
-    | tr -d '"' || true)"
-  [[ -n "$tag" ]] || die "failed to resolve the latest a2acli release tag from $api_url"
-  printf '%s\n' "$tag"
+  local version
+  version="$(fetch_text "$manifest_url" \
+    | grep -m1 '^version[[:space:]]*=' \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+  [[ -n "$version" ]] || die "failed to resolve the latest a2acli version from $manifest_url"
+  printf '%s\n' "${RELEASE_PREFIX}${version}"
 }
 
 resolve_target() {

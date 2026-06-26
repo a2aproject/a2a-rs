@@ -4,16 +4,24 @@
 class A2acli < Formula
   desc "Standalone A2A CLI client"
   homepage "https://github.com/a2aproject/a2a-rs"
-  url "https://github.com/a2aproject/a2a-rs/archive/refs/tags/a2a-cli-v0.1.6.tar.gz"
-  sha256 "8cce1316e3f16ff072cfccbdd676e7f378805752768a5b54c039a9b774fcbbdc"
+  version "0.1.6"
   license "Apache-2.0"
-  head "https://github.com/a2aproject/a2a-rs.git", branch: "main"
+  depends_on :macos
 
-  depends_on "cmake" => :build
-  depends_on "rust" => :build
+  on_macos do
+    on_arm do
+      url "https://github.com/a2aproject/a2a-rs/releases/download/a2a-cli-v#{version}/a2acli-v#{version}-aarch64-apple-darwin.tar.gz"
+      sha256 "15e6deba9687e6d967409e22b1adaa726012f30014a6ada637f102ec6534eaff"
+    end
+
+    on_intel do
+      url "https://github.com/a2aproject/a2a-rs/releases/download/a2a-cli-v#{version}/a2acli-v#{version}-x86_64-apple-darwin.tar.gz"
+      sha256 "7e6878bf6b2e4552a34f656fe511b459d3cc22a7765349d954e3ae87b88036ae"
+    end
+  end
 
   def install
-    system "cargo", "install", *std_cargo_args(path: "a2acli")
+    bin.install "a2acli"
   end
 
   test do
