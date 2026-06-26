@@ -1,0 +1,93 @@
+# Copyright AGNTCY Contributors (https://github.com/agntcy)
+# SPDX-License-Identifier: Apache-2.0
+
+name: Upload a2acli Release Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to upload binaries for (e.g. a2a-cli-v0.1.6)"
+        required: true
+        type: string
+
+jobs:
+  upload-a2acli-binaries:
+    name: Upload a2acli binaries (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macOS arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - name: macOS x86_64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+          - name: Windows x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve release metadata
+        id: metadata
+        shell: bash
+        run: |
+          python scripts/resolve_a2acli_release_metadata.py \
+            --event-name release \
+            --release-tag "${{ inputs.release_tag }}" \
+            --target "${{ matrix.target }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Build a2acli
+        run: cargo build -p a2a-cli --release --locked --target ${{ matrix.target }}
+
+      - name: Package release archive
+        id: package
+        shell: bash
+        run: |
+          python scripts/package_a2acli_release.py \
+            --binary "${{ steps.metadata.outputs.binary_path }}" \
+            --target "${{ matrix.target }}" \
+            --version "${{ steps.metadata.outputs.version }}" \
+            --output-dir dist \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release upload "${{ inputs.release_tag }}" \
+            "${{ steps.package.outputs.archive_path }}" \
+            "${{ steps.package.outputs.checksum_path }}" \
+            --repo "${{ github.repository }}" \
+            --clobber
