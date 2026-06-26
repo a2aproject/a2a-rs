@@ -102,6 +102,36 @@ When the example starts, the following endpoints are available:
 The example does not start a gRPC server, but the `a2a-grpc` crate provides the
 client and server bindings needed to add one.
 
+## Installing a2acli
+
+Pre-built binaries are available for macOS (arm64, x86_64), Linux (x86_64, aarch64), and Windows (x86_64).
+
+**macOS** — [Homebrew](https://brew.sh):
+
+```sh
+brew install a2aproject/a2a-rs/a2acli
+```
+
+**Linux** — install script:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/a2aproject/a2a-rs/main/install.sh | bash
+```
+
+Installs to `/usr/local/bin` as root or `~/.local/bin` otherwise. Override with `A2A_CLI_INSTALL_DIR`.
+
+**Windows** — [WinGet](https://learn.microsoft.com/en-us/windows/package-manager/winget/):
+
+```sh
+winget install a2aproject.a2acli
+```
+
+**From source**:
+
+```sh
+cargo install a2a-cli
+```
+
 ## Running The A2A CLI
 
 The workspace includes a standalone CLI client built on `a2a-client`. It
@@ -122,9 +152,6 @@ hello world server. Override the target with `--base-url https://host` for any
 compatible A2A server, use `--binding jsonrpc` or `--binding http-json` to pin
 transport selection, and pass `--bearer-token` or repeated `--header Name:Value`
 arguments when the server requires authentication.
-
-Install from the workspace with `cargo install --path a2acli`, or from crates.io
-after release with `cargo install a2a-cli`.
 
 ## Depending On The Workspace
 
