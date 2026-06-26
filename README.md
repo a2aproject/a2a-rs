@@ -109,7 +109,7 @@ Pre-built binaries are available for macOS (arm64, x86_64), Linux (x86_64, aarch
 **macOS** — [Homebrew](https://brew.sh):
 
 ```sh
-brew tap a2aproject/a2a-rs
+brew tap a2aproject/a2a-rs https://github.com/a2aproject/a2a-rs
 brew trust a2aproject/a2a-rs
 brew install a2acli
 ```
