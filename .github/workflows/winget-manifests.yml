@@ -145,9 +145,15 @@ jobs:
           Upstream release: $RELEASE_URL
           EOF
 
-          GH_TOKEN="$WINGET_PKGS_TOKEN" gh pr create \
+          if ! GH_TOKEN="$WINGET_PKGS_TOKEN" gh pr create \
             --repo microsoft/winget-pkgs \
             --base master \
             --head "$fork_owner:$branch" \
             --title "Add WinGet manifest for a2aproject.a2acli version $PACKAGE_VERSION" \
-            --body-file /tmp/winget-pr-body.md
+            --body-file /tmp/winget-pr-body.md 2>&1 | tee /tmp/gh-pr-create.log; then
+            if grep -q "already exists" /tmp/gh-pr-create.log; then
+              echo "PR already exists for $branch — branch updated in place"
+              exit 0
+            fi
+            exit 1
+          fi
