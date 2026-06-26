@@ -34,7 +34,7 @@ jobs:
             runner: macos-latest
             target: aarch64-apple-darwin
           - name: macOS x86_64
-            runner: macos-13
+            runner: macos-latest
             target: x86_64-apple-darwin
           - name: Windows x86_64
             runner: windows-latest
