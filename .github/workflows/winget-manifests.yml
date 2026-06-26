@@ -129,13 +129,19 @@ jobs:
           git commit -m "release: add WinGet manifest for a2acli v$PACKAGE_VERSION"
           git push --force --set-upstream origin "$branch"
 
-          pr_number=$(GH_TOKEN="$WINGET_PKGS_TOKEN" gh pr list --repo microsoft/winget-pkgs --head "$fork_owner:$branch" --base master --state open --json number --jq 'first(.[].number) // ""')
+          pr_number=$(GH_TOKEN="$WINGET_PKGS_TOKEN" gh api \
+            repos/microsoft/winget-pkgs/pulls \
+            --method GET \
+            -f head="$fork_owner:$branch" \
+            -f base=master \
+            -f state=open \
+            --jq 'first(.[].number) // ""')
           if [ -n "$pr_number" ]; then
             echo "Updated existing PR #$pr_number"
             exit 0
           fi
 
-          cat > /tmp/winget-pr-body.md <<EOF
+          cat > /tmp/winget-pr-body.txt <<EOF
           Add WinGet manifests for $PACKAGE_IDENTIFIER $PACKAGE_VERSION.
 
           - publishes the Windows portable ZIP for a2acli
@@ -145,9 +151,10 @@ jobs:
           Upstream release: $RELEASE_URL
           EOF
 
-          GH_TOKEN="$WINGET_PKGS_TOKEN" gh pr create \
-            --repo microsoft/winget-pkgs \
-            --base master \
-            --head "$fork_owner:$branch" \
-            --title "Add WinGet manifest for a2aproject.a2acli version $PACKAGE_VERSION" \
-            --body-file /tmp/winget-pr-body.md
+          GH_TOKEN="$WINGET_PKGS_TOKEN" gh api \
+            repos/microsoft/winget-pkgs/pulls \
+            --method POST \
+            -f title="Add WinGet manifest for a2aproject.a2acli version $PACKAGE_VERSION" \
+            -f head="$fork_owner:$branch" \
+            -f base=master \
+            -F body=@/tmp/winget-pr-body.txt
