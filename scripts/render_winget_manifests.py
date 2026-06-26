@@ -12,7 +12,6 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-import textwrap
 import tomllib
 import urllib.request
 from urllib.error import HTTPError, URLError
@@ -197,16 +196,14 @@ def resolve_release_assets(tag: str, repository_slug: str) -> ReleaseAssets:
 
 
 def render_version_manifest(version: str) -> str:
-    return textwrap.dedent(
-        f"""\
-        # yaml-language-server: $schema=https://aka.ms/winget-manifest.version.{MANIFEST_VERSION}.schema.json
-
-        PackageIdentifier: {PACKAGE_IDENTIFIER}
-        PackageVersion: {version}
-        DefaultLocale: {PACKAGE_LOCALE}
-        ManifestType: version
-        ManifestVersion: {MANIFEST_VERSION}
-        """
+    return (
+        f"# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.{MANIFEST_VERSION}.schema.json\n"
+        f"\n"
+        f"PackageIdentifier: {PACKAGE_IDENTIFIER}\n"
+        f"PackageVersion: {version}\n"
+        f"DefaultLocale: {PACKAGE_LOCALE}\n"
+        f"ManifestType: version\n"
+        f"ManifestVersion: {MANIFEST_VERSION}\n"
     )
 
 
@@ -218,38 +215,31 @@ def render_default_locale_manifest(
     repository_url: str,
     license_id: str,
 ) -> str:
-    tags = "\n".join(
-        [
-            "Tags:",
-            "- a2a",
-            "- agent",
-            "- cli",
-            "- llm",
-            "- protocol",
-        ]
-    )
-    return textwrap.dedent(
-        f"""\
-        # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.{MANIFEST_VERSION}.schema.json
-
-        PackageIdentifier: {PACKAGE_IDENTIFIER}
-        PackageVersion: {version}
-        PackageLocale: {PACKAGE_LOCALE}
-        Publisher: {PUBLISHER}
-        PublisherUrl: https://github.com/a2aproject
-        PublisherSupportUrl: {repository_url}/issues
-        Author: AGNTCY Contributors
-        PackageName: {PACKAGE_NAME}
-        PackageUrl: {repository_url}
-        License: {license_id}
-        LicenseUrl: {repository_url}/blob/{tag}/LICENSE.md
-        ShortDescription: {description}
-        Moniker: {MONIKER}
-        {tags}
-        ReleaseNotesUrl: {repository_url}/releases/tag/{tag}
-        ManifestType: defaultLocale
-        ManifestVersion: {MANIFEST_VERSION}
-        """
+    return (
+        f"# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.{MANIFEST_VERSION}.schema.json\n"
+        f"\n"
+        f"PackageIdentifier: {PACKAGE_IDENTIFIER}\n"
+        f"PackageVersion: {version}\n"
+        f"PackageLocale: {PACKAGE_LOCALE}\n"
+        f"Publisher: {PUBLISHER}\n"
+        f"PublisherUrl: https://github.com/a2aproject\n"
+        f"PublisherSupportUrl: {repository_url}/issues\n"
+        f"Author: AGNTCY Contributors\n"
+        f"PackageName: {PACKAGE_NAME}\n"
+        f"PackageUrl: {repository_url}\n"
+        f"License: {license_id}\n"
+        f"LicenseUrl: {repository_url}/blob/{tag}/LICENSE.md\n"
+        f"ShortDescription: {description}\n"
+        f"Moniker: {MONIKER}\n"
+        f"Tags:\n"
+        f"- a2a\n"
+        f"- agent\n"
+        f"- cli\n"
+        f"- llm\n"
+        f"- protocol\n"
+        f"ReleaseNotesUrl: {repository_url}/releases/tag/{tag}\n"
+        f"ManifestType: defaultLocale\n"
+        f"ManifestVersion: {MANIFEST_VERSION}\n"
     )
 
 
@@ -257,27 +247,25 @@ def render_installer_manifest(release_assets: ReleaseAssets) -> str:
     relative_file_path = (
         f"a2acli-v{release_assets.version}-{WINDOWS_TARGET}\\a2acli.exe"
     )
-    return textwrap.dedent(
-        f"""\
-        # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.{MANIFEST_VERSION}.schema.json
-
-        PackageIdentifier: {PACKAGE_IDENTIFIER}
-        PackageVersion: {release_assets.version}
-        InstallerType: zip
-        NestedInstallerType: portable
-        Commands:
-        - {MONIKER}
-        ReleaseDate: {release_assets.release_date}
-        Installers:
-        - Architecture: {WINDOWS_ARCHITECTURE}
-          InstallerUrl: {release_assets.installer_url}
-          InstallerSha256: {release_assets.installer_sha256}
-          NestedInstallerFiles:
-          - RelativeFilePath: {relative_file_path}
-            PortableCommandAlias: {MONIKER}
-        ManifestType: installer
-        ManifestVersion: {MANIFEST_VERSION}
-        """
+    return (
+        f"# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.{MANIFEST_VERSION}.schema.json\n"
+        f"\n"
+        f"PackageIdentifier: {PACKAGE_IDENTIFIER}\n"
+        f"PackageVersion: {release_assets.version}\n"
+        f"InstallerType: zip\n"
+        f"NestedInstallerType: portable\n"
+        f"Commands:\n"
+        f"- {MONIKER}\n"
+        f"ReleaseDate: {release_assets.release_date}\n"
+        f"Installers:\n"
+        f"- Architecture: {WINDOWS_ARCHITECTURE}\n"
+        f"  InstallerUrl: {release_assets.installer_url}\n"
+        f"  InstallerSha256: {release_assets.installer_sha256}\n"
+        f"  NestedInstallerFiles:\n"
+        f"  - RelativeFilePath: {relative_file_path}\n"
+        f"    PortableCommandAlias: {MONIKER}\n"
+        f"ManifestType: installer\n"
+        f"ManifestVersion: {MANIFEST_VERSION}\n"
     )
 
 
