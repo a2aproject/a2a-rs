@@ -128,7 +128,7 @@ Installs to `/usr/local/bin` as root or `~/.local/bin` otherwise. Override with 
 winget install a2aproject.a2acli
 ```
 
-**From source**:
+**From source** — via [crates.io](https://crates.io/crates/a2a-cli):
 
 ```sh
 cargo install a2a-cli
@@ -157,7 +157,7 @@ arguments when the server requires authentication.
 
 ## Depending On The Workspace
 
-Until the crates are published, depend on them directly from Git:
+The crates are published on crates.io. To depend on the latest development version directly from Git:
 
 ```toml
 [dependencies]
