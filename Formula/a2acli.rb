@@ -13,7 +13,7 @@ class A2acli < Formula
   depends_on "rust" => :build
 
   def install
-    system "cargo", "install", "--locked", "--path", "a2acli", *std_cargo_args
+    system "cargo", "install", *std_cargo_args(path: "a2acli")
   end
 
   test do
