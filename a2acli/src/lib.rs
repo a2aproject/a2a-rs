@@ -7,6 +7,8 @@ use std::sync::Arc;
 use a2a::*;
 use a2a_client::auth::AuthInterceptor;
 use a2a_client::{A2AClient, A2AClientFactory, BoxStream};
+#[cfg(feature = "slimrpc")]
+use a2a_slimrpc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use reqwest::{Client, RequestBuilder};
@@ -294,6 +296,8 @@ pub struct HeaderArg {
 pub enum Binding {
     Jsonrpc,
     HttpJson,
+    #[cfg(feature = "slimrpc")]
+    Slimrpc,
 }
 
 impl Binding {
