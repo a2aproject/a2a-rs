@@ -478,7 +478,7 @@ async fn card_and_extended_card_commands_work() {
     assert_eq!(headers[0].1.as_deref(), Some("abc"));
 
     let compact = run_cli_success(&[
-        "--transport",
+        "--enabled-binding",
         "http-json",
         "-o",
         "json",
