@@ -16,11 +16,11 @@ use thiserror::Error;
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
 #[command(name = "a2a", version, about = "A2A client CLI")]
 pub struct Cli {
-    /// Enabled transports in preference order (first = most preferred).
-    /// Repeat the flag to enable multiple transports, e.g. --transport jsonrpc --transport http-json.
-    /// Only transports listed here will be used; the order overrides the server's preference.
-    #[arg(long = "transport", global = true, value_enum)]
-    pub transports: Vec<Transport>,
+    /// Enabled protocol bindings in preference order (first = most preferred).
+    /// Repeat the flag to enable multiple bindings, e.g. --enabled-binding jsonrpc --enabled-binding http-json.
+    /// Only bindings listed here will be used; the order overrides the server's preference.
+    #[arg(long = "enabled-binding", global = true, value_enum)]
+    pub enabled_bindings: Vec<Binding>,
 
     /// Bearer token attached to the agent-card fetch and client calls.
     #[arg(long, global = true, env = "A2A_BEARER_TOKEN")]
@@ -291,21 +291,21 @@ pub struct HeaderArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Transport {
+pub enum Binding {
     Jsonrpc,
     HttpJson,
 }
 
-impl Transport {
+impl Binding {
     fn protocol(self) -> &'static str {
         match self {
-            Transport::Jsonrpc => TRANSPORT_PROTOCOL_JSONRPC,
-            Transport::HttpJson => TRANSPORT_PROTOCOL_HTTP_JSON,
+            Binding::Jsonrpc => TRANSPORT_PROTOCOL_JSONRPC,
+            Binding::HttpJson => TRANSPORT_PROTOCOL_HTTP_JSON,
         }
     }
 }
 
-const DEFAULT_TRANSPORTS: &[Transport] = &[Transport::Jsonrpc, Transport::HttpJson];
+const DEFAULT_BINDINGS: &[Binding] = &[Binding::Jsonrpc, Binding::HttpJson];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TaskStateArg {
@@ -609,15 +609,15 @@ async fn resolve_client(
 ) -> Result<A2AClient<Box<dyn a2a_client::Transport>>, CliError> {
     let card = resolve_agent_card(agent_ref, cli).await?;
 
-    let effective_transports = if cli.transports.is_empty() {
-        DEFAULT_TRANSPORTS.to_vec()
+    let effective_bindings = if cli.enabled_bindings.is_empty() {
+        DEFAULT_BINDINGS.to_vec()
     } else {
-        cli.transports.clone()
+        cli.enabled_bindings.clone()
     };
 
-    let preferred: Vec<String> = effective_transports
+    let preferred: Vec<String> = effective_bindings
         .iter()
-        .map(|t| t.protocol().to_string())
+        .map(|b| b.protocol().to_string())
         .collect();
 
     let mut builder = A2AClientFactory::builder().preferred_bindings(preferred);
@@ -1346,7 +1346,7 @@ mod tests {
     #[test]
     fn test_cli_parse_send_command() {
         let cli = parse_cli(&[
-            "--transport",
+            "--enabled-binding",
             "jsonrpc",
             "--header",
             "X-Test:123",
@@ -1357,7 +1357,7 @@ mod tests {
             "2",
         ]);
 
-        assert_eq!(cli.transports, vec![crate::Transport::Jsonrpc]);
+        assert_eq!(cli.enabled_bindings, vec![crate::Binding::Jsonrpc]);
         assert_eq!(cli.headers.len(), 1);
         assert!(matches!(cli.command, Command::Send(_)));
     }
@@ -1461,9 +1461,9 @@ mod tests {
     }
 
     #[test]
-    fn test_transport_protocols() {
-        assert_eq!(crate::Transport::Jsonrpc.protocol(), TRANSPORT_PROTOCOL_JSONRPC);
-        assert_eq!(crate::Transport::HttpJson.protocol(), TRANSPORT_PROTOCOL_HTTP_JSON);
+    fn test_binding_protocols() {
+        assert_eq!(crate::Binding::Jsonrpc.protocol(), TRANSPORT_PROTOCOL_JSONRPC);
+        assert_eq!(crate::Binding::HttpJson.protocol(), TRANSPORT_PROTOCOL_HTTP_JSON);
     }
 
     #[test]
@@ -1678,7 +1678,7 @@ mod tests {
             .await
             .unwrap();
         run(parse_cli(&[
-            "--transport",
+            "--enabled-binding",
             "jsonrpc",
             "--bearer-token",
             "secret",

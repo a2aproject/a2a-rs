@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{Cli, HeaderArg, OutputFormat, Transport};
+use crate::{Binding, Cli, HeaderArg, OutputFormat};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
-    pub transports: Vec<String>,
+    pub enabled_bindings: Vec<String>,
     #[serde(default)]
     pub bearer_token: Option<String>,
     #[serde(default)]
@@ -84,13 +84,13 @@ pub fn apply_config(
     let placeholder = PathBuf::from("<config>");
     let p = path.as_ref().unwrap_or(&placeholder);
 
-    // Transports: CLI wins if any flags were given
-    if cli.transports.is_empty() && !config.transports.is_empty() {
-        for s in &config.transports {
-            let transport = parse_transport_str(s).ok_or_else(|| {
+    // Enabled bindings: CLI wins if any flags were given
+    if cli.enabled_bindings.is_empty() && !config.enabled_bindings.is_empty() {
+        for s in &config.enabled_bindings {
+            let binding = parse_binding_str(s).ok_or_else(|| {
                 ConfigError::Invalid(p.clone(), format!("unknown transport: {s:?}"))
             })?;
-            cli.transports.push(transport);
+            cli.enabled_bindings.push(binding);
         }
     }
 
@@ -125,12 +125,12 @@ pub fn apply_config(
     Ok(())
 }
 
-fn parse_transport_str(s: &str) -> Option<Transport> {
+fn parse_binding_str(s: &str) -> Option<Binding> {
     match s {
-        "jsonrpc" => Some(Transport::Jsonrpc),
-        "http-json" => Some(Transport::HttpJson),
+        "jsonrpc" => Some(Binding::Jsonrpc),
+        "http-json" => Some(Binding::HttpJson),
         #[cfg(feature = "slimrpc")]
-        "slimrpc" => Some(Transport::Slimrpc),
+        "slimrpc" => Some(Binding::Slimrpc),
         _ => None,
     }
 }
@@ -146,7 +146,7 @@ fn parse_output_format(s: &str) -> Option<OutputFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OutputFormat, Transport};
+    use crate::{Binding, OutputFormat};
 
     fn parse_config(yaml: &str) -> Config {
         serde_yaml::from_str(yaml).unwrap()
@@ -155,7 +155,7 @@ mod tests {
     fn empty_cli() -> Cli {
         use crate::Command;
         Cli {
-            transports: vec![],
+            enabled_bindings: vec![],
             bearer_token: None,
             headers: vec![],
             output: None,
@@ -218,8 +218,8 @@ mod tests {
 
     #[test]
     fn test_parse_valid_config() {
-        let cfg = parse_config("transports:\n  - jsonrpc\nbearer_token: tok\noutput: json\n");
-        assert_eq!(cfg.transports, vec!["jsonrpc"]);
+        let cfg = parse_config("enabled_bindings:\n  - jsonrpc\nbearer_token: tok\noutput: json\n");
+        assert_eq!(cfg.enabled_bindings, vec!["jsonrpc"]);
         assert_eq!(cfg.bearer_token.as_deref(), Some("tok"));
         assert_eq!(cfg.output.as_deref(), Some("json"));
     }
@@ -233,20 +233,20 @@ mod tests {
     #[test]
     fn test_apply_fills_empty_cli() {
         let mut cli = empty_cli();
-        let cfg = parse_config("transports:\n  - http-json\nbearer_token: tok\noutput: json\n");
+        let cfg = parse_config("enabled_bindings:\n  - http-json\nbearer_token: tok\noutput: json\n");
         apply_config(&mut cli, &cfg, &None).unwrap();
-        assert_eq!(cli.transports, vec![crate::Transport::HttpJson]);
+        assert_eq!(cli.enabled_bindings, vec![crate::Binding::HttpJson]);
         assert_eq!(cli.bearer_token.as_deref(), Some("tok"));
         assert_eq!(cli.output, Some(OutputFormat::Json));
     }
 
     #[test]
-    fn test_cli_transports_take_precedence() {
+    fn test_cli_bindings_take_precedence() {
         let mut cli = empty_cli();
-        cli.transports = vec![Transport::Jsonrpc];
-        let cfg = parse_config("transports:\n  - http-json\n");
+        cli.enabled_bindings = vec![Binding::Jsonrpc];
+        let cfg = parse_config("enabled_bindings:\n  - http-json\n");
         apply_config(&mut cli, &cfg, &None).unwrap();
-        assert_eq!(cli.transports, vec![Transport::Jsonrpc]);
+        assert_eq!(cli.enabled_bindings, vec![Binding::Jsonrpc]);
     }
 
     #[test]
@@ -264,9 +264,9 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_transport_errors() {
+    fn test_invalid_binding_errors() {
         let mut cli = empty_cli();
-        let cfg = parse_config("transports:\n  - bogus\n");
+        let cfg = parse_config("enabled_bindings:\n  - bogus\n");
         let err = apply_config(&mut cli, &cfg, &None).unwrap_err();
         assert!(err.to_string().contains("unknown transport"));
     }
