@@ -1,5 +1,7 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // SPDX-License-Identifier: Apache-2.0
+mod config;
+
 use std::sync::Arc;
 
 use a2a::*;
@@ -28,13 +30,9 @@ pub struct Cli {
     #[arg(long = "header", global = true, value_parser = parse_header)]
     pub headers: Vec<HeaderArg>,
 
-    /// Optional tenant forwarded to A2A requests that support it.
-    #[arg(long, global = true)]
-    pub tenant: Option<String>,
-
-    /// Output format.
-    #[arg(long, short = 'o', global = true, value_enum, default_value = "pretty")]
-    pub output: OutputFormat,
+    /// Output format (default: pretty).
+    #[arg(long, short = 'o', global = true, value_enum)]
+    pub output: Option<OutputFormat>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -352,19 +350,21 @@ pub enum CliError {
     InvalidAgentCard { reason: String },
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("{0}")]
+    Config(#[from] config::ConfigError),
 }
 
-pub async fn run(cli: Cli) -> Result<(), CliError> {
-    let compact = cli.output == OutputFormat::Json;
+pub async fn run(mut cli: Cli) -> Result<(), CliError> {
+    let (cfg, cfg_path) = config::load_config()?;
+    config::apply_config(&mut cli, &cfg, &cfg_path)?;
+    let compact = cli.output.unwrap_or(OutputFormat::Pretty) == OutputFormat::Json;
 
     match &cli.command {
         Command::Discover(command) => {
             if command.extended {
                 let client = resolve_client(&command.agent_ref, &cli).await?;
                 let result = client
-                    .get_extended_agent_card(&GetExtendedAgentCardRequest {
-                        tenant: cli.tenant.clone(),
-                    })
+                    .get_extended_agent_card(&GetExtendedAgentCardRequest { tenant: None })
                     .await;
                 let card = finish_client_call(client, result).await?;
                 print_json(&card, compact)?;
@@ -374,7 +374,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             }
         }
         Command::Send(command) => {
-            let request = build_send_message_request(command, cli.tenant.clone());
+            let request = build_send_message_request(command);
             let client = resolve_client(&command.agent_ref, &cli).await?;
             let result = client.send_message(&request).await;
             let response = finish_client_call(client, result).await?;
@@ -382,7 +382,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         }
         Command::Stream(command) => {
             let client = resolve_client(&command.agent_ref, &cli).await?;
-            let request = build_stream_message_request(command, cli.tenant.clone());
+            let request = build_stream_message_request(command);
             let stream = client.send_streaming_message(&request).await?;
             consume_stream(client, stream, compact).await?;
         }
@@ -397,7 +397,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
     Ok(())
 }
 
-fn build_send_message_request(command: &SendCommand, tenant: Option<String>) -> SendMessageRequest {
+fn build_send_message_request(command: &SendCommand) -> SendMessageRequest {
     let mut message = Message::new(Role::User, vec![Part::text(command.text.clone())]);
     message.context_id = command.context_id.clone();
     message.task_id = command.task_id.clone();
@@ -421,14 +421,11 @@ fn build_send_message_request(command: &SendCommand, tenant: Option<String>) -> 
         message,
         configuration,
         metadata: None,
-        tenant,
+        tenant: None,
     }
 }
 
-fn build_stream_message_request(
-    command: &StreamCommand,
-    tenant: Option<String>,
-) -> SendMessageRequest {
+fn build_stream_message_request(command: &StreamCommand) -> SendMessageRequest {
     let mut message = Message::new(Role::User, vec![Part::text(command.text.clone())]);
     message.context_id = command.context_id.clone();
     message.task_id = command.task_id.clone();
@@ -451,7 +448,7 @@ fn build_stream_message_request(
         message,
         configuration,
         metadata: None,
-        tenant,
+        tenant: None,
     }
 }
 
@@ -467,7 +464,7 @@ async fn run_task_command(
                 .get_task(&GetTaskRequest {
                     id: command.id.clone(),
                     history_length: command.history_length,
-                    tenant: cli.tenant.clone(),
+                    tenant: None,
                 })
                 .await;
             let task = finish_client_call(client, result).await?;
@@ -484,7 +481,7 @@ async fn run_task_command(
                     history_length: command.history_length,
                     status_timestamp_after: None,
                     include_artifacts: command.include_artifacts.then_some(true),
-                    tenant: cli.tenant.clone(),
+                    tenant: None,
                 })
                 .await;
             let response = finish_client_call(client, result).await?;
@@ -496,7 +493,7 @@ async fn run_task_command(
                 .cancel_task(&CancelTaskRequest {
                     id: command.id.clone(),
                     metadata: None,
-                    tenant: cli.tenant.clone(),
+                    tenant: None,
                 })
                 .await;
             let task = finish_client_call(client, result).await?;
@@ -507,7 +504,7 @@ async fn run_task_command(
             let stream = client
                 .subscribe_to_task(&SubscribeToTaskRequest {
                     id: command.id.clone(),
-                    tenant: cli.tenant.clone(),
+                    tenant: None,
                 })
                 .await?;
             consume_stream(client, stream, compact).await?;
@@ -553,7 +550,6 @@ async fn run_push_config_command(
             let client = resolve_client(&command.agent_ref, cli).await?;
             let mut config = build_push_notification_config(command)?;
             config.task_id = command.task_id.clone();
-            config.tenant = cli.tenant.clone();
             let result = client.create_push_config(&config).await;
             let response = finish_client_call(client, result).await?;
             print_json(&response, compact)?;
@@ -564,7 +560,7 @@ async fn run_push_config_command(
                 .get_push_config(&GetTaskPushNotificationConfigRequest {
                     task_id: command.task_id.clone(),
                     id: command.id.clone(),
-                    tenant: cli.tenant.clone(),
+                    tenant: None,
                 })
                 .await;
             let response = finish_client_call(client, result).await?;
@@ -577,7 +573,7 @@ async fn run_push_config_command(
                     task_id: command.task_id.clone(),
                     page_size: command.page_size,
                     page_token: command.page_token.clone(),
-                    tenant: cli.tenant.clone(),
+                    tenant: None,
                 })
                 .await;
             let response = finish_client_call(client, result).await?;
@@ -589,7 +585,7 @@ async fn run_push_config_command(
                 .delete_push_config(&DeleteTaskPushNotificationConfigRequest {
                     task_id: command.task_id.clone(),
                     id: command.id.clone(),
-                    tenant: cli.tenant.clone(),
+                    tenant: None,
                 })
                 .await;
             finish_client_call(client, result).await?;
@@ -684,7 +680,7 @@ fn print_json<T: Serialize>(value: &T, compact: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-fn parse_header(input: &str) -> Result<HeaderArg, String> {
+pub(crate) fn parse_header(input: &str) -> Result<HeaderArg, String> {
     let (name, value) = input
         .split_once(':')
         .ok_or_else(|| "header must be in NAME:VALUE format".to_string())?;
@@ -1204,12 +1200,8 @@ mod tests {
         async fn get_extended_agent_card(
             &self,
             _params: &HandlerServiceParams,
-            req: GetExtendedAgentCardRequest,
+            _req: GetExtendedAgentCardRequest,
         ) -> Result<AgentCard, A2AError> {
-            if req.tenant.as_deref() == Some("error") {
-                return Err(A2AError::unsupported_operation("extended card denied"));
-            }
-
             Ok(self.extended_card.clone())
         }
     }
@@ -1306,23 +1298,19 @@ mod tests {
 
     #[test]
     fn test_build_send_message_request_populates_optional_fields() {
-        let request = build_send_message_request(
-            &SendCommand {
-                agent_ref: "http://localhost:3000".to_string(),
-                text: "hello".to_string(),
-                context_id: Some("ctx-1".to_string()),
-                task_id: Some("task-1".to_string()),
-                history_length: Some(4),
-                accepted_output_modes: vec!["text/plain".to_string()],
-                return_immediately: true,
-            },
-            Some("tenant-1".to_string()),
-        );
+        let request = build_send_message_request(&SendCommand {
+            agent_ref: "http://localhost:3000".to_string(),
+            text: "hello".to_string(),
+            context_id: Some("ctx-1".to_string()),
+            task_id: Some("task-1".to_string()),
+            history_length: Some(4),
+            accepted_output_modes: vec!["text/plain".to_string()],
+            return_immediately: true,
+        });
 
         assert_eq!(request.message.text(), Some("hello"));
         assert_eq!(request.message.context_id.as_deref(), Some("ctx-1"));
         assert_eq!(request.message.task_id.as_deref(), Some("task-1"));
-        assert_eq!(request.tenant.as_deref(), Some("tenant-1"));
         assert_eq!(
             request
                 .configuration
@@ -1341,22 +1329,18 @@ mod tests {
 
     #[test]
     fn test_build_send_message_request_without_optional_fields() {
-        let request = build_send_message_request(
-            &SendCommand {
-                agent_ref: "http://localhost:3000".to_string(),
-                text: "hello".to_string(),
-                context_id: None,
-                task_id: None,
-                history_length: None,
-                accepted_output_modes: Vec::new(),
-                return_immediately: false,
-            },
-            None,
-        );
+        let request = build_send_message_request(&SendCommand {
+            agent_ref: "http://localhost:3000".to_string(),
+            text: "hello".to_string(),
+            context_id: None,
+            task_id: None,
+            history_length: None,
+            accepted_output_modes: Vec::new(),
+            return_immediately: false,
+        });
 
         assert_eq!(request.message.text(), Some("hello"));
         assert!(request.configuration.is_none());
-        assert!(request.tenant.is_none());
     }
 
     #[test]
@@ -1799,14 +1783,6 @@ mod tests {
     async fn test_run_surfaces_errors_in_lib_tests() {
         let server = RunTestServer::spawn().await;
         let base_url = &server.base_url;
-
-        let err = run(parse_cli(&["discover", base_url, "--extended", "--tenant", "error"]))
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            CliError::A2A(error) if error.code == a2a::error_code::UNSUPPORTED_OPERATION
-        ));
 
         let err = run(parse_cli(&["send", base_url, "send-error"]))
             .await
