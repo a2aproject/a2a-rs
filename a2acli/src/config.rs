@@ -1,6 +1,8 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // SPDX-License-Identifier: Apache-2.0
+#[cfg(not(test))]
 use std::fs::File;
+#[cfg(not(test))]
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
@@ -34,6 +36,7 @@ pub enum ConfigError {
 
 const CONFIG_FILENAME: &str = ".a2a.yaml";
 
+#[cfg(not(test))]
 pub fn find_config_file() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let home = home_dir();
@@ -44,6 +47,7 @@ pub fn find_config_file() -> Option<PathBuf> {
     })
 }
 
+#[cfg(not(test))]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -68,6 +72,7 @@ fn find_config_file_from(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(test))]
 pub fn load_config() -> Result<(Config, Option<PathBuf>), ConfigError> {
     match find_config_file() {
         Some(path) => {

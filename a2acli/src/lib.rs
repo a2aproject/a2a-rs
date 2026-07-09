@@ -354,12 +354,14 @@ pub enum CliError {
     Config(#[from] config::ConfigError),
 }
 
-pub async fn run(mut cli: Cli) -> Result<(), CliError> {
+pub async fn run(cli: Cli) -> Result<(), CliError> {
     #[cfg(not(test))]
-    {
+    let cli = {
+        let mut cli = cli;
         let (cfg, cfg_path) = config::load_config()?;
         config::apply_config(&mut cli, &cfg, &cfg_path)?;
-    }
+        cli
+    };
     let compact = cli.output.unwrap_or(OutputFormat::Pretty) == OutputFormat::Json;
 
     match &cli.command {
