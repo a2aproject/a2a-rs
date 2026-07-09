@@ -37,7 +37,11 @@ const CONFIG_FILENAME: &str = ".a2a.yaml";
 pub fn find_config_file() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let home = home_dir();
-    find_config_file_from(&cwd, home.as_deref())
+    find_config_file_from(&cwd, home.as_deref()).or_else(|| {
+        home.as_ref()
+            .map(|h| h.join(CONFIG_FILENAME))
+            .filter(|p| p.is_file())
+    })
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -129,8 +133,6 @@ fn parse_binding_str(s: &str) -> Option<Binding> {
     match s {
         "jsonrpc" => Some(Binding::Jsonrpc),
         "http-json" => Some(Binding::HttpJson),
-        #[cfg(feature = "slimrpc")]
-        "slimrpc" => Some(Binding::Slimrpc),
         _ => None,
     }
 }

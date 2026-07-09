@@ -367,7 +367,7 @@ pub async fn run(mut cli: Cli) -> Result<(), CliError> {
             if command.extended {
                 let client = resolve_client(&command.agent_ref, &cli).await?;
                 let result = client
-                    .get_extended_agent_card(&GetExtendedAgentCardRequest { tenant: None })
+                    .get_extended_agent_card(GetExtendedAgentCardRequest { tenant: None })
                     .await;
                 let card = finish_client_call(client, result).await?;
                 print_json(&card, compact)?;
@@ -379,14 +379,14 @@ pub async fn run(mut cli: Cli) -> Result<(), CliError> {
         Command::Send(command) => {
             let request = build_send_message_request(command);
             let client = resolve_client(&command.agent_ref, &cli).await?;
-            let result = client.send_message(&request).await;
+            let result = client.send_message(request).await;
             let response = finish_client_call(client, result).await?;
             print_json(&response, compact)?;
         }
         Command::Stream(command) => {
             let client = resolve_client(&command.agent_ref, &cli).await?;
             let request = build_stream_message_request(command);
-            let stream = client.send_streaming_message(&request).await?;
+            let stream = client.send_streaming_message(request).await?;
             consume_stream(client, stream, compact).await?;
         }
         Command::Task { command } => {
@@ -464,7 +464,7 @@ async fn run_task_command(
         TaskCommand::Get(command) => {
             let client = resolve_client(&command.agent_ref, cli).await?;
             let result = client
-                .get_task(&GetTaskRequest {
+                .get_task(GetTaskRequest {
                     id: command.id.clone(),
                     history_length: command.history_length,
                     tenant: None,
@@ -476,7 +476,7 @@ async fn run_task_command(
         TaskCommand::List(command) => {
             let client = resolve_client(&command.agent_ref, cli).await?;
             let result = client
-                .list_tasks(&ListTasksRequest {
+                .list_tasks(ListTasksRequest {
                     context_id: command.context_id.clone(),
                     status: command.status.map(TaskState::from),
                     page_size: command.page_size,
@@ -493,7 +493,7 @@ async fn run_task_command(
         TaskCommand::Cancel(command) => {
             let client = resolve_client(&command.agent_ref, cli).await?;
             let result = client
-                .cancel_task(&CancelTaskRequest {
+                .cancel_task(CancelTaskRequest {
                     id: command.id.clone(),
                     metadata: None,
                     tenant: None,
@@ -505,7 +505,7 @@ async fn run_task_command(
         TaskCommand::Subscribe(command) => {
             let client = resolve_client(&command.agent_ref, cli).await?;
             let stream = client
-                .subscribe_to_task(&SubscribeToTaskRequest {
+                .subscribe_to_task(SubscribeToTaskRequest {
                     id: command.id.clone(),
                     tenant: None,
                 })
@@ -553,14 +553,14 @@ async fn run_push_config_command(
             let client = resolve_client(&command.agent_ref, cli).await?;
             let mut config = build_push_notification_config(command)?;
             config.task_id = command.task_id.clone();
-            let result = client.create_push_config(&config).await;
+            let result = client.create_push_config(config).await;
             let response = finish_client_call(client, result).await?;
             print_json(&response, compact)?;
         }
         PushConfigCommand::Get(command) => {
             let client = resolve_client(&command.agent_ref, cli).await?;
             let result = client
-                .get_push_config(&GetTaskPushNotificationConfigRequest {
+                .get_push_config(GetTaskPushNotificationConfigRequest {
                     task_id: command.task_id.clone(),
                     id: command.id.clone(),
                     tenant: None,
@@ -572,7 +572,7 @@ async fn run_push_config_command(
         PushConfigCommand::List(command) => {
             let client = resolve_client(&command.agent_ref, cli).await?;
             let result = client
-                .list_push_configs(&ListTaskPushNotificationConfigsRequest {
+                .list_push_configs(ListTaskPushNotificationConfigsRequest {
                     task_id: command.task_id.clone(),
                     page_size: command.page_size,
                     page_token: command.page_token.clone(),
@@ -585,7 +585,7 @@ async fn run_push_config_command(
         PushConfigCommand::Delete(command) => {
             let client = resolve_client(&command.agent_ref, cli).await?;
             let result = client
-                .delete_push_config(&DeleteTaskPushNotificationConfigRequest {
+                .delete_push_config(DeleteTaskPushNotificationConfigRequest {
                     task_id: command.task_id.clone(),
                     id: command.id.clone(),
                     tenant: None,
@@ -657,7 +657,7 @@ async fn resolve_agent_card(agent_ref: &str, cli: &Cli) -> Result<AgentCard, Cli
             reason: e.to_string(),
         })
     } else {
-        let json = std::fs::read_to_string(agent_ref)?;
+        let json = tokio::fs::read_to_string(agent_ref).await?;
         serde_json::from_str(&json).map_err(|e| CliError::InvalidAgentCard {
             reason: e.to_string(),
         })
