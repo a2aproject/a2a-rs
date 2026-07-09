@@ -305,6 +305,8 @@ impl Binding {
         match self {
             Binding::Jsonrpc => TRANSPORT_PROTOCOL_JSONRPC,
             Binding::HttpJson => TRANSPORT_PROTOCOL_HTTP_JSON,
+            #[cfg(feature = "slimrpc")]
+            Binding::Slimrpc => a2a::TRANSPORT_PROTOCOL_SLIMRPC,
         }
     }
 }

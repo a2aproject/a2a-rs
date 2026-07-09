@@ -138,6 +138,8 @@ fn parse_binding_str(s: &str) -> Option<Binding> {
     match s {
         "jsonrpc" => Some(Binding::Jsonrpc),
         "http-json" => Some(Binding::HttpJson),
+        #[cfg(feature = "slimrpc")]
+        "slimrpc" => Some(Binding::Slimrpc),
         _ => None,
     }
 }
