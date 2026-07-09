@@ -12,7 +12,7 @@ rust-version.workspace = true
 name = "a2acli"
 
 [[bin]]
-name = "a2acli"
+name = "a2a"
 path = "src/main.rs"
 
 [dependencies]

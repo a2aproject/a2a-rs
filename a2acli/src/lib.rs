@@ -12,15 +12,13 @@ use serde::Serialize;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
-#[command(name = "a2acli", version, about = "Standalone A2A client CLI")]
+#[command(name = "a2a", version, about = "A2A client CLI")]
 pub struct Cli {
-    /// Base URL used to resolve /.well-known/agent-card.json.
-    #[arg(long, global = true, default_value = "http://localhost:3000")]
-    pub base_url: String,
-
-    /// Prefer a specific transport when the agent card exposes multiple bindings.
-    #[arg(long, global = true, value_enum)]
-    pub binding: Option<Binding>,
+    /// Enabled transports in preference order (first = most preferred).
+    /// Repeat the flag to enable multiple transports, e.g. --transport jsonrpc --transport http-json.
+    /// Only transports listed here will be used; the order overrides the server's preference.
+    #[arg(long = "transport", global = true, value_enum)]
+    pub transports: Vec<Transport>,
 
     /// Bearer token attached to the agent-card fetch and client calls.
     #[arg(long, global = true, env = "A2A_BEARER_TOKEN")]
@@ -34,32 +32,35 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub tenant: Option<String>,
 
-    /// Emit compact JSON instead of pretty-printed JSON.
-    #[arg(long, global = true)]
-    pub compact: bool,
+    /// Output format.
+    #[arg(long, short = 'o', global = true, value_enum, default_value = "pretty")]
+    pub output: OutputFormat,
 
     #[command(subcommand)]
     pub command: Command,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Pretty-printed JSON.
+    Pretty,
+    /// Compact JSON (one object per line for streaming commands).
+    Json,
+}
+
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
 pub enum Command {
-    /// Fetch and print the public agent card.
-    Card,
-    /// Fetch and print the extended agent card.
-    ExtendedCard,
-    /// Send a one-shot message.
-    Send(MessageCommand),
+    /// Fetch and print an agent's card.
+    Discover(DiscoverCommand),
+    /// Send a one-shot message to an agent.
+    Send(SendCommand),
     /// Send a streaming message and print each event as it arrives.
-    Stream(MessageCommand),
-    /// Fetch a task by ID.
-    GetTask(TaskLookupCommand),
-    /// List tasks with optional filters.
-    ListTasks(ListTasksCommand),
-    /// Cancel a task by ID.
-    CancelTask(TaskIdCommand),
-    /// Subscribe to task updates and print each event as it arrives.
-    Subscribe(TaskIdCommand),
+    Stream(StreamCommand),
+    /// Task lifecycle operations.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
     /// Manage push notification configs for a task.
     PushConfig {
         #[command(subcommand)]
@@ -68,7 +69,20 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-pub struct MessageCommand {
+pub struct DiscoverCommand {
+    /// Agent reference: base URL, full agent-card URL, or local JSON file path.
+    pub agent_ref: String,
+
+    /// Fetch the extended agent card instead of the public one.
+    #[arg(long)]
+    pub extended: bool,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct SendCommand {
+    /// Agent reference: base URL, full agent-card URL, or local JSON file path.
+    pub agent_ref: String,
+
     /// Text payload to send as the user message.
     pub text: String,
 
@@ -94,7 +108,47 @@ pub struct MessageCommand {
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-pub struct TaskLookupCommand {
+pub struct StreamCommand {
+    /// Agent reference: base URL, full agent-card URL, or local JSON file path.
+    pub agent_ref: String,
+
+    /// Text payload to send as the user message.
+    pub text: String,
+
+    /// Optional context identifier to continue an existing conversation.
+    #[arg(long)]
+    pub context_id: Option<String>,
+
+    /// Optional task identifier to continue an existing task.
+    #[arg(long)]
+    pub task_id: Option<String>,
+
+    /// Ask the server to include up to this many history items in task responses.
+    #[arg(long)]
+    pub history_length: Option<i32>,
+
+    /// Accepted output mode, for example text/plain or application/json.
+    #[arg(long = "accept-output")]
+    pub accepted_output_modes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
+pub enum TaskCommand {
+    /// Fetch a task by ID.
+    Get(TaskGetCommand),
+    /// List tasks with optional filters.
+    List(TaskListCommand),
+    /// Cancel a task by ID.
+    Cancel(TaskCancelCommand),
+    /// Subscribe to task updates and print each event as it arrives.
+    Subscribe(TaskSubscribeCommand),
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct TaskGetCommand {
+    /// Agent reference: base URL, full agent-card URL, or local JSON file path.
+    pub agent_ref: String,
+
     /// Task identifier.
     pub id: String,
 
@@ -104,7 +158,10 @@ pub struct TaskLookupCommand {
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-pub struct ListTasksCommand {
+pub struct TaskListCommand {
+    /// Agent reference: base URL, full agent-card URL, or local JSON file path.
+    pub agent_ref: String,
+
     /// Filter by context identifier.
     #[arg(long)]
     pub context_id: Option<String>,
@@ -131,7 +188,19 @@ pub struct ListTasksCommand {
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-pub struct TaskIdCommand {
+pub struct TaskCancelCommand {
+    /// Agent reference: base URL, full agent-card URL, or local JSON file path.
+    pub agent_ref: String,
+
+    /// Task identifier.
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct TaskSubscribeCommand {
+    /// Agent reference: base URL, full agent-card URL, or local JSON file path.
+    pub agent_ref: String,
+
     /// Task identifier.
     pub id: String,
 }
@@ -141,15 +210,18 @@ pub enum PushConfigCommand {
     /// Create a push notification config for a task.
     Create(CreatePushConfigCommand),
     /// Fetch a push notification config by ID.
-    Get(PushConfigIdCommand),
+    Get(PushConfigGetCommand),
     /// List push notification configs for a task.
-    List(ListPushConfigsCommand),
+    List(PushConfigListCommand),
     /// Delete a push notification config by ID.
-    Delete(PushConfigIdCommand),
+    Delete(PushConfigDeleteCommand),
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 pub struct CreatePushConfigCommand {
+    /// Agent reference: base URL, full agent-card URL, or local JSON file path.
+    pub agent_ref: String,
+
     /// Task identifier.
     pub task_id: String,
 
@@ -174,7 +246,10 @@ pub struct CreatePushConfigCommand {
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-pub struct PushConfigIdCommand {
+pub struct PushConfigGetCommand {
+    /// Agent reference: base URL, full agent-card URL, or local JSON file path.
+    pub agent_ref: String,
+
     /// Task identifier.
     pub task_id: String,
 
@@ -183,7 +258,22 @@ pub struct PushConfigIdCommand {
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-pub struct ListPushConfigsCommand {
+pub struct PushConfigDeleteCommand {
+    /// Agent reference: base URL, full agent-card URL, or local JSON file path.
+    pub agent_ref: String,
+
+    /// Task identifier.
+    pub task_id: String,
+
+    /// Push config identifier.
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct PushConfigListCommand {
+    /// Agent reference: base URL, full agent-card URL, or local JSON file path.
+    pub agent_ref: String,
+
     /// Task identifier.
     pub task_id: String,
 
@@ -203,19 +293,21 @@ pub struct HeaderArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Binding {
+pub enum Transport {
     Jsonrpc,
     HttpJson,
 }
 
-impl Binding {
+impl Transport {
     fn protocol(self) -> &'static str {
         match self {
-            Binding::Jsonrpc => TRANSPORT_PROTOCOL_JSONRPC,
-            Binding::HttpJson => TRANSPORT_PROTOCOL_HTTP_JSON,
+            Transport::Jsonrpc => TRANSPORT_PROTOCOL_JSONRPC,
+            Transport::HttpJson => TRANSPORT_PROTOCOL_HTTP_JSON,
         }
     }
 }
+
+const DEFAULT_TRANSPORTS: &[Transport] = &[Transport::Jsonrpc, Transport::HttpJson];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TaskStateArg {
@@ -254,102 +346,58 @@ pub enum CliError {
     Http(#[from] reqwest::Error),
     #[error("failed to serialize output: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("failed to read file: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid agent card: {reason}")]
+    InvalidAgentCard { reason: String },
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }
 
 pub async fn run(cli: Cli) -> Result<(), CliError> {
+    let compact = cli.output == OutputFormat::Json;
+
     match &cli.command {
-        Command::Card => {
-            let card = resolve_agent_card(&cli).await?;
-            print_json(&card, cli.compact)?;
-        }
-        Command::ExtendedCard => {
-            let client = resolve_client(&cli).await?;
-            let result = client
-                .get_extended_agent_card(&GetExtendedAgentCardRequest {
-                    tenant: cli.tenant.clone(),
-                })
-                .await;
-            let card = finish_client_call(client, result).await?;
-            print_json(&card, cli.compact)?;
+        Command::Discover(command) => {
+            if command.extended {
+                let client = resolve_client(&command.agent_ref, &cli).await?;
+                let result = client
+                    .get_extended_agent_card(&GetExtendedAgentCardRequest {
+                        tenant: cli.tenant.clone(),
+                    })
+                    .await;
+                let card = finish_client_call(client, result).await?;
+                print_json(&card, compact)?;
+            } else {
+                let card = resolve_agent_card(&command.agent_ref, &cli).await?;
+                print_json(&card, compact)?;
+            }
         }
         Command::Send(command) => {
             let request = build_send_message_request(command, cli.tenant.clone());
-            let client = resolve_client(&cli).await?;
+            let client = resolve_client(&command.agent_ref, &cli).await?;
             let result = client.send_message(&request).await;
             let response = finish_client_call(client, result).await?;
-            print_json(&response, cli.compact)?;
+            print_json(&response, compact)?;
         }
         Command::Stream(command) => {
-            let client = resolve_client(&cli).await?;
-            let request = build_send_message_request(command, cli.tenant.clone());
+            let client = resolve_client(&command.agent_ref, &cli).await?;
+            let request = build_stream_message_request(command, cli.tenant.clone());
             let stream = client.send_streaming_message(&request).await?;
-            consume_stream(client, stream, cli.compact).await?;
+            consume_stream(client, stream, compact).await?;
         }
-        Command::GetTask(command) => {
-            let client = resolve_client(&cli).await?;
-            let result = client
-                .get_task(&GetTaskRequest {
-                    id: command.id.clone(),
-                    history_length: command.history_length,
-                    tenant: cli.tenant.clone(),
-                })
-                .await;
-            let task = finish_client_call(client, result).await?;
-            print_json(&task, cli.compact)?;
-        }
-        Command::ListTasks(command) => {
-            let client = resolve_client(&cli).await?;
-            let result = client
-                .list_tasks(&ListTasksRequest {
-                    context_id: command.context_id.clone(),
-                    status: command.status.map(TaskState::from),
-                    page_size: command.page_size,
-                    page_token: command.page_token.clone(),
-                    history_length: command.history_length,
-                    status_timestamp_after: None,
-                    include_artifacts: command.include_artifacts.then_some(true),
-                    tenant: cli.tenant.clone(),
-                })
-                .await;
-            let response = finish_client_call(client, result).await?;
-            print_json(&response, cli.compact)?;
-        }
-        Command::CancelTask(command) => {
-            let client = resolve_client(&cli).await?;
-            let result = client
-                .cancel_task(&CancelTaskRequest {
-                    id: command.id.clone(),
-                    metadata: None,
-                    tenant: cli.tenant.clone(),
-                })
-                .await;
-            let task = finish_client_call(client, result).await?;
-            print_json(&task, cli.compact)?;
-        }
-        Command::Subscribe(command) => {
-            let client = resolve_client(&cli).await?;
-            let stream = client
-                .subscribe_to_task(&SubscribeToTaskRequest {
-                    id: command.id.clone(),
-                    tenant: cli.tenant.clone(),
-                })
-                .await?;
-            consume_stream(client, stream, cli.compact).await?;
+        Command::Task { command } => {
+            run_task_command(&cli, command, compact).await?;
         }
         Command::PushConfig { command } => {
-            run_push_config_command(&cli, command).await?;
+            run_push_config_command(&cli, command, compact).await?;
         }
     }
 
     Ok(())
 }
 
-fn build_send_message_request(
-    command: &MessageCommand,
-    tenant: Option<String>,
-) -> SendMessageRequest {
+fn build_send_message_request(command: &SendCommand, tenant: Option<String>) -> SendMessageRequest {
     let mut message = Message::new(Role::User, vec![Part::text(command.text.clone())]);
     message.context_id = command.context_id.clone();
     message.task_id = command.task_id.clone();
@@ -375,6 +423,97 @@ fn build_send_message_request(
         metadata: None,
         tenant,
     }
+}
+
+fn build_stream_message_request(
+    command: &StreamCommand,
+    tenant: Option<String>,
+) -> SendMessageRequest {
+    let mut message = Message::new(Role::User, vec![Part::text(command.text.clone())]);
+    message.context_id = command.context_id.clone();
+    message.task_id = command.task_id.clone();
+
+    let configuration = if command.history_length.is_some()
+        || !command.accepted_output_modes.is_empty()
+    {
+        Some(SendMessageConfiguration {
+            accepted_output_modes: (!command.accepted_output_modes.is_empty())
+                .then_some(command.accepted_output_modes.clone()),
+            task_push_notification_config: None,
+            history_length: command.history_length,
+            return_immediately: None,
+        })
+    } else {
+        None
+    };
+
+    SendMessageRequest {
+        message,
+        configuration,
+        metadata: None,
+        tenant,
+    }
+}
+
+async fn run_task_command(
+    cli: &Cli,
+    command: &TaskCommand,
+    compact: bool,
+) -> Result<(), CliError> {
+    match command {
+        TaskCommand::Get(command) => {
+            let client = resolve_client(&command.agent_ref, cli).await?;
+            let result = client
+                .get_task(&GetTaskRequest {
+                    id: command.id.clone(),
+                    history_length: command.history_length,
+                    tenant: cli.tenant.clone(),
+                })
+                .await;
+            let task = finish_client_call(client, result).await?;
+            print_json(&task, compact)?;
+        }
+        TaskCommand::List(command) => {
+            let client = resolve_client(&command.agent_ref, cli).await?;
+            let result = client
+                .list_tasks(&ListTasksRequest {
+                    context_id: command.context_id.clone(),
+                    status: command.status.map(TaskState::from),
+                    page_size: command.page_size,
+                    page_token: command.page_token.clone(),
+                    history_length: command.history_length,
+                    status_timestamp_after: None,
+                    include_artifacts: command.include_artifacts.then_some(true),
+                    tenant: cli.tenant.clone(),
+                })
+                .await;
+            let response = finish_client_call(client, result).await?;
+            print_json(&response, compact)?;
+        }
+        TaskCommand::Cancel(command) => {
+            let client = resolve_client(&command.agent_ref, cli).await?;
+            let result = client
+                .cancel_task(&CancelTaskRequest {
+                    id: command.id.clone(),
+                    metadata: None,
+                    tenant: cli.tenant.clone(),
+                })
+                .await;
+            let task = finish_client_call(client, result).await?;
+            print_json(&task, compact)?;
+        }
+        TaskCommand::Subscribe(command) => {
+            let client = resolve_client(&command.agent_ref, cli).await?;
+            let stream = client
+                .subscribe_to_task(&SubscribeToTaskRequest {
+                    id: command.id.clone(),
+                    tenant: cli.tenant.clone(),
+                })
+                .await?;
+            consume_stream(client, stream, compact).await?;
+        }
+    }
+    Ok(())
 }
 
 fn build_push_notification_config(
@@ -404,19 +543,23 @@ fn build_push_notification_config(
     })
 }
 
-async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Result<(), CliError> {
+async fn run_push_config_command(
+    cli: &Cli,
+    command: &PushConfigCommand,
+    compact: bool,
+) -> Result<(), CliError> {
     match command {
         PushConfigCommand::Create(command) => {
-            let client = resolve_client(cli).await?;
+            let client = resolve_client(&command.agent_ref, cli).await?;
             let mut config = build_push_notification_config(command)?;
             config.task_id = command.task_id.clone();
             config.tenant = cli.tenant.clone();
             let result = client.create_push_config(&config).await;
             let response = finish_client_call(client, result).await?;
-            print_json(&response, cli.compact)?;
+            print_json(&response, compact)?;
         }
         PushConfigCommand::Get(command) => {
-            let client = resolve_client(cli).await?;
+            let client = resolve_client(&command.agent_ref, cli).await?;
             let result = client
                 .get_push_config(&GetTaskPushNotificationConfigRequest {
                     task_id: command.task_id.clone(),
@@ -425,10 +568,10 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
                 })
                 .await;
             let response = finish_client_call(client, result).await?;
-            print_json(&response, cli.compact)?;
+            print_json(&response, compact)?;
         }
         PushConfigCommand::List(command) => {
-            let client = resolve_client(cli).await?;
+            let client = resolve_client(&command.agent_ref, cli).await?;
             let result = client
                 .list_push_configs(&ListTaskPushNotificationConfigsRequest {
                     task_id: command.task_id.clone(),
@@ -438,10 +581,10 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
                 })
                 .await;
             let response = finish_client_call(client, result).await?;
-            print_json(&response, cli.compact)?;
+            print_json(&response, compact)?;
         }
         PushConfigCommand::Delete(command) => {
-            let client = resolve_client(cli).await?;
+            let client = resolve_client(&command.agent_ref, cli).await?;
             let result = client
                 .delete_push_config(&DeleteTaskPushNotificationConfigRequest {
                     task_id: command.task_id.clone(),
@@ -456,7 +599,7 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
                     "taskId": command.task_id,
                     "id": command.id,
                 }),
-                cli.compact,
+                compact,
             )?;
         }
     }
@@ -464,13 +607,25 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
     Ok(())
 }
 
-async fn resolve_client(cli: &Cli) -> Result<A2AClient<Box<dyn a2a_client::Transport>>, CliError> {
-    let card = resolve_agent_card(cli).await?;
+async fn resolve_client(
+    agent_ref: &str,
+    cli: &Cli,
+) -> Result<A2AClient<Box<dyn a2a_client::Transport>>, CliError> {
+    let card = resolve_agent_card(agent_ref, cli).await?;
 
-    let mut builder = A2AClientFactory::builder();
-    if let Some(binding) = cli.binding {
-        builder = builder.preferred_bindings(vec![binding.protocol().to_string()]);
-    }
+    let effective_transports = if cli.transports.is_empty() {
+        DEFAULT_TRANSPORTS.to_vec()
+    } else {
+        cli.transports.clone()
+    };
+
+    let preferred: Vec<String> = effective_transports
+        .iter()
+        .map(|t| t.protocol().to_string())
+        .collect();
+
+    let mut builder = A2AClientFactory::builder().preferred_bindings(preferred);
+
     if let Some(token) = &cli.bearer_token {
         builder = builder.with_interceptor(Arc::new(AuthInterceptor::bearer(token.clone())));
     }
@@ -485,15 +640,29 @@ async fn resolve_client(cli: &Cli) -> Result<A2AClient<Box<dyn a2a_client::Trans
     Ok(factory.create_from_card(&card).await?)
 }
 
-async fn resolve_agent_card(cli: &Cli) -> Result<AgentCard, CliError> {
-    let url = format!(
-        "{}/.well-known/agent-card.json",
-        cli.base_url.trim_end_matches('/')
-    );
-    let client = Client::new();
-    let request = apply_request_auth(client.get(url), cli);
-    let response = request.send().await?.error_for_status()?;
-    Ok(response.json::<AgentCard>().await?)
+async fn resolve_agent_card(agent_ref: &str, cli: &Cli) -> Result<AgentCard, CliError> {
+    if agent_ref.starts_with("http://") || agent_ref.starts_with("https://") {
+        let url = if agent_ref.ends_with(".json") {
+            agent_ref.to_string()
+        } else {
+            format!(
+                "{}/.well-known/agent-card.json",
+                agent_ref.trim_end_matches('/')
+            )
+        };
+        let client = Client::new();
+        let request = apply_request_auth(client.get(url), cli);
+        let response = request.send().await?.error_for_status()?;
+        let body = response.text().await?;
+        serde_json::from_str(&body).map_err(|e| CliError::InvalidAgentCard {
+            reason: e.to_string(),
+        })
+    } else {
+        let json = std::fs::read_to_string(agent_ref)?;
+        serde_json::from_str(&json).map_err(|e| CliError::InvalidAgentCard {
+            reason: e.to_string(),
+        })
+    }
 }
 
 fn apply_request_auth(mut request: RequestBuilder, cli: &Cli) -> RequestBuilder {
@@ -1096,12 +1265,8 @@ mod tests {
         }
     }
 
-    fn parse_cli_with_base_url(base_url: &str, args: &[&str]) -> Cli {
-        let mut argv = vec![
-            "a2acli".to_string(),
-            "--base-url".to_string(),
-            base_url.to_string(),
-        ];
+    fn parse_cli(args: &[&str]) -> Cli {
+        let mut argv = vec!["a2a".to_string()];
         argv.extend(args.iter().map(|arg| (*arg).to_string()));
         Cli::try_parse_from(argv).unwrap()
     }
@@ -1142,7 +1307,8 @@ mod tests {
     #[test]
     fn test_build_send_message_request_populates_optional_fields() {
         let request = build_send_message_request(
-            &MessageCommand {
+            &SendCommand {
+                agent_ref: "http://localhost:3000".to_string(),
                 text: "hello".to_string(),
                 context_id: Some("ctx-1".to_string()),
                 task_id: Some("task-1".to_string()),
@@ -1176,7 +1342,8 @@ mod tests {
     #[test]
     fn test_build_send_message_request_without_optional_fields() {
         let request = build_send_message_request(
-            &MessageCommand {
+            &SendCommand {
+                agent_ref: "http://localhost:3000".to_string(),
                 text: "hello".to_string(),
                 context_id: None,
                 task_id: None,
@@ -1194,30 +1361,29 @@ mod tests {
 
     #[test]
     fn test_cli_parse_send_command() {
-        let cli = Cli::try_parse_from([
-            "a2acli",
-            "--binding",
+        let cli = parse_cli(&[
+            "--transport",
             "jsonrpc",
             "--header",
             "X-Test:123",
             "send",
+            "http://localhost:3000",
             "hello",
             "--history-length",
             "2",
-        ])
-        .unwrap();
+        ]);
 
-        assert_eq!(cli.binding, Some(Binding::Jsonrpc));
+        assert_eq!(cli.transports, vec![crate::Transport::Jsonrpc]);
         assert_eq!(cli.headers.len(), 1);
         assert!(matches!(cli.command, Command::Send(_)));
     }
 
     #[test]
     fn test_cli_parse_push_config_create_command() {
-        let cli = Cli::try_parse_from([
-            "a2acli",
+        let cli = parse_cli(&[
             "push-config",
             "create",
+            "http://localhost:3000",
             "task-1",
             "https://example.com/callback",
             "--config-id",
@@ -1228,13 +1394,13 @@ mod tests {
             "Bearer",
             "--auth-credentials",
             "secret",
-        ])
-        .unwrap();
+        ]);
 
         match cli.command {
             Command::PushConfig {
                 command: PushConfigCommand::Create(command),
             } => {
+                assert_eq!(command.agent_ref, "http://localhost:3000");
                 assert_eq!(command.task_id, "task-1");
                 assert_eq!(command.url, "https://example.com/callback");
                 assert_eq!(command.config_id.as_deref(), Some("cfg-1"));
@@ -1249,6 +1415,7 @@ mod tests {
     #[test]
     fn test_build_push_notification_config() {
         let config = build_push_notification_config(&CreatePushConfigCommand {
+            agent_ref: "http://localhost:3000".to_string(),
             task_id: "task-1".to_string(),
             url: "https://example.com/callback".to_string(),
             config_id: Some("cfg-1".to_string()),
@@ -1279,6 +1446,7 @@ mod tests {
     #[test]
     fn test_build_push_notification_config_requires_auth_scheme() {
         let err = build_push_notification_config(&CreatePushConfigCommand {
+            agent_ref: "http://localhost:3000".to_string(),
             task_id: "task-1".to_string(),
             url: "https://example.com/callback".to_string(),
             config_id: None,
@@ -1294,6 +1462,7 @@ mod tests {
     #[test]
     fn test_build_push_notification_config_without_authentication() {
         let config = build_push_notification_config(&CreatePushConfigCommand {
+            agent_ref: "http://localhost:3000".to_string(),
             task_id: "task-1".to_string(),
             url: "https://example.com/callback".to_string(),
             config_id: None,
@@ -1308,22 +1477,21 @@ mod tests {
     }
 
     #[test]
-    fn test_binding_protocols() {
-        assert_eq!(Binding::Jsonrpc.protocol(), TRANSPORT_PROTOCOL_JSONRPC);
-        assert_eq!(Binding::HttpJson.protocol(), TRANSPORT_PROTOCOL_HTTP_JSON);
+    fn test_transport_protocols() {
+        assert_eq!(crate::Transport::Jsonrpc.protocol(), TRANSPORT_PROTOCOL_JSONRPC);
+        assert_eq!(crate::Transport::HttpJson.protocol(), TRANSPORT_PROTOCOL_HTTP_JSON);
     }
 
     #[test]
     fn test_apply_request_auth_builds_headers() {
-        let cli = Cli::try_parse_from([
-            "a2acli",
+        let cli = parse_cli(&[
             "--bearer-token",
             "secret",
             "--header",
             "X-Test: 123",
-            "card",
-        ])
-        .unwrap();
+            "discover",
+            "http://localhost:3000",
+        ]);
 
         let request = apply_request_auth(Client::new().get("http://example.com"), &cli)
             .build()
@@ -1519,109 +1687,110 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_run_executes_all_commands_in_lib_tests() {
         let server = RunTestServer::spawn().await;
+        let base_url = &server.base_url;
 
-        run(parse_cli_with_base_url(&server.base_url, &["card"]))
+        run(parse_cli(&["discover", base_url])).await.unwrap();
+        run(parse_cli(&["-o", "json", "discover", base_url, "--extended"]))
             .await
             .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &["--compact", "extended-card"],
-        ))
+        run(parse_cli(&[
+            "--transport",
+            "jsonrpc",
+            "--bearer-token",
+            "secret",
+            "--header",
+            "X-Test: 123",
+            "send",
+            base_url,
+            "hello from unit test",
+            "--task-id",
+            "task-send",
+            "--context-id",
+            "ctx-send",
+        ]))
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &[
-                "--binding",
-                "jsonrpc",
-                "--bearer-token",
-                "secret",
-                "--header",
-                "X-Test: 123",
-                "send",
-                "hello from unit test",
-                "--task-id",
-                "task-send",
-                "--context-id",
-                "ctx-send",
-            ],
-        ))
+        run(parse_cli(&[
+            "-o",
+            "json",
+            "stream",
+            base_url,
+            "streaming request",
+            "--task-id",
+            "task-stream",
+            "--context-id",
+            "ctx-stream",
+        ]))
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &[
-                "--compact",
-                "stream",
-                "streaming request",
-                "--task-id",
-                "task-stream",
-                "--context-id",
-                "ctx-stream",
-            ],
-        ))
+        run(parse_cli(&["task", "get", base_url, "task-send"]))
+            .await
+            .unwrap();
+        run(parse_cli(&[
+            "-o",
+            "json",
+            "task",
+            "list",
+            base_url,
+            "--context-id",
+            "ctx-send",
+            "--status",
+            "completed",
+        ]))
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &["get-task", "task-send"],
-        ))
+        run(parse_cli(&["task", "cancel", base_url, "task-send"]))
+            .await
+            .unwrap();
+        run(parse_cli(&[
+            "-o",
+            "json",
+            "task",
+            "subscribe",
+            base_url,
+            "task-stream",
+        ]))
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &[
-                "--compact",
-                "list-tasks",
-                "--context-id",
-                "ctx-send",
-                "--status",
-                "completed",
-            ],
-        ))
+        run(parse_cli(&[
+            "push-config",
+            "create",
+            base_url,
+            "task-1",
+            "https://example.com/callback",
+            "--config-id",
+            "cfg-1",
+        ]))
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &["cancel-task", "task-send"],
-        ))
+        run(parse_cli(&[
+            "-o",
+            "json",
+            "push-config",
+            "get",
+            base_url,
+            "task-1",
+            "cfg-1",
+        ]))
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &["--compact", "subscribe", "task-stream"],
-        ))
+        run(parse_cli(&[
+            "-o",
+            "json",
+            "push-config",
+            "list",
+            base_url,
+            "task-1",
+        ]))
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &[
-                "push-config",
-                "create",
-                "task-1",
-                "https://example.com/callback",
-                "--config-id",
-                "cfg-1",
-            ],
-        ))
-        .await
-        .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &["--compact", "push-config", "get", "task-1", "cfg-1"],
-        ))
-        .await
-        .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &["--compact", "push-config", "list", "task-1"],
-        ))
-        .await
-        .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &["push-config", "delete", "task-1", "cfg-1"],
-        ))
+        run(parse_cli(&[
+            "push-config",
+            "delete",
+            base_url,
+            "task-1",
+            "cfg-1",
+        ]))
         .await
         .unwrap();
     }
@@ -1629,33 +1798,31 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_run_surfaces_errors_in_lib_tests() {
         let server = RunTestServer::spawn().await;
+        let base_url = &server.base_url;
 
-        let err = run(parse_cli_with_base_url(
-            &server.base_url,
-            &["extended-card", "--tenant", "error"],
-        ))
-        .await
-        .unwrap_err();
+        let err = run(parse_cli(&["discover", base_url, "--extended", "--tenant", "error"]))
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             CliError::A2A(error) if error.code == a2a::error_code::UNSUPPORTED_OPERATION
         ));
 
-        let err = run(parse_cli_with_base_url(
-            &server.base_url,
-            &["send", "send-error"],
-        ))
-        .await
-        .unwrap_err();
+        let err = run(parse_cli(&["send", base_url, "send-error"]))
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             CliError::A2A(error) if error.code == a2a::error_code::INVALID_REQUEST
         ));
 
-        let err = run(parse_cli_with_base_url(
-            &server.base_url,
-            &["list-tasks", "--context-id", "error"],
-        ))
+        let err = run(parse_cli(&[
+            "task",
+            "list",
+            base_url,
+            "--context-id",
+            "error",
+        ]))
         .await
         .unwrap_err();
         assert!(matches!(
@@ -1663,10 +1830,22 @@ mod tests {
             CliError::A2A(error) if error.code == a2a::error_code::INVALID_PARAMS
         ));
 
-        let err = run(parse_cli_with_base_url(
-            &server.base_url,
-            &["--compact", "stream", "stream-error"],
-        ))
+        let err = run(parse_cli(&["-o", "json", "stream", base_url, "stream-error"]))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CliError::A2A(error) if error.code == a2a::error_code::INTERNAL_ERROR
+        ));
+
+        let err = run(parse_cli(&[
+            "-o",
+            "json",
+            "task",
+            "subscribe",
+            base_url,
+            "stream-error",
+        ]))
         .await
         .unwrap_err();
         assert!(matches!(
@@ -1674,28 +1853,15 @@ mod tests {
             CliError::A2A(error) if error.code == a2a::error_code::INTERNAL_ERROR
         ));
 
-        let err = run(parse_cli_with_base_url(
-            &server.base_url,
-            &["--compact", "subscribe", "stream-error"],
-        ))
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            CliError::A2A(error) if error.code == a2a::error_code::INTERNAL_ERROR
-        ));
-
-        let err = run(parse_cli_with_base_url(
-            &server.base_url,
-            &[
-                "push-config",
-                "create",
-                "missing",
-                "https://example.com/callback",
-                "--config-id",
-                "cfg-missing",
-            ],
-        ))
+        let err = run(parse_cli(&[
+            "push-config",
+            "create",
+            base_url,
+            "missing",
+            "https://example.com/callback",
+            "--config-id",
+            "cfg-missing",
+        ]))
         .await
         .unwrap_err();
         assert!(matches!(
@@ -1703,10 +1869,12 @@ mod tests {
             CliError::A2A(error) if error.code == a2a::error_code::TASK_NOT_FOUND
         ));
 
-        let err = run(parse_cli_with_base_url(
-            &server.base_url,
-            &["push-config", "list", "missing"],
-        ))
+        let err = run(parse_cli(&[
+            "push-config",
+            "list",
+            base_url,
+            "missing",
+        ]))
         .await
         .unwrap_err();
         assert!(matches!(
@@ -1715,7 +1883,7 @@ mod tests {
         ));
 
         let base_url = unused_base_url().await;
-        let err = run(parse_cli_with_base_url(&base_url, &["card"]))
+        let err = run(parse_cli(&["discover", &base_url]))
             .await
             .unwrap_err();
         assert!(matches!(err, CliError::Http(_)));
