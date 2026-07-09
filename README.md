@@ -142,18 +142,30 @@ HTTP+JSON, prints responses as JSON, and manages task push notification
 configs.
 
 ```sh
-cargo run --bin a2acli -- card
-cargo run --bin a2acli -- send "hello from rust"
-cargo run --bin a2acli -- stream "hello from rust"
-cargo run --bin a2acli -- list-tasks
-cargo run --bin a2acli -- push-config list task-123
+# Inspect an agent card
+a2a discover http://localhost:3000
+
+# Send a one-shot message
+a2a send http://localhost:3000 "hello from rust"
+
+# Send a streaming message
+a2a stream http://localhost:3000 "hello from rust"
+
+# List tasks
+a2a task list http://localhost:3000
+
+# Manage push notification configs
+a2a push-config list http://localhost:3000 task-123
 ```
 
-By default the CLI targets `http://localhost:3000`, which matches the bundled
-hello world server. Override the target with `--base-url https://host` for any
-compatible A2A server, use `--binding jsonrpc` or `--binding http-json` to pin
+Each command takes an agent reference as its first argument: a base URL
+(`http://host` → card fetched from `/.well-known/agent-card.json`), a direct
+URL to a card JSON file (`https://host/path/agent.json`), or a local file path.
+Use `--enabled-binding jsonrpc` or `--enabled-binding http-json` to pin
 transport selection, and pass `--bearer-token` or repeated `--header Name:Value`
 arguments when the server requires authentication.
+
+See [`a2acli/README.md`](a2acli/README.md) for the full command reference.
 
 ## Depending On The Workspace
 
