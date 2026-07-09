@@ -14,6 +14,7 @@ pub struct A2AClient<T: Transport> {
     transport: T,
     interceptors: Vec<Arc<dyn CallInterceptor>>,
     default_params: ServiceParams,
+    tenant: Option<String>,
 }
 
 impl<T: Transport> A2AClient<T> {
@@ -24,11 +25,17 @@ impl<T: Transport> A2AClient<T> {
             transport,
             interceptors: Vec::new(),
             default_params,
+            tenant: None,
         }
     }
 
     pub fn with_interceptors(mut self, interceptors: Vec<Arc<dyn CallInterceptor>>) -> Self {
         self.interceptors = interceptors;
+        self
+    }
+
+    pub fn with_tenant(mut self, tenant: Option<String>) -> Self {
+        self.tenant = tenant;
         self
     }
 
@@ -75,7 +82,11 @@ impl<T: Transport> A2AClient<T> {
         req: &SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
         let params = self.apply_before(methods::SEND_MESSAGE).await?;
-        let result = self.transport.send_message(&params, req).await;
+        let patched = SendMessageRequest {
+            tenant: self.tenant.clone(),
+            ..req.clone()
+        };
+        let result = self.transport.send_message(&params, &patched).await;
         self.finish_call(methods::SEND_MESSAGE, result).await
     }
 
@@ -84,26 +95,45 @@ impl<T: Transport> A2AClient<T> {
         req: &SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let params = self.apply_before(methods::SEND_STREAMING_MESSAGE).await?;
-        let result = self.transport.send_streaming_message(&params, req).await;
+        let patched = SendMessageRequest {
+            tenant: self.tenant.clone(),
+            ..req.clone()
+        };
+        let result = self
+            .transport
+            .send_streaming_message(&params, &patched)
+            .await;
         self.finish_call(methods::SEND_STREAMING_MESSAGE, result)
             .await
     }
 
     pub async fn get_task(&self, req: &GetTaskRequest) -> Result<Task, A2AError> {
         let params = self.apply_before(methods::GET_TASK).await?;
-        let result = self.transport.get_task(&params, req).await;
+        let patched = GetTaskRequest {
+            tenant: self.tenant.clone(),
+            ..req.clone()
+        };
+        let result = self.transport.get_task(&params, &patched).await;
         self.finish_call(methods::GET_TASK, result).await
     }
 
     pub async fn list_tasks(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
         let params = self.apply_before(methods::LIST_TASKS).await?;
-        let result = self.transport.list_tasks(&params, req).await;
+        let patched = ListTasksRequest {
+            tenant: self.tenant.clone(),
+            ..req.clone()
+        };
+        let result = self.transport.list_tasks(&params, &patched).await;
         self.finish_call(methods::LIST_TASKS, result).await
     }
 
     pub async fn cancel_task(&self, req: &CancelTaskRequest) -> Result<Task, A2AError> {
         let params = self.apply_before(methods::CANCEL_TASK).await?;
-        let result = self.transport.cancel_task(&params, req).await;
+        let patched = CancelTaskRequest {
+            tenant: self.tenant.clone(),
+            ..req.clone()
+        };
+        let result = self.transport.cancel_task(&params, &patched).await;
         self.finish_call(methods::CANCEL_TASK, result).await
     }
 
@@ -112,7 +142,11 @@ impl<T: Transport> A2AClient<T> {
         req: &SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let params = self.apply_before(methods::SUBSCRIBE_TO_TASK).await?;
-        let result = self.transport.subscribe_to_task(&params, req).await;
+        let patched = SubscribeToTaskRequest {
+            tenant: self.tenant.clone(),
+            ..req.clone()
+        };
+        let result = self.transport.subscribe_to_task(&params, &patched).await;
         self.finish_call(methods::SUBSCRIBE_TO_TASK, result).await
     }
 
@@ -121,7 +155,11 @@ impl<T: Transport> A2AClient<T> {
         req: &TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let params = self.apply_before(methods::CREATE_PUSH_CONFIG).await?;
-        let result = self.transport.create_push_config(&params, req).await;
+        let patched = TaskPushNotificationConfig {
+            tenant: self.tenant.clone(),
+            ..req.clone()
+        };
+        let result = self.transport.create_push_config(&params, &patched).await;
         self.finish_call(methods::CREATE_PUSH_CONFIG, result).await
     }
 
@@ -130,7 +168,11 @@ impl<T: Transport> A2AClient<T> {
         req: &GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let params = self.apply_before(methods::GET_PUSH_CONFIG).await?;
-        let result = self.transport.get_push_config(&params, req).await;
+        let patched = GetTaskPushNotificationConfigRequest {
+            tenant: self.tenant.clone(),
+            ..req.clone()
+        };
+        let result = self.transport.get_push_config(&params, &patched).await;
         self.finish_call(methods::GET_PUSH_CONFIG, result).await
     }
 
@@ -139,7 +181,11 @@ impl<T: Transport> A2AClient<T> {
         req: &ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
         let params = self.apply_before(methods::LIST_PUSH_CONFIGS).await?;
-        let result = self.transport.list_push_configs(&params, req).await;
+        let patched = ListTaskPushNotificationConfigsRequest {
+            tenant: self.tenant.clone(),
+            ..req.clone()
+        };
+        let result = self.transport.list_push_configs(&params, &patched).await;
         self.finish_call(methods::LIST_PUSH_CONFIGS, result).await
     }
 
@@ -148,7 +194,11 @@ impl<T: Transport> A2AClient<T> {
         req: &DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
         let params = self.apply_before(methods::DELETE_PUSH_CONFIG).await?;
-        let result = self.transport.delete_push_config(&params, req).await;
+        let patched = DeleteTaskPushNotificationConfigRequest {
+            tenant: self.tenant.clone(),
+            ..req.clone()
+        };
+        let result = self.transport.delete_push_config(&params, &patched).await;
         self.finish_call(methods::DELETE_PUSH_CONFIG, result).await
     }
 
@@ -157,7 +207,14 @@ impl<T: Transport> A2AClient<T> {
         req: &GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
         let params = self.apply_before(methods::GET_EXTENDED_AGENT_CARD).await?;
-        let result = self.transport.get_extended_agent_card(&params, req).await;
+        let patched = GetExtendedAgentCardRequest {
+            tenant: self.tenant.clone(),
+            ..req.clone()
+        };
+        let result = self
+            .transport
+            .get_extended_agent_card(&params, &patched)
+            .await;
         self.finish_call(methods::GET_EXTENDED_AGENT_CARD, result)
             .await
     }

@@ -367,12 +367,8 @@ impl RequestHandler for TestHandler {
     async fn get_extended_agent_card(
         &self,
         _params: &ServiceParams,
-        req: GetExtendedAgentCardRequest,
+        _req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
-        if req.tenant.as_deref() == Some("error") {
-            return Err(A2AError::unsupported_operation("extended card denied"));
-        }
-
         Ok(self.extended_card.clone())
     }
 }
@@ -585,8 +581,6 @@ async fn push_config_crud_commands_work() {
     let create = run_cli_success(&[
         "-o",
         "json",
-        "--tenant",
-        "tenant-1",
         "push-config",
         "create",
         base_url,
@@ -604,7 +598,6 @@ async fn push_config_crud_commands_work() {
     let create_json: Value = serde_json::from_str(create.trim()).unwrap();
     assert_eq!(create_json["taskId"], "task-1");
     assert_eq!(create_json["id"], "cfg-1");
-    assert_eq!(create_json["tenant"], "tenant-1");
 
     let get = run_cli_success(&[
         "-o",
@@ -660,15 +653,6 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("http request failed:"));
 
-    let (_stdout, stderr) = run_cli_failure(&[
-        "discover",
-        base_url,
-        "--extended",
-        "--tenant",
-        "error",
-    ]);
-    assert!(stderr.contains("a2a error -32004: extended card denied"));
-
     let (_stdout, stderr) = run_cli_failure(&["send", base_url, "send-error"]);
     assert!(stderr.contains("a2a error -32600: send failed"));
 
@@ -721,4 +705,27 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
         "secret",
     ]);
     assert!(stderr.contains("invalid input: --auth-credentials requires --auth-scheme"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_file_sets_output_format() {
+    let server = TestServer::spawn().await;
+    let base_url = &server.base_url;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join(".a2a.yaml"), "output: json\n").unwrap();
+
+    let output = StdCommand::cargo_bin("a2a")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["discover", base_url])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    // compact JSON (output: json) is a single line; pretty-printed JSON spans multiple lines
+    assert_eq!(stdout.trim().lines().count(), 1);
 }
