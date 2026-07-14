@@ -358,10 +358,11 @@ impl SlimRpcTransportFactory {
 
 async fn create_app_from_slim_config() -> Result<Arc<slim_bindings::App>, a2a::A2AError> {
     slim_bindings::initialize_with_defaults();
-    let config = slim_bindings::load_slim_config()
+    let config = slim_bindings::load_slim_config(None)
         .map_err(|e| a2a::A2AError::internal(e.to_string()))?;
     slim_bindings::get_global_service()
-        .create_app_from_slim_config(config)
+        .create_app_from_slim_config_async(config).await
+        .map(|h| h.app)
         .map_err(|e| a2a::A2AError::internal(e.to_string()))
 }
 
