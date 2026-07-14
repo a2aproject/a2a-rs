@@ -57,8 +57,8 @@ impl SlimRpcTransport {
     pub async fn from_slim_config(
         remote: Arc<slim_bindings::Name>,
     ) -> Result<Self, a2a::A2AError> {
-        let app = create_app_from_slim_config().await?;
-        Ok(Self::new(app, remote))
+        let (app, conn_id) = create_app_from_slim_config().await?;
+        Ok(Self::new_with_connection(app, remote, Some(conn_id)))
     }
 
     async fn call_unary<Req, Res>(
@@ -351,18 +351,19 @@ impl SlimRpcTransportFactory {
     /// `~/.slim/config.yaml`), with environment variables taking highest priority. Initializes
     /// the global SLIM service, connects to the node, and subscribes the local app.
     pub async fn from_slim_config() -> Result<Self, a2a::A2AError> {
-        let app = create_app_from_slim_config().await?;
-        Ok(Self::new(app))
+        let (app, conn_id) = create_app_from_slim_config().await?;
+        Ok(Self::new_with_connection(app, Some(conn_id)))
     }
 }
 
-async fn create_app_from_slim_config() -> Result<Arc<slim_bindings::App>, a2a::A2AError> {
+async fn create_app_from_slim_config() -> Result<(Arc<slim_bindings::App>, u64), a2a::A2AError> {
     slim_bindings::initialize_with_defaults();
     let config = slim_bindings::load_slim_config(None)
         .map_err(|e| a2a::A2AError::internal(e.to_string()))?;
     slim_bindings::get_global_service()
-        .create_app_from_slim_config_async(config).await
-        .map(|h| h.app)
+        .create_app_from_slim_config_async(config)
+        .await
+        .map(|h| (h.app, h.conn_id))
         .map_err(|e| a2a::A2AError::internal(e.to_string()))
 }
 

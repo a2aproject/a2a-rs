@@ -96,10 +96,26 @@ impl A2AClientFactory {
         // Sort by preference (lower is better)
         candidates.sort_by_key(|(prio, _, _)| *prio);
 
+        tracing::info!(
+            candidates = ?candidates.iter().map(|(_, iface, _)| &iface.protocol_binding).collect::<Vec<_>>(),
+            preferred = ?self.preferred_bindings,
+            "negotiating transport binding"
+        );
+
         let mut last_err = None;
         for (_prio, iface, factory) in &candidates {
+            tracing::info!(
+                protocol = %iface.protocol_binding,
+                url = %iface.url,
+                "trying transport binding"
+            );
             match factory.create(card, iface).await {
                 Ok(transport) => {
+                    tracing::info!(
+                        protocol = %iface.protocol_binding,
+                        url = %iface.url,
+                        "selected transport binding"
+                    );
                     return Ok(A2AClient::new(transport)
                         .with_tenant(iface.tenant.clone())
                         .with_interceptors(self.interceptors.clone()));

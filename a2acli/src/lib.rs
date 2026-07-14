@@ -631,6 +631,14 @@ async fn resolve_client(
 
     let mut builder = A2AClientFactory::builder().preferred_bindings(preferred);
 
+    #[cfg(feature = "slimrpc")]
+    if effective_bindings.contains(&Binding::Slimrpc) {
+        let slimrpc_factory = a2a_slimrpc::SlimRpcTransportFactory::from_slim_config()
+            .await
+            .map_err(CliError::A2A)?;
+        builder = builder.register(Arc::new(slimrpc_factory));
+    }
+
     if let Some(token) = &cli.bearer_token {
         builder = builder.with_interceptor(Arc::new(AuthInterceptor::bearer(token.clone())));
     }
