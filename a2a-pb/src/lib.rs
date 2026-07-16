@@ -7,6 +7,12 @@ pub mod proto {
 
 /// ProtoJSON-capable generated protobuf types for the A2A v1 protocol.
 pub mod protojson {
+    // Generated serde code emits `write!(f, "...", &FIELDS)`, which newer
+    // clippy flags as a useless borrow. Suppress it for the generated module.
+    // `unknown_lints` keeps this compiling on clippy versions predating the lint.
+    #![allow(unknown_lints)]
+    #![allow(clippy::useless_borrows_in_formatting)]
+
     include!(concat!(env!("OUT_DIR"), "/lf.a2a.v1.rs"));
     include!(concat!(env!("OUT_DIR"), "/lf.a2a.v1.serde.rs"));
 }
