@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use a2a::A2AError;
 use prost::Message;
-use slim_bindings::{Context, DEADLINE_KEY, RpcError, STATUS_CODE_KEY};
+use slim_rpc::{Context, DEADLINE_KEY, RpcError, STATUS_CODE_KEY};
 
 pub type ServiceParamsMap = HashMap<String, Vec<String>>;
 
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn test_decode_proto_request_invalid_payload() {
         let error = decode_proto_request::<a2a_pb::proto::Task>(vec![0xff], "Task").unwrap_err();
-        assert_eq!(error.code(), slim_bindings::RpcCode::InvalidArgument);
+        assert_eq!(error.code(), slim_rpc::RpcCode::InvalidArgument);
         assert!(error.message().contains("invalid Task payload"));
     }
 }

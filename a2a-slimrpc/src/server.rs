@@ -21,7 +21,7 @@ use crate::errors::a2a_error_to_rpc_error;
 
 type HandlerFuture<T> = Pin<Box<dyn Future<Output = Result<T, A2AError>> + Send>>;
 
-/// Registers A2A request handling methods on a `slim_bindings::Server`.
+/// Registers A2A request handling methods on a `slim_rpc::Server`.
 pub struct SlimRpcHandler<H: RequestHandler> {
     handler: Arc<H>,
 }
@@ -31,7 +31,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
         Self { handler }
     }
 
-    pub fn register(&self, server: &slim_bindings::Server) {
+    pub fn register(&self, server: &slim_rpc::Server) {
         register_unary_unary::<H, proto::SendMessageRequest, _, _, _, _>(
             server,
             self.handler.clone(),
@@ -158,7 +158,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
 }
 
 fn register_unary_unary<H, ReqProto, ReqNative, ResNative, DecodeReq, EncodeRes>(
-    server: &slim_bindings::Server,
+    server: &slim_rpc::Server,
     handler: Arc<H>,
     method_name: &'static str,
     request_name: &'static str,
@@ -183,7 +183,7 @@ fn register_unary_unary<H, ReqProto, ReqNative, ResNative, DecodeReq, EncodeRes>
     server.register_unary_unary_internal(
         A2A_SLIMRPC_SERVICE,
         method_name,
-        move |request: Vec<u8>, context: slim_bindings::Context| {
+        move |request: Vec<u8>, context: slim_rpc::Context| {
             let handler = handler.clone();
             let decode_req = decode_req.clone();
             let call = call.clone();
@@ -202,14 +202,14 @@ fn register_unary_unary<H, ReqProto, ReqNative, ResNative, DecodeReq, EncodeRes>
     );
 }
 
-fn register_unary_stream_send_message<H>(server: &slim_bindings::Server, handler: Arc<H>)
+fn register_unary_stream_send_message<H>(server: &slim_rpc::Server, handler: Arc<H>)
 where
     H: RequestHandler,
 {
     server.register_unary_stream_internal(
         A2A_SLIMRPC_SERVICE,
         METHOD_SEND_STREAMING_MESSAGE,
-        move |request: Vec<u8>, context: slim_bindings::Context| {
+        move |request: Vec<u8>, context: slim_rpc::Context| {
             let handler = handler.clone();
 
             async move {
@@ -230,14 +230,14 @@ where
     );
 }
 
-fn register_unary_stream_subscribe_to_task<H>(server: &slim_bindings::Server, handler: Arc<H>)
+fn register_unary_stream_subscribe_to_task<H>(server: &slim_rpc::Server, handler: Arc<H>)
 where
     H: RequestHandler,
 {
     server.register_unary_stream_internal(
         A2A_SLIMRPC_SERVICE,
         METHOD_SUBSCRIBE_TO_TASK,
-        move |request: Vec<u8>, context: slim_bindings::Context| {
+        move |request: Vec<u8>, context: slim_rpc::Context| {
             let handler = handler.clone();
 
             async move {
@@ -260,7 +260,7 @@ where
 
 fn map_stream_response(
     response: Result<StreamResponse, A2AError>,
-) -> Result<Vec<u8>, slim_bindings::RpcError> {
+) -> Result<Vec<u8>, slim_rpc::RpcError> {
     response
         .map(|response| encode_proto_message(&pbconv::to_proto_stream_response(&response)))
         .map_err(|error| a2a_error_to_rpc_error(&error))

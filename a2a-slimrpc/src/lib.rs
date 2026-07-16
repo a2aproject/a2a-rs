@@ -5,5 +5,5 @@ mod common;
 pub mod errors;
 pub mod server;
 
-pub use client::{SlimRpcTransport, SlimRpcTransportFactory, parse_slimrpc_target};
+pub use client::{SlimApp, SlimRpcTransport, SlimRpcTransportFactory, parse_slimrpc_target};
 pub use server::SlimRpcHandler;

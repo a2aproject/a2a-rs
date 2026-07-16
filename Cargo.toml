@@ -36,7 +36,7 @@ a2a-client = { package = "a2a-client-lf", path = "a2a-client", version = "0.2.0"
 a2a-server = { package = "a2a-server-lf", path = "a2a-server", version = "0.4.0", default-features = false }
 a2a-pb = { package = "a2a-pb", path = "a2a-pb", version = "0.1.8" }
 a2a-grpc = { package = "a2a-grpc", path = "a2a-grpc", version = "0.3.0", default-features = false }
-a2a-slimrpc = { package = "a2a-slimrpc", path = "a2a-slimrpc", version = "0.1.13" }
+a2a-slimrpc = { package = "a2a-slimrpc", path = "a2a-slimrpc", version = "0.2.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -71,7 +71,13 @@ prost = "0.14"
 prost-types = "0.14"
 pbjson-build = "0.9"
 protoc-bin-vendored = "3"
-slim_bindings = { package = "agntcy-slim-bindings", version = "1.3.0" }
+slim_rpc = { package = "agntcy-slim-rpc", version = "2.0.0-alpha.3" }
+slim_config = { package = "agntcy-slim-config", version = "0.12.1" }
+slim_service = { package = "agntcy-slim-service", version = "0.11.1", features = [
+    "session",
+] }
+slim_datapath = { package = "agntcy-slim-datapath", version = "0.16.2" }
+slim_auth = { package = "agntcy-slim-auth", version = "0.12.0" }
 
 # Utilities
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
