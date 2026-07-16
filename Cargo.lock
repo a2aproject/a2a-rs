@@ -192,9 +192,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-config"
-version = "0.12.1"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9eca6bb123f78d7f2c14140638ef07e2e8a88b239b3852efe1c7f83d03662fc6"
+checksum = "421c3302596f9298c8fc57182c84381b17f0e20681e7930c6211e4d39c26e68c"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-version",
