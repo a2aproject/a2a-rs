@@ -8,15 +8,18 @@ use a2a::*;
 use a2a_client::Transport;
 use a2a_client::transport::{ServiceParams, TransportFactory};
 use a2a_server::RequestHandler;
+use a2a_slimrpc::SlimApp;
 use a2a_slimrpc::{SlimRpcHandler, SlimRpcTransport, SlimRpcTransportFactory};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use prost::Message as _;
-use slim_bindings::{
-    App, Channel, Direction, IdentityProviderConfig, IdentityVerifierConfig, Name, RpcError,
-    Server, initialize_with_defaults,
-};
+use slim_auth::auth_provider::{AuthProvider, AuthVerifier};
+use slim_auth::shared_secret::SharedSecret;
+use slim_config::component::id::{ID, Kind};
+use slim_datapath::api::ProtoName as Name;
+use slim_rpc::{Channel, RpcError, Server};
+use slim_service::service::Service;
 
 const A2A_SERVICE_NAME: &str = "lf.a2a.v1.A2AService";
 const GET_TASK_METHOD: &str = "GetTask";
@@ -91,51 +94,46 @@ fn send_message_request(task_id: &str) -> SendMessageRequest {
     }
 }
 
-fn provider_config(id: &str) -> IdentityProviderConfig {
-    IdentityProviderConfig::SharedSecret {
-        id: id.to_string(),
-        data: SHARED_SECRET.to_string(),
-    }
-}
-
-fn verifier_config(id: &str) -> IdentityVerifierConfig {
-    IdentityVerifierConfig::SharedSecret {
-        id: id.to_string(),
-        data: SHARED_SECRET.to_string(),
-    }
+/// Build a shared-secret auth provider/verifier pair for the given identity id.
+fn auth(id: &str) -> (AuthProvider, AuthVerifier) {
+    let secret = SharedSecret::new(id, SHARED_SECRET).unwrap();
+    (
+        AuthProvider::shared_secret(secret.clone()),
+        AuthVerifier::shared_secret(secret),
+    )
 }
 
 struct TestEnv {
     test_name: String,
+    service: Arc<Service>,
     server: Arc<Server>,
-    _server_app: Arc<App>,
+    _server_app: Arc<SlimApp>,
     server_name: Arc<Name>,
 }
 
 impl TestEnv {
     async fn new(test_name: &str) -> Self {
-        initialize_with_defaults();
+        let id = ID::new_with_name(Kind::new("slim").unwrap(), test_name).unwrap();
+        let service = Arc::new(Service::new(id));
 
-        let server_name = Arc::new(Name::new(
-            "org".to_string(),
-            "test".to_string(),
-            test_name.to_string(),
+        let server_name = Name::from_strings(["org", "test", test_name]);
+        let (provider, verifier) = auth("test-provider");
+        let (server_app, server_notifications) = service
+            .create_app(&server_name, provider, verifier)
+            .unwrap();
+        let server_app = Arc::new(server_app);
+        let server = Arc::new(Server::new_internal(
+            server_app.clone(),
+            server_app.app_name().clone(),
+            server_notifications,
         ));
-        let server_app = App::new_with_direction_async(
-            server_name.clone(),
-            provider_config("test-provider"),
-            verifier_config("test-verifier"),
-            Direction::Bidirectional,
-        )
-        .await
-        .unwrap();
-        let server = Arc::new(Server::new(&server_app, server_app.name().clone()));
 
         Self {
             test_name: test_name.to_string(),
+            service,
             server,
             _server_app: server_app,
-            server_name,
+            server_name: Arc::new(server_name),
         }
     }
 
@@ -152,21 +150,15 @@ impl TestEnv {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    async fn new_client_app(&self, suffix: &str) -> Arc<App> {
-        let name = Arc::new(Name::new(
+    async fn new_client_app(&self, suffix: &str) -> Arc<SlimApp> {
+        let name = Name::from_strings([
             "org".to_string(),
             "test".to_string(),
             format!("{}-{suffix}", self.test_name),
-        ));
-
-        App::new_with_direction_async(
-            name,
-            provider_config("test-provider-client"),
-            verifier_config("test-verifier-client"),
-            Direction::Bidirectional,
-        )
-        .await
-        .unwrap()
+        ]);
+        let (provider, verifier) = auth("test-provider-client");
+        let (app, _) = self.service.create_app(&name, provider, verifier).unwrap();
+        Arc::new(app)
     }
 
     async fn transport(&self, suffix: &str) -> SlimRpcTransport {

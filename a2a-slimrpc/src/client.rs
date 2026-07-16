@@ -8,6 +8,13 @@ use a2a_client::transport::{ServiceParams, Transport, TransportFactory};
 use a2a_pb::pbconv;
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
+use slim_datapath::api::ProtoName;
+
+/// Native SLIM application type backing the RPC channel.
+pub type SlimApp = slim_service::app::App<
+    slim_auth::auth_provider::AuthProvider,
+    slim_auth::auth_provider::AuthVerifier,
+>;
 
 use crate::common::{
     A2A_SLIMRPC_SERVICE, METHOD_CANCEL_TASK, METHOD_CREATE_PUSH_CONFIG, METHOD_DELETE_PUSH_CONFIG,
@@ -20,25 +27,25 @@ use crate::errors::rpc_error_to_a2a_error;
 
 /// SLIMRPC transport for A2A clients.
 pub struct SlimRpcTransport {
-    channel: slim_bindings::Channel,
+    channel: slim_rpc::Channel,
 }
 
 impl SlimRpcTransport {
-    pub fn new(app: Arc<slim_bindings::App>, remote: Arc<slim_bindings::Name>) -> Self {
+    pub fn new(app: Arc<SlimApp>, remote: Arc<ProtoName>) -> Self {
         Self::new_with_connection(app, remote, None)
     }
 
     pub fn new_with_connection(
-        app: Arc<slim_bindings::App>,
-        remote: Arc<slim_bindings::Name>,
+        app: Arc<SlimApp>,
+        remote: Arc<ProtoName>,
         connection_id: Option<u64>,
     ) -> Self {
         Self {
-            channel: slim_bindings::Channel::new_with_connection(app, remote, connection_id),
+            channel: slim_rpc::Channel::new_with_connection(app, remote, connection_id),
         }
     }
 
-    pub fn from_channel(channel: slim_bindings::Channel) -> Self {
+    pub fn from_channel(channel: slim_rpc::Channel) -> Self {
         Self { channel }
     }
 
@@ -93,13 +100,13 @@ impl SlimRpcTransport {
 
         let stream = futures::stream::unfold(reader, move |reader| async move {
             match reader.next_async().await {
-                slim_bindings::StreamMessage::Data(data) => {
+                slim_rpc::StreamMessage::Data(data) => {
                     Some((decode_proto_response::<Res>(data, response_name), reader))
                 }
-                slim_bindings::StreamMessage::Error(error) => {
+                slim_rpc::StreamMessage::Error(error) => {
                     Some((Err(rpc_error_to_a2a_error(&error)), reader))
                 }
-                slim_bindings::StreamMessage::End => None,
+                slim_rpc::StreamMessage::End => None,
             }
         });
 
@@ -310,19 +317,19 @@ impl Transport for SlimRpcTransport {
 
 #[derive(Clone)]
 pub struct SlimRpcTransportFactory {
-    app: Arc<slim_bindings::App>,
+    app: Arc<SlimApp>,
     connection_id: Option<u64>,
 }
 
 impl SlimRpcTransportFactory {
-    pub fn new(app: Arc<slim_bindings::App>) -> Self {
+    pub fn new(app: Arc<SlimApp>) -> Self {
         Self {
             app,
             connection_id: None,
         }
     }
 
-    pub fn new_with_connection(app: Arc<slim_bindings::App>, connection_id: Option<u64>) -> Self {
+    pub fn new_with_connection(app: Arc<SlimApp>, connection_id: Option<u64>) -> Self {
         Self { app, connection_id }
     }
 }
@@ -346,7 +353,7 @@ impl TransportFactory for SlimRpcTransportFactory {
 }
 
 /// Parse a SLIMRPC target from agent card interface data.
-pub fn parse_slimrpc_target(target: &str) -> Result<Arc<slim_bindings::Name>, A2AError> {
+pub fn parse_slimrpc_target(target: &str) -> Result<Arc<ProtoName>, A2AError> {
     let normalized = target
         .trim()
         .strip_prefix("slimrpc://")
@@ -354,11 +361,21 @@ pub fn parse_slimrpc_target(target: &str) -> Result<Arc<slim_bindings::Name>, A2
         .unwrap_or(target.trim())
         .trim_start_matches('/');
 
-    let name = slim_bindings::Name::from_string(normalized.to_string()).map_err(|error| {
-        A2AError::invalid_params(format!("invalid SLIMRPC target '{target}': {error}"))
-    })?;
+    let components: Vec<&str> = normalized.split('/').collect();
+    let [org, namespace, agent] = components.as_slice() else {
+        return Err(A2AError::invalid_params(format!(
+            "invalid SLIMRPC target '{target}': expected 'org/namespace/agent'"
+        )));
+    };
+    if org.is_empty() || namespace.is_empty() || agent.is_empty() {
+        return Err(A2AError::invalid_params(format!(
+            "invalid SLIMRPC target '{target}': components must be non-empty"
+        )));
+    }
 
-    Ok(Arc::new(name))
+    Ok(Arc::new(ProtoName::from_strings([
+        *org, *namespace, *agent,
+    ])))
 }
 
 #[cfg(test)]
@@ -368,22 +385,22 @@ mod tests {
     #[test]
     fn test_parse_slimrpc_target_plain_name() {
         let name = parse_slimrpc_target("org/namespace/agent").unwrap();
-        assert_eq!(name.components(), vec!["org", "namespace", "agent"]);
+        assert_eq!(name.str_components(), ("org", "namespace", "agent"));
     }
 
     #[test]
     fn test_parse_slimrpc_target_scheme() {
         let name = parse_slimrpc_target("slimrpc://org/namespace/agent").unwrap();
-        assert_eq!(name.components(), vec!["org", "namespace", "agent"]);
+        assert_eq!(name.str_components(), ("org", "namespace", "agent"));
     }
 
     #[test]
     fn test_parse_slimrpc_target_slim_scheme_and_leading_slash() {
         let name = parse_slimrpc_target("slim://org/namespace/agent").unwrap();
-        assert_eq!(name.components(), vec!["org", "namespace", "agent"]);
+        assert_eq!(name.str_components(), ("org", "namespace", "agent"));
 
         let name = parse_slimrpc_target("/org/namespace/agent").unwrap();
-        assert_eq!(name.components(), vec!["org", "namespace", "agent"]);
+        assert_eq!(name.str_components(), ("org", "namespace", "agent"));
     }
 
     #[test]
