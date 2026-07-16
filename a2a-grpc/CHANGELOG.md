@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/a2aproject/a2a-rs/compare/a2a-grpc-v0.3.0...a2a-grpc-v0.3.1) - 2026-07-16
+
+### Other
+
+- updated the following local packages: a2a-pb, a2a-client-lf, a2a-server-lf
+
 ## [0.3.0](https://github.com/a2aproject/a2a-rs/compare/a2a-grpc-v0.2.3...a2a-grpc-v0.3.0) - 2026-05-27
 
 ### Fixed
