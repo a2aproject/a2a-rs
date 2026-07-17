@@ -71,13 +71,13 @@ prost = "0.14"
 prost-types = "0.14"
 pbjson-build = "0.9"
 protoc-bin-vendored = "3"
-slim_rpc = { package = "agntcy-slim-rpc", version = "2.0.0-alpha.3" }
-slim_config = { package = "agntcy-slim-config", version = "0.12.1" }
-slim_service = { package = "agntcy-slim-service", version = "0.11.1", features = [
+slim_rpc = { package = "agntcy-slim-rpc", version = "2.0.0-alpha.5" }
+slim_config = { package = "agntcy-slim-config", version = "0.12.3" }
+slim_service = { package = "agntcy-slim-service", version = "0.11.4", features = [
     "session",
 ] }
-slim_datapath = { package = "agntcy-slim-datapath", version = "0.16.2" }
-slim_auth = { package = "agntcy-slim-auth", version = "0.12.0" }
+slim_datapath = { package = "agntcy-slim-datapath", version = "0.16.5" }
+slim_auth = { package = "agntcy-slim-auth", version = "0.13.0" }
 
 # Utilities
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
