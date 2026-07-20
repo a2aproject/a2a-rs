@@ -22,9 +22,9 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 slim_rpc = { workspace = true }
 slim_service = { workspace = true }
+slim_config = { workspace = true }
 slim_datapath = { workspace = true }
 slim_auth = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-slim_config = { workspace = true }

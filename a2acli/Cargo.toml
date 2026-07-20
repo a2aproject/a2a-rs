@@ -19,7 +19,6 @@ path = "src/main.rs"
 a2a = { workspace = true }
 a2a-client = { workspace = true }
 a2a-slimrpc = { workspace = true, optional = true }
-slim_bindings = { workspace = true, optional = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 futures = { workspace = true }
 reqwest = { workspace = true }
@@ -28,12 +27,13 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 default = ["rustls-tls"]
 native-tls = ["a2a-client/native-tls", "reqwest/native-tls"]
 rustls-tls = ["a2a-client/rustls-tls", "reqwest/rustls"]
-slimrpc = ["dep:a2a-slimrpc", "dep:slim_bindings"]
+slimrpc = ["dep:a2a-slimrpc"]
 
 [dev-dependencies]
 a2a-server = { workspace = true }
