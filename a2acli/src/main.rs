@@ -4,6 +4,8 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let cli = a2acli::Cli::parse();
     match a2acli::run(cli).await {
         Ok(()) => {}

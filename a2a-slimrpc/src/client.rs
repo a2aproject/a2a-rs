@@ -25,28 +25,104 @@ use crate::common::{
 };
 use crate::errors::rpc_error_to_a2a_error;
 
+// ---------------------------------------------------------------------------
+// SlimRpcTransport
+// ---------------------------------------------------------------------------
+
 /// SLIMRPC transport for A2A clients.
 pub struct SlimRpcTransport {
     channel: slim_rpc::Channel,
+    _service: Option<Arc<slim_service::Service>>,
+}
+
+/// Builder for [`SlimRpcTransport`].
+#[derive(Default)]
+pub struct SlimRpcTransportBuilder {
+    app: Option<Arc<SlimApp>>,
+    remote: Option<Arc<ProtoName>>,
+    connection_id: Option<u64>,
+    service: Option<Arc<slim_service::Service>>,
+    channel: Option<slim_rpc::Channel>,
+    use_slim_config: bool,
+}
+
+impl SlimRpcTransportBuilder {
+    pub fn with_app(mut self, app: Arc<SlimApp>) -> Self {
+        self.app = Some(app);
+        self
+    }
+
+    pub fn with_remote(mut self, remote: Arc<ProtoName>) -> Self {
+        self.remote = Some(remote);
+        self
+    }
+
+    pub fn with_connection(mut self, conn_id: u64) -> Self {
+        self.connection_id = Some(conn_id);
+        self
+    }
+
+    /// Keep an existing [`slim_service::Service`] alive for the lifetime of this transport.
+    /// When combined with [`with_slim_config`], the provided service is used instead of
+    /// creating a new one.
+    pub fn with_service(mut self, service: Arc<slim_service::Service>) -> Self {
+        self.service = Some(service);
+        self
+    }
+
+    /// Use a pre-built [`slim_rpc::Channel`] directly, bypassing app/remote/connection.
+    pub fn with_channel(mut self, channel: slim_rpc::Channel) -> Self {
+        self.channel = Some(channel);
+        self
+    }
+
+    /// Load connection and identity config from `slim.yaml` (walks up from cwd, falls back
+    /// to `~/.slim/config.yaml`). If [`with_service`] was also called, that service is reused;
+    /// otherwise a new one is created. Requires [`with_remote`].
+    pub fn with_slim_config(mut self) -> Self {
+        self.use_slim_config = true;
+        self
+    }
+
+    pub async fn build(self) -> Result<SlimRpcTransport, a2a::A2AError> {
+        if let Some(channel) = self.channel {
+            return Ok(SlimRpcTransport {
+                channel,
+                _service: self.service,
+            });
+        }
+
+        if self.use_slim_config {
+            let remote = self.remote.ok_or_else(|| {
+                a2a::A2AError::internal("remote is required when using slim config")
+            })?;
+            let (service, handle) = build_app_from_slim_config(self.service).await?;
+            return Ok(SlimRpcTransport {
+                channel: slim_rpc::Channel::new_with_connection(
+                    Arc::new(handle.app),
+                    remote,
+                    Some(handle.conn_id),
+                ),
+                _service: Some(service),
+            });
+        }
+
+        let app = self
+            .app
+            .ok_or_else(|| a2a::A2AError::internal("app is required"))?;
+        let remote = self
+            .remote
+            .ok_or_else(|| a2a::A2AError::internal("remote is required"))?;
+        Ok(SlimRpcTransport {
+            channel: slim_rpc::Channel::new_with_connection(app, remote, self.connection_id),
+            _service: self.service,
+        })
+    }
 }
 
 impl SlimRpcTransport {
-    pub fn new(app: Arc<SlimApp>, remote: Arc<ProtoName>) -> Self {
-        Self::new_with_connection(app, remote, None)
-    }
-
-    pub fn new_with_connection(
-        app: Arc<SlimApp>,
-        remote: Arc<ProtoName>,
-        connection_id: Option<u64>,
-    ) -> Self {
-        Self {
-            channel: slim_rpc::Channel::new_with_connection(app, remote, connection_id),
-        }
-    }
-
-    pub fn from_channel(channel: slim_rpc::Channel) -> Self {
-        Self { channel }
+    pub fn builder() -> SlimRpcTransportBuilder {
+        SlimRpcTransportBuilder::default()
     }
 
     async fn call_unary<Req, Res>(
@@ -315,22 +391,77 @@ impl Transport for SlimRpcTransport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SlimRpcTransportFactory
+// ---------------------------------------------------------------------------
+
 #[derive(Clone)]
 pub struct SlimRpcTransportFactory {
     app: Arc<SlimApp>,
     connection_id: Option<u64>,
+    _service: Option<Arc<slim_service::Service>>,
+}
+
+/// Builder for [`SlimRpcTransportFactory`].
+#[derive(Default)]
+pub struct SlimRpcTransportFactoryBuilder {
+    app: Option<Arc<SlimApp>>,
+    connection_id: Option<u64>,
+    service: Option<Arc<slim_service::Service>>,
+    use_slim_config: bool,
+}
+
+impl SlimRpcTransportFactoryBuilder {
+    pub fn with_app(mut self, app: Arc<SlimApp>) -> Self {
+        self.app = Some(app);
+        self
+    }
+
+    pub fn with_connection(mut self, conn_id: u64) -> Self {
+        self.connection_id = Some(conn_id);
+        self
+    }
+
+    /// Keep an existing [`slim_service::Service`] alive for the lifetime of this factory (and
+    /// all transports it creates). When combined with [`with_slim_config`], the provided service
+    /// is reused instead of creating a new one.
+    pub fn with_service(mut self, service: Arc<slim_service::Service>) -> Self {
+        self.service = Some(service);
+        self
+    }
+
+    /// Load connection and identity config from `slim.yaml` (walks up from cwd, falls back to
+    /// `~/.slim/config.yaml`). If [`with_service`] was also called, that service is reused;
+    /// otherwise a new one is created.
+    pub fn with_slim_config(mut self) -> Self {
+        self.use_slim_config = true;
+        self
+    }
+
+    pub async fn build(self) -> Result<SlimRpcTransportFactory, a2a::A2AError> {
+        if self.use_slim_config {
+            let (service, handle) = build_app_from_slim_config(self.service).await?;
+            return Ok(SlimRpcTransportFactory {
+                app: Arc::new(handle.app),
+                connection_id: Some(handle.conn_id),
+                _service: Some(service),
+            });
+        }
+
+        let app = self
+            .app
+            .ok_or_else(|| a2a::A2AError::internal("app is required"))?;
+        Ok(SlimRpcTransportFactory {
+            app,
+            connection_id: self.connection_id,
+            _service: self.service,
+        })
+    }
 }
 
 impl SlimRpcTransportFactory {
-    pub fn new(app: Arc<SlimApp>) -> Self {
-        Self {
-            app,
-            connection_id: None,
-        }
-    }
-
-    pub fn new_with_connection(app: Arc<SlimApp>, connection_id: Option<u64>) -> Self {
-        Self { app, connection_id }
+    pub fn builder() -> SlimRpcTransportFactoryBuilder {
+        SlimRpcTransportFactoryBuilder::default()
     }
 }
 
@@ -346,11 +477,49 @@ impl TransportFactory for SlimRpcTransportFactory {
         iface: &AgentInterface,
     ) -> Result<Box<dyn Transport>, A2AError> {
         let remote = parse_slimrpc_target(&iface.url)?;
-        let transport =
-            SlimRpcTransport::new_with_connection(self.app.clone(), remote, self.connection_id);
+        let transport = SlimRpcTransport {
+            channel: slim_rpc::Channel::new_with_connection(
+                self.app.clone(),
+                remote,
+                self.connection_id,
+            ),
+            _service: self._service.clone(),
+        };
         Ok(Box::new(transport))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shared slim config helper
+// ---------------------------------------------------------------------------
+
+/// Connect to a SLIM node using the discovered `slim.yaml` config. If `service` is `Some`,
+/// it is reused; otherwise a new [`slim_service::Service`] is created. Returns the service
+/// (wrapped in `Arc`) and the app handle.
+async fn build_app_from_slim_config(
+    service: Option<Arc<slim_service::Service>>,
+) -> Result<(Arc<slim_service::Service>, slim_service::AppHandle), a2a::A2AError> {
+    use slim_config::component::ComponentBuilder as _;
+    let config = slim_service::node_config::load_slim_node_config(None)
+        .map_err(|e| a2a::A2AError::internal(e.to_string()))?;
+    let service = match service {
+        Some(svc) => svc,
+        None => Arc::new(
+            slim_service::Service::builder()
+                .build("a2a-slimrpc".to_string())
+                .map_err(|e| a2a::A2AError::internal(e.to_string()))?,
+        ),
+    };
+    let handle = service
+        .create_app_from_slim_config(config)
+        .await
+        .map_err(|e| a2a::A2AError::internal(e.to_string()))?;
+    Ok((service, handle))
+}
+
+// ---------------------------------------------------------------------------
+// URL parsing
+// ---------------------------------------------------------------------------
 
 /// Parse a SLIMRPC target from agent card interface data.
 pub fn parse_slimrpc_target(target: &str) -> Result<Arc<ProtoName>, A2AError> {

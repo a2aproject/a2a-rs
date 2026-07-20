@@ -178,10 +178,7 @@ impl<T: Transport> A2AClient<T> {
     ) -> Result<AgentCard, A2AError> {
         let params = self.apply_before(methods::GET_EXTENDED_AGENT_CARD).await?;
         req.tenant = self.tenant.clone();
-        let result = self
-            .transport
-            .get_extended_agent_card(&params, &req)
-            .await;
+        let result = self.transport.get_extended_agent_card(&params, &req).await;
         self.finish_call(methods::GET_EXTENDED_AGENT_CARD, result)
             .await
     }

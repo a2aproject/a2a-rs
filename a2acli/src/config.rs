@@ -138,6 +138,8 @@ fn parse_binding_str(s: &str) -> Option<Binding> {
     match s {
         "jsonrpc" => Some(Binding::Jsonrpc),
         "http-json" => Some(Binding::HttpJson),
+        #[cfg(feature = "slimrpc")]
+        "slimrpc" => Some(Binding::Slimrpc),
         _ => None,
     }
 }
@@ -200,10 +202,7 @@ mod tests {
         let above = home.path().parent().unwrap().to_path_buf();
         // Put config above home — should NOT be found
         std::fs::write(above.join(".a2a.yaml"), "").unwrap();
-        assert_eq!(
-            find_config_file_from(home.path(), Some(home.path())),
-            None
-        );
+        assert_eq!(find_config_file_from(home.path(), Some(home.path())), None);
     }
 
     #[test]
@@ -240,7 +239,8 @@ mod tests {
     #[test]
     fn test_apply_fills_empty_cli() {
         let mut cli = empty_cli();
-        let cfg = parse_config("enabled_bindings:\n  - http-json\nbearer_token: tok\noutput: json\n");
+        let cfg =
+            parse_config("enabled_bindings:\n  - http-json\nbearer_token: tok\noutput: json\n");
         apply_config(&mut cli, &cfg, &None).unwrap();
         assert_eq!(cli.enabled_bindings, vec![crate::Binding::HttpJson]);
         assert_eq!(cli.bearer_token.as_deref(), Some("tok"));

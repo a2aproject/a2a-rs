@@ -294,6 +294,8 @@ pub struct HeaderArg {
 pub enum Binding {
     Jsonrpc,
     HttpJson,
+    #[cfg(feature = "slimrpc")]
+    Slimrpc,
 }
 
 impl Binding {
@@ -301,6 +303,8 @@ impl Binding {
         match self {
             Binding::Jsonrpc => TRANSPORT_PROTOCOL_JSONRPC,
             Binding::HttpJson => TRANSPORT_PROTOCOL_HTTP_JSON,
+            #[cfg(feature = "slimrpc")]
+            Binding::Slimrpc => a2a::TRANSPORT_PROTOCOL_SLIMRPC,
         }
     }
 }
@@ -435,19 +439,18 @@ fn build_stream_message_request(command: &StreamCommand) -> SendMessageRequest {
     message.context_id = command.context_id.clone();
     message.task_id = command.task_id.clone();
 
-    let configuration = if command.history_length.is_some()
-        || !command.accepted_output_modes.is_empty()
-    {
-        Some(SendMessageConfiguration {
-            accepted_output_modes: (!command.accepted_output_modes.is_empty())
-                .then_some(command.accepted_output_modes.clone()),
-            task_push_notification_config: None,
-            history_length: command.history_length,
-            return_immediately: None,
-        })
-    } else {
-        None
-    };
+    let configuration =
+        if command.history_length.is_some() || !command.accepted_output_modes.is_empty() {
+            Some(SendMessageConfiguration {
+                accepted_output_modes: (!command.accepted_output_modes.is_empty())
+                    .then_some(command.accepted_output_modes.clone()),
+                task_push_notification_config: None,
+                history_length: command.history_length,
+                return_immediately: None,
+            })
+        } else {
+            None
+        };
 
     SendMessageRequest {
         message,
@@ -457,11 +460,7 @@ fn build_stream_message_request(command: &StreamCommand) -> SendMessageRequest {
     }
 }
 
-async fn run_task_command(
-    cli: &Cli,
-    command: &TaskCommand,
-    compact: bool,
-) -> Result<(), CliError> {
+async fn run_task_command(cli: &Cli, command: &TaskCommand, compact: bool) -> Result<(), CliError> {
     match command {
         TaskCommand::Get(command) => {
             let client = resolve_client(&command.agent_ref, cli).await?;
@@ -626,6 +625,16 @@ async fn resolve_client(
         .collect();
 
     let mut builder = A2AClientFactory::builder().preferred_bindings(preferred);
+
+    #[cfg(feature = "slimrpc")]
+    if effective_bindings.contains(&Binding::Slimrpc) {
+        let slimrpc_factory = a2a_slimrpc::SlimRpcTransportFactory::builder()
+            .with_slim_config()
+            .build()
+            .await
+            .map_err(CliError::A2A)?;
+        builder = builder.register(Arc::new(slimrpc_factory));
+    }
 
     if let Some(token) = &cli.bearer_token {
         builder = builder.with_interceptor(Arc::new(AuthInterceptor::bearer(token.clone())));
@@ -1467,8 +1476,14 @@ mod tests {
 
     #[test]
     fn test_binding_protocols() {
-        assert_eq!(crate::Binding::Jsonrpc.protocol(), TRANSPORT_PROTOCOL_JSONRPC);
-        assert_eq!(crate::Binding::HttpJson.protocol(), TRANSPORT_PROTOCOL_HTTP_JSON);
+        assert_eq!(
+            crate::Binding::Jsonrpc.protocol(),
+            TRANSPORT_PROTOCOL_JSONRPC
+        );
+        assert_eq!(
+            crate::Binding::HttpJson.protocol(),
+            TRANSPORT_PROTOCOL_HTTP_JSON
+        );
     }
 
     #[test]
@@ -1679,9 +1694,15 @@ mod tests {
         let base_url = &server.base_url;
 
         run(parse_cli(&["discover", base_url])).await.unwrap();
-        run(parse_cli(&["-o", "json", "discover", base_url, "--extended"]))
-            .await
-            .unwrap();
+        run(parse_cli(&[
+            "-o",
+            "json",
+            "discover",
+            base_url,
+            "--extended",
+        ]))
+        .await
+        .unwrap();
         run(parse_cli(&[
             "--enabled-binding",
             "jsonrpc",
@@ -1811,9 +1832,15 @@ mod tests {
             CliError::A2A(error) if error.code == a2a::error_code::INVALID_PARAMS
         ));
 
-        let err = run(parse_cli(&["-o", "json", "stream", base_url, "stream-error"]))
-            .await
-            .unwrap_err();
+        let err = run(parse_cli(&[
+            "-o",
+            "json",
+            "stream",
+            base_url,
+            "stream-error",
+        ]))
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             CliError::A2A(error) if error.code == a2a::error_code::INTERNAL_ERROR
@@ -1850,23 +1877,16 @@ mod tests {
             CliError::A2A(error) if error.code == a2a::error_code::TASK_NOT_FOUND
         ));
 
-        let err = run(parse_cli(&[
-            "push-config",
-            "list",
-            base_url,
-            "missing",
-        ]))
-        .await
-        .unwrap_err();
+        let err = run(parse_cli(&["push-config", "list", base_url, "missing"]))
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             CliError::A2A(error) if error.code == a2a::error_code::TASK_NOT_FOUND
         ));
 
         let base_url = unused_base_url().await;
-        let err = run(parse_cli(&["discover", &base_url]))
-            .await
-            .unwrap_err();
+        let err = run(parse_cli(&["discover", &base_url])).await.unwrap_err();
         assert!(matches!(err, CliError::Http(_)));
     }
 

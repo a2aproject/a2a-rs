@@ -519,7 +519,14 @@ async fn send_task_list_and_cancel_commands_work() {
         "Echo: hello from cli"
     );
 
-    let get_task = run_cli_success(&["task", "get", base_url, "task-send", "--history-length", "1"]);
+    let get_task = run_cli_success(&[
+        "task",
+        "get",
+        base_url,
+        "task-send",
+        "--history-length",
+        "1",
+    ]);
     let task_json: Value = serde_json::from_str(&get_task).unwrap();
     assert_eq!(task_json["id"], "task-send");
 
@@ -656,8 +663,7 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
     let (_stdout, stderr) = run_cli_failure(&["send", base_url, "send-error"]);
     assert!(stderr.contains("a2a error -32600: send failed"));
 
-    let (_stdout, stderr) =
-        run_cli_failure(&["task", "list", base_url, "--context-id", "error"]);
+    let (_stdout, stderr) = run_cli_failure(&["task", "list", base_url, "--context-id", "error"]);
     assert!(stderr.contains("a2a error -32602: list failed"));
 
     let (_stdout, stderr) = run_cli_failure(&["task", "get", base_url, "missing"]);
@@ -669,8 +675,7 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
     let (_stdout, stderr) = run_cli_failure(&["task", "subscribe", base_url, "stream-error"]);
     assert!(stderr.contains("a2a error -32603: stream failed"));
 
-    let (_stdout, stderr) =
-        run_cli_failure(&["-o", "json", "stream", base_url, "stream-error"]);
+    let (_stdout, stderr) = run_cli_failure(&["-o", "json", "stream", base_url, "stream-error"]);
     assert!(stderr.contains("a2a error -32603: stream failed"));
 
     let (_stdout, stderr) = run_cli_failure(&[
@@ -684,8 +689,7 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
     ]);
     assert!(stderr.contains("a2a error -32001: task not found: missing"));
 
-    let (_stdout, stderr) =
-        run_cli_failure(&["push-config", "get", base_url, "task-1", "missing"]);
+    let (_stdout, stderr) = run_cli_failure(&["push-config", "get", base_url, "task-1", "missing"]);
     assert!(stderr.contains("a2a error -32001: task not found: task-1"));
 
     let (_stdout, stderr) = run_cli_failure(&["push-config", "list", base_url, "missing"]);
