@@ -254,7 +254,7 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
     println!("{sep}");
 
     // ---- send_message ----------------------------------------------------
-    let task_id = match client.send_message(&req("Hello, world!")).await {
+    let task_id = match client.send_message(req("Hello, world!")).await {
         Ok(SendMessageResponse::Task(t)) => {
             row!("send_message", &t.id, &t.status.state);
             t.id
@@ -271,7 +271,7 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
 
     // ---- get_task --------------------------------------------------------
     match client
-        .get_task(&GetTaskRequest {
+        .get_task(GetTaskRequest {
             id: task_id.clone(),
             history_length: Some(10),
             tenant: None,
@@ -284,7 +284,7 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
 
     // ---- list_tasks ------------------------------------------------------
     match client
-        .list_tasks(&ListTasksRequest {
+        .list_tasks(ListTasksRequest {
             context_id: None,
             status: None,
             page_size: Some(10),
@@ -301,10 +301,10 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
     }
 
     // ---- cancel_task -----------------------------------------------------
-    match client.send_message(&wait_req("cancel demo")).await {
+    match client.send_message(wait_req("cancel demo")).await {
         Ok(SendMessageResponse::Task(t)) => {
             match client
-                .cancel_task(&CancelTaskRequest {
+                .cancel_task(CancelTaskRequest {
                     id: t.id,
                     metadata: None,
                     tenant: None,
@@ -326,7 +326,7 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
         metadata: None,
         tenant: None,
     };
-    match client.send_streaming_message(&stream_req).await {
+    match client.send_streaming_message(stream_req).await {
         Ok(mut stream) => {
             println!("send_streaming_message");
             let mut n = 0usize;
@@ -349,11 +349,11 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
     }
 
     // ---- subscribe_to_task -----------------------------------------------
-    match client.send_message(&wait_req("subscribe demo")).await {
+    match client.send_message(wait_req("subscribe demo")).await {
         Ok(SendMessageResponse::Task(t)) => {
             let sub_id = t.id;
             match client
-                .subscribe_to_task(&SubscribeToTaskRequest {
+                .subscribe_to_task(SubscribeToTaskRequest {
                     id: sub_id.clone(),
                     tenant: None,
                 })
@@ -361,7 +361,7 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
             {
                 Ok(mut sub) => {
                     match client
-                        .cancel_task(&CancelTaskRequest {
+                        .cancel_task(CancelTaskRequest {
                             id: sub_id.clone(),
                             metadata: None,
                             tenant: None,

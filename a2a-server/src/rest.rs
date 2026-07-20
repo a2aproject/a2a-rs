@@ -1265,7 +1265,7 @@ mod tests {
 
         let app = make_app();
         let req = Request::builder()
-            .uri(format!("/tasks/{}?historyLength=5", task_id))
+            .uri(format!("/tasks/{task_id}?historyLength=5"))
             .method("GET")
             .body(Body::empty())
             .unwrap();

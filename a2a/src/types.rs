@@ -955,7 +955,7 @@ mod tests {
 
         for (state, expected_str) in cases {
             let json = serde_json::to_string(&state).unwrap();
-            assert_eq!(json, format!("\"{}\"", expected_str));
+            assert_eq!(json, format!("\"{expected_str}\""));
             let back: TaskState = serde_json::from_str(&json).unwrap();
             assert_eq!(back, state);
         }

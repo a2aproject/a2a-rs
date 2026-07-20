@@ -616,7 +616,7 @@ mod tests {
         let result_val = protojson_conv::to_value(&sr).unwrap();
         let rpc_resp = JsonRpcResponse::success(JsonRpcId::Number(1), result_val);
         let data = serde_json::to_string(&rpc_resp).unwrap();
-        let sse_text = format!("data: {}\n\n", data);
+        let sse_text = format!("data: {data}\n\n");
 
         let stream = byte_stream(vec![sse_text]);
         let mut parsed = parse_sse_stream(stream);
@@ -636,7 +636,7 @@ mod tests {
             },
         );
         let data = serde_json::to_string(&rpc_resp).unwrap();
-        let sse_text = format!("data: {}\n\n", data);
+        let sse_text = format!("data: {data}\n\n");
 
         let stream = byte_stream(vec![sse_text]);
         let mut parsed = parse_sse_stream(stream);
@@ -659,7 +659,7 @@ mod tests {
         };
         let sr = StreamResponse::StatusUpdate(status_update);
         let data = serde_json::to_string(&protojson_conv::to_value(&sr).unwrap()).unwrap();
-        let sse_text = format!("data: {}\n\n", data);
+        let sse_text = format!("data: {data}\n\n");
 
         let stream = byte_stream(vec![sse_text]);
         let mut parsed = parse_sse_stream(stream);
@@ -681,7 +681,7 @@ mod tests {
         };
         let sr = StreamResponse::StatusUpdate(status_update);
         let data = serde_json::to_string(&protojson_conv::to_value(&sr).unwrap()).unwrap();
-        let sse_text = format!("data: {}\n\n", data);
+        let sse_text = format!("data: {data}\n\n");
 
         let stream = byte_stream(vec![sse_text]);
         let mut parsed = parse_sse_stream_rest(stream);
@@ -713,7 +713,7 @@ mod tests {
         });
         let data = serde_json::to_string(&protojson_conv::to_value(&sr).unwrap()).unwrap();
         // First event has no data, second has data
-        let sse_text = format!("event: ping\n\ndata: {}\n\n", data);
+        let sse_text = format!("event: ping\n\ndata: {data}\n\n");
 
         let stream = byte_stream(vec![sse_text]);
         let mut parsed = parse_sse_stream_rest(stream);
@@ -735,7 +735,7 @@ mod tests {
             metadata: None,
         });
         let data = serde_json::to_string(&protojson_conv::to_value(&sr).unwrap()).unwrap();
-        let full = format!("data: {}\n\n", data);
+        let full = format!("data: {data}\n\n");
         let mid = full.len() / 2;
         let chunk1 = full[..mid].to_string();
         let chunk2 = full[mid..].to_string();
@@ -760,7 +760,7 @@ mod tests {
             metadata: None,
         });
         let data = serde_json::to_string(&protojson_conv::to_value(&sr).unwrap()).unwrap();
-        let sse_text = format!("data:{}\n\n", data);
+        let sse_text = format!("data:{data}\n\n");
 
         let stream = byte_stream(vec![sse_text]);
         let mut parsed = parse_sse_stream_rest(stream);
@@ -789,8 +789,8 @@ mod tests {
             &protojson_conv::to_value(&make_sr(TaskState::Completed)).unwrap(),
         )
         .unwrap();
-        let chunk1 = format!("data: {}\n\n", sr1);
-        let chunk2 = format!("data: {}\n\n", sr2);
+        let chunk1 = format!("data: {sr1}\n\n");
+        let chunk2 = format!("data: {sr2}\n\n");
 
         let stream = byte_stream(vec![chunk1, chunk2]);
         let items: Vec<_> = parse_sse_stream_rest(stream).collect().await;
@@ -1075,7 +1075,7 @@ mod tests {
         });
         let data = serde_json::to_string(&protojson_conv::to_value(&sr).unwrap()).unwrap();
         // Use \r\n\r\n instead of \n\n
-        let sse_text = format!("data: {}\r\n\r\n", data);
+        let sse_text = format!("data: {data}\r\n\r\n");
 
         let stream = byte_stream(vec![sse_text]);
         let mut parsed = parse_sse_stream(stream);
@@ -1098,7 +1098,7 @@ mod tests {
             metadata: None,
         });
         let data = serde_json::to_string(&protojson_conv::to_value(&sr).unwrap()).unwrap();
-        let sse_text = format!("data: {}\r\r", data);
+        let sse_text = format!("data: {data}\r\r");
 
         let stream = byte_stream(vec![sse_text]);
         let mut parsed = parse_sse_stream_rest(stream);

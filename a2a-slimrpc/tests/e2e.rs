@@ -163,28 +163,50 @@ impl TestEnv {
 
     async fn transport(&self, suffix: &str) -> SlimRpcTransport {
         let client_app = self.new_client_app(suffix).await;
-        SlimRpcTransport::new(client_app, self.server_name.clone())
+        SlimRpcTransport::builder()
+            .with_app(client_app)
+            .with_remote(self.server_name.clone())
+            .build()
+            .await
+            .unwrap()
     }
 
     async fn transport_with_connection(&self, suffix: &str) -> SlimRpcTransport {
         let client_app = self.new_client_app(suffix).await;
-        SlimRpcTransport::new_with_connection(client_app, self.server_name.clone(), None)
+        SlimRpcTransport::builder()
+            .with_app(client_app)
+            .with_remote(self.server_name.clone())
+            .build()
+            .await
+            .unwrap()
     }
 
     async fn transport_from_channel(&self, suffix: &str) -> SlimRpcTransport {
         let client_app = self.new_client_app(suffix).await;
         let channel = Channel::new(client_app, self.server_name.clone());
-        SlimRpcTransport::from_channel(channel)
+        SlimRpcTransport::builder()
+            .with_channel(channel)
+            .build()
+            .await
+            .unwrap()
     }
 
     async fn factory(&self, suffix: &str) -> SlimRpcTransportFactory {
         let client_app = self.new_client_app(suffix).await;
-        SlimRpcTransportFactory::new(client_app)
+        SlimRpcTransportFactory::builder()
+            .with_app(client_app)
+            .build()
+            .await
+            .unwrap()
     }
 
     async fn factory_with_connection(&self, suffix: &str) -> SlimRpcTransportFactory {
         let client_app = self.new_client_app(suffix).await;
-        SlimRpcTransportFactory::new_with_connection(client_app, None)
+        SlimRpcTransportFactory::builder()
+            .with_app(client_app)
+            .build()
+            .await
+            .unwrap()
     }
 
     fn target(&self) -> String {
