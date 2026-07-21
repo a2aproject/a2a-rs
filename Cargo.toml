@@ -72,12 +72,12 @@ prost = "0.14"
 prost-types = "0.14"
 pbjson-build = "0.9"
 protoc-bin-vendored = "3"
-slim_rpc = { package = "agntcy-slim-rpc", version = "2.0.0-alpha.6" }
+slim_rpc = { package = "agntcy-slim-rpc", version = "2.0.0-alpha.7" }
 slim_config = { package = "agntcy-slim-config", version = "0.12.6" }
-slim_service = { package = "agntcy-slim-service", version = "0.11.5", features = [
+slim_service = { package = "agntcy-slim-service", version = "0.11.6", features = [
     "session",
 ] }
-slim_datapath = { package = "agntcy-slim-datapath", version = "0.16.6" }
+slim_datapath = { package = "agntcy-slim-datapath", version = "0.16.7" }
 slim_auth = { package = "agntcy-slim-auth", version = "0.14.0" }
 
 # Utilities
