@@ -1,6 +1,6 @@
 [package]
 name = "a2a-slimrpc"
-version = "0.2.1"
+version = "0.2.2"
 description = "A2A v1 SLIMRPC protocol binding for client and server"
 readme = "README.md"
 edition.workspace = true
@@ -19,6 +19,7 @@ a2a-pb = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 futures = { workspace = true }
+async-stream = { workspace = true }
 async-trait = { workspace = true }
 slim_rpc = { workspace = true }
 slim_service = { workspace = true }

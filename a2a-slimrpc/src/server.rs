@@ -180,7 +180,7 @@ fn register_unary_unary<H, ReqProto, ReqNative, ResNative, DecodeReq, EncodeRes>
     let call = Arc::new(call);
     let encode_res = Arc::new(encode_res);
 
-    server.register_unary_unary_internal(
+    server.register_unary_unary(
         A2A_SLIMRPC_SERVICE,
         method_name,
         move |request: Vec<u8>, context: slim_rpc::Context| {
@@ -206,7 +206,7 @@ fn register_unary_stream_send_message<H>(server: &slim_rpc::Server, handler: Arc
 where
     H: RequestHandler,
 {
-    server.register_unary_stream_internal(
+    server.register_unary_stream(
         A2A_SLIMRPC_SERVICE,
         METHOD_SEND_STREAMING_MESSAGE,
         move |request: Vec<u8>, context: slim_rpc::Context| {
@@ -234,7 +234,7 @@ fn register_unary_stream_subscribe_to_task<H>(server: &slim_rpc::Server, handler
 where
     H: RequestHandler,
 {
-    server.register_unary_stream_internal(
+    server.register_unary_stream(
         A2A_SLIMRPC_SERVICE,
         METHOD_SUBSCRIBE_TO_TASK,
         move |request: Vec<u8>, context: slim_rpc::Context| {

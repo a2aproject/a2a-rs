@@ -62,9 +62,9 @@ impl SlimRpcTransport {
     {
         let response = self
             .channel
-            .call_unary_async(
-                A2A_SLIMRPC_SERVICE.to_string(),
-                method_name.to_string(),
+            .unary::<Vec<u8>, Vec<u8>>(
+                A2A_SLIMRPC_SERVICE,
+                method_name,
                 encode_proto_message(request),
                 None,
                 service_params_to_metadata_opt(params),
@@ -86,29 +86,31 @@ impl SlimRpcTransport {
         Req: prost::Message,
         Res: prost::Message + Default + Send + 'static,
     {
-        let reader = self
-            .channel
-            .call_unary_stream_async(
-                A2A_SLIMRPC_SERVICE.to_string(),
-                method_name.to_string(),
-                encode_proto_message(request),
-                None,
-                service_params_to_metadata_opt(params),
-            )
-            .await
-            .map_err(|error| rpc_error_to_a2a_error(&error))?;
+        // `Channel::unary_stream` borrows `&self` (its `impl Stream` return captures the
+        // channel's lifetime), but the `Transport` trait requires a `'static` stream.
+        // Own a channel clone inside an `async_stream` generator so the driven inner
+        // stream lives as long as the returned stream. Errors are delivered as stream
+        // items, so there is no fallible setup step to await up front.
+        let channel = self.channel.clone();
+        let payload = encode_proto_message(request);
+        let metadata = service_params_to_metadata_opt(params);
 
-        let stream = futures::stream::unfold(reader, move |reader| async move {
-            match reader.next_async().await {
-                slim_rpc::StreamMessage::Data(data) => {
-                    Some((decode_proto_response::<Res>(data, response_name), reader))
-                }
-                slim_rpc::StreamMessage::Error(error) => {
-                    Some((Err(rpc_error_to_a2a_error(&error)), reader))
-                }
-                slim_rpc::StreamMessage::End => None,
+        let stream = async_stream::stream! {
+            let inner = channel.unary_stream::<Vec<u8>, Vec<u8>>(
+                A2A_SLIMRPC_SERVICE,
+                method_name,
+                payload,
+                None,
+                metadata,
+            );
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().await {
+                yield match item {
+                    Ok(data) => decode_proto_response::<Res>(data, response_name),
+                    Err(error) => Err(rpc_error_to_a2a_error(&error)),
+                };
             }
-        });
+        };
 
         Ok(Box::pin(stream))
     }
@@ -279,11 +281,11 @@ impl Transport for SlimRpcTransport {
         req: &DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
         let request = pbconv::to_proto_delete_task_push_notification_config_request(req);
-        let _response = self
+        let _response: Vec<u8> = self
             .channel
-            .call_unary_async(
-                A2A_SLIMRPC_SERVICE.to_string(),
-                METHOD_DELETE_PUSH_CONFIG.to_string(),
+            .unary(
+                A2A_SLIMRPC_SERVICE,
+                METHOD_DELETE_PUSH_CONFIG,
                 encode_proto_message(&request),
                 None,
                 service_params_to_metadata_opt(params),

@@ -122,7 +122,7 @@ impl TestEnv {
             .create_app(&server_name, provider, verifier)
             .unwrap();
         let server_app = Arc::new(server_app);
-        let server = Arc::new(Server::new_internal(
+        let server = Arc::new(Server::new(
             server_app.clone(),
             server_app.app_name().clone(),
             server_notifications,
@@ -140,13 +140,13 @@ impl TestEnv {
     async fn start(&self) {
         let server = self.server.clone();
         tokio::spawn(async move {
-            let _ = server.serve_async().await;
+            let _ = server.serve().await;
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     async fn shutdown(&self) {
-        self.server.shutdown_async().await;
+        self.server.shutdown().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -676,19 +676,19 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
 async fn slimrpc_transport_reports_malformed_payloads() {
     let env = TestEnv::new("transport-malformed").await;
 
-    env.server.register_unary_unary_internal(
+    env.server.register_unary_unary(
         A2A_SERVICE_NAME,
         GET_TASK_METHOD,
         |_request: Vec<u8>, _context| async move { Ok(vec![0xff]) },
     );
-    env.server.register_unary_unary_internal(
+    env.server.register_unary_unary(
         A2A_SERVICE_NAME,
         SEND_MESSAGE_METHOD,
         |_request: Vec<u8>, _context| async move {
             Ok(a2a_pb::proto::SendMessageResponse::default().encode_to_vec())
         },
     );
-    env.server.register_unary_stream_internal(
+    env.server.register_unary_stream(
         A2A_SERVICE_NAME,
         SEND_STREAMING_MESSAGE_METHOD,
         |_request: Vec<u8>, _context| async move {
