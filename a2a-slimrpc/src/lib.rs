@@ -6,4 +6,5 @@ pub mod errors;
 pub mod server;
 
 pub use client::{SlimApp, SlimRpcTransport, SlimRpcTransportFactory, parse_slimrpc_target};
-pub use server::SlimRpcHandler;
+pub use common::SLIM_SRC_METADATA_KEY;
+pub use server::{SlimRpcHandler, register_collaborate};

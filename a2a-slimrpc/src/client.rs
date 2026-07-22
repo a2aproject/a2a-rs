@@ -17,15 +17,17 @@ pub type SlimApp = slim_service::app::App<
 >;
 
 use crate::common::{
-    A2A_SLIMRPC_SERVICE, METHOD_CANCEL_TASK, METHOD_CREATE_PUSH_CONFIG, METHOD_DELETE_PUSH_CONFIG,
-    METHOD_GET_EXTENDED_AGENT_CARD, METHOD_GET_PUSH_CONFIG, METHOD_GET_TASK,
-    METHOD_LIST_PUSH_CONFIGS, METHOD_LIST_TASKS, METHOD_SEND_MESSAGE,
-    METHOD_SEND_STREAMING_MESSAGE, METHOD_SUBSCRIBE_TO_TASK, decode_proto_response,
-    encode_proto_message, service_params_to_metadata_opt,
+    A2A_COLLABORATIVE_CHANNEL_SERVICE, A2A_SLIMRPC_SERVICE, METHOD_CANCEL_TASK, METHOD_COLLABORATE,
+    METHOD_CREATE_PUSH_CONFIG, METHOD_DELETE_PUSH_CONFIG, METHOD_GET_EXTENDED_AGENT_CARD,
+    METHOD_GET_PUSH_CONFIG, METHOD_GET_TASK, METHOD_LIST_PUSH_CONFIGS, METHOD_LIST_TASKS,
+    METHOD_SEND_MESSAGE, METHOD_SEND_STREAMING_MESSAGE, METHOD_SUBSCRIBE_TO_TASK,
+    SLIM_SRC_METADATA_KEY, decode_proto_response, encode_proto_message,
+    service_params_to_metadata_opt,
 };
 use crate::errors::rpc_error_to_a2a_error;
 
 /// SLIMRPC transport for A2A clients.
+#[derive(Clone)]
 pub struct SlimRpcTransport {
     channel: slim_rpc::Channel,
 }
@@ -47,6 +49,64 @@ impl SlimRpcTransport {
 
     pub fn from_channel(channel: slim_rpc::Channel) -> Self {
         Self { channel }
+    }
+
+    /// Build a transport backed by a SLIM **group** channel spanning `members`,
+    /// for the `Collaborate` many-to-many operation (see
+    /// [`Self::collaborate`]). Unlike the point-to-point [`Self::new`], this does
+    /// not correspond to a single `Transport` peer.
+    pub fn new_group(
+        app: Arc<SlimApp>,
+        members: Vec<Arc<ProtoName>>,
+    ) -> Result<Self, slim_rpc::RpcError> {
+        Self::new_group_with_connection(app, members, None)
+    }
+
+    pub fn new_group_with_connection(
+        app: Arc<SlimApp>,
+        members: Vec<Arc<ProtoName>>,
+        connection_id: Option<u64>,
+    ) -> Result<Self, slim_rpc::RpcError> {
+        Ok(Self {
+            channel: slim_rpc::Channel::new_group_with_connection(app, members, connection_id)?,
+        })
+    }
+
+    /// Open a `Collaborate` session on this (group) channel: broadcast every
+    /// `Message` produced by `outbound` to the group, and yield every `Message`
+    /// broadcast by other members — each attributed via
+    /// `metadata["slim-src"]` (the sender's SLIM name), per the SLIMRPC
+    /// collaborative channel extension spec. Additive: not part of the
+    /// point-to-point [`Transport`] trait, whose methods assume exactly one
+    /// response per call.
+    pub fn collaborate(
+        &self,
+        outbound: impl futures::Stream<Item = Message> + Send + 'static,
+        timeout: Option<std::time::Duration>,
+    ) -> impl futures::Stream<Item = Result<Message, A2AError>> {
+        let request_stream =
+            outbound.map(|message| encode_proto_message(&pbconv::to_proto_message(&message)));
+        let stream = self.channel.multicast_stream_stream::<Vec<u8>, Vec<u8>>(
+            A2A_COLLABORATIVE_CHANNEL_SERVICE,
+            METHOD_COLLABORATE,
+            request_stream,
+            timeout,
+            None,
+        );
+        stream.map(|item| {
+            let item = item.map_err(|error| rpc_error_to_a2a_error(&error))?;
+            let proto_message =
+                decode_proto_response::<a2a_pb::proto::Message>(item.message, "Message")?;
+            let mut message = pbconv::from_proto_message(&proto_message);
+            message
+                .metadata
+                .get_or_insert_with(std::collections::HashMap::new)
+                .insert(
+                    SLIM_SRC_METADATA_KEY.to_string(),
+                    serde_json::Value::String(item.context.source.to_string()),
+                );
+            Ok(message)
+        })
     }
 
     async fn call_unary<Req, Res>(

@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "a2a-slimrpc"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -140,6 +140,7 @@ dependencies = [
  "futures",
  "prost",
  "prost-types",
+ "serde_json",
  "tokio",
 ]
 
