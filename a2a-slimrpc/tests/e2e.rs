@@ -738,3 +738,106 @@ async fn slimrpc_transport_reports_malformed_payloads() {
 
     env.shutdown().await;
 }
+
+/// Group `Collaborate`: every member independently broadcasts one intro `Message`
+/// to the others over its own group channel, and every other member's listen-only
+/// `register_collaborate` handler receives it — proving the SLIMRPC collaborative
+/// channel extension's many-to-many delivery end to end (not just moderator-to-
+/// members fan-out).
+#[tokio::test]
+async fn slimrpc_collaborate_broadcasts_to_every_other_member() {
+    use std::sync::Mutex;
+
+    const MEMBERS: [&str; 3] = ["avatar", "agent-a", "agent-b"];
+
+    let service = Arc::new(Service::new(
+        ID::new_with_name(Kind::new("slim").unwrap(), "collab-group").unwrap(),
+    ));
+
+    struct Member {
+        name: Arc<Name>,
+        app: Arc<SlimApp>,
+        received: Arc<Mutex<Vec<Message>>>,
+    }
+
+    let mut members = Vec::new();
+    for suffix in MEMBERS {
+        let name = Arc::new(Name::from_strings([
+            "org",
+            "test",
+            &format!("collab-{suffix}"),
+        ]));
+        let (provider, verifier) = auth(&format!("collab-provider-{suffix}"));
+        let (app, notifications) = service.create_app(&name, provider, verifier).unwrap();
+        let app = Arc::new(app);
+
+        let server = Arc::new(Server::new(
+            app.clone(),
+            app.app_name().clone(),
+            notifications,
+        ));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_for_handler = received.clone();
+        a2a_slimrpc::register_collaborate(&server, move |message| {
+            received_for_handler.lock().unwrap().push(message);
+        });
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        members.push(Member {
+            name,
+            app,
+            received,
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Every member independently broadcasts its own intro to the other two.
+    let mut senders = Vec::new();
+    for (i, member) in members.iter().enumerate() {
+        let others: Vec<Arc<Name>> = members
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, m)| m.name.clone())
+            .collect();
+        let transport = SlimRpcTransport::new_group(member.app.clone(), others).unwrap();
+        let intro = sample_message(
+            Role::Agent,
+            &format!("hi, I am {}", MEMBERS[i]),
+            "collaborate",
+        );
+        let outbound = stream::once(async move { intro });
+        senders.push(tokio::spawn(async move {
+            let replies = transport.collaborate(outbound, Some(Duration::from_secs(5)));
+            futures::pin_mut!(replies);
+            // Everyone else is listen-only, so this drains to nothing; the point
+            // is proving the broadcast send doesn't error.
+            while let Some(reply) = replies.next().await {
+                reply.expect("collaborate reply stream should not error");
+            }
+        }));
+    }
+    for sender in senders {
+        sender.await.expect("collaborate sender task panicked");
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    for (i, member) in members.iter().enumerate() {
+        let received = member.received.lock().unwrap();
+        for (j, other) in MEMBERS.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let expected = format!("hi, I am {other}");
+            assert!(
+                received.iter().any(|m| m.text() == Some(expected.as_str())),
+                "{} did not receive {other}'s intro; got {:?}",
+                MEMBERS[i],
+                received.iter().map(|m| m.text()).collect::<Vec<_>>()
+            );
+        }
+    }
+}

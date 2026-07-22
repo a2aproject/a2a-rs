@@ -4,17 +4,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use a2a::{A2AError, StreamResponse};
+use a2a::{A2AError, Message, StreamResponse};
 use a2a_pb::pbconv;
 use a2a_pb::proto;
 use a2a_server::RequestHandler;
 use futures::StreamExt;
 
 use crate::common::{
-    A2A_SLIMRPC_SERVICE, METHOD_CANCEL_TASK, METHOD_CREATE_PUSH_CONFIG, METHOD_DELETE_PUSH_CONFIG,
-    METHOD_GET_EXTENDED_AGENT_CARD, METHOD_GET_PUSH_CONFIG, METHOD_GET_TASK,
-    METHOD_LIST_PUSH_CONFIGS, METHOD_LIST_TASKS, METHOD_SEND_MESSAGE,
-    METHOD_SEND_STREAMING_MESSAGE, METHOD_SUBSCRIBE_TO_TASK, ServiceParamsMap,
+    A2A_COLLABORATIVE_CHANNEL_SERVICE, A2A_SLIMRPC_SERVICE, METHOD_CANCEL_TASK, METHOD_COLLABORATE,
+    METHOD_CREATE_PUSH_CONFIG, METHOD_DELETE_PUSH_CONFIG, METHOD_GET_EXTENDED_AGENT_CARD,
+    METHOD_GET_PUSH_CONFIG, METHOD_GET_TASK, METHOD_LIST_PUSH_CONFIGS, METHOD_LIST_TASKS,
+    METHOD_SEND_MESSAGE, METHOD_SEND_STREAMING_MESSAGE, METHOD_SUBSCRIBE_TO_TASK, ServiceParamsMap,
     context_to_service_params, decode_proto_request, encode_proto_message,
 };
 use crate::errors::a2a_error_to_rpc_error;
@@ -155,6 +155,46 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
             |_| vec![0],
         );
     }
+}
+
+/// Register `server` as a **listen-only** `Collaborate` participant (see the
+/// SLIMRPC collaborative channel extension spec): `on_message` is invoked for
+/// every inbound `Message` on any `Collaborate` session this app is a member of.
+/// This participant sends nothing of its own — its reply stream is empty, which
+/// per the spec signals non-participation on the send side without affecting its
+/// ability to receive.
+///
+/// Independent of [`SlimRpcHandler`]/`RequestHandler` — `Collaborate` is a
+/// broadcast channel rather than a request/response operation, so this takes a
+/// plain callback instead.
+pub fn register_collaborate<F>(server: &slim_rpc::Server, on_message: F)
+where
+    F: Fn(Message) + Send + Sync + 'static,
+{
+    let on_message = Arc::new(on_message);
+    server.register_stream_stream::<_, Vec<u8>, Vec<u8>, _, _>(
+        A2A_COLLABORATIVE_CHANNEL_SERVICE,
+        METHOD_COLLABORATE,
+        move |mut stream: slim_rpc::DecodedStream<Vec<u8>>, _context: slim_rpc::Context| {
+            let on_message = on_message.clone();
+            async move {
+                // Drain the broadcast concurrently with returning the (empty)
+                // reply stream below, so this member's non-participation is
+                // visible immediately rather than only after the session ends.
+                tokio::spawn(async move {
+                    while let Some(item) = stream.next().await {
+                        if let Ok(bytes) = item
+                            && let Ok(proto_message) =
+                                decode_proto_request::<a2a_pb::proto::Message>(bytes, "Message")
+                        {
+                            on_message(pbconv::from_proto_message(&proto_message));
+                        }
+                    }
+                });
+                Ok(futures::stream::empty::<Result<Vec<u8>, slim_rpc::RpcError>>())
+            }
+        },
+    );
 }
 
 fn register_unary_unary<H, ReqProto, ReqNative, ResNative, DecodeReq, EncodeRes>(
