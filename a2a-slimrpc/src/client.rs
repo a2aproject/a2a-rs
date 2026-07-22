@@ -27,6 +27,7 @@ use crate::common::{
 use crate::errors::rpc_error_to_a2a_error;
 
 /// SLIMRPC transport for A2A clients.
+#[derive(Clone)]
 pub struct SlimRpcTransport {
     channel: slim_rpc::Channel,
 }
