@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.2.2...a2a-slimrpc-v0.2.3) - 2026-07-22
+
+### Added
+
+- *(slimrpc)* add Collaborate — many-to-many messaging on SLIM group channels ([#111](https://github.com/a2aproject/a2a-rs/pull/111))
+
 ## [0.2.2](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.2.1...a2a-slimrpc-v0.2.2) - 2026-07-21
 
 ### Fixed
