@@ -67,6 +67,7 @@ tonic = "0.14"
 tonic-build = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
+tonic-types = "0.14"
 tonic-tls = { version = "0.7", default-features = false }
 prost = "0.14"
 prost-types = "0.14"
