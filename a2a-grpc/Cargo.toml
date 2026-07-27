@@ -17,6 +17,7 @@ a2a-client = { workspace = true, default-features = false }
 a2a-server = { workspace = true, default-features = false }
 a2a-pb = { workspace = true }
 tonic = { workspace = true }
+tonic-types = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
