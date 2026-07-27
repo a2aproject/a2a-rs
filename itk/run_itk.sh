@@ -92,24 +92,12 @@ RESPONSE=$(curl -s -X POST http://127.0.0.1:8000/run \
   -H "Content-Type: application/json" \
   -d "@$SCENARIO_FILE")
 
-if [ "${ITK_NIGHTLY_RUN^^}" = "TRUE" ]; then
-  # Nightly path: persist raw results and hand off to the canonical metrics
-  # processor from a2a-itk. Matches the other SDKs' nightly artefact shape
-  # so downstream dashboards ingest all SDKs uniformly.
-  echo "Nightly run detected. Saving raw results and running process_results.py..."
-  echo "$RESPONSE" > raw_results.json
-  python3 a2a-itk/scripts/process_results.py \
-    --history_output_file itk_rust.json \
-    --history_url https://github.com/a2aproject/a2a-rs/releases/download/nightly-metrics/itk_rust.json
-  RESULT=$?
-else
-  # CI path: print per-scenario status; exit 1 on any failure or malformed
-  # ITK response. Kept inline (rather than in a shared script) to match the
-  # convention already used by a2a-java / a2a-js run_itk.sh.
-  echo "--------------------------------------------------------"
-  echo "ITK TEST RESULTS:"
-  echo "--------------------------------------------------------"
-  echo "$RESPONSE" | python3 -c "
+# Validate the ITK response shape BEFORE branching into nightly/CI post-processing.
+# Guards against both branches silently accepting a malformed or error response:
+# - CI mode: prevents an unhandled AttributeError inside the summariser.
+# - Nightly mode: prevents the metrics processor from producing an empty/invalid
+#   history entry that would then be uploaded to the release asset.
+echo "$RESPONSE" | python3 -c "
 import sys, json
 raw = sys.stdin.read()
 try:
@@ -118,7 +106,6 @@ except json.JSONDecodeError as e:
     print(f'ERROR: could not parse ITK response JSON: {e}', file=sys.stderr)
     print(f'Raw response: {raw}', file=sys.stderr)
     sys.exit(1)
-
 if not isinstance(data, dict):
     print(f'ERROR: ITK response is not a JSON object (got {type(data).__name__})', file=sys.stderr)
     sys.exit(1)
@@ -128,13 +115,40 @@ if 'detail' in data:
 if 'results' not in data:
     print(f'ERROR: ITK response missing \"results\" field. Keys: {list(data.keys())}', file=sys.stderr)
     sys.exit(1)
+if not isinstance(data['results'], dict):
+    print(f'ERROR: ITK response \"results\" field is not an object (got {type(data[\"results\"]).__name__})', file=sys.stderr)
+    sys.exit(1)
+"
+RESULT=$?
+if [ $RESULT -ne 0 ]; then
+  echo "ITK response failed validation. Container logs:"
+  docker logs itk-service
+  exit $RESULT
+fi
 
+if [ "${ITK_NIGHTLY_RUN^^}" = "TRUE" ]; then
+  echo "Nightly run detected. Saving raw results and running process_results.py..."
+  echo "$RESPONSE" > raw_results.json
+  python3 a2a-itk/scripts/process_results.py \
+    --history_output_file itk_rust.json \
+    --history_url https://github.com/a2aproject/a2a-rs/releases/download/nightly-metrics/itk_rust.json
+  RESULT=$?
+else
+  echo "--------------------------------------------------------"
+  echo "ITK TEST RESULTS:"
+  echo "--------------------------------------------------------"
+  echo "$RESPONSE" | python3 -c "
+import sys, json
+data = json.loads(sys.stdin.read())
 all_passed = data.get('all_passed', False)
-results = data.get('results', {})
-for name, value in results.items():
-    passed = value.get('passed') if isinstance(value, dict) else value
-    status = 'PASSED' if passed else 'FAILED'
-    print(f'{name}: {status}')
+for name, value in data['results'].items():
+    if isinstance(value, dict):
+        passed = bool(value.get('passed', False))
+    elif isinstance(value, bool):
+        passed = value
+    else:
+        passed = False
+    print(f'{name}: {\"PASSED\" if passed else \"FAILED\"}')
 print('--------------------------------------------------------')
 print(f'OVERALL STATUS: {\"PASSED\" if all_passed else \"FAILED\"}')
 if not all_passed:
