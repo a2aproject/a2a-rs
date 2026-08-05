@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.1.7...a2a-cli-v0.1.8) - 2026-08-05
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.1.7](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.1.6...a2a-cli-v0.1.7) - 2026-07-16
 
 ### Other
