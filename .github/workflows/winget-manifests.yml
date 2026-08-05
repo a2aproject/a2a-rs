@@ -15,6 +15,8 @@ on:
         required: false
       PROJECT_APP_KEY:
         required: false
+      WINGET_PKGS_PAT:
+        required: false
   workflow_dispatch:
     inputs:
       release_tag:
@@ -145,10 +147,11 @@ jobs:
 
       - name: Open or update winget-pkgs PR
         env:
-          WINGET_PKGS_TOKEN: ${{ steps.app-token.outputs.token }}
+          WINGET_PKGS_TOKEN: ${{ secrets.WINGET_PKGS_PAT || steps.app-token.outputs.token }}
+          WINGET_PKGS_PAT: ${{ secrets.WINGET_PKGS_PAT }}
           FORK_OWNER: ${{ github.repository_owner }}
-          GIT_AUTHOR_NAME: ${{ steps.app-token.outputs.app-slug }}[bot]
-          GIT_AUTHOR_EMAIL: ${{ steps.app-user.outputs.user_id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com
+          APP_GIT_AUTHOR_NAME: ${{ steps.app-token.outputs.app-slug }}[bot]
+          APP_GIT_AUTHOR_EMAIL: ${{ steps.app-user.outputs.user_id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com
           MANIFEST_DIR: ${{ github.workspace }}/dist/winget/${{ needs.render-winget-manifests.outputs.manifest_rel_dir }}
           MANIFEST_REL_DIR: ${{ needs.render-winget-manifests.outputs.manifest_rel_dir }}
           PACKAGE_IDENTIFIER: ${{ needs.render-winget-manifests.outputs.package_identifier }}
@@ -156,22 +159,37 @@ jobs:
           RELEASE_URL: ${{ needs.render-winget-manifests.outputs.release_url }}
         run: |
           if [ -z "$WINGET_PKGS_TOKEN" ]; then
-            echo "::notice::PROJECT_APP_ID / PROJECT_APP_KEY are not configured; uploaded generated WinGet manifests as a workflow artifact only."
+            echo "::notice::Neither WINGET_PKGS_PAT nor PROJECT_APP_ID / PROJECT_APP_KEY are configured; uploaded generated WinGet manifests as a workflow artifact only."
             exit 0
-          fi
-
-          fork_owner="$FORK_OWNER"
-
-          if ! GH_TOKEN="$WINGET_PKGS_TOKEN" gh repo view "$fork_owner/winget-pkgs" >/dev/null 2>&1; then
-            echo "::error::Expected an existing fork at $fork_owner/winget-pkgs. Create and maintain that fork before running this workflow."
-            exit 1
           fi
 
           export GH_TOKEN="$WINGET_PKGS_TOKEN"
           GH_TOKEN="$WINGET_PKGS_TOKEN" gh auth setup-git >/dev/null
 
+          # GitHub App installation tokens can push to our own fork but cannot
+          # open a pull request against microsoft/winget-pkgs, since our app
+          # can never be installed on that external repo ("Resource not
+          # accessible by integration"). When WINGET_PKGS_PAT (a classic
+          # personal access token for a real GitHub user account) is
+          # configured, use its identity for the commit and PR instead of the
+          # GitHub App bot identity.
+          if [ -n "$WINGET_PKGS_PAT" ]; then
+            GIT_AUTHOR_NAME="$(gh api user --jq .login)"
+            GIT_AUTHOR_EMAIL="$(gh api user --jq .id)+${GIT_AUTHOR_NAME}@users.noreply.github.com"
+          else
+            GIT_AUTHOR_NAME="$APP_GIT_AUTHOR_NAME"
+            GIT_AUTHOR_EMAIL="$APP_GIT_AUTHOR_EMAIL"
+          fi
+
+          fork_owner="$FORK_OWNER"
+
+          if ! gh repo view "$fork_owner/winget-pkgs" >/dev/null 2>&1; then
+            echo "::error::Expected an existing fork at $fork_owner/winget-pkgs. Create and maintain that fork before running this workflow."
+            exit 1
+          fi
+
           rm -rf /tmp/winget-pkgs
-          GH_TOKEN="$WINGET_PKGS_TOKEN" gh repo clone "$fork_owner/winget-pkgs" /tmp/winget-pkgs -- --depth 1
+          gh repo clone "$fork_owner/winget-pkgs" /tmp/winget-pkgs -- --depth 1
 
           branch="automation/winget-a2acli-$PACKAGE_VERSION"
 
@@ -200,7 +218,7 @@ jobs:
           git commit -m "release: add WinGet manifest for a2acli v$PACKAGE_VERSION"
           git push --force --set-upstream origin "$branch"
 
-          pr_number=$(GH_TOKEN="$WINGET_PKGS_TOKEN" gh pr list --repo microsoft/winget-pkgs --head "$fork_owner:$branch" --base master --state open --json number --jq 'first(.[].number) // ""')
+          pr_number=$(gh pr list --repo microsoft/winget-pkgs --head "$fork_owner:$branch" --base master --state open --json number --jq 'first(.[].number) // ""')
           if [ -n "$pr_number" ]; then
             echo "Updated existing PR #$pr_number"
             exit 0
@@ -216,9 +234,18 @@ jobs:
           Upstream release: $RELEASE_URL
           EOF
 
-          GH_TOKEN="$WINGET_PKGS_TOKEN" gh pr create \
+          if ! gh pr create \
             --repo microsoft/winget-pkgs \
             --base master \
             --head "$fork_owner:$branch" \
             --title "Add WinGet manifest for a2aproject.a2acli version $PACKAGE_VERSION" \
-            --body-file /tmp/winget-pr-body.md
+            --body-file /tmp/winget-pr-body.md 2>&1 | tee /tmp/gh-pr-create.log; then
+            if grep -q "already exists" /tmp/gh-pr-create.log; then
+              echo "PR already exists for $branch — branch updated in place"
+              exit 0
+            fi
+            if [ -z "$WINGET_PKGS_PAT" ]; then
+              echo "::error::Failed to open the winget-pkgs pull request using the GitHub App token. GitHub Apps cannot open pull requests on repositories they aren't installed on (microsoft/winget-pkgs), which blocks this final step. Configure a WINGET_PKGS_PAT secret (classic PAT, public_repo scope, from a maintainer account with a winget-pkgs fork) to complete publishing."
+            fi
+            exit 1
+          fi
