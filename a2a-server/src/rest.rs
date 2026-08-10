@@ -437,6 +437,7 @@ fn rest_payload_error_response(error: impl std::fmt::Display) -> axum::response:
 }
 
 fn rest_error_response(err: A2AError) -> axum::response::Response {
+    let err = crate::sanitize_client_error(err);
     let status =
         StatusCode::from_u16(err.http_status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let reason = error_reason(err.code);
@@ -764,6 +765,26 @@ mod tests {
 
         let resp = rest_error_response(A2AError::content_type_not_supported());
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_rest_error_response_sanitizes_internal_message() {
+        let resp = rest_error_response(A2AError::internal("boom with internal details"));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["message"], "Internal error");
+        assert!(!payload["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("internal details"));
+
+        // Non-internal errors keep their message (client-validation feedback).
+        let resp = rest_error_response(A2AError::task_not_found("t1"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["message"], "task not found: t1");
     }
 
     #[tokio::test]
