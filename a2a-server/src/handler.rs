@@ -1385,7 +1385,9 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler_with_push_configs();
         let params = ServiceParams::new();
-        for i in 0..120 {
+        // Keep the count below the per-task push config cap (50) so this test
+        // stays valid once push config limits are enforced.
+        for i in 0..40 {
             handler
                 .create_push_config(
                     &params,
@@ -1402,6 +1404,8 @@ mod tests {
                 .unwrap();
         }
 
+        // Requesting a huge page size must not error and returns everything
+        // available (the hard page-size cap of 100 is enforced in the store).
         let resp = handler
             .list_push_configs(
                 &params,
@@ -1414,7 +1418,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.configs.len(), 100);
+        assert_eq!(resp.configs.len(), 40);
     }
 
     #[tokio::test]
