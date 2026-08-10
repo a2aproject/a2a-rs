@@ -201,6 +201,7 @@ async fn handle_streaming_request<H: RequestHandler>(
 }
 
 fn error_response(id: JsonRpcId, err: A2AError) -> axum::response::Response {
+    let err = crate::sanitize_client_error(err);
     let resp = JsonRpcResponse::error(id, err.to_jsonrpc_error());
     (StatusCode::OK, Json(resp)).into_response()
 }
@@ -376,6 +377,26 @@ mod tests {
         let resp = post_jsonrpc(app, "unknown.method", Value::Null).await;
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, error_code::METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_error_response_sanitizes_internal_message() {
+        let resp = error_response(JsonRpcId::Number(1), A2AError::internal("boom details"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let error = rpc_resp.error.unwrap();
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert_eq!(error.message, "Internal error");
+        assert!(!error.message.contains("boom"));
+
+        // Non-internal errors keep their message (client-validation feedback).
+        let resp = error_response(JsonRpcId::Number(1), A2AError::task_not_found("t1"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            rpc_resp.error.unwrap().message,
+            "task not found: t1"
+        );
     }
 
     #[tokio::test]
