@@ -213,9 +213,15 @@ async fn handle_list_tasks<H: RequestHandler>(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
-    let status = query
-        .status
-        .and_then(|s| serde_json::from_value::<TaskState>(serde_json::Value::String(s)).ok());
+    let status = match query.status {
+        Some(s) => match serde_json::from_value::<TaskState>(serde_json::Value::String(s)) {
+            Ok(state) => Some(state),
+            Err(_) => {
+                return rest_error_response(A2AError::invalid_params("invalid status filter"));
+            }
+        },
+        None => None,
+    };
     let req = ListTasksRequest {
         context_id: query.context_id,
         status,
@@ -948,12 +954,27 @@ mod tests {
     async fn test_list_tasks_with_query_params() {
         let app = make_app();
         let req = Request::builder()
-            .uri("/tasks?contextId=c1&pageSize=5&pageToken=tok&historyLength=3&includeArtifacts=true&statusTimestampAfter=2025-01-01T00:00:00Z")
+            .uri("/tasks?contextId=c1&pageSize=5&pageToken=0&historyLength=3&includeArtifacts=true&statusTimestampAfter=2025-01-01T00:00:00Z")
             .method("GET")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_invalid_status_returns_bad_request() {
+        let app = make_app();
+        let req = Request::builder()
+            .uri("/tasks?status=invalid")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["message"], "invalid status filter");
     }
 
     #[tokio::test]
