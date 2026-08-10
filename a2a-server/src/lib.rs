@@ -17,7 +17,7 @@ pub use agent_card::{AgentCardProducer, StaticAgentCard, WELL_KNOWN_AGENT_CARD_P
 pub use executor::{AgentExecutor, ExecutorContext};
 pub use handler::{DefaultRequestHandler, RequestHandler};
 pub use middleware::{CallContext, CallInterceptor, InterceptedHandler, ServiceParams, User};
-pub use push::{HttpPushSender, InMemoryPushConfigStore, PushConfigStore};
+pub use push::{HttpPushSender, HttpPushSenderConfig, InMemoryPushConfigStore, PushConfigStore};
 pub use task_store::{InMemoryTaskStore, TaskStore};
 
 #[cfg(test)]
