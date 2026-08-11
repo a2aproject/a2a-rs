@@ -246,6 +246,25 @@ fn parse_rest_error(status: reqwest::StatusCode, body: &str) -> A2AError {
     )
 }
 
+fn should_retry_subscribe_with_legacy_path(err: &A2AError) -> bool {
+    if matches!(
+        err.code,
+        error_code::METHOD_NOT_FOUND | error_code::UNSUPPORTED_OPERATION
+    ) {
+        return true;
+    }
+
+    if err.code != error_code::INTERNAL_ERROR {
+        return false;
+    }
+
+    let msg = err.message.to_ascii_lowercase();
+    msg.contains("http 404")
+        || msg.contains("http 405")
+        || msg.contains("not found")
+        || msg.contains("method not allowed")
+}
+
 #[async_trait]
 impl Transport for RestTransport {
     async fn send_message(
@@ -326,8 +345,15 @@ impl Transport for RestTransport {
         params: &ServiceParams,
         req: &SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        self.get_streaming(&format!("/tasks/{}:subscribe", req.id), params)
-            .await
+        let canonical_path = format!("/tasks/{}:subscribe", req.id);
+        match self.get_streaming(&canonical_path, params).await {
+            Ok(stream) => Ok(stream),
+            Err(err) if should_retry_subscribe_with_legacy_path(&err) => {
+                self.get_streaming(&format!("/tasks/{}/subscribe", req.id), params)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn create_push_config(
@@ -646,6 +672,33 @@ mod tests {
 
         let err = parse_rest_error(reqwest::StatusCode::BAD_REQUEST, &body);
         assert_eq!(err.code, error_code::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn test_should_retry_subscribe_with_legacy_path() {
+        assert!(should_retry_subscribe_with_legacy_path(&A2AError {
+            code: error_code::METHOD_NOT_FOUND,
+            message: "method missing".to_string(),
+            details: None,
+        }));
+
+        assert!(should_retry_subscribe_with_legacy_path(&A2AError {
+            code: error_code::UNSUPPORTED_OPERATION,
+            message: "unsupported".to_string(),
+            details: None,
+        }));
+
+        assert!(should_retry_subscribe_with_legacy_path(&A2AError {
+            code: error_code::INTERNAL_ERROR,
+            message: "HTTP 404: not found".to_string(),
+            details: None,
+        }));
+
+        assert!(!should_retry_subscribe_with_legacy_path(&A2AError {
+            code: error_code::TASK_NOT_FOUND,
+            message: "task not found".to_string(),
+            details: None,
+        }));
     }
 
     #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
