@@ -22,6 +22,8 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Run Nightly ITK Tests
+        id: nightly_itk
+        continue-on-error: true
         run: bash run_itk.sh
         working-directory: itk
         env:
@@ -29,6 +31,7 @@ jobs:
           ITK_NIGHTLY_RUN: "True"
 
       - name: Upload Results to Rolling Release
+        if: always()
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
         with:
           tag_name: "nightly-metrics"
@@ -37,3 +40,9 @@ jobs:
             itk/itk_rust.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fail on Nightly ITK Scenario Failures
+        if: steps.nightly_itk.outcome != 'success'
+        run: |
+          echo "Nightly ITK scenarios reported failures. See prior step logs."
+          exit 1

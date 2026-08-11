@@ -133,6 +133,15 @@ if [ "${ITK_NIGHTLY_RUN^^}" = "TRUE" ]; then
     --history_output_file itk_rust.json \
     --history_url https://github.com/a2aproject/a2a-rs/releases/download/nightly-metrics/itk_rust.json
   RESULT=$?
+  if [ $RESULT -eq 0 ]; then
+    echo "Evaluating nightly scenario aggregate status..."
+    if jq -e '.all_passed == true' raw_results.json > /dev/null; then
+      echo "OVERALL STATUS: PASSED"
+    else
+      echo "OVERALL STATUS: FAILED"
+      RESULT=1
+    fi
+  fi
 else
   echo "--------------------------------------------------------"
   echo "ITK TEST RESULTS:"
