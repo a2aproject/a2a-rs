@@ -346,14 +346,33 @@ impl Transport for RestTransport {
         req: &SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let canonical_path = format!("/tasks/{}:subscribe", req.id);
+        let legacy_path = format!("/tasks/{}/subscribe", req.id);
+
         match self.get_streaming(&canonical_path, params).await {
-            Ok(stream) => Ok(stream),
-            Err(err) if should_retry_subscribe_with_legacy_path(&err) => {
-                self.get_streaming(&format!("/tasks/{}/subscribe", req.id), params)
-                    .await
+            Ok(stream) => return Ok(stream),
+            Err(err) if !should_retry_subscribe_with_legacy_path(&err) => {
+                return Err(err);
             }
-            Err(err) => Err(err),
+            Err(_) => {}
         }
+
+        match self.get_streaming(&legacy_path, params).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) if !should_retry_subscribe_with_legacy_path(&err) => {
+                return Err(err);
+            }
+            Err(_) => {}
+        }
+
+        match self.post_streaming(&canonical_path, params, req).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) if !should_retry_subscribe_with_legacy_path(&err) => {
+                return Err(err);
+            }
+            Err(_) => {}
+        }
+
+        self.post_streaming(&legacy_path, params, req).await
     }
 
     async fn create_push_config(
@@ -562,6 +581,97 @@ mod tests {
             );
             second_socket
                 .write_all(second_response.as_bytes())
+                .await
+                .unwrap();
+        });
+
+        format!("http://{addr}")
+    }
+
+    async fn spawn_subscribe_method_fallback_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut first_socket, _) = listener.accept().await.unwrap();
+            let first_request = read_http_request(&mut first_socket).await;
+            assert!(
+                first_request.starts_with("GET /tasks/task-1:subscribe HTTP/1.1"),
+                "unexpected first request: {first_request}"
+            );
+
+            let first_body = json!({
+                "error": {
+                    "code": 405,
+                    "status": "METHOD_NOT_ALLOWED",
+                    "message": "method not allowed",
+                    "details": []
+                }
+            })
+            .to_string();
+            let first_response = format!(
+                "HTTP/1.1 405 Method Not Allowed\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                first_body.len(),
+                first_body,
+            );
+            first_socket
+                .write_all(first_response.as_bytes())
+                .await
+                .unwrap();
+
+            let (mut second_socket, _) = listener.accept().await.unwrap();
+            let second_request = read_http_request(&mut second_socket).await;
+            assert!(
+                second_request.starts_with("GET /tasks/task-1/subscribe HTTP/1.1"),
+                "unexpected second request: {second_request}"
+            );
+
+            let second_body = json!({
+                "error": {
+                    "code": 405,
+                    "status": "METHOD_NOT_ALLOWED",
+                    "message": "method not allowed",
+                    "details": []
+                }
+            })
+            .to_string();
+            let second_response = format!(
+                "HTTP/1.1 405 Method Not Allowed\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                second_body.len(),
+                second_body,
+            );
+            second_socket
+                .write_all(second_response.as_bytes())
+                .await
+                .unwrap();
+
+            let (mut third_socket, _) = listener.accept().await.unwrap();
+            let third_request = read_http_request(&mut third_socket).await;
+            assert!(
+                third_request.starts_with("POST /tasks/task-1:subscribe HTTP/1.1"),
+                "unexpected third request: {third_request}"
+            );
+
+            let status_update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: "task-1".into(),
+                context_id: "ctx-1".into(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            });
+            let sse_payload =
+                serde_json::to_string(&protojson_conv::to_value(&status_update).unwrap()).unwrap();
+            let third_body = format!("data: {sse_payload}\n\n");
+            let third_response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n{}",
+                third_body.len(),
+                third_body,
+            );
+            third_socket
+                .write_all(third_response.as_bytes())
                 .await
                 .unwrap();
         });
@@ -790,6 +900,26 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_to_task_falls_back_to_legacy_rest_path() {
         let base_url = spawn_subscribe_fallback_server().await;
+        let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), base_url);
+
+        let mut stream = Transport::subscribe_to_task(
+            &transport,
+            &ServiceParams::new(),
+            &SubscribeToTaskRequest {
+                id: "task-1".into(),
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let item = stream.next().await.unwrap().unwrap();
+        assert!(matches!(item, StreamResponse::StatusUpdate(_)));
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_task_falls_back_to_post_when_get_not_allowed() {
+        let base_url = spawn_subscribe_method_fallback_server().await;
         let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), base_url);
 
         let mut stream = Transport::subscribe_to_task(
