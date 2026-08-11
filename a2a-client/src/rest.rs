@@ -530,7 +530,10 @@ mod tests {
                 first_body.len(),
                 first_body,
             );
-            first_socket.write_all(first_response.as_bytes()).await.unwrap();
+            first_socket
+                .write_all(first_response.as_bytes())
+                .await
+                .unwrap();
 
             let (mut second_socket, _) = listener.accept().await.unwrap();
             let second_request = read_http_request(&mut second_socket).await;
@@ -549,10 +552,8 @@ mod tests {
                 },
                 metadata: None,
             });
-            let sse_payload = serde_json::to_string(
-                &protojson_conv::to_value(&status_update).unwrap(),
-            )
-            .unwrap();
+            let sse_payload =
+                serde_json::to_string(&protojson_conv::to_value(&status_update).unwrap()).unwrap();
             let second_body = format!("data: {sse_payload}\n\n");
             let second_response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n{}",
@@ -789,10 +790,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_to_task_falls_back_to_legacy_rest_path() {
         let base_url = spawn_subscribe_fallback_server().await;
-        let transport = RestTransport::new(
-            crate::default_reqwest_client(None).unwrap(),
-            base_url,
-        );
+        let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), base_url);
 
         let mut stream = Transport::subscribe_to_task(
             &transport,
