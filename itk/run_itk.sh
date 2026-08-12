@@ -38,8 +38,11 @@ if git symbolic-ref -q HEAD > /dev/null; then
 fi
 cd ..
 
-# Build the ITK service Docker image (polyglot: includes Rust 1.85, Go, Python, Node, etc.)
-docker build -t itk_service a2a-itk
+# Build ITK service Docker image from root of a2a-itk (skipped in CI where
+# the workflow builds via docker/build-push-action for GHA caching).
+if [ "${ITK_SKIP_BUILD:-0}" != "1" ]; then
+  docker build -t itk_service a2a-itk
+fi
 
 A2A_RS_ROOT=$(cd .. && pwd)
 ITK_DIR=$(pwd)
@@ -52,17 +55,26 @@ if [ "${ITK_LOG_LEVEL^^}" = "DEBUG" ]; then
   DOCKER_MOUNT_LOGS="-v $ITK_DIR/logs:/app/logs"
 fi
 
+mkdir -p "$HOME/.cache/a2a-itk-launcher"
+
 docker run -d --name itk-service \
   -v "$A2A_RS_ROOT:/app/agents/repo" \
   -v "$ITK_DIR:/app/agents/repo/itk" \
+  -v "$HOME/.cache/a2a-itk-launcher:/root/.cache/a2a-itk" \
   $DOCKER_MOUNT_LOGS \
   -e ITK_LOG_LEVEL="$ITK_LOG_LEVEL" \
+  -e ITK_ENTRYPOINT="${ITK_ENTRYPOINT:-itk_service_v2.py}" \
+  -e ITK_READINESS_TIMEOUT="${ITK_READINESS_TIMEOUT:-180}" \
+  -e ITK_MAX_WORKERS="${ITK_MAX_WORKERS:-2}" \
   -p 8000:8000 \
   itk_service
 
 docker exec -u root itk-service git config --system --add safe.directory /app/agents/repo
 docker exec -u root itk-service git config --system --add safe.directory /app/agents/repo/itk
 docker exec -u root itk-service git config --system core.multiPackIndex false
+# Launcher's peer checkouts under /root/.cache/a2a-itk are host-owned; trust
+# every path so container-side git accepts them.
+docker exec -u root itk-service git config --system --add safe.directory '*'
 
 MAX_RETRIES=30
 echo "Waiting for ITK service to start on 127.0.0.1:8000..."
