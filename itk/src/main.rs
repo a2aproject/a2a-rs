@@ -1,3 +1,6 @@
+// Copyright AGNTCY Contributors (https://github.com/agntcy)
+// SPDX-License-Identifier: Apache-2.0
+
 // ITK Rust v1.0 Agent
 // Implements the ITK Instruction proto traversal over JSON-RPC, HTTP+JSON, and gRPC.
 // Architecture mirrors agents/go/v10/main.go; server-side wiring follows the
