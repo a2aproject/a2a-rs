@@ -170,13 +170,19 @@ dependencies = [
  "hyper",
  "hyper-util",
  "parking_lot",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tracing",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1766,6 +1772,7 @@ dependencies = [
  "a2a-lf",
  "a2a-pb",
  "a2a-server-lf",
+ "a2a-websocket",
  "async-trait",
  "axum",
  "chrono",
@@ -4516,6 +4523,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -6053,6 +6061,15 @@ name = "winapi-i686-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
+]
 
 [[package]]
 name = "winapi-util"
