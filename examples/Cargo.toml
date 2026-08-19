@@ -24,12 +24,21 @@ path = "src/helloworld_tls/server.rs"
 name = "helloworld-tls-client"
 path = "src/helloworld_tls/client.rs"
 
+[[bin]]
+name = "websocket-server"
+path = "src/websocket/server.rs"
+
+[[bin]]
+name = "websocket-client"
+path = "src/websocket/client.rs"
+
 [dependencies]
 a2a = { workspace = true }
 a2a-client = { workspace = true, features = ["rustls-tls"] }
 a2a-grpc = { workspace = true, features = ["rustls-tls"] }
 a2a-pb = { workspace = true }
 a2a-server = { workspace = true, features = ["rustls-tls"] }
+a2a-websocket = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic-tls = { workspace = true, features = ["rustls"] }
