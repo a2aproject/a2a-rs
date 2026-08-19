@@ -690,7 +690,9 @@ pub const TRANSPORT_PROTOCOL_GRPC: &str = "GRPC";
 pub const TRANSPORT_PROTOCOL_HTTP_JSON: &str = "HTTP+JSON";
 /// SLIMRPC transport protocol constant.
 pub const TRANSPORT_PROTOCOL_SLIMRPC: &str = "SLIMRPC";
-/// WebSocket transport protocol constant.
+/// WebSocket transport protocol constant (Agent Card `protocolBinding` value
+/// for the A2A WebSocket custom protocol binding). The binding carries
+/// JSON-RPC 2.0 messages on the wire, but the identifier is simply `WEBSOCKET`.
 pub const TRANSPORT_PROTOCOL_WEBSOCKET: &str = "WEBSOCKET";
 
 /// Protocol version string (e.g., "1.0").

@@ -18,6 +18,7 @@ default-members = [
     "a2a-pb",
     "a2a-grpc",
     "a2a-slimrpc",
+    "a2a-websocket",
     "a2acli",
     "examples",
 ]
