@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use a2a::*;
@@ -26,14 +26,161 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
+use crate::auth::AuthenticateParams;
 use crate::common::{
-    DEFAULT_MAX_FRAME_BYTES, SUBPROTOCOL, TRANSPORT_PROTOCOL_WEBSOCKET, WsRequestEnvelope,
-    WsResponseEnvelope, methods, service_params_to_envelope,
+    CONTROL_REAUTH_REQUIRED, DEFAULT_MAX_FRAME_BYTES, JsonRpcId, SERVER_ERROR_CODE, SUBPROTOCOL,
+    TRANSPORT_PROTOCOL_WEBSOCKET, WsRequestEnvelope, WsResponseEnvelope, close_codes, id_key,
+    methods, service_params_to_envelope,
 };
-use crate::errors::ws_error_to_a2a_error;
+use crate::errors::jsonrpc_error_to_a2a;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_BUFFER_CAPACITY: usize = 64;
+
+/// Details carried by a server-sent `ReauthenticationRequired` control frame
+/// (spec Section 9.3.2).
+#[derive(Debug, Clone, Default)]
+pub struct ReauthRequired {
+    /// Human-readable explanation supplied by the server, if any.
+    pub reason: Option<String>,
+    /// Suggested delay before reconnecting, in milliseconds.
+    pub retry_after_ms: Option<u64>,
+}
+
+/// Source of fresh credentials for a live connection.
+///
+/// Implement this to let the transport satisfy a `ReauthenticationRequired`
+/// signal by refreshing in-band (spec Section 9.3.3) rather than forcing the
+/// application to rebuild the connection.
+#[async_trait]
+pub trait CredentialProvider: Send + Sync + 'static {
+    /// Produce credentials to install on the connection. Called when the server
+    /// asks for reauthentication.
+    async fn fresh_credentials(&self) -> Result<AuthenticateParams, A2AError>;
+}
+
+/// How the client reacts to a `ReauthenticationRequired` control frame. Section
+/// 9.3.2 requires clients to *handle* the signal, so a policy should be set on
+/// any connection whose credentials can expire.
+#[derive(Clone)]
+pub enum ReauthPolicy {
+    /// Invoke the callback so the application can obtain fresh credentials and
+    /// establish a new connection itself.
+    Notify(Arc<dyn Fn(ReauthRequired) + Send + Sync>),
+    /// Fetch fresh credentials from the provider and install them on the live
+    /// connection using the in-band `Authenticate` method (spec Section 9.3.3),
+    /// avoiding a reconnect. A server that does not support in-band refresh
+    /// answers `UnsupportedOperationError` and then closes with `4001`, so the
+    /// application should still be prepared to reconnect.
+    RefreshInBand(Arc<dyn CredentialProvider>),
+}
+
+impl std::fmt::Debug for ReauthPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReauthPolicy::Notify(_) => f.write_str("ReauthPolicy::Notify(..)"),
+            ReauthPolicy::RefreshInBand(_) => f.write_str("ReauthPolicy::RefreshInBand(..)"),
+        }
+    }
+}
+
+/// Options controlling how a [`WebSocketTransport`] connects.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectOptions {
+    /// Extra HTTP headers to send on the upgrade handshake — typically the
+    /// `Authorization` header carrying connection-scoped credentials
+    /// (spec Section 9.1). Header names are sent as-is.
+    pub headers: Vec<(String, String)>,
+
+    /// TLS options applied when connecting to a `wss://` endpoint (requires the
+    /// `tls` crate feature). Ignored for plaintext `ws://` connections.
+    pub tls: TlsOptions,
+
+    /// Response to a `ReauthenticationRequired` control frame (spec Section
+    /// 9.3.2). When `None` the frame is only logged, and the server will
+    /// subsequently close the connection with `4001`.
+    pub reauth: Option<ReauthPolicy>,
+}
+
+impl ConnectOptions {
+    /// Convenience constructor adding an `Authorization: Bearer <token>` header.
+    pub fn with_bearer_token(token: impl AsRef<str>) -> Self {
+        ConnectOptions {
+            headers: vec![(
+                "Authorization".to_string(),
+                format!("Bearer {}", token.as_ref()),
+            )],
+            ..Default::default()
+        }
+    }
+
+    /// Add an arbitrary header to the handshake request.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Replace the TLS options used for `wss://` connections.
+    pub fn with_tls(mut self, tls: TlsOptions) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    /// Be notified when the server requests reauthentication, so the
+    /// application can reconnect with fresh credentials (spec Section 9.3.2).
+    pub fn on_reauth_required<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(ReauthRequired) + Send + Sync + 'static,
+    {
+        self.reauth = Some(ReauthPolicy::Notify(Arc::new(callback)));
+        self
+    }
+
+    /// Refresh credentials in-band via the `Authenticate` method when the server
+    /// requests reauthentication, keeping the connection open
+    /// (spec Section 9.3.3).
+    pub fn with_credential_provider(mut self, provider: Arc<dyn CredentialProvider>) -> Self {
+        self.reauth = Some(ReauthPolicy::RefreshInBand(provider));
+        self
+    }
+}
+
+/// TLS configuration for `wss://` connections (spec Section 13.1).
+///
+/// By default the platform trust store is used (falling back to the bundled
+/// Mozilla root set). Additional trusted roots may be supplied for private
+/// CAs or self-signed certificates.
+#[derive(Debug, Clone, Default)]
+pub struct TlsOptions {
+    /// Extra trusted root certificates, in PEM form, appended to the default
+    /// trust anchors. Useful for private CAs or pinned self-signed certs.
+    pub extra_root_certs_pem: Vec<Vec<u8>>,
+
+    /// **DANGER:** disable server certificate verification entirely. This
+    /// defeats the protection TLS provides against man-in-the-middle attacks
+    /// and must only ever be used in tests against a local server. Never enable
+    /// this in production.
+    pub danger_accept_invalid_certs: bool,
+}
+
+impl TlsOptions {
+    /// Trust an additional root certificate (PEM). May be called repeatedly.
+    pub fn trust_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.extra_root_certs_pem.push(pem.into());
+        self
+    }
+
+    /// **DANGER:** disable certificate verification. Tests only. See
+    /// [`TlsOptions::danger_accept_invalid_certs`].
+    pub fn danger_accept_invalid_certs(mut self) -> Self {
+        self.danger_accept_invalid_certs = true;
+        self
+    }
+}
+
+fn id_key_of(id: &str) -> String {
+    id_key(&JsonRpcId::String(id.to_string()))
+}
 
 #[derive(Debug)]
 enum OutboundClient {
@@ -83,7 +230,7 @@ impl ConnectionInner {
 
     fn register_unary(
         &self,
-        id: &str,
+        key: &str,
     ) -> Result<oneshot::Receiver<Result<Value, A2AError>>, A2AError> {
         let (tx, rx) = oneshot::channel();
         let mut pending = self.pending.lock();
@@ -94,13 +241,13 @@ impl ConnectionInner {
                 .unwrap_or_else(|| A2AError::internal("websocket connection closed"));
             return Err(err);
         }
-        pending.unary.insert(id.to_string(), tx);
+        pending.unary.insert(key.to_string(), tx);
         Ok(rx)
     }
 
     fn register_streaming(
         &self,
-        id: &str,
+        key: &str,
     ) -> Result<mpsc::UnboundedReceiver<Result<StreamResponse, A2AError>>, A2AError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut pending = self.pending.lock();
@@ -111,17 +258,48 @@ impl ConnectionInner {
                 .unwrap_or_else(|| A2AError::internal("websocket connection closed"));
             return Err(err);
         }
-        pending.streaming.insert(id.to_string(), tx);
+        pending.streaming.insert(key.to_string(), tx);
         Ok(rx)
     }
 
-    fn deregister_streaming(&self, id: &str) {
+    fn deregister_streaming(&self, key: &str) {
         let mut pending = self.pending.lock();
-        pending.streaming.remove(id);
+        pending.streaming.remove(key);
     }
 
     async fn close(&self) {
         let _ = self.send_outbound(OutboundClient::Close).await;
+    }
+
+    /// Issue a unary JSON-RPC request and await its correlated response.
+    async fn call_unary_raw(
+        &self,
+        method: &str,
+        params: &ServiceParams,
+        request_params: Value,
+    ) -> Result<Value, A2AError> {
+        let id = uuid::Uuid::now_v7().to_string();
+        let key = id_key_of(&id);
+        let envelope = WsRequestEnvelope {
+            id: Some(JsonRpcId::String(id)),
+            method: Some(method.to_string()),
+            params: Some(request_params),
+            service_params: service_params_to_envelope(params),
+            ..Default::default()
+        };
+
+        let receiver = self.register_unary(&key)?;
+        self.send_outbound(OutboundClient::Frame(
+            serde_json::to_string(&envelope).map_err(|err| {
+                A2AError::internal(format!("failed to serialize envelope: {err}"))
+            })?,
+        ))
+        .await?;
+
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) => Err(connection_closed_error(&self.pending)),
+        }
     }
 }
 
@@ -140,10 +318,21 @@ pub struct WebSocketTransport {
 }
 
 impl WebSocketTransport {
-    /// Connect to the agent at the given endpoint URL. Accepts `ws://`,
-    /// `wss://` (returns an unsupported error in this build), or bare
-    /// `host:port[/path]` strings (normalized to `ws://`).
+    /// Connect to the agent at the given endpoint URL with default options.
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self, A2AError> {
+        Self::connect_with_options(endpoint, ConnectOptions::default()).await
+    }
+
+    /// Connect to the agent, supplying handshake headers (e.g. credentials)
+    /// and, for `wss://`, TLS options.
+    ///
+    /// Accepts `ws://`, `wss://`, or bare `host:port[/path]` (normalized to
+    /// `ws://`). `wss://` requires the `tls` crate feature (enabled by
+    /// default).
+    pub async fn connect_with_options(
+        endpoint: impl Into<String>,
+        options: ConnectOptions,
+    ) -> Result<Self, A2AError> {
         let endpoint = endpoint.into();
         let parsed = parse_endpoint(&endpoint)?;
 
@@ -155,7 +344,7 @@ impl WebSocketTransport {
             format!("{}:{}", parsed.host, parsed.port)
         };
 
-        let req = Request::builder()
+        let mut builder = Request::builder()
             .method("GET")
             .uri(parsed.path.clone())
             .header(HOST, host_header)
@@ -163,18 +352,41 @@ impl WebSocketTransport {
             .header(CONNECTION, "upgrade")
             .header("Sec-WebSocket-Key", handshake::generate_key())
             .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Protocol", SUBPROTOCOL)
+            .header("Sec-WebSocket-Protocol", SUBPROTOCOL);
+        for (name, value) in &options.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        let req = builder
             .body(Empty::<Bytes>::new())
             .map_err(|err| A2AError::internal(format!("failed to build upgrade request: {err}")))?;
 
-        let (ws, response) = handshake::client(&SpawnExecutor, req, stream)
-            .await
-            .map_err(|err| A2AError::internal(format!("websocket handshake failed: {err}")))?;
+        let (ws, response) = if parsed.scheme == "wss" {
+            #[cfg(feature = "tls")]
+            {
+                let tls = tls::connect(&parsed.host, stream, &options.tls).await?;
+                handshake::client(&SpawnExecutor, req, tls)
+                    .await
+                    .map_err(|err| {
+                        A2AError::internal(format!("websocket handshake failed: {err}"))
+                    })?
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = (stream, req);
+                return Err(A2AError::internal(
+                    "wss:// requires the `tls` feature of a2a-websocket to be enabled",
+                ));
+            }
+        } else {
+            handshake::client(&SpawnExecutor, req, stream)
+                .await
+                .map_err(|err| A2AError::internal(format!("websocket handshake failed: {err}")))?
+        };
 
         if !response_subprotocol_matches(&response) {
-            return Err(A2AError::internal(
-                "server did not negotiate the 'a2a.v1' sub-protocol",
-            ));
+            return Err(A2AError::internal(format!(
+                "server did not negotiate the '{SUBPROTOCOL}' sub-protocol"
+            )));
         }
 
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
@@ -184,9 +396,34 @@ impl WebSocketTransport {
             pending: pending.clone(),
         });
 
-        tokio::spawn(run_connection(ws, outbound_rx, pending));
+        // The read loop holds a weak reference so that dropping the transport
+        // still closes the outbound channel and lets the loop exit.
+        tokio::spawn(run_connection(
+            ws,
+            outbound_rx,
+            pending,
+            Arc::downgrade(&inner),
+            options.reauth,
+        ));
 
         Ok(WebSocketTransport { inner })
+    }
+
+    /// Refresh connection credentials in-band via the optional `Authenticate`
+    /// method (spec Section 9.3.3). Returns `UnsupportedOperationError` if the
+    /// server does not support in-band refresh.
+    pub async fn authenticate(
+        &self,
+        scheme: impl Into<String>,
+        credentials: impl Into<String>,
+    ) -> Result<(), A2AError> {
+        let params = serde_json::json!({
+            "scheme": scheme.into(),
+            "credentials": credentials.into(),
+        });
+        self.call_unary_raw(methods::AUTHENTICATE, &ServiceParams::new(), params)
+            .await
+            .map(|_| ())
     }
 
     async fn call_unary<Req, Resp>(
@@ -225,28 +462,9 @@ impl WebSocketTransport {
         params: &ServiceParams,
         request_params: Value,
     ) -> Result<Value, A2AError> {
-        let id = uuid::Uuid::now_v7().to_string();
-        let envelope = WsRequestEnvelope {
-            id: id.clone(),
-            method: Some(method.to_string()),
-            params: Some(request_params),
-            service_params: service_params_to_envelope(params),
-            cancel_stream: None,
-        };
-
-        let receiver = self.inner.register_unary(&id)?;
         self.inner
-            .send_outbound(OutboundClient::Frame(
-                serde_json::to_string(&envelope).map_err(|err| {
-                    A2AError::internal(format!("failed to serialize envelope: {err}"))
-                })?,
-            ))
-            .await?;
-
-        match receiver.await {
-            Ok(result) => result,
-            Err(_) => Err(connection_closed_error(&self.inner.pending)),
-        }
+            .call_unary_raw(method, params, request_params)
+            .await
     }
 
     async fn call_streaming<Req>(
@@ -262,15 +480,16 @@ impl WebSocketTransport {
             A2AError::internal(format!("failed to serialize request as ProtoJSON: {err}"))
         })?;
         let id = uuid::Uuid::now_v7().to_string();
+        let key = id_key_of(&id);
         let envelope = WsRequestEnvelope {
-            id: id.clone(),
+            id: Some(JsonRpcId::String(id.clone())),
             method: Some(method.to_string()),
             params: Some(payload),
             service_params: service_params_to_envelope(params),
-            cancel_stream: None,
+            ..Default::default()
         };
 
-        let receiver = self.inner.register_streaming(&id)?;
+        let receiver = self.inner.register_streaming(&key)?;
         self.inner
             .send_outbound(OutboundClient::Frame(
                 serde_json::to_string(&envelope).map_err(|err| {
@@ -282,7 +501,7 @@ impl WebSocketTransport {
         let stream = StreamingResponse {
             receiver,
             inner: self.inner.clone(),
-            id: id.clone(),
+            id,
             cancel_sent: false,
             terminated: false,
         };
@@ -349,11 +568,12 @@ impl Stream for StreamingResponse {
 
 impl Drop for StreamingResponse {
     fn drop(&mut self) {
+        let key = id_key_of(&self.id);
         if !self.cancel_sent && !self.terminated {
             self.cancel_sent = true;
-            self.inner.deregister_streaming(&self.id);
+            self.inner.deregister_streaming(&key);
             let envelope = WsRequestEnvelope {
-                id: self.id.clone(),
+                id: Some(JsonRpcId::String(self.id.clone())),
                 cancel_stream: Some(true),
                 ..Default::default()
             };
@@ -361,7 +581,7 @@ impl Drop for StreamingResponse {
                 let _ = self.inner.try_send_outbound(OutboundClient::Frame(text));
             }
         } else {
-            self.inner.deregister_streaming(&self.id);
+            self.inner.deregister_streaming(&key);
         }
     }
 }
@@ -388,12 +608,7 @@ struct ParsedEndpoint {
 fn parse_endpoint(endpoint: &str) -> Result<ParsedEndpoint, A2AError> {
     let (scheme, rest) = match endpoint.split_once("://") {
         Some(("ws", rest)) => ("ws".to_string(), rest),
-        Some(("wss", _)) => {
-            return Err(A2AError::internal(
-                "wss:// endpoints are not supported by this build of a2a-websocket; \
-                 use ws:// or wrap the connection with TLS upstream",
-            ));
-        }
+        Some(("wss", rest)) => ("wss".to_string(), rest),
         Some((scheme, _)) => {
             return Err(A2AError::internal(format!(
                 "unsupported scheme '{scheme}'; expected ws:// or wss://"
@@ -444,11 +659,17 @@ async fn run_connection(
     mut ws: fastwebsockets::WebSocket<TokioIo<Upgraded>>,
     mut outbound_rx: mpsc::Receiver<OutboundClient>,
     pending: Arc<Mutex<Pending>>,
+    inner: Weak<ConnectionInner>,
+    reauth: Option<ReauthPolicy>,
 ) {
     ws.set_max_message_size(DEFAULT_MAX_FRAME_BYTES);
     ws.set_auto_close(true);
     ws.set_auto_pong(true);
     let mut ws = FragmentCollector::new(ws);
+
+    // Error reported to in-flight requests once the loop exits, refined by the
+    // server's Close code when one is received.
+    let mut close_error = A2AError::internal("websocket connection closed");
 
     loop {
         tokio::select! {
@@ -481,15 +702,23 @@ async fn run_connection(
             incoming = ws.read_frame() => {
                 match incoming {
                     Ok(frame) => match frame.opcode {
-                        OpCode::Close => break,
+                        OpCode::Close => {
+                            close_error = close_error_for(&frame.payload);
+                            break;
+                        }
                         OpCode::Text => {
-                            handle_incoming_text(&frame.payload, &pending);
+                            handle_incoming_text(&frame.payload, &pending, &inner, &reauth);
                         }
                         OpCode::Binary => {
-                            // Servers should not send binary frames in this binding.
                             tracing::debug!(
                                 "received unexpected binary frame from server; closing"
                             );
+                            let _ = ws
+                                .write_frame(Frame::close(
+                                    close_codes::UNSUPPORTED_DATA,
+                                    b"binary frames are reserved for future use",
+                                ))
+                                .await;
                             break;
                         }
                         _ => {}
@@ -505,10 +734,103 @@ async fn run_connection(
     }
 
     let mut pending = pending.lock();
-    pending.fail_all(A2AError::internal("websocket connection closed"));
+    pending.fail_all(close_error);
 }
 
-fn handle_incoming_text(payload: &[u8], pending: &Arc<Mutex<Pending>>) {
+/// Translate a Close frame into the error surfaced to in-flight requests, so an
+/// authentication close is distinguishable from an ordinary disconnect.
+fn close_error_for(payload: &[u8]) -> A2AError {
+    let Some(code) = payload
+        .get(..2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+    else {
+        return A2AError::internal("websocket connection closed");
+    };
+    match code {
+        close_codes::AUTHENTICATION_REQUIRED => A2AError::new(
+            SERVER_ERROR_CODE,
+            "connection closed with 4001: reauthentication required, reconnect with fresh credentials",
+        ),
+        close_codes::POLICY_VIOLATION => A2AError::new(
+            SERVER_ERROR_CODE,
+            "connection closed with 1008: policy violation (for example a rate limit)",
+        ),
+        close_codes::MESSAGE_TOO_BIG => A2AError::new(
+            SERVER_ERROR_CODE,
+            "connection closed with 1009: message exceeded the server's maximum size",
+        ),
+        close_codes::VERSION_NOT_SUPPORTED => A2AError::new(
+            SERVER_ERROR_CODE,
+            "connection closed with 4002: the requested A2A protocol version is not supported",
+        ),
+        close_codes::NORMAL_CLOSURE => A2AError::internal("websocket connection closed"),
+        other => A2AError::internal(format!("websocket connection closed with code {other}")),
+    }
+}
+
+/// Act on a `ReauthenticationRequired` control frame per the configured policy
+/// (spec Section 9.3.2). The work is spawned because the read loop must keep
+/// running to receive the `Authenticate` response.
+fn handle_reauth_required(
+    envelope: &WsResponseEnvelope,
+    inner: &Weak<ConnectionInner>,
+    reauth: &Option<ReauthPolicy>,
+) {
+    let request = ReauthRequired {
+        reason: envelope.reason.clone(),
+        retry_after_ms: envelope.retry_after_ms,
+    };
+
+    match reauth {
+        Some(ReauthPolicy::Notify(callback)) => {
+            let callback = callback.clone();
+            tokio::spawn(async move { callback(request) });
+        }
+        Some(ReauthPolicy::RefreshInBand(provider)) => {
+            let provider = provider.clone();
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                let credentials = match provider.fresh_credentials().await {
+                    Ok(credentials) => credentials,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err.message,
+                            "credential provider failed; the server will close this connection"
+                        );
+                        return;
+                    }
+                };
+                let Some(inner) = inner.upgrade() else { return };
+                let params = serde_json::json!({
+                    "scheme": credentials.scheme,
+                    "credentials": credentials.credentials,
+                });
+                match inner
+                    .call_unary_raw(methods::AUTHENTICATE, &ServiceParams::new(), params)
+                    .await
+                {
+                    Ok(_) => tracing::debug!("refreshed connection credentials in-band"),
+                    Err(err) => tracing::warn!(
+                        error = %err.message,
+                        "in-band credential refresh failed; reconnect with fresh credentials"
+                    ),
+                }
+            });
+        }
+        None => tracing::warn!(
+            reason = request.reason.as_deref().unwrap_or_default(),
+            "server requested reauthentication but no ReauthPolicy is configured; \
+             set ConnectOptions::on_reauth_required or ::with_credential_provider"
+        ),
+    }
+}
+
+fn handle_incoming_text(
+    payload: &[u8],
+    pending: &Arc<Mutex<Pending>>,
+    inner: &Weak<ConnectionInner>,
+    reauth: &Option<ReauthPolicy>,
+) {
     let envelope: WsResponseEnvelope = match serde_json::from_slice(payload) {
         Ok(env) => env,
         Err(err) => {
@@ -517,52 +839,58 @@ fn handle_incoming_text(payload: &[u8], pending: &Arc<Mutex<Pending>>) {
         }
     };
 
+    // Server-originated control frames (spec Section 9.3.2) carry no id.
+    if let Some(control) = envelope.control.as_deref() {
+        if control == CONTROL_REAUTH_REQUIRED {
+            handle_reauth_required(&envelope, inner, reauth);
+        } else {
+            tracing::debug!(control, "received unknown server control frame");
+        }
+        return;
+    }
+
     let Some(id) = envelope.id.clone() else {
-        // Server emitted an error with id=null; nothing we can route to.
         if let Some(error) = envelope.error {
             tracing::warn!(error = %error.message, "received unrouted server error");
         }
         return;
     };
+    let key = id_key(&id);
 
     if let Some(error) = envelope.error {
-        let a2a_error = ws_error_to_a2a_error(&error);
+        let a2a_error = jsonrpc_error_to_a2a(&error);
         let mut pending = pending.lock();
-        if let Some(tx) = pending.unary.remove(&id) {
+        if let Some(tx) = pending.unary.remove(&key) {
             let _ = tx.send(Err(a2a_error));
-        } else if let Some(tx) = pending.streaming.remove(&id) {
+        } else if let Some(tx) = pending.streaming.remove(&key) {
             let _ = tx.send(Err(a2a_error));
-        }
-        return;
-    }
-
-    if let Some(value) = envelope.event {
-        let pending = pending.lock();
-        if let Some(tx) = pending.streaming.get(&id) {
-            match protojson_conv::from_value::<StreamResponse>(value) {
-                Ok(sr) => {
-                    let _ = tx.send(Ok(sr));
-                }
-                Err(err) => {
-                    let _ = tx.send(Err(A2AError::internal(format!(
-                        "failed to deserialize event: {err}"
-                    ))));
-                }
-            }
         }
         return;
     }
 
     if envelope.stream_end.unwrap_or(false) {
         let mut pending = pending.lock();
-        pending.streaming.remove(&id);
+        pending.streaming.remove(&key);
         return;
     }
 
+    // A `result` frame is either a unary response or a single streaming chunk;
+    // the registry the id lives in disambiguates (spec Section 3.4).
     if let Some(value) = envelope.result {
         let mut pending = pending.lock();
-        if let Some(tx) = pending.unary.remove(&id) {
+        if let Some(tx) = pending.unary.remove(&key) {
             let _ = tx.send(Ok(value));
+        } else if let Some(tx) = pending.streaming.get(&key) {
+            match protojson_conv::from_value::<StreamResponse>(value) {
+                Ok(sr) => {
+                    let _ = tx.send(Ok(sr));
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(A2AError::internal(format!(
+                        "failed to deserialize streaming result: {err}"
+                    ))));
+                }
+            }
         }
     }
 }
@@ -689,10 +1017,6 @@ impl TransportFactory for WebSocketTransportFactory {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Hyper executor adapter (binds hyper's executor to the tokio runtime).
-// ---------------------------------------------------------------------------
-
 struct SpawnExecutor;
 
 impl<Fut> hyper::rt::Executor<Fut> for SpawnExecutor
@@ -705,9 +1029,169 @@ where
     }
 }
 
+/// `wss://` (TLS) support, built on rustls with the `ring` crypto provider.
+#[cfg(feature = "tls")]
+mod tls {
+    use std::sync::Arc;
+
+    use a2a::A2AError;
+    use rustls::pki_types::{CertificateDer, ServerName};
+    use tokio::net::TcpStream;
+    use tokio_rustls::{TlsConnector, client::TlsStream};
+
+    use super::TlsOptions;
+
+    /// Establish a TLS session over an existing TCP stream, validating the
+    /// server certificate against the configured trust anchors.
+    pub(super) async fn connect(
+        host: &str,
+        stream: TcpStream,
+        options: &TlsOptions,
+    ) -> Result<TlsStream<TcpStream>, A2AError> {
+        let config = build_client_config(options)?;
+        let connector = TlsConnector::from(Arc::new(config));
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|_| A2AError::internal(format!("invalid TLS server name: {host}")))?;
+        connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|err| A2AError::internal(format!("TLS handshake failed: {err}")))
+    }
+
+    pub(super) fn build_client_config(
+        options: &TlsOptions,
+    ) -> Result<rustls::ClientConfig, A2AError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|err| A2AError::internal(format!("failed to configure TLS: {err}")))?;
+
+        if options.danger_accept_invalid_certs {
+            tracing::warn!(
+                "TLS certificate verification is DISABLED (danger_accept_invalid_certs); \
+                 never enable this outside of tests"
+            );
+            return Ok(builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(danger::NoVerification::new(provider)))
+                .with_no_client_auth());
+        }
+
+        let mut roots = rustls::RootCertStore::empty();
+        let native = rustls_native_certs::load_native_certs();
+        for cert in native.certs {
+            // Skip individual malformed platform certs rather than failing hard.
+            let _ = roots.add(cert);
+        }
+        if roots.is_empty() {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+        for cert in parse_pem_certs(&options.extra_root_certs_pem)? {
+            roots
+                .add(cert)
+                .map_err(|err| A2AError::internal(format!("invalid root certificate: {err}")))?;
+        }
+
+        Ok(builder.with_root_certificates(roots).with_no_client_auth())
+    }
+
+    fn parse_pem_certs(pems: &[Vec<u8>]) -> Result<Vec<CertificateDer<'static>>, A2AError> {
+        let mut out = Vec::new();
+        for pem in pems {
+            let mut reader = std::io::BufReader::new(pem.as_slice());
+            for item in rustls_pemfile::certs(&mut reader) {
+                let cert = item.map_err(|err| {
+                    A2AError::internal(format!("failed to parse PEM certificate: {err}"))
+                })?;
+                out.push(cert);
+            }
+        }
+        Ok(out)
+    }
+
+    mod danger {
+        use std::sync::Arc;
+
+        use rustls::client::danger::{
+            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+        };
+        use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+
+        /// A verifier that accepts any certificate. Signatures are still checked
+        /// against the crypto provider, but the certificate chain and hostname
+        /// are NOT validated. Testing only.
+        #[derive(Debug)]
+        pub(super) struct NoVerification(Arc<CryptoProvider>);
+
+        impl NoVerification {
+            pub(super) fn new(provider: Arc<CryptoProvider>) -> Self {
+                Self(provider)
+            }
+        }
+
+        impl ServerCertVerifier for NoVerification {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, Error> {
+                verify_tls12_signature(
+                    message,
+                    cert,
+                    dss,
+                    &self.0.signature_verification_algorithms,
+                )
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, Error> {
+                verify_tls13_signature(
+                    message,
+                    cert,
+                    dss,
+                    &self.0.signature_verification_algorithms,
+                )
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                self.0.signature_verification_algorithms.supported_schemes()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Route a response envelope through the read loop's dispatcher, without a
+    /// live connection or reauthentication policy.
+    fn dispatch(envelope: &WsResponseEnvelope, pending: &Arc<Mutex<Pending>>) {
+        handle_incoming_text(
+            &serde_json::to_vec(envelope).unwrap(),
+            pending,
+            &Weak::new(),
+            &None,
+        );
+    }
 
     #[test]
     fn parse_endpoint_accepts_ws_with_explicit_port_and_path() {
@@ -724,13 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_endpoint_uses_default_path_when_missing() {
-        let parsed = parse_endpoint("ws://example.com:9000").unwrap();
-        assert_eq!(parsed.path, "/");
-    }
-
-    #[test]
-    fn parse_endpoint_uses_default_port_when_missing() {
+    fn parse_endpoint_uses_default_path_and_port_when_missing() {
         let parsed = parse_endpoint("ws://example.com").unwrap();
         assert_eq!(parsed.port, 80);
         assert_eq!(parsed.path, "/");
@@ -746,105 +1224,50 @@ mod tests {
     }
 
     #[test]
-    fn parse_endpoint_rejects_wss_in_this_build() {
-        let err = parse_endpoint("wss://example.com").unwrap_err();
-        assert!(err.message.contains("wss://"));
+    fn parse_endpoint_accepts_wss_with_default_port() {
+        let parsed = parse_endpoint("wss://example.com/a2a/ws").unwrap();
+        assert_eq!(parsed.scheme, "wss");
+        assert_eq!(parsed.host, "example.com");
+        assert_eq!(parsed.port, 443);
+        assert_eq!(parsed.path, "/a2a/ws");
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_client_config_builds_with_default_roots() {
+        let cfg = super::tls::build_client_config(&TlsOptions::default());
+        assert!(cfg.is_ok(), "default TLS config should build");
     }
 
     #[test]
-    fn parse_endpoint_rejects_unknown_scheme() {
-        let err = parse_endpoint("http://example.com").unwrap_err();
-        assert!(err.message.contains("unsupported scheme"));
-    }
-
-    #[test]
-    fn parse_endpoint_rejects_empty_host() {
-        let err = parse_endpoint("ws:///path").unwrap_err();
-        assert!(err.message.contains("missing a host"));
-    }
-
-    #[test]
-    fn parse_endpoint_rejects_non_numeric_port() {
-        let err = parse_endpoint("ws://example.com:not-a-port").unwrap_err();
-        assert!(err.message.contains("invalid port"));
-    }
-
-    #[test]
-    fn default_port_returns_443_for_wss_and_80_otherwise() {
-        assert_eq!(default_port("ws"), 80);
-        assert_eq!(default_port("wss"), 443);
-        assert_eq!(default_port("anything-else"), 80);
-    }
-
-    #[test]
-    fn uses_default_port_recognizes_default_combinations() {
-        assert!(uses_default_port("ws", 80));
-        assert!(uses_default_port("wss", 443));
-        assert!(!uses_default_port("ws", 9000));
-    }
-
-    #[tokio::test]
-    async fn connect_with_timeout_returns_successful_connection_result() {
-        let result = connect_with_timeout(
-            futures::future::ready(Ok::<_, std::io::Error>(())),
-            Duration::from_secs(1),
-            "example.com",
-            80,
-        )
-        .await;
-
-        assert_eq!(result.unwrap(), ());
-    }
-
-    #[tokio::test]
-    async fn connect_with_timeout_maps_connection_errors() {
-        let result = connect_with_timeout(
-            futures::future::ready(Err::<(), _>(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                "refused",
-            ))),
-            Duration::from_secs(1),
-            "example.com",
-            443,
-        )
-        .await;
-
-        let err = result.unwrap_err();
-        assert_eq!(err.code, error_code::INTERNAL_ERROR);
-        assert!(err.message.contains("failed to connect to example.com:443"));
-        assert!(err.message.contains("refused"));
-    }
-
-    #[tokio::test]
-    async fn connect_with_timeout_fails_when_connection_attempt_hangs() {
-        let result = connect_with_timeout(
-            futures::future::pending::<Result<(), std::io::Error>>(),
-            Duration::from_millis(0),
-            "example.com",
-            80,
-        )
-        .await;
-
-        let err = result.unwrap_err();
-        assert_eq!(err.code, error_code::INTERNAL_ERROR);
+    fn parse_endpoint_rejects_unknown_scheme_and_empty_host() {
         assert!(
-            err.message
-                .contains("timed out connecting to example.com:80")
+            parse_endpoint("http://example.com")
+                .unwrap_err()
+                .message
+                .contains("unsupported scheme")
+        );
+        assert!(
+            parse_endpoint("ws:///path")
+                .unwrap_err()
+                .message
+                .contains("missing a host")
         );
     }
 
     #[test]
-    fn response_subprotocol_matches_recognises_a2a_v1() {
-        let response = http::Response::builder()
-            .status(101)
-            .header("Sec-WebSocket-Protocol", "a2a.v1")
-            .body(())
-            .unwrap();
-        assert!(response_subprotocol_matches(&response));
+    fn connect_options_bearer_token_builds_authorization_header() {
+        let opts = ConnectOptions::with_bearer_token("tok-123");
+        assert_eq!(opts.headers.len(), 1);
+        assert_eq!(opts.headers[0].0, "Authorization");
+        assert_eq!(opts.headers[0].1, "Bearer tok-123");
+    }
 
+    #[test]
+    fn response_subprotocol_matches_recognises_negotiated_protocol() {
         let response = http::Response::builder()
             .status(101)
-            .header("Sec-WebSocket-Protocol", "foo, A2A.V1, bar")
+            .header("Sec-WebSocket-Protocol", SUBPROTOCOL)
             .body(())
             .unwrap();
         assert!(response_subprotocol_matches(&response));
@@ -876,422 +1299,10 @@ mod tests {
 
         pending.fail_all(A2AError::internal("closed"));
 
-        let unary = futures::executor::block_on(urx).unwrap();
-        assert!(unary.is_err());
-
-        let stream_item = srx.try_recv().unwrap();
-        assert!(stream_item.is_err());
-
+        assert!(futures::executor::block_on(urx).unwrap().is_err());
+        assert!(srx.try_recv().unwrap().is_err());
         assert!(pending.closed);
-        assert_eq!(
-            pending.close_error.as_ref().unwrap().code,
-            error_code::INTERNAL_ERROR
-        );
     }
-
-    #[test]
-    fn pending_register_after_close_fails() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        pending.lock().fail_all(A2AError::internal("dropped"));
-
-        let (outbound, _outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
-        let inner = ConnectionInner {
-            outbound,
-            pending: pending.clone(),
-        };
-
-        let unary_err = inner.register_unary("x").unwrap_err();
-        assert_eq!(unary_err.code, error_code::INTERNAL_ERROR);
-
-        let streaming_err = inner.register_streaming("y").unwrap_err();
-        assert_eq!(streaming_err.code, error_code::INTERNAL_ERROR);
-    }
-
-    #[test]
-    fn connection_closed_error_uses_default_when_no_close_error_is_set() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let err = connection_closed_error(&pending);
-        assert_eq!(err.code, error_code::INTERNAL_ERROR);
-        assert_eq!(err.message, "websocket connection closed");
-    }
-
-    #[test]
-    fn connection_closed_error_preserves_recorded_close_error() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        pending
-            .lock()
-            .fail_all(A2AError::invalid_request("bad close"));
-        let err = connection_closed_error(&pending);
-        assert_eq!(err.code, error_code::INVALID_REQUEST);
-        assert_eq!(err.message, "bad close");
-    }
-
-    #[tokio::test]
-    async fn connection_inner_send_outbound_succeeds_while_receiver_is_open() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (outbound, mut outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
-        let inner = ConnectionInner { outbound, pending };
-
-        inner
-            .send_outbound(OutboundClient::Frame("{}".into()))
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            outbound_rx.try_recv(),
-            Ok(OutboundClient::Frame(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn connection_inner_send_outbound_returns_close_error_when_receiver_is_dropped() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        pending.lock().close_error = Some(A2AError::internal("closed earlier"));
-        let (outbound, outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
-        drop(outbound_rx);
-        let inner = ConnectionInner { outbound, pending };
-
-        let err = inner
-            .send_outbound(OutboundClient::Close)
-            .await
-            .unwrap_err();
-        assert_eq!(err.message, "closed earlier");
-    }
-
-    #[test]
-    fn connection_inner_try_send_outbound_returns_error_when_buffer_is_full() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (outbound, _outbound_rx) = mpsc::channel::<OutboundClient>(1);
-        let inner = ConnectionInner { outbound, pending };
-
-        inner
-            .try_send_outbound(OutboundClient::Frame("one".into()))
-            .unwrap();
-        let err = inner
-            .try_send_outbound(OutboundClient::Frame("two".into()))
-            .unwrap_err();
-
-        assert_eq!(err.code, error_code::INTERNAL_ERROR);
-        assert_eq!(err.message, "websocket connection closed");
-    }
-
-    #[test]
-    fn register_and_deregister_streaming_updates_pending_map() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (outbound, _outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
-        let inner = ConnectionInner {
-            outbound,
-            pending: pending.clone(),
-        };
-
-        let _rx = inner.register_streaming("stream-1").unwrap();
-        assert!(pending.lock().streaming.contains_key("stream-1"));
-
-        inner.deregister_streaming("stream-1");
-        assert!(!pending.lock().streaming.contains_key("stream-1"));
-    }
-
-    #[tokio::test]
-    async fn connection_inner_close_sends_close_message() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (outbound, mut outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
-        let inner = ConnectionInner { outbound, pending };
-
-        inner.close().await;
-
-        assert!(matches!(outbound_rx.try_recv(), Ok(OutboundClient::Close)));
-    }
-
-    #[test]
-    fn streaming_response_drop_sends_cancel_when_not_terminated() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (outbound, mut outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
-        let inner = Arc::new(ConnectionInner {
-            outbound,
-            pending: pending.clone(),
-        });
-        let (tx, receiver) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        pending.lock().streaming.insert("s1".into(), tx);
-
-        let stream = StreamingResponse {
-            receiver,
-            inner,
-            id: "s1".into(),
-            cancel_sent: false,
-            terminated: false,
-        };
-        drop(stream);
-
-        assert!(!pending.lock().streaming.contains_key("s1"));
-        match outbound_rx.try_recv().unwrap() {
-            OutboundClient::Frame(text) => {
-                let envelope: WsRequestEnvelope = serde_json::from_str(&text).unwrap();
-                assert_eq!(envelope.id, "s1");
-                assert_eq!(envelope.cancel_stream, Some(true));
-            }
-            OutboundClient::Close => panic!("expected cancel frame"),
-        }
-    }
-
-    #[test]
-    fn streaming_response_drop_does_not_cancel_after_termination() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (outbound, mut outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
-        let inner = Arc::new(ConnectionInner { outbound, pending });
-        let (_tx, receiver) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-
-        let stream = StreamingResponse {
-            receiver,
-            inner,
-            id: "s1".into(),
-            cancel_sent: false,
-            terminated: true,
-        };
-        drop(stream);
-
-        assert!(outbound_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn call_unary_raw_sends_envelope_and_routes_result() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (outbound, mut outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
-        let transport = WebSocketTransport {
-            inner: Arc::new(ConnectionInner {
-                outbound,
-                pending: pending.clone(),
-            }),
-        };
-        let params = HashMap::from([(
-            "x-trace".to_string(),
-            vec!["a".to_string(), "b".to_string()],
-        )]);
-
-        let task = tokio::spawn(async move {
-            transport
-                .call_unary_raw(methods::GET_TASK, &params, serde_json::json!({"id": "t1"}))
-                .await
-        });
-
-        let envelope = match outbound_rx.recv().await.unwrap() {
-            OutboundClient::Frame(text) => {
-                serde_json::from_str::<WsRequestEnvelope>(&text).unwrap()
-            }
-            OutboundClient::Close => panic!("expected request frame"),
-        };
-        assert_eq!(envelope.method.as_deref(), Some(methods::GET_TASK));
-        assert_eq!(envelope.params.unwrap()["id"], "t1");
-        assert_eq!(
-            envelope.service_params.unwrap().get("x-trace").unwrap(),
-            "a, b"
-        );
-
-        let tx = pending.lock().unary.remove(&envelope.id).unwrap();
-        tx.send(Ok(serde_json::json!({"ok": true}))).unwrap();
-
-        let value = task.await.unwrap().unwrap();
-        assert_eq!(value["ok"], true);
-    }
-
-    #[test]
-    fn handle_incoming_text_dispatches_unary_result() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (tx, rx) = oneshot::channel::<Result<Value, A2AError>>();
-        pending.lock().unary.insert("req-1".into(), tx);
-
-        let response = WsResponseEnvelope::result("req-1", serde_json::json!({"ok": 1}));
-        let json = serde_json::to_vec(&response).unwrap();
-        handle_incoming_text(&json, &pending);
-
-        let value = futures::executor::block_on(rx).unwrap().unwrap();
-        assert_eq!(value["ok"], 1);
-        assert!(pending.lock().unary.is_empty());
-    }
-
-    #[test]
-    fn handle_incoming_text_dispatches_unary_error() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (tx, rx) = oneshot::channel::<Result<Value, A2AError>>();
-        pending.lock().unary.insert("req-1".into(), tx);
-
-        let response = WsResponseEnvelope::error(
-            Some("req-1".into()),
-            crate::common::WsErrorObject {
-                error_type: crate::common::error_types::TASK_NOT_FOUND.to_string(),
-                message: "missing".into(),
-                details: None,
-            },
-        );
-        let json = serde_json::to_vec(&response).unwrap();
-        handle_incoming_text(&json, &pending);
-
-        let err = futures::executor::block_on(rx).unwrap().unwrap_err();
-        assert_eq!(err.code, error_code::TASK_NOT_FOUND);
-        assert_eq!(err.message, "missing");
-    }
-
-    #[test]
-    fn handle_incoming_text_dispatches_streaming_error_and_removes_sink() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (tx, mut rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        pending.lock().streaming.insert("req-2".into(), tx);
-
-        let response = WsResponseEnvelope::error(
-            Some("req-2".into()),
-            crate::common::WsErrorObject {
-                error_type: crate::common::error_types::INVALID_PARAMS.to_string(),
-                message: "bad params".into(),
-                details: None,
-            },
-        );
-        let json = serde_json::to_vec(&response).unwrap();
-        handle_incoming_text(&json, &pending);
-
-        let err = rx.try_recv().unwrap().unwrap_err();
-        assert_eq!(err.code, error_code::INVALID_PARAMS);
-        assert!(!pending.lock().streaming.contains_key("req-2"));
-    }
-
-    #[test]
-    fn handle_incoming_text_ignores_error_for_unknown_id() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let response = WsResponseEnvelope::error(
-            Some("unknown".into()),
-            crate::common::WsErrorObject {
-                error_type: crate::common::error_types::INTERNAL.to_string(),
-                message: "oops".into(),
-                details: None,
-            },
-        );
-        let json = serde_json::to_vec(&response).unwrap();
-
-        handle_incoming_text(&json, &pending);
-
-        assert!(pending.lock().unary.is_empty());
-        assert!(pending.lock().streaming.is_empty());
-    }
-
-    #[test]
-    fn handle_incoming_text_routes_stream_event_to_streaming_sink() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (tx, mut rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        pending.lock().streaming.insert("req-2".into(), tx);
-
-        // Build a TaskStatusUpdateEvent to embed.
-        let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-            task_id: "task-1".into(),
-            context_id: "ctx-1".into(),
-            status: TaskStatus {
-                state: TaskState::Working,
-                message: None,
-                timestamp: None,
-            },
-            metadata: None,
-        });
-        let event_value = protojson_conv::to_value(&event).unwrap();
-        let response = WsResponseEnvelope::event("req-2", event_value);
-        let json = serde_json::to_vec(&response).unwrap();
-        handle_incoming_text(&json, &pending);
-
-        let item = rx.try_recv().unwrap().unwrap();
-        match item {
-            StreamResponse::StatusUpdate(_) => {}
-            _ => panic!("expected StatusUpdate"),
-        }
-        // Streaming sink stays registered until streamEnd or error.
-        assert!(pending.lock().streaming.contains_key("req-2"));
-    }
-
-    #[test]
-    fn handle_incoming_text_routes_bad_stream_event_as_error() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (tx, mut rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        pending.lock().streaming.insert("req-2".into(), tx);
-
-        let response = WsResponseEnvelope::event("req-2", serde_json::json!({"unknown": {}}));
-        let json = serde_json::to_vec(&response).unwrap();
-        handle_incoming_text(&json, &pending);
-
-        let err = rx.try_recv().unwrap().unwrap_err();
-        assert_eq!(err.code, error_code::INTERNAL_ERROR);
-        assert!(err.message.contains("failed to deserialize event"));
-        assert!(pending.lock().streaming.contains_key("req-2"));
-    }
-
-    #[test]
-    fn handle_incoming_text_ignores_event_for_unknown_id() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let response = WsResponseEnvelope::event("missing", serde_json::json!({"unknown": {}}));
-        let json = serde_json::to_vec(&response).unwrap();
-
-        handle_incoming_text(&json, &pending);
-
-        assert!(pending.lock().streaming.is_empty());
-    }
-
-    #[test]
-    fn handle_incoming_text_stream_end_removes_streaming_sink() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (tx, _rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        pending.lock().streaming.insert("req-2".into(), tx);
-
-        let response = WsResponseEnvelope::stream_end("req-2");
-        let json = serde_json::to_vec(&response).unwrap();
-        handle_incoming_text(&json, &pending);
-
-        assert!(!pending.lock().streaming.contains_key("req-2"));
-    }
-
-    #[test]
-    fn handle_incoming_text_stream_end_unknown_id_is_noop() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let response = WsResponseEnvelope::stream_end("missing");
-        let json = serde_json::to_vec(&response).unwrap();
-
-        handle_incoming_text(&json, &pending);
-
-        assert!(pending.lock().streaming.is_empty());
-    }
-
-    #[test]
-    fn handle_incoming_text_result_for_unknown_id_is_noop() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let response = WsResponseEnvelope::result("missing", serde_json::json!({"ok": true}));
-        let json = serde_json::to_vec(&response).unwrap();
-
-        handle_incoming_text(&json, &pending);
-
-        assert!(pending.lock().unary.is_empty());
-    }
-
-    #[test]
-    fn handle_incoming_text_ignores_envelope_with_null_id() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let envelope = WsResponseEnvelope::error(
-            None,
-            crate::common::WsErrorObject {
-                error_type: crate::common::error_types::JSON_PARSE.to_string(),
-                message: "bad json".into(),
-                details: None,
-            },
-        );
-        let json = serde_json::to_vec(&envelope).unwrap();
-        // Should not panic and should not affect any sinks.
-        handle_incoming_text(&json, &pending);
-    }
-
-    #[test]
-    fn handle_incoming_text_ignores_invalid_json() {
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        // Should silently drop malformed payload.
-        handle_incoming_text(b"not json", &pending);
-    }
-
-    // ---------------------------------------------------------------------
-    // Helpers for exercising the `Transport` trait methods without a real
-    // websocket connection: we mock `ConnectionInner` and a background task
-    // that listens for outbound envelopes and injects pre-canned results.
-    // ---------------------------------------------------------------------
 
     fn make_mock_transport() -> (
         WebSocketTransport,
@@ -1309,286 +1320,79 @@ mod tests {
         (transport, pending, outbound_rx)
     }
 
-    async fn respond_unary(
-        outbound_rx: &mut mpsc::Receiver<OutboundClient>,
-        pending: &Arc<Mutex<Pending>>,
-        result: Value,
-    ) -> WsRequestEnvelope {
-        let envelope = match outbound_rx.recv().await.unwrap() {
+    #[tokio::test]
+    async fn call_unary_raw_sends_jsonrpc_envelope_and_routes_result() {
+        let (transport, pending, mut outbound_rx) = make_mock_transport();
+        let params = HashMap::from([(
+            "x-trace".to_string(),
+            vec!["a".to_string(), "b".to_string()],
+        )]);
+
+        let task = tokio::spawn(async move {
+            transport
+                .call_unary_raw(methods::GET_TASK, &params, serde_json::json!({"id": "t1"}))
+                .await
+        });
+
+        let (envelope, key) = match outbound_rx.recv().await.unwrap() {
             OutboundClient::Frame(text) => {
-                serde_json::from_str::<WsRequestEnvelope>(&text).unwrap()
+                let env: WsRequestEnvelope = serde_json::from_str(&text).unwrap();
+                let key = id_key(env.id.as_ref().unwrap());
+                (env, key)
             }
             OutboundClient::Close => panic!("expected request frame"),
         };
-        let tx = pending.lock().unary.remove(&envelope.id).unwrap();
-        tx.send(Ok(result)).unwrap();
-        envelope
-    }
-
-    #[tokio::test]
-    async fn transport_send_message_dispatches_send_message_method() {
-        let (transport, pending, mut outbound_rx) = make_mock_transport();
-        let task_resp = SendMessageResponse::Task(Task {
-            id: "t1".into(),
-            context_id: "ctx".into(),
-            status: TaskStatus {
-                state: TaskState::Completed,
-                message: None,
-                timestamp: None,
-            },
-            artifacts: None,
-            history: None,
-            metadata: None,
-        });
-        let result_value = protojson_conv::to_value(&task_resp).unwrap();
-
-        let handle = tokio::spawn(async move {
-            let req = SendMessageRequest {
-                message: Message::new(Role::User, vec![Part::text("hi")]),
-                configuration: None,
-                metadata: None,
-                tenant: None,
-            };
-            transport
-                .send_message(&ServiceParams::new(), &req)
-                .await
-                .unwrap()
-        });
-
-        let envelope = respond_unary(&mut outbound_rx, &pending, result_value).await;
-        assert_eq!(envelope.method.as_deref(), Some(methods::SEND_MESSAGE));
-        let resp = handle.await.unwrap();
-        match resp {
-            SendMessageResponse::Task(t) => assert_eq!(t.id, "t1"),
-            _ => panic!("expected Task"),
-        }
-    }
-
-    #[tokio::test]
-    async fn transport_list_tasks_dispatches_list_tasks_method() {
-        let (transport, pending, mut outbound_rx) = make_mock_transport();
-        let listed = ListTasksResponse {
-            tasks: vec![],
-            next_page_token: "".into(),
-            page_size: 0,
-            total_size: 0,
-        };
-        let result_value = protojson_conv::to_value(&listed).unwrap();
-
-        let handle = tokio::spawn(async move {
-            let req = ListTasksRequest {
-                context_id: None,
-                status: None,
-                page_size: None,
-                page_token: None,
-                history_length: None,
-                status_timestamp_after: None,
-                include_artifacts: None,
-                tenant: None,
-            };
-            transport
-                .list_tasks(&ServiceParams::new(), &req)
-                .await
-                .unwrap()
-        });
-
-        let envelope = respond_unary(&mut outbound_rx, &pending, result_value).await;
-        assert_eq!(envelope.method.as_deref(), Some(methods::LIST_TASKS));
-        let resp = handle.await.unwrap();
-        assert_eq!(resp.total_size, 0);
-    }
-
-    #[tokio::test]
-    async fn transport_cancel_task_dispatches_cancel_task_method() {
-        let (transport, pending, mut outbound_rx) = make_mock_transport();
-        let task = Task {
-            id: "cancel".into(),
-            context_id: "ctx".into(),
-            status: TaskStatus {
-                state: TaskState::Canceled,
-                message: None,
-                timestamp: None,
-            },
-            artifacts: None,
-            history: None,
-            metadata: None,
-        };
-        let result_value = protojson_conv::to_value(&task).unwrap();
-
-        let handle = tokio::spawn(async move {
-            let req = CancelTaskRequest {
-                id: "cancel".into(),
-                metadata: None,
-                tenant: None,
-            };
-            transport
-                .cancel_task(&ServiceParams::new(), &req)
-                .await
-                .unwrap()
-        });
-
-        let envelope = respond_unary(&mut outbound_rx, &pending, result_value).await;
-        assert_eq!(envelope.method.as_deref(), Some(methods::CANCEL_TASK));
-        let resp = handle.await.unwrap();
-        assert_eq!(resp.id, "cancel");
-    }
-
-    #[tokio::test]
-    async fn transport_create_push_config_dispatches_create_push_config_method() {
-        let (transport, pending, mut outbound_rx) = make_mock_transport();
-        let cfg = TaskPushNotificationConfig {
-            url: "https://hook.example.test".into(),
-            id: Some("cfg".into()),
-            task_id: "t1".into(),
-            token: None,
-            authentication: None,
-            tenant: None,
-        };
-        let result_value = protojson_conv::to_value(&cfg).unwrap();
-
-        let handle = tokio::spawn(async move {
-            let req = TaskPushNotificationConfig {
-                url: "https://hook.example.test".into(),
-                id: Some("cfg".into()),
-                task_id: "t1".into(),
-                token: None,
-                authentication: None,
-                tenant: None,
-            };
-            transport
-                .create_push_config(&ServiceParams::new(), &req)
-                .await
-                .unwrap()
-        });
-
-        let envelope = respond_unary(&mut outbound_rx, &pending, result_value).await;
+        assert_eq!(envelope.jsonrpc, "2.0");
+        assert_eq!(envelope.method.as_deref(), Some(methods::GET_TASK));
         assert_eq!(
-            envelope.method.as_deref(),
-            Some(methods::CREATE_PUSH_CONFIG)
+            envelope.service_params.unwrap().get("x-trace").unwrap(),
+            "a, b"
         );
-        let resp = handle.await.unwrap();
-        assert_eq!(resp.task_id, "t1");
+
+        let tx = pending.lock().unary.remove(&key).unwrap();
+        tx.send(Ok(serde_json::json!({"ok": true}))).unwrap();
+
+        let value = task.await.unwrap().unwrap();
+        assert_eq!(value["ok"], true);
     }
 
-    #[tokio::test]
-    async fn transport_get_push_config_dispatches_get_push_config_method() {
-        let (transport, pending, mut outbound_rx) = make_mock_transport();
-        let cfg = TaskPushNotificationConfig {
-            url: "https://hook.example.test".into(),
-            id: Some("cfg".into()),
-            task_id: "t1".into(),
-            token: None,
-            authentication: None,
-            tenant: None,
-        };
-        let result_value = protojson_conv::to_value(&cfg).unwrap();
+    #[test]
+    fn handle_incoming_text_dispatches_unary_result_and_error() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let key = id_key_of("req-1");
+        let (tx, rx) = oneshot::channel::<Result<Value, A2AError>>();
+        pending.lock().unary.insert(key.clone(), tx);
 
-        let handle = tokio::spawn(async move {
-            let req = GetTaskPushNotificationConfigRequest {
-                task_id: "t1".into(),
-                id: "cfg".into(),
-                tenant: None,
-            };
-            transport
-                .get_push_config(&ServiceParams::new(), &req)
-                .await
-                .unwrap()
-        });
+        let response = WsResponseEnvelope::result("req-1".into(), serde_json::json!({"ok": 1}));
+        dispatch(&response, &pending);
+        assert_eq!(futures::executor::block_on(rx).unwrap().unwrap()["ok"], 1);
 
-        let envelope = respond_unary(&mut outbound_rx, &pending, result_value).await;
-        assert_eq!(envelope.method.as_deref(), Some(methods::GET_PUSH_CONFIG));
-        let resp = handle.await.unwrap();
-        assert_eq!(resp.task_id, "t1");
-    }
-
-    #[tokio::test]
-    async fn transport_list_push_configs_dispatches_list_push_configs_method() {
-        let (transport, pending, mut outbound_rx) = make_mock_transport();
-        let listed = ListTaskPushNotificationConfigsResponse {
-            configs: vec![],
-            next_page_token: None,
-        };
-        let result_value = protojson_conv::to_value(&listed).unwrap();
-
-        let handle = tokio::spawn(async move {
-            let req = ListTaskPushNotificationConfigsRequest {
-                task_id: "t1".into(),
-                page_size: None,
-                page_token: None,
-                tenant: None,
-            };
-            transport
-                .list_push_configs(&ServiceParams::new(), &req)
-                .await
-                .unwrap()
-        });
-
-        let envelope = respond_unary(&mut outbound_rx, &pending, result_value).await;
-        assert_eq!(envelope.method.as_deref(), Some(methods::LIST_PUSH_CONFIGS));
-        let resp = handle.await.unwrap();
-        assert!(resp.configs.is_empty());
-    }
-
-    #[tokio::test]
-    async fn transport_delete_push_config_dispatches_delete_push_config_method() {
-        let (transport, pending, mut outbound_rx) = make_mock_transport();
-
-        let handle = tokio::spawn(async move {
-            let req = DeleteTaskPushNotificationConfigRequest {
-                task_id: "t1".into(),
-                id: "cfg".into(),
-                tenant: None,
-            };
-            transport
-                .delete_push_config(&ServiceParams::new(), &req)
-                .await
-                .unwrap();
-        });
-
-        let envelope = respond_unary(
-            &mut outbound_rx,
-            &pending,
-            Value::Object(Default::default()),
-        )
-        .await;
-        assert_eq!(
-            envelope.method.as_deref(),
-            Some(methods::DELETE_PUSH_CONFIG)
+        // Error routing with numeric JSON-RPC code.
+        let (tx, rx) = oneshot::channel::<Result<Value, A2AError>>();
+        pending.lock().unary.insert(key, tx);
+        let err_resp = WsResponseEnvelope::error(
+            Some("req-1".into()),
+            a2a::jsonrpc::JsonRpcError {
+                code: error_code::TASK_NOT_FOUND,
+                message: "missing".into(),
+                data: None,
+            },
         );
-        handle.await.unwrap();
+        dispatch(&err_resp, &pending);
+        let err = futures::executor::block_on(rx).unwrap().unwrap_err();
+        assert_eq!(err.code, error_code::TASK_NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn transport_subscribe_to_task_dispatches_subscribe_method_and_streams_events() {
-        use futures::StreamExt as _;
-        let (transport, pending, mut outbound_rx) = make_mock_transport();
+    #[test]
+    fn handle_incoming_text_routes_stream_result_chunk() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let key = id_key_of("req-2");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
+        pending.lock().streaming.insert(key.clone(), tx);
 
-        let handle = tokio::spawn(async move {
-            let req = SubscribeToTaskRequest {
-                id: "t1".into(),
-                tenant: None,
-            };
-            let mut stream = transport
-                .subscribe_to_task(&ServiceParams::new(), &req)
-                .await
-                .unwrap();
-            let first = stream.next().await.unwrap().unwrap();
-            // Drop the stream to exercise cancel-on-drop path.
-            drop(stream);
-            first
-        });
-
-        let envelope = match outbound_rx.recv().await.unwrap() {
-            OutboundClient::Frame(text) => {
-                serde_json::from_str::<WsRequestEnvelope>(&text).unwrap()
-            }
-            OutboundClient::Close => panic!("expected request frame"),
-        };
-        assert_eq!(envelope.method.as_deref(), Some(methods::SUBSCRIBE_TO_TASK));
-        // Inject a stream event.
         let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-            task_id: "t1".into(),
-            context_id: "ctx".into(),
+            task_id: "task-1".into(),
+            context_id: "ctx-1".into(),
             status: TaskStatus {
                 state: TaskState::Working,
                 message: None,
@@ -1596,16 +1400,111 @@ mod tests {
             },
             metadata: None,
         });
-        {
-            let p = pending.lock();
-            let tx = p.streaming.get(&envelope.id).unwrap();
-            tx.send(Ok(event)).unwrap();
-        }
+        let response = WsResponseEnvelope::stream_chunk(
+            "req-2".into(),
+            protojson_conv::to_value(&event).unwrap(),
+        );
+        dispatch(&response, &pending);
 
-        let first = handle.await.unwrap();
-        match first {
-            StreamResponse::StatusUpdate(_) => {}
-            _ => panic!("expected StatusUpdate"),
+        assert!(matches!(
+            rx.try_recv().unwrap().unwrap(),
+            StreamResponse::StatusUpdate(_)
+        ));
+        // Sink stays registered until streamEnd or error.
+        assert!(pending.lock().streaming.contains_key(&key));
+
+        // streamEnd removes the sink.
+        let end = WsResponseEnvelope::stream_end("req-2".into());
+        dispatch(&end, &pending);
+        assert!(!pending.lock().streaming.contains_key(&key));
+    }
+
+    #[test]
+    fn reauth_control_frame_without_a_policy_is_ignored() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let frame = WsResponseEnvelope::reauth_required("expiring", 0);
+        dispatch(&frame, &pending);
+        assert!(pending.lock().unary.is_empty());
+        assert!(pending.lock().streaming.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reauth_control_frame_invokes_the_notify_callback() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let seen = Arc::new(Mutex::new(None::<ReauthRequired>));
+        let sink = seen.clone();
+        let policy = Some(ReauthPolicy::Notify(Arc::new(move |request| {
+            *sink.lock() = Some(request);
+        })));
+
+        let frame = WsResponseEnvelope::reauth_required("token expiring", 5_000);
+        handle_incoming_text(
+            &serde_json::to_vec(&frame).unwrap(),
+            &pending,
+            &Weak::new(),
+            &policy,
+        );
+
+        // The callback runs on a spawned task, so yield until it lands.
+        for _ in 0..100 {
+            if seen.lock().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let request = seen.lock().clone().expect("callback should have been run");
+        assert_eq!(request.reason.as_deref(), Some("token expiring"));
+        assert_eq!(request.retry_after_ms, Some(5_000));
+    }
+
+    #[test]
+    fn close_error_distinguishes_reauth_from_an_ordinary_disconnect() {
+        let reauth = close_error_for(&close_codes::AUTHENTICATION_REQUIRED.to_be_bytes());
+        assert_eq!(reauth.code, SERVER_ERROR_CODE);
+        assert!(
+            reauth.message.contains("4001"),
+            "the close code should be visible to the caller: {}",
+            reauth.message
+        );
+
+        let rate_limited = close_error_for(&close_codes::POLICY_VIOLATION.to_be_bytes());
+        assert!(rate_limited.message.contains("1008"));
+
+        // A normal closure and an empty payload are both plain disconnects.
+        assert_eq!(
+            close_error_for(&close_codes::NORMAL_CLOSURE.to_be_bytes()).message,
+            close_error_for(&[]).message
+        );
+    }
+
+    #[test]
+    fn streaming_response_drop_sends_cancel_when_not_terminated() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let (outbound, mut outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
+        let inner = Arc::new(ConnectionInner {
+            outbound,
+            pending: pending.clone(),
+        });
+        let (tx, receiver) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
+        pending.lock().streaming.insert(id_key_of("s1"), tx);
+
+        let stream = StreamingResponse {
+            receiver,
+            inner,
+            id: "s1".into(),
+            cancel_sent: false,
+            terminated: false,
+        };
+        drop(stream);
+
+        assert!(!pending.lock().streaming.contains_key(&id_key_of("s1")));
+        match outbound_rx.try_recv().unwrap() {
+            OutboundClient::Frame(text) => {
+                let envelope: WsRequestEnvelope = serde_json::from_str(&text).unwrap();
+                assert_eq!(envelope.id, Some(JsonRpcId::String("s1".into())));
+                assert_eq!(envelope.cancel_stream, Some(true));
+            }
+            OutboundClient::Close => panic!("expected cancel frame"),
         }
     }
 
@@ -1636,71 +1535,6 @@ mod tests {
             signatures: None,
         };
         let iface = AgentInterface::new("ws://127.0.0.1:1", TRANSPORT_PROTOCOL_WEBSOCKET);
-        let result = factory.create(&card, &iface).await;
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn streaming_response_poll_after_termination_returns_ready_none() {
-        use futures::task::noop_waker;
-        use std::task::{Context, Poll};
-
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (outbound, _outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
-        let inner = Arc::new(ConnectionInner { outbound, pending });
-        let (_tx, receiver) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        let mut stream = StreamingResponse {
-            receiver,
-            inner,
-            id: "s1".into(),
-            cancel_sent: true,
-            terminated: true,
-        };
-
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(matches!(
-            Pin::new(&mut stream).poll_next(&mut cx),
-            Poll::Ready(None)
-        ));
-    }
-
-    #[test]
-    fn streaming_response_marks_terminated_when_receiver_closes() {
-        use futures::task::noop_waker;
-        use std::task::{Context, Poll};
-
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let (outbound, _outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
-        let inner = Arc::new(ConnectionInner { outbound, pending });
-        let (tx, receiver) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
-        drop(tx);
-        let mut stream = StreamingResponse {
-            receiver,
-            inner,
-            id: "s1".into(),
-            cancel_sent: false,
-            terminated: false,
-        };
-
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(matches!(
-            Pin::new(&mut stream).poll_next(&mut cx),
-            Poll::Ready(None)
-        ));
-        assert!(stream.terminated);
-    }
-
-    #[test]
-    fn spawn_executor_executes_future_on_tokio_runtime() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let (tx, rx) = oneshot::channel::<u32>();
-            <SpawnExecutor as hyper::rt::Executor<_>>::execute(&SpawnExecutor, async move {
-                tx.send(7).unwrap();
-            });
-            assert_eq!(rx.await.unwrap(), 7);
-        });
+        assert!(factory.create(&card, &iface).await.is_err());
     }
 }

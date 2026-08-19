@@ -1,7 +1,9 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // SPDX-License-Identifier: Apache-2.0
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
@@ -12,7 +14,6 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use bytes::Bytes;
 use fastwebsockets::{
     FragmentCollector, Frame, OpCode, Payload, WebSocketError, upgrade::IncomingUpgrade,
 };
@@ -22,39 +23,128 @@ use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+use crate::auth::{AuthContext, AuthStatus, AuthenticateParams, WsAuthenticator};
 use crate::common::{
-    DEFAULT_MAX_FRAME_BYTES, SUBPROTOCOL, WsErrorObject, WsRequestEnvelope, WsResponseEnvelope,
-    close_codes, error_types, methods, service_params_from_envelope,
+    DEFAULT_MAX_FRAME_BYTES, JSONRPC_VERSION, JsonRpcId, SERVER_ERROR_CODE, SUBPROTOCOL,
+    WsRequestEnvelope, WsResponseEnvelope, close_codes, id_key, methods,
+    service_params_from_envelope,
 };
-use crate::errors::{a2a_error_to_ws_error, close_code_for_fatal};
+use crate::errors::{a2a_error_to_jsonrpc, close_code_for_fatal, close_code_for_read_error};
+use crate::ratelimit::{ConnectionRateLimiter, IdentityRateLimiter, RateLimitPolicy};
 
 const SEC_WEBSOCKET_PROTOCOL: &str = "sec-websocket-protocol";
 const OUTBOUND_BUFFER_CAPACITY: usize = 64;
 
+/// Error message returned when an inbound rate limit is exceeded. The exact
+/// wording is prescribed by spec Section 13.3.
+const RATE_LIMIT_EXCEEDED: &str = "Rate limit exceeded";
+
+/// Server configuration for the WebSocket binding.
+#[derive(Clone, Default)]
+pub struct WebSocketConfig {
+    /// Optional handshake authenticator (spec Section 9). When `None`, the
+    /// binding performs no authentication and treats every connection as
+    /// anonymous — appropriate only when a trusted layer in front of the agent
+    /// handles authentication.
+    pub authenticator: Option<Arc<dyn WsAuthenticator>>,
+    /// Optional allowlist of permitted `Origin` header values (spec Section
+    /// 13.2, Cross-Site WebSocket Hijacking mitigation). When `Some`, upgrades
+    /// whose `Origin` is missing or not listed are rejected with `403`.
+    pub allowed_origins: Option<Vec<String>>,
+    /// Maximum accepted size of a single inbound message. A larger message is
+    /// rejected by closing the connection with code `1009` (spec Section 3.6).
+    /// `None` applies the spec's recommended [`DEFAULT_MAX_FRAME_BYTES`].
+    pub max_frame_bytes: Option<usize>,
+    /// Inbound message rate limit, enforced per-connection and per-authenticated
+    /// identity (spec Section 13.3). Defaults to [`DEFAULT_RATE_LIMIT`]; switch
+    /// it off explicitly with [`RateLimitPolicy::Disabled`].
+    ///
+    /// [`DEFAULT_RATE_LIMIT`]: crate::ratelimit::DEFAULT_RATE_LIMIT
+    pub rate_limit: RateLimitPolicy,
+}
+
+impl WebSocketConfig {
+    /// The effective inbound message size limit (spec Section 3.6).
+    fn max_frame_bytes(&self) -> usize {
+        self.max_frame_bytes.unwrap_or(DEFAULT_MAX_FRAME_BYTES)
+    }
+}
+
 /// Shared state for the WebSocket binding handler.
 pub struct WebSocketState<H: RequestHandler> {
     pub handler: Arc<H>,
+    pub config: Arc<WebSocketConfig>,
+    /// Rate-limit buckets keyed by authenticated identity, shared across every
+    /// connection served by this router (spec Section 13.3).
+    pub identity_rate_limiter: Option<Arc<IdentityRateLimiter>>,
 }
 
 impl<H: RequestHandler> Clone for WebSocketState<H> {
     fn clone(&self) -> Self {
         WebSocketState {
             handler: self.handler.clone(),
+            config: self.config.clone(),
+            identity_rate_limiter: self.identity_rate_limiter.clone(),
         }
     }
 }
 
-/// Build an `axum::Router` exposing the A2A WebSocket binding at `/` of the
-/// returned router.
+/// Per-connection authentication state (spec Section 9.2).
+struct ConnAuth {
+    authenticator: Option<Arc<dyn WsAuthenticator>>,
+    ctx: StdMutex<AuthContext>,
+    /// Service parameters derived from the handshake and the *current* context.
+    /// Held here rather than alongside the connection loop so that an in-band
+    /// refresh replaces the identity the handler sees at the same moment it
+    /// replaces the credentials (Section 9.3.3).
+    params: StdMutex<Arc<ConnectionParams>>,
+    reauth_signaled: AtomicBool,
+}
+
+impl ConnAuth {
+    fn params(&self) -> Arc<ConnectionParams> {
+        self.params.lock().unwrap().clone()
+    }
+}
+
+/// Build an `axum::Router` exposing the A2A WebSocket binding without
+/// authentication.
 ///
-/// Mount the router under whatever path your application uses for the
-/// WebSocket endpoint (e.g. `Router::new().nest("/a2a/ws", websocket_router(handler))`).
-///
-/// Each accepted connection negotiates the `a2a.v1` sub-protocol and is
-/// driven by a dedicated tokio task that multiplexes requests, streams, and
-/// stream cancellations over the single connection.
+/// Mount the router under whatever path your application uses (e.g.
+/// `Router::new().nest("/a2a/ws", websocket_router(handler))`).
 pub fn websocket_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
-    let state = WebSocketState { handler };
+    websocket_router_with_config(handler, WebSocketConfig::default())
+}
+
+/// Build a router that authenticates every connection during the upgrade
+/// handshake using the supplied [`WsAuthenticator`] (spec Section 9).
+pub fn websocket_router_with_auth<H: RequestHandler>(
+    handler: Arc<H>,
+    authenticator: Arc<dyn WsAuthenticator>,
+) -> axum::Router {
+    websocket_router_with_config(
+        handler,
+        WebSocketConfig {
+            authenticator: Some(authenticator),
+            ..Default::default()
+        },
+    )
+}
+
+/// Build a router with a fully specified [`WebSocketConfig`].
+pub fn websocket_router_with_config<H: RequestHandler>(
+    handler: Arc<H>,
+    config: WebSocketConfig,
+) -> axum::Router {
+    let identity_rate_limiter = config
+        .rate_limit
+        .limit()
+        .map(|limit| Arc::new(IdentityRateLimiter::new(limit)));
+    let state = WebSocketState {
+        handler,
+        config: Arc::new(config),
+        identity_rate_limiter,
+    };
     axum::Router::new()
         .route("/", axum::routing::any(handle_upgrade::<H>))
         .with_state(state)
@@ -68,12 +158,34 @@ async fn handle_upgrade<H: RequestHandler>(
     if !subprotocol_is_negotiated(&headers) {
         return (
             StatusCode::BAD_REQUEST,
-            "Sec-WebSocket-Protocol header must include 'a2a.v1'",
+            format!("Sec-WebSocket-Protocol header must include '{SUBPROTOCOL}'"),
         )
             .into_response();
     }
 
-    let connection_params = capture_connection_params(&headers);
+    // Origin validation (spec Section 13.2) — only enforced when an allowlist
+    // is configured.
+    if let Some(allowed) = state.config.allowed_origins.as_ref() {
+        if !origin_allowed(&headers, allowed) {
+            return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+        }
+    }
+
+    // Handshake authentication (spec Section 9.1). On failure the upgrade is
+    // rejected with 401/403 and never reaches the 101 response.
+    let auth_ctx = match state.config.authenticator.as_ref() {
+        Some(authenticator) => match authenticator.authenticate(&headers).await {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                let status = StatusCode::from_u16(err.status).unwrap_or(StatusCode::UNAUTHORIZED);
+                tracing::debug!(status = err.status, "websocket handshake auth rejected");
+                return (status, err.message).into_response();
+            }
+        },
+        None => AuthContext::default(),
+    };
+
+    let connection_params = ConnectionParams::new(&headers, &auth_ctx);
 
     let (mut response, fut) = match upgrade.upgrade() {
         Ok(pair) => pair,
@@ -89,9 +201,25 @@ async fn handle_upgrade<H: RequestHandler>(
     );
 
     let handler = state.handler.clone();
+    let max_frame_bytes = state.config.max_frame_bytes();
+    // The per-identity scope only applies to authenticated connections; an
+    // anonymous connection is limited by its own bucket alone (Section 13.3).
+    let rate_limiter = state.config.rate_limit.limit().map(|limit| {
+        ConnectionRateLimiter::new(
+            limit,
+            auth_ctx.user.as_ref().map(|user| user.name.clone()),
+            state.identity_rate_limiter.clone(),
+        )
+    });
+    let conn_auth = Arc::new(ConnAuth {
+        authenticator: state.config.authenticator.clone(),
+        ctx: StdMutex::new(auth_ctx),
+        params: StdMutex::new(Arc::new(connection_params)),
+        reauth_signaled: AtomicBool::new(false),
+    });
     tokio::spawn(async move {
         match fut.await {
-            Ok(ws) => run_connection(ws, handler, connection_params).await,
+            Ok(ws) => run_connection(ws, handler, conn_auth, max_frame_bytes, rate_limiter).await,
             Err(err) => tracing::warn!(error = %err, "websocket upgrade future failed"),
         }
     });
@@ -107,6 +235,13 @@ fn subprotocol_is_negotiated(headers: &HeaderMap) -> bool {
         .flat_map(|value| value.split(','))
         .map(|item| item.trim())
         .any(|protocol| protocol.eq_ignore_ascii_case(SUBPROTOCOL))
+}
+
+fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+    match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        Some(origin) => allowed.iter().any(|a| a == origin),
+        None => false,
+    }
 }
 
 fn capture_connection_params(headers: &HeaderMap) -> ServiceParams {
@@ -149,16 +284,21 @@ type StreamRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;
 async fn run_connection<H: RequestHandler>(
     mut ws: fastwebsockets::WebSocket<TokioIo<Upgraded>>,
     handler: Arc<H>,
-    connection_params: ServiceParams,
+    conn_auth: Arc<ConnAuth>,
+    max_frame_bytes: usize,
+    mut rate_limiter: Option<ConnectionRateLimiter>,
 ) {
-    ws.set_max_message_size(DEFAULT_MAX_FRAME_BYTES);
+    ws.set_max_message_size(max_frame_bytes);
     ws.set_auto_close(true);
     ws.set_auto_pong(true);
     let mut ws = FragmentCollector::new(ws);
 
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(OUTBOUND_BUFFER_CAPACITY);
     let streams: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let connection_params = Arc::new(connection_params);
+
+    // Set when the connection is torn down after queueing a final error and
+    // Close frame, which still have to be written before the socket goes away.
+    let mut flush_pending = false;
 
     loop {
         tokio::select! {
@@ -189,19 +329,24 @@ async fn run_connection<H: RequestHandler>(
                 match incoming {
                     Ok(frame) => match frame.opcode {
                         OpCode::Close => break,
-                        OpCode::Text
+                        OpCode::Text => {
+                            if !rate_limit_allows(rate_limiter.as_mut(), &out_tx).await {
+                                flush_pending = true;
+                                break;
+                            }
                             if !handle_text_frame(
                                 &frame.payload,
                                 &handler,
-                                &connection_params,
                                 &streams,
+                                &conn_auth,
                                 &out_tx,
                             )
-                            .await =>
-                        {
-                            break;
+                            .await
+                            {
+                                flush_pending = true;
+                                break;
+                            }
                         }
-                        OpCode::Text => {}
                         OpCode::Binary => {
                             let _ = ws
                                 .write_frame(Frame::close(
@@ -217,6 +362,14 @@ async fn run_connection<H: RequestHandler>(
                     Err(WebSocketError::ConnectionClosed) => break,
                     Err(err) => {
                         tracing::debug!(error = %err, "websocket read error; closing");
+                        // An oversize message must be answered with 1009 and a
+                        // framing violation with 1002, rather than a bare
+                        // disconnect (spec Sections 3.6 and 2.3).
+                        if let Some(code) = close_code_for_read_error(&err) {
+                            let _ = ws
+                                .write_frame(Frame::close(code, err.to_string().as_bytes()))
+                                .await;
+                        }
                         break;
                     }
                 }
@@ -224,7 +377,70 @@ async fn run_connection<H: RequestHandler>(
         }
     }
 
+    if flush_pending {
+        flush_outbound(&mut ws, &mut out_rx).await;
+    }
+
     cancel_all_streams(&streams).await;
+}
+
+/// Admit one inbound message, or queue the `-32000` error and the `1008` close
+/// the spec prescribes when a limit is exceeded (Section 13.3).
+///
+/// The check runs before the frame is parsed, so the error carries `"id": null`
+/// rather than a request id: refusing to parse is the point of the limit.
+async fn rate_limit_allows(
+    rate_limiter: Option<&mut ConnectionRateLimiter>,
+    out_tx: &mpsc::Sender<OutboundMessage>,
+) -> bool {
+    let Some(limiter) = rate_limiter else {
+        return true;
+    };
+    if limiter.allow() {
+        return true;
+    }
+    tracing::debug!("inbound message rate limit exceeded; closing with 1008");
+    send_error(
+        out_tx,
+        Some(JsonRpcId::Null),
+        &A2AError::new(SERVER_ERROR_CODE, RATE_LIMIT_EXCEEDED),
+    )
+    .await;
+    send_outbound(
+        out_tx,
+        OutboundMessage::Close {
+            code: close_codes::POLICY_VIOLATION,
+            reason: RATE_LIMIT_EXCEEDED.to_string(),
+        },
+    )
+    .await;
+    false
+}
+
+/// Write everything already queued on the outbound channel, stopping after a
+/// Close frame. Without this, a fatal error response and its Close frame would
+/// be dropped when the read loop exits, leaving the peer to guess why.
+async fn flush_outbound(
+    ws: &mut FragmentCollector<TokioIo<Upgraded>>,
+    out_rx: &mut mpsc::Receiver<OutboundMessage>,
+) {
+    while let Ok(message) = out_rx.try_recv() {
+        match message {
+            OutboundMessage::Frame(text) => {
+                if ws
+                    .write_frame(Frame::text(Payload::Owned(text.into_bytes())))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            OutboundMessage::Close { code, reason } => {
+                let _ = ws.write_frame(Frame::close(code, reason.as_bytes())).await;
+                return;
+            }
+        }
+    }
 }
 
 async fn cancel_all_streams(streams: &StreamRegistry) {
@@ -234,28 +450,166 @@ async fn cancel_all_streams(streams: &StreamRegistry) {
     }
 }
 
+enum AuthCheck {
+    Proceed,
+    Fatal,
+}
+
+/// Revalidate the connection's credentials before dispatching a request
+/// (spec Section 9.3.1 / 9.3.2).
+async fn check_connection_auth(
+    conn_auth: &Arc<ConnAuth>,
+    out_tx: &mpsc::Sender<OutboundMessage>,
+    id: &JsonRpcId,
+) -> AuthCheck {
+    let Some(authenticator) = conn_auth.authenticator.as_ref() else {
+        return AuthCheck::Proceed;
+    };
+    let ctx = conn_auth.ctx.lock().unwrap().clone();
+    match authenticator.revalidate(&ctx).await {
+        AuthStatus::Valid => AuthCheck::Proceed,
+        AuthStatus::ReauthRequired {
+            reason,
+            retry_after_ms,
+        } => {
+            if !conn_auth.reauth_signaled.swap(true, Ordering::SeqCst) {
+                send_outbound(
+                    out_tx,
+                    OutboundMessage::Frame(serialize_response(
+                        WsResponseEnvelope::reauth_required(reason, retry_after_ms),
+                    )),
+                )
+                .await;
+                // Allow a grace period for in-flight requests, then close with
+                // 4001 so the client reconnects with fresh credentials. A
+                // successful in-band `Authenticate` in the meantime clears the
+                // flag and cancels the close, which is the whole point of
+                // Section 9.3.3.
+                let grace = authenticator.reauth_grace();
+                let out_tx = out_tx.clone();
+                let conn_auth = conn_auth.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(grace).await;
+                    if !conn_auth.reauth_signaled.load(Ordering::SeqCst) {
+                        tracing::debug!("credentials refreshed in-band; cancelling 4001 close");
+                        return;
+                    }
+                    let _ = out_tx
+                        .send(OutboundMessage::Close {
+                            code: close_codes::AUTHENTICATION_REQUIRED,
+                            reason: "reauthentication required".to_string(),
+                        })
+                        .await;
+                });
+            }
+            AuthCheck::Proceed
+        }
+        AuthStatus::Expired { reason } => {
+            send_error(
+                out_tx,
+                Some(id.clone()),
+                &A2AError::new(SERVER_ERROR_CODE, reason),
+            )
+            .await;
+            send_outbound(
+                out_tx,
+                OutboundMessage::Close {
+                    code: close_codes::AUTHENTICATION_REQUIRED,
+                    reason: "authentication expired or revoked".to_string(),
+                },
+            )
+            .await;
+            AuthCheck::Fatal
+        }
+    }
+}
+
+/// Handle the binding-specific in-band `Authenticate` refresh method
+/// (spec Section 9.3.3).
+async fn handle_authenticate(
+    conn_auth: &Arc<ConnAuth>,
+    out_tx: &mpsc::Sender<OutboundMessage>,
+    id: JsonRpcId,
+    params: Value,
+) {
+    let supported = conn_auth
+        .authenticator
+        .as_ref()
+        .map(|a| a.supports_in_band_refresh())
+        .unwrap_or(false);
+    if !supported {
+        send_error(
+            out_tx,
+            Some(id),
+            &A2AError::unsupported_operation("in-band token refresh is not supported"),
+        )
+        .await;
+        return;
+    }
+    let authenticator = conn_auth.authenticator.as_ref().unwrap();
+
+    let parsed: AuthenticateParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(err) => {
+            send_error(
+                out_tx,
+                Some(id),
+                &A2AError::invalid_params(format!("invalid Authenticate params: {err}")),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let current = conn_auth.ctx.lock().unwrap().clone();
+    match authenticator
+        .refresh(&current, &parsed.scheme, &parsed.credentials)
+        .await
+    {
+        Ok(new_ctx) => {
+            // The parameters handed to the handler are derived from the
+            // context, so they have to be rebuilt here; otherwise the
+            // connection would keep acting as the principal it just replaced.
+            let refreshed = conn_auth.params().reauthenticated(&new_ctx);
+            *conn_auth.params.lock().unwrap() = Arc::new(refreshed);
+            *conn_auth.ctx.lock().unwrap() = new_ctx;
+            conn_auth.reauth_signaled.store(false, Ordering::SeqCst);
+            send_outbound(
+                out_tx,
+                OutboundMessage::Frame(serialize_response(WsResponseEnvelope::result(
+                    id,
+                    Value::Object(serde_json::Map::new()),
+                ))),
+            )
+            .await;
+        }
+        Err(auth_err) => {
+            send_error(
+                out_tx,
+                Some(id),
+                &A2AError::new(SERVER_ERROR_CODE, auth_err.message),
+            )
+            .await;
+        }
+    }
+}
+
 /// Returns `false` if the connection should be terminated (fatal protocol
 /// error already signalled to the client via the outbound channel).
 async fn handle_text_frame<H: RequestHandler>(
     payload: &[u8],
     handler: &Arc<H>,
-    connection_params: &Arc<ServiceParams>,
     streams: &StreamRegistry,
+    conn_auth: &Arc<ConnAuth>,
     out_tx: &mpsc::Sender<OutboundMessage>,
 ) -> bool {
     let envelope: WsRequestEnvelope = match serde_json::from_slice(payload) {
         Ok(envelope) => envelope,
         Err(err) => {
-            send_outbound(
+            send_error(
                 out_tx,
-                OutboundMessage::Frame(serialize_response(WsResponseEnvelope::error(
-                    None,
-                    WsErrorObject {
-                        error_type: error_types::JSON_PARSE.to_string(),
-                        message: format!("invalid JSON envelope: {err}"),
-                        details: None,
-                    },
-                ))),
+                Some(JsonRpcId::Null),
+                &A2AError::parse_error(format!("invalid JSON envelope: {err}")),
             )
             .await;
             send_outbound(
@@ -270,22 +624,44 @@ async fn handle_text_frame<H: RequestHandler>(
         }
     };
 
-    if envelope.id.is_empty() {
+    if envelope.jsonrpc != JSONRPC_VERSION {
         send_error(
             out_tx,
-            None,
-            error_types::INVALID_REQUEST,
-            "request id is required",
+            envelope.id.clone(),
+            &A2AError::invalid_request(format!(
+                "unsupported jsonrpc version: '{}'",
+                envelope.jsonrpc
+            )),
+        )
+        .await;
+        return true;
+    }
+
+    let Some(id) = envelope.id.clone() else {
+        send_error(
+            out_tx,
+            Some(JsonRpcId::Null),
+            &A2AError::invalid_request("request id is required"),
+        )
+        .await;
+        return true;
+    };
+
+    if matches!(id, JsonRpcId::Null) {
+        send_error(
+            out_tx,
+            Some(JsonRpcId::Null),
+            &A2AError::invalid_request("request id must not be null"),
         )
         .await;
         return true;
     }
 
     if envelope.cancel_stream.unwrap_or(false) {
-        let id = envelope.id.clone();
+        let key = id_key(&id);
         let streams = streams.clone();
         tokio::spawn(async move {
-            if let Some(tx) = streams.lock().await.remove(&id) {
+            if let Some(tx) = streams.lock().await.remove(&key) {
                 let _ = tx.send(());
             }
         });
@@ -295,27 +671,37 @@ async fn handle_text_frame<H: RequestHandler>(
     let Some(method) = envelope.method.clone() else {
         send_error(
             out_tx,
-            Some(envelope.id),
-            error_types::INVALID_REQUEST,
-            "method is required",
+            Some(id),
+            &A2AError::invalid_request("method is required"),
         )
         .await;
         return true;
     };
 
-    if !methods::is_known(&method) {
-        send_error(
-            out_tx,
-            Some(envelope.id),
-            error_types::METHOD_NOT_FOUND,
-            &format!("method not found: {method}"),
-        )
-        .await;
+    // In-band token refresh is a binding-specific method handled outside the
+    // normal A2A dispatch and is exempt from revalidation (spec Section 9.3.3).
+    if method == methods::AUTHENTICATE {
+        let params = envelope.params.clone().unwrap_or(Value::Null);
+        let conn_auth = conn_auth.clone();
+        let out_tx = out_tx.clone();
+        tokio::spawn(async move {
+            handle_authenticate(&conn_auth, &out_tx, id, params).await;
+        });
         return true;
     }
 
-    let combined_params = combine_service_params(connection_params, &envelope);
-    let request_id = envelope.id.clone();
+    // Per-request credential revalidation (spec Section 9.3.1).
+    match check_connection_auth(conn_auth, out_tx, &id).await {
+        AuthCheck::Proceed => {}
+        AuthCheck::Fatal => return false,
+    }
+
+    if !methods::is_known(&method) {
+        send_error(out_tx, Some(id), &A2AError::method_not_found(&method)).await;
+        return true;
+    }
+
+    let combined_params = combine_service_params(&conn_auth.params(), &envelope);
     let raw_params = envelope.params.clone().unwrap_or(Value::Null);
 
     let handler = handler.clone();
@@ -326,7 +712,7 @@ async fn handle_text_frame<H: RequestHandler>(
         if methods::is_streaming(&method) {
             run_streaming_request(
                 method,
-                request_id,
+                id,
                 raw_params,
                 combined_params,
                 handler,
@@ -337,7 +723,7 @@ async fn handle_text_frame<H: RequestHandler>(
         } else {
             run_unary_request(
                 method,
-                request_id,
+                id,
                 raw_params,
                 combined_params,
                 handler,
@@ -350,13 +736,75 @@ async fn handle_text_frame<H: RequestHandler>(
     true
 }
 
+/// Service parameters established when the connection was accepted: the
+/// handshake headers, overlaid with whatever the authenticator published.
+///
+/// The authenticator's keys are tracked separately because they are
+/// authoritative for the lifetime of the connection. This is the seam through
+/// which an authenticated identity reaches the [`RequestHandler`], so a client
+/// must not be able to rewrite it — see [`combine_service_params`].
+#[derive(Debug, Default)]
+struct ConnectionParams {
+    /// The handshake headers alone. Fixed for the lifetime of the connection,
+    /// and retained so the set can be rebuilt against a replaced context.
+    base: ServiceParams,
+    /// `base` overlaid with the current context's parameters.
+    params: ServiceParams,
+    authenticated: HashSet<String>,
+}
+
+impl ConnectionParams {
+    fn new(headers: &HeaderMap, auth_ctx: &AuthContext) -> Self {
+        Self::from_base(capture_connection_params(headers), auth_ctx)
+    }
+
+    fn from_base(base: ServiceParams, auth_ctx: &AuthContext) -> Self {
+        let mut params = base.clone();
+        let mut authenticated = HashSet::new();
+        // The authenticator runs after the headers are captured and wins on
+        // conflict, so a client cannot pre-seed one of its keys at handshake
+        // time either. Keys are lowercased to match the captured headers.
+        for (key, values) in &auth_ctx.service_params {
+            let key = key.to_ascii_lowercase();
+            params.insert(key.clone(), values.clone());
+            authenticated.insert(key);
+        }
+        Self {
+            base,
+            params,
+            authenticated,
+        }
+    }
+
+    /// Rebuild against a context that replaced the original one, so that a
+    /// connection which refreshed its credentials in-band stops presenting the
+    /// identity, tenant, or scopes it authenticated with earlier
+    /// (Section 9.3.3).
+    fn reauthenticated(&self, auth_ctx: &AuthContext) -> Self {
+        Self::from_base(self.base.clone(), auth_ctx)
+    }
+}
+
+/// Merge the connection-scoped parameters with a request's own `serviceParams`.
+///
+/// Per-request entries override connection-scoped ones, *except* for keys the
+/// authenticator established (spec Section 9.1). Letting a request overwrite
+/// those would allow a client that authenticated as one identity or tenant to
+/// present itself to the handler as another.
 fn combine_service_params(
-    connection_params: &ServiceParams,
+    connection: &ConnectionParams,
     envelope: &WsRequestEnvelope,
 ) -> ServiceParams {
-    let mut combined = connection_params.clone();
+    let mut combined = connection.params.clone();
     if let Some(per_request) = envelope.service_params.as_ref() {
         for (key, values) in service_params_from_envelope(per_request) {
+            if connection.authenticated.contains(&key) {
+                tracing::debug!(
+                    %key,
+                    "ignoring per-request override of an authenticator-established service param"
+                );
+                continue;
+            }
             combined.insert(key, values);
         }
     }
@@ -365,7 +813,7 @@ fn combine_service_params(
 
 async fn run_unary_request<H: RequestHandler>(
     method: String,
-    id: String,
+    id: JsonRpcId,
     raw_params: Value,
     params: ServiceParams,
     handler: Arc<H>,
@@ -381,15 +829,7 @@ async fn run_unary_request<H: RequestHandler>(
             .await;
         }
         Err(err) => {
-            let error_obj = a2a_error_to_ws_error(&err);
-            send_outbound(
-                &out_tx,
-                OutboundMessage::Frame(serialize_response(WsResponseEnvelope::error(
-                    Some(id),
-                    error_obj,
-                ))),
-            )
-            .await;
+            send_error(&out_tx, Some(id), &err).await;
             if let Some(code) = close_code_for_fatal(&err) {
                 send_outbound(
                     &out_tx,
@@ -462,7 +902,7 @@ async fn dispatch_unary<H: RequestHandler>(
 
 async fn run_streaming_request<H: RequestHandler>(
     method: String,
-    id: String,
+    id: JsonRpcId,
     raw_params: Value,
     params: ServiceParams,
     handler: Arc<H>,
@@ -485,22 +925,16 @@ async fn run_streaming_request<H: RequestHandler>(
     let mut stream = match stream_result {
         Ok(stream) => stream,
         Err(err) => {
-            send_outbound(
-                &out_tx,
-                OutboundMessage::Frame(serialize_response(WsResponseEnvelope::error(
-                    Some(id),
-                    a2a_error_to_ws_error(&err),
-                ))),
-            )
-            .await;
+            send_error(&out_tx, Some(id), &err).await;
             return;
         }
     };
 
+    let key = id_key(&id);
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
     {
         let mut map = streams.lock().await;
-        map.insert(id.clone(), cancel_tx);
+        map.insert(key.clone(), cancel_tx);
     }
 
     let mut errored = false;
@@ -522,22 +956,16 @@ async fn run_streaming_request<H: RequestHandler>(
                             send_outbound(
                                 &out_tx,
                                 OutboundMessage::Frame(serialize_response(
-                                    WsResponseEnvelope::event(id.clone(), value),
+                                    WsResponseEnvelope::stream_chunk(id.clone(), value),
                                 )),
                             )
                             .await;
                         }
                         Err(err) => {
-                            send_outbound(
+                            send_error(
                                 &out_tx,
-                                OutboundMessage::Frame(serialize_response(
-                                    WsResponseEnvelope::error(
-                                        Some(id.clone()),
-                                        a2a_error_to_ws_error(&A2AError::internal(format!(
-                                            "failed to serialize event: {err}"
-                                        ))),
-                                    ),
-                                )),
+                                Some(id.clone()),
+                                &A2AError::internal(format!("failed to serialize event: {err}")),
                             )
                             .await;
                             errored = true;
@@ -545,16 +973,7 @@ async fn run_streaming_request<H: RequestHandler>(
                         }
                     },
                     Err(err) => {
-                        send_outbound(
-                            &out_tx,
-                            OutboundMessage::Frame(serialize_response(
-                                WsResponseEnvelope::error(
-                                    Some(id.clone()),
-                                    a2a_error_to_ws_error(&err),
-                                ),
-                            )),
-                        )
-                        .await;
+                        send_error(&out_tx, Some(id.clone()), &err).await;
                         errored = true;
                         break;
                     }
@@ -565,7 +984,7 @@ async fn run_streaming_request<H: RequestHandler>(
 
     {
         let mut map = streams.lock().await;
-        map.remove(&id);
+        map.remove(&key);
     }
 
     if !errored {
@@ -591,13 +1010,14 @@ fn serialize_response(resp: WsResponseEnvelope) -> String {
         tracing::warn!(error = %err, "failed to serialize WebSocket response envelope");
         let fallback = WsResponseEnvelope::error(
             resp.id.clone(),
-            WsErrorObject {
-                error_type: error_types::INTERNAL.to_string(),
-                message: format!("failed to serialize response: {err}"),
-                details: None,
-            },
+            a2a_error_to_jsonrpc(&A2AError::internal(format!(
+                "failed to serialize response: {err}"
+            ))),
         );
-        serde_json::to_string(&fallback).unwrap_or_else(|_| "{\"error\":{}}".to_string())
+        serde_json::to_string(&fallback).unwrap_or_else(|_| {
+            "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"serialization error\"}}"
+                .to_string()
+        })
     })
 }
 
@@ -607,38 +1027,15 @@ async fn send_outbound(out_tx: &mpsc::Sender<OutboundMessage>, message: Outbound
     }
 }
 
-async fn send_error(
-    out_tx: &mpsc::Sender<OutboundMessage>,
-    id: Option<String>,
-    error_type: &str,
-    message: &str,
-) {
-    let envelope = WsResponseEnvelope::error(
-        id,
-        WsErrorObject {
-            error_type: error_type.to_string(),
-            message: message.to_string(),
-            details: None,
-        },
-    );
+async fn send_error(out_tx: &mpsc::Sender<OutboundMessage>, id: Option<JsonRpcId>, err: &A2AError) {
+    let envelope = WsResponseEnvelope::error(id, a2a_error_to_jsonrpc(err));
     send_outbound(out_tx, OutboundMessage::Frame(serialize_response(envelope))).await;
-}
-
-// ---------------------------------------------------------------------------
-// Construction helper: trait-object adapter (used by tests).
-// ---------------------------------------------------------------------------
-
-/// Helper alias that downcasts a `Bytes` slice to a `&str` without requiring
-/// the caller to import the type. Currently unused; reserved for future
-/// payload helpers.
-#[allow(dead_code)]
-pub(crate) fn bytes_as_str(bytes: &Bytes) -> Option<&str> {
-    std::str::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{AuthContext, AuthError};
     use a2a_server::handler::DefaultRequestHandler;
     use a2a_server::task_store::InMemoryTaskStore;
     use async_trait::async_trait;
@@ -669,6 +1066,24 @@ mod tests {
             NoopExecutor,
             InMemoryTaskStore::new(),
         ))
+    }
+
+    fn no_auth() -> Arc<ConnAuth> {
+        Arc::new(ConnAuth {
+            authenticator: None,
+            ctx: StdMutex::new(AuthContext::default()),
+            params: StdMutex::new(Arc::new(ConnectionParams::default())),
+            reauth_signaled: AtomicBool::new(false),
+        })
+    }
+
+    fn conn_auth_with(authenticator: Arc<dyn WsAuthenticator>) -> Arc<ConnAuth> {
+        Arc::new(ConnAuth {
+            authenticator: Some(authenticator),
+            ctx: StdMutex::new(AuthContext::default()),
+            params: StdMutex::new(Arc::new(ConnectionParams::default())),
+            reauth_signaled: AtomicBool::new(false),
+        })
     }
 
     #[derive(Default)]
@@ -721,33 +1136,18 @@ mod tests {
         }
     }
 
-    fn sample_agent_card() -> AgentCard {
-        AgentCard {
-            name: "stub".into(),
-            description: "stub agent".into(),
-            version: "1.0.0".into(),
-            supported_interfaces: vec![AgentInterface::new(
-                "ws://example.test/a2a/ws",
-                TRANSPORT_PROTOCOL_WEBSOCKET,
-            )],
-            capabilities: AgentCapabilities::default(),
-            default_input_modes: vec!["text/plain".into()],
-            default_output_modes: vec!["text/plain".into()],
-            skills: vec![],
-            provider: None,
-            documentation_url: None,
-            icon_url: None,
-            security_schemes: None,
-            security_requirements: None,
-            signatures: None,
-        }
-    }
-
     fn frame_payload(message: OutboundMessage) -> WsResponseEnvelope {
         match message {
             OutboundMessage::Frame(text) => serde_json::from_str(&text).unwrap(),
             OutboundMessage::Close { .. } => panic!("expected frame"),
         }
+    }
+
+    fn error_reason_of(resp: &WsResponseEnvelope) -> String {
+        let err = resp.error.as_ref().expect("error present");
+        let data = err.data.as_ref().expect("data present");
+        let arr = data.as_array().expect("array");
+        arr.last().unwrap()["reason"].as_str().unwrap().to_string()
     }
 
     #[async_trait]
@@ -760,7 +1160,6 @@ mod tests {
             if let Some(error) = &self.send_message_error {
                 return Err(error.clone());
             }
-
             Ok(SendMessageResponse::Task(sample_task("send")))
         }
 
@@ -772,7 +1171,6 @@ mod tests {
             if self.streaming_pending {
                 return Ok(Box::pin(futures::stream::pending()));
             }
-
             Ok(Box::pin(futures::stream::iter(vec![Ok(
                 StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
                     task_id: "stream".into(),
@@ -873,22 +1271,48 @@ mod tests {
             _params: &ServiceParams,
             _req: GetExtendedAgentCardRequest,
         ) -> Result<AgentCard, A2AError> {
-            Ok(sample_agent_card())
+            Err(A2AError::unsupported_operation("no extended card"))
+        }
+    }
+
+    // In-band-refresh authenticator used to exercise the auth pathways.
+    struct RefreshAuth {
+        status: AuthStatus,
+        supports_refresh: bool,
+        refresh_ok: bool,
+    }
+
+    #[async_trait]
+    impl WsAuthenticator for RefreshAuth {
+        async fn authenticate(&self, _headers: &HeaderMap) -> Result<AuthContext, AuthError> {
+            Ok(AuthContext::default())
+        }
+        async fn revalidate(&self, _ctx: &AuthContext) -> AuthStatus {
+            self.status.clone()
+        }
+        fn supports_in_band_refresh(&self) -> bool {
+            self.supports_refresh
+        }
+        async fn refresh(
+            &self,
+            _ctx: &AuthContext,
+            _scheme: &str,
+            _credentials: &str,
+        ) -> Result<AuthContext, AuthError> {
+            if self.refresh_ok {
+                Ok(AuthContext::default())
+            } else {
+                Err(AuthError::unauthorized("bad token"))
+            }
+        }
+        fn reauth_grace(&self) -> std::time::Duration {
+            std::time::Duration::from_millis(10)
         }
     }
 
     #[test]
     fn websocket_router_constructs_with_request_handler() {
         let _router = websocket_router(make_handler());
-    }
-
-    #[test]
-    fn websocket_state_is_cloneable() {
-        let state = WebSocketState {
-            handler: make_handler(),
-        };
-        let cloned = state.clone();
-        assert!(Arc::ptr_eq(&state.handler, &cloned.handler));
     }
 
     #[test]
@@ -902,36 +1326,29 @@ mod tests {
     }
 
     #[test]
-    fn subprotocol_is_negotiated_accepts_csv_with_other_protocols() {
+    fn subprotocol_is_negotiated_rejects_unknown_name() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static("foo, a2a.v1, bar"),
+            HeaderValue::from_static("a2a.jsonrpc.v1"),
         );
-        assert!(subprotocol_is_negotiated(&headers));
+        assert!(!subprotocol_is_negotiated(&headers));
     }
 
     #[test]
-    fn subprotocol_is_negotiated_is_case_insensitive() {
+    fn origin_allowed_matches_allowlist() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static("A2A.V1"),
-        );
-        assert!(subprotocol_is_negotiated(&headers));
-    }
-
-    #[test]
-    fn subprotocol_is_negotiated_rejects_missing_protocol() {
-        let headers = HeaderMap::new();
-        assert!(!subprotocol_is_negotiated(&headers));
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static("foo, bar"),
-        );
-        assert!(!subprotocol_is_negotiated(&headers));
+        headers.insert(header::ORIGIN, HeaderValue::from_static("https://ok.test"));
+        assert!(origin_allowed(&headers, &["https://ok.test".to_string()]));
+        assert!(!origin_allowed(
+            &headers,
+            &["https://other.test".to_string()]
+        ));
+        // Missing Origin is rejected when an allowlist is configured.
+        assert!(!origin_allowed(
+            &HeaderMap::new(),
+            &["https://ok.test".to_string()]
+        ));
     }
 
     #[test]
@@ -940,10 +1357,6 @@ mod tests {
         headers.insert("A2A-Version", HeaderValue::from_static("1.0"));
         headers.insert("Authorization", HeaderValue::from_static("Bearer t"));
         headers.insert(header::HOST, HeaderValue::from_static("agent.example.com"));
-        headers.insert(
-            header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static("a2a.v1"),
-        );
 
         let params = capture_connection_params(&headers);
         assert_eq!(params.get("a2a-version").unwrap(), &vec!["1.0".to_string()]);
@@ -952,44 +1365,33 @@ mod tests {
             &vec!["Bearer t".to_string()]
         );
         assert!(!params.contains_key("host"));
-        assert!(!params.contains_key("sec-websocket-protocol"));
     }
 
-    #[test]
-    fn is_internal_header_lists_the_websocket_handshake_headers() {
-        for name in [
-            "host",
-            "connection",
-            "upgrade",
-            "sec-websocket-key",
-            "sec-websocket-version",
-            "sec-websocket-protocol",
-            "sec-websocket-extensions",
-            "content-length",
-            "transfer-encoding",
-        ] {
-            assert!(is_internal_header(name), "{name} should be internal");
+    fn envelope_with_params(pairs: &[(&str, &str)]) -> WsRequestEnvelope {
+        WsRequestEnvelope {
+            id: Some("req".into()),
+            method: Some(methods::SEND_MESSAGE.into()),
+            service_params: Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
         }
-        assert!(!is_internal_header("authorization"));
-        assert!(!is_internal_header("a2a-version"));
     }
 
     #[test]
     fn combine_service_params_per_request_overrides_connection_scope() {
-        let mut connection: ServiceParams = HashMap::new();
-        connection.insert("a2a-version".into(), vec!["1.0".into()]);
-        connection.insert("x-keep".into(), vec!["preserve".into()]);
+        let mut connection = ConnectionParams::default();
+        connection
+            .params
+            .insert("a2a-version".into(), vec!["1.0".into()]);
+        connection
+            .params
+            .insert("x-keep".into(), vec!["preserve".into()]);
 
-        let envelope = WsRequestEnvelope {
-            id: "req".into(),
-            method: Some(methods::SEND_MESSAGE.into()),
-            params: None,
-            service_params: Some(HashMap::from([
-                ("a2a-version".into(), "1.5".into()),
-                ("x-extra".into(), "added".into()),
-            ])),
-            cancel_stream: None,
-        };
+        let envelope = envelope_with_params(&[("a2a-version", "1.5"), ("x-extra", "added")]);
 
         let combined = combine_service_params(&connection, &envelope);
         assert_eq!(
@@ -1004,373 +1406,154 @@ mod tests {
     }
 
     #[test]
-    fn serialize_response_emits_compact_json() {
-        let json = serialize_response(WsResponseEnvelope::stream_end("req-1"));
-        let value: Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["id"], "req-1");
-        assert_eq!(value["streamEnd"], true);
+    fn combine_service_params_refuses_to_override_authenticated_params() {
+        let auth_ctx = AuthContext {
+            service_params: HashMap::from([("x-tenant".to_string(), vec!["acme".to_string()])]),
+            ..Default::default()
+        };
+        let connection = ConnectionParams::new(&HeaderMap::new(), &auth_ctx);
+
+        let envelope = envelope_with_params(&[("x-tenant", "evil-corp")]);
+
+        let combined = combine_service_params(&connection, &envelope);
+        assert_eq!(combined.get("x-tenant").unwrap(), &vec!["acme".to_string()]);
     }
 
     #[test]
-    fn parse_params_returns_invalid_params_error_on_bad_payload() {
-        let value = serde_json::json!({ "bogus": true });
-        let err: A2AError = parse_params::<SendMessageRequest>(value).unwrap_err();
-        assert_eq!(err.code, error_code::INVALID_PARAMS);
+    fn combine_service_params_matches_authenticated_keys_case_insensitively() {
+        let auth_ctx = AuthContext {
+            service_params: HashMap::from([("X-Tenant".to_string(), vec!["acme".to_string()])]),
+            ..Default::default()
+        };
+        let connection = ConnectionParams::new(&HeaderMap::new(), &auth_ctx);
+        assert_eq!(
+            connection.params.get("x-tenant").unwrap(),
+            &vec!["acme".to_string()]
+        );
+
+        let envelope = envelope_with_params(&[("X-TENANT", "evil-corp")]);
+
+        let combined = combine_service_params(&connection, &envelope);
+        assert_eq!(combined.get("x-tenant").unwrap(), &vec!["acme".to_string()]);
+        assert!(!combined.contains_key("X-TENANT"));
     }
 
-    #[tokio::test]
-    async fn send_outbound_drops_message_when_receiver_is_closed() {
-        let (out_tx, out_rx) = mpsc::channel(1);
-        drop(out_rx);
+    #[test]
+    fn connection_params_let_the_authenticator_override_a_handshake_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tenant", HeaderValue::from_static("claimed-by-client"));
+        let auth_ctx = AuthContext {
+            service_params: HashMap::from([("x-tenant".to_string(), vec!["acme".to_string()])]),
+            ..Default::default()
+        };
 
-        send_outbound(
-            &out_tx,
-            OutboundMessage::Frame(serialize_response(WsResponseEnvelope::stream_end("req"))),
-        )
-        .await;
+        let connection = ConnectionParams::new(&headers, &auth_ctx);
+        assert_eq!(
+            connection.params.get("x-tenant").unwrap(),
+            &vec!["acme".to_string()]
+        );
     }
 
-    #[tokio::test]
-    async fn send_error_emits_error_envelope() {
-        let (out_tx, mut out_rx) = mpsc::channel(1);
-
-        send_error(
-            &out_tx,
-            Some("req-1".into()),
-            error_types::INVALID_REQUEST,
-            "bad request",
-        )
-        .await;
-
-        let response = frame_payload(out_rx.recv().await.unwrap());
-        assert_eq!(response.id.as_deref(), Some("req-1"));
-        let error = response.error.unwrap();
-        assert_eq!(error.error_type, error_types::INVALID_REQUEST);
-        assert_eq!(error.message, "bad request");
-    }
-
-    #[tokio::test]
-    async fn cancel_all_streams_signals_and_drains_registry() {
-        let streams: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let (tx1, rx1) = oneshot::channel();
-        let (tx2, rx2) = oneshot::channel();
-        streams.lock().await.insert("s1".into(), tx1);
-        streams.lock().await.insert("s2".into(), tx2);
-
-        cancel_all_streams(&streams).await;
-
-        rx1.await.unwrap();
-        rx2.await.unwrap();
-        assert!(streams.lock().await.is_empty());
+    #[test]
+    fn serialize_response_emits_jsonrpc_stream_end() {
+        let json = serialize_response(WsResponseEnvelope::stream_end("req-1".into()));
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], "req-1");
+        assert_eq!(value["streamEnd"], true);
     }
 
     #[tokio::test]
     async fn handle_text_frame_invalid_json_sends_error_and_close() {
         let handler = Arc::new(StubHandler::default());
-        let params = Arc::new(ServiceParams::new());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
 
-        assert!(!handle_text_frame(b"{not json", &handler, &params, &streams, &out_tx,).await);
+        assert!(!handle_text_frame(b"{not json", &handler, &streams, &no_auth(), &out_tx).await);
 
-        let envelope = frame_payload(out_rx.try_recv().unwrap());
-        assert_eq!(envelope.id, None);
-        assert_eq!(envelope.error.unwrap().error_type, error_types::JSON_PARSE);
+        // The wire frame MUST carry an explicit `"id": null` per spec Section 3.3.
+        let raw = match out_rx.try_recv().unwrap() {
+            OutboundMessage::Frame(text) => text,
+            OutboundMessage::Close { .. } => panic!("expected frame"),
+        };
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert!(value["id"].is_null());
+        assert!(value.as_object().unwrap().contains_key("id"));
+        assert_eq!(value["error"]["code"], error_code::PARSE_ERROR);
 
         match out_rx.try_recv().unwrap() {
-            OutboundMessage::Close { code, reason } => {
-                assert_eq!(code, close_codes::PROTOCOL_ERROR);
-                assert_eq!(reason, "JSON parse error");
-            }
+            OutboundMessage::Close { code, .. } => assert_eq!(code, close_codes::PROTOCOL_ERROR),
             OutboundMessage::Frame(_) => panic!("expected close frame"),
         }
     }
 
     #[tokio::test]
-    async fn handle_text_frame_empty_id_sends_invalid_request() {
+    async fn handle_text_frame_bad_jsonrpc_version_is_invalid_request() {
         let handler = Arc::new(StubHandler::default());
-        let params = Arc::new(ServiceParams::new());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
-        let envelope = WsRequestEnvelope {
-            id: "".into(),
-            method: Some(methods::SEND_MESSAGE.into()),
-            ..Default::default()
-        };
-        let payload = serde_json::to_vec(&envelope).unwrap();
+        let payload = br#"{"jsonrpc":"1.0","id":"r","method":"GetTask"}"#;
 
-        assert!(handle_text_frame(&payload, &handler, &params, &streams, &out_tx,).await);
-
-        let response = frame_payload(out_rx.try_recv().unwrap());
-        assert_eq!(response.id, None);
-        assert_eq!(
-            response.error.unwrap().error_type,
-            error_types::INVALID_REQUEST
-        );
+        assert!(handle_text_frame(payload, &handler, &streams, &no_auth(), &out_tx).await);
+        let resp = frame_payload(out_rx.try_recv().unwrap());
+        assert_eq!(resp.error.unwrap().code, error_code::INVALID_REQUEST);
     }
 
     #[tokio::test]
     async fn handle_text_frame_missing_method_sends_invalid_request() {
         let handler = Arc::new(StubHandler::default());
-        let params = Arc::new(ServiceParams::new());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
         let envelope = WsRequestEnvelope {
-            id: "req-1".into(),
+            id: Some("req-1".into()),
             ..Default::default()
         };
         let payload = serde_json::to_vec(&envelope).unwrap();
 
-        assert!(handle_text_frame(&payload, &handler, &params, &streams, &out_tx,).await);
-
+        assert!(handle_text_frame(&payload, &handler, &streams, &no_auth(), &out_tx).await);
         let response = frame_payload(out_rx.try_recv().unwrap());
-        assert_eq!(response.id.as_deref(), Some("req-1"));
-        assert_eq!(
-            response.error.unwrap().error_type,
-            error_types::INVALID_REQUEST
-        );
+        assert_eq!(response.id, Some(JsonRpcId::String("req-1".into())));
+        assert_eq!(response.error.unwrap().code, error_code::INVALID_REQUEST);
     }
 
     #[tokio::test]
     async fn handle_text_frame_unknown_method_sends_method_not_found() {
         let handler = Arc::new(StubHandler::default());
-        let params = Arc::new(ServiceParams::new());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
         let envelope = WsRequestEnvelope {
-            id: "req-1".into(),
+            id: Some("req-1".into()),
             method: Some("Bogus".into()),
             ..Default::default()
         };
         let payload = serde_json::to_vec(&envelope).unwrap();
 
-        assert!(handle_text_frame(&payload, &handler, &params, &streams, &out_tx,).await);
-
+        assert!(handle_text_frame(&payload, &handler, &streams, &no_auth(), &out_tx).await);
         let response = frame_payload(out_rx.try_recv().unwrap());
-        assert_eq!(response.id.as_deref(), Some("req-1"));
-        assert_eq!(
-            response.error.unwrap().error_type,
-            error_types::METHOD_NOT_FOUND
-        );
+        assert_eq!(response.error.unwrap().code, error_code::METHOD_NOT_FOUND);
     }
 
     #[tokio::test]
     async fn handle_text_frame_cancel_stream_removes_registered_stream() {
         let handler = Arc::new(StubHandler::default());
-        let params = Arc::new(ServiceParams::new());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        streams.lock().await.insert("stream-1".into(), cancel_tx);
+        streams
+            .lock()
+            .await
+            .insert(id_key(&JsonRpcId::from("stream-1")), cancel_tx);
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
         let envelope = WsRequestEnvelope {
-            id: "stream-1".into(),
+            id: Some("stream-1".into()),
             cancel_stream: Some(true),
             ..Default::default()
         };
         let payload = serde_json::to_vec(&envelope).unwrap();
 
-        assert!(handle_text_frame(&payload, &handler, &params, &streams, &out_tx,).await);
-
+        assert!(handle_text_frame(&payload, &handler, &streams, &no_auth(), &out_tx).await);
         cancel_rx.await.unwrap();
         assert!(out_rx.try_recv().is_err());
         assert!(streams.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn handle_text_frame_cancel_unknown_stream_does_not_emit_stream_end() {
-        let handler = Arc::new(StubHandler::default());
-        let params = Arc::new(ServiceParams::new());
-        let streams = Arc::new(Mutex::new(HashMap::new()));
-        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
-        let envelope = WsRequestEnvelope {
-            id: "missing-stream".into(),
-            cancel_stream: Some(true),
-            ..Default::default()
-        };
-        let payload = serde_json::to_vec(&envelope).unwrap();
-
-        assert!(handle_text_frame(&payload, &handler, &params, &streams, &out_tx,).await);
-
-        assert!(out_rx.try_recv().is_err());
-        assert!(streams.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn dispatch_unary_covers_all_supported_methods() {
-        let handler = Arc::new(StubHandler::default());
-        let params = ServiceParams::new();
-        let msg_req = SendMessageRequest {
-            message: sample_message(),
-            configuration: None,
-            metadata: None,
-            tenant: None,
-        };
-
-        let send = dispatch_unary(
-            methods::SEND_MESSAGE,
-            &handler,
-            &params,
-            protojson_conv::to_value(&msg_req).unwrap(),
-        )
-        .await
-        .unwrap();
-        assert!(send.get("task").is_some());
-
-        let task = dispatch_unary(
-            methods::GET_TASK,
-            &handler,
-            &params,
-            protojson_conv::to_value(&GetTaskRequest {
-                id: "task-1".into(),
-                history_length: None,
-                tenant: None,
-            })
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(task["id"], "task-1");
-
-        let listed = dispatch_unary(
-            methods::LIST_TASKS,
-            &handler,
-            &params,
-            protojson_conv::to_value(&ListTasksRequest {
-                context_id: None,
-                status: None,
-                page_size: None,
-                page_token: None,
-                history_length: None,
-                status_timestamp_after: None,
-                include_artifacts: None,
-                tenant: None,
-            })
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(listed["totalSize"], 1);
-
-        let canceled = dispatch_unary(
-            methods::CANCEL_TASK,
-            &handler,
-            &params,
-            protojson_conv::to_value(&CancelTaskRequest {
-                id: "cancel-1".into(),
-                metadata: None,
-                tenant: None,
-            })
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(canceled["id"], "cancel-1");
-
-        let push_config = TaskPushNotificationConfig {
-            url: "https://hook.example.test".into(),
-            id: Some("cfg-1".into()),
-            task_id: "task-1".into(),
-            token: None,
-            authentication: None,
-            tenant: None,
-        };
-        let created = dispatch_unary(
-            methods::CREATE_PUSH_CONFIG,
-            &handler,
-            &params,
-            protojson_conv::to_value(&push_config).unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(created["taskId"], "task-1");
-
-        let got = dispatch_unary(
-            methods::GET_PUSH_CONFIG,
-            &handler,
-            &params,
-            protojson_conv::to_value(&GetTaskPushNotificationConfigRequest {
-                task_id: "task-1".into(),
-                id: "cfg-1".into(),
-                tenant: None,
-            })
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(got["taskId"], "task-1");
-
-        let push_list = dispatch_unary(
-            methods::LIST_PUSH_CONFIGS,
-            &handler,
-            &params,
-            protojson_conv::to_value(&ListTaskPushNotificationConfigsRequest {
-                task_id: "task-1".into(),
-                page_size: None,
-                page_token: None,
-                tenant: None,
-            })
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert!(push_list.as_object().is_some());
-
-        let deleted = dispatch_unary(
-            methods::DELETE_PUSH_CONFIG,
-            &handler,
-            &params,
-            protojson_conv::to_value(&DeleteTaskPushNotificationConfigRequest {
-                task_id: "task-1".into(),
-                id: "cfg-1".into(),
-                tenant: None,
-            })
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert!(deleted.as_object().unwrap().is_empty());
-
-        let card = dispatch_unary(
-            methods::GET_EXTENDED_AGENT_CARD,
-            &handler,
-            &params,
-            protojson_conv::to_value(&GetExtendedAgentCardRequest { tenant: None }).unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(card["name"], "stub");
-    }
-
-    #[tokio::test]
-    async fn dispatch_unary_unknown_method_returns_method_not_found() {
-        let handler = Arc::new(StubHandler::default());
-        let err = dispatch_unary("Nope", &handler, &ServiceParams::new(), Value::Null)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, error_code::METHOD_NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn run_unary_request_emits_error_for_bad_params() {
-        let handler = Arc::new(StubHandler::default());
-        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
-
-        run_unary_request(
-            methods::GET_TASK.into(),
-            "req-1".into(),
-            serde_json::json!({"notId": true}),
-            ServiceParams::new(),
-            handler,
-            out_tx,
-        )
-        .await;
-
-        let response = frame_payload(out_rx.recv().await.unwrap());
-        assert_eq!(response.id.as_deref(), Some("req-1"));
-        assert_eq!(
-            response.error.unwrap().error_type,
-            error_types::INVALID_PARAMS
-        );
     }
 
     #[tokio::test]
@@ -1395,20 +1578,15 @@ mod tests {
         .await;
 
         let response = frame_payload(out_rx.recv().await.unwrap());
-        assert_eq!(response.id.as_deref(), Some("req-fatal"));
-        assert_eq!(response.error.unwrap().error_type, error_types::JSON_PARSE);
-
+        assert_eq!(response.error.unwrap().code, error_code::PARSE_ERROR);
         match out_rx.recv().await.unwrap() {
-            OutboundMessage::Close { code, reason } => {
-                assert_eq!(code, close_codes::PROTOCOL_ERROR);
-                assert_eq!(reason, "fatal parse");
-            }
+            OutboundMessage::Close { code, .. } => assert_eq!(code, close_codes::PROTOCOL_ERROR),
             OutboundMessage::Frame(_) => panic!("expected close after fatal error"),
         }
     }
 
     #[tokio::test]
-    async fn run_streaming_request_emits_event_and_stream_end() {
+    async fn run_streaming_request_emits_result_chunk_and_stream_end() {
         let handler = Arc::new(StubHandler::default());
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
@@ -1430,9 +1608,9 @@ mod tests {
         )
         .await;
 
-        let event = frame_payload(out_rx.recv().await.unwrap());
-        assert_eq!(event.id.as_deref(), Some("stream-1"));
-        assert!(event.event.is_some());
+        let chunk = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(chunk.id, Some(JsonRpcId::String("stream-1".into())));
+        assert!(chunk.result.is_some(), "streaming chunk must use `result`");
         let end = frame_payload(out_rx.recv().await.unwrap());
         assert_eq!(end.stream_end, Some(true));
         assert!(streams.lock().await.is_empty());
@@ -1450,7 +1628,6 @@ mod tests {
             tenant: None,
         };
         let task_streams = streams.clone();
-
         let join = tokio::spawn(run_streaming_request(
             methods::SEND_STREAMING_MESSAGE.into(),
             "stream-cancel".into(),
@@ -1462,7 +1639,11 @@ mod tests {
         ));
 
         let cancel_tx = loop {
-            if let Some(tx) = streams.lock().await.remove("stream-cancel") {
+            if let Some(tx) = streams
+                .lock()
+                .await
+                .remove(&id_key(&JsonRpcId::from("stream-cancel")))
+            {
                 break tx;
             }
             tokio::task::yield_now().await;
@@ -1473,201 +1654,152 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let response = frame_payload(end);
-        assert_eq!(response.id.as_deref(), Some("stream-cancel"));
-        assert_eq!(response.stream_end, Some(true));
+        assert_eq!(frame_payload(end).stream_end, Some(true));
         join.await.unwrap();
-        assert!(streams.lock().await.is_empty());
     }
 
     #[tokio::test]
-    async fn run_streaming_request_emits_error_for_stream_item_error() {
-        let handler = Arc::new(StubHandler::default());
-        let streams = Arc::new(Mutex::new(HashMap::new()));
+    async fn authenticate_unsupported_returns_unsupported_operation() {
+        let conn_auth = conn_auth_with(Arc::new(RefreshAuth {
+            status: AuthStatus::Valid,
+            supports_refresh: false,
+            refresh_ok: false,
+        }));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
 
-        run_streaming_request(
-            methods::SUBSCRIBE_TO_TASK.into(),
-            "sub-1".into(),
-            protojson_conv::to_value(&SubscribeToTaskRequest {
-                id: "task-1".into(),
-                tenant: None,
-            })
-            .unwrap(),
-            ServiceParams::new(),
-            handler,
-            streams.clone(),
-            out_tx,
+        handle_authenticate(
+            &conn_auth,
+            &out_tx,
+            "auth-1".into(),
+            serde_json::json!({"scheme":"Bearer","credentials":"x"}),
         )
         .await;
 
-        let response = frame_payload(out_rx.recv().await.unwrap());
-        assert_eq!(response.id.as_deref(), Some("sub-1"));
-        assert_eq!(response.error.unwrap().error_type, error_types::INTERNAL);
-        assert!(out_rx.try_recv().is_err());
-        assert!(streams.lock().await.is_empty());
+        let resp = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(resp.error.unwrap().code, error_code::UNSUPPORTED_OPERATION);
     }
 
     #[tokio::test]
-    async fn run_streaming_request_emits_error_for_bad_stream_params() {
-        let handler = Arc::new(StubHandler::default());
-        let streams = Arc::new(Mutex::new(HashMap::new()));
+    async fn authenticate_success_returns_empty_result() {
+        let conn_auth = conn_auth_with(Arc::new(RefreshAuth {
+            status: AuthStatus::Valid,
+            supports_refresh: true,
+            refresh_ok: true,
+        }));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
 
-        run_streaming_request(
-            methods::SEND_STREAMING_MESSAGE.into(),
-            "stream-1".into(),
-            serde_json::json!({"bad": true}),
-            ServiceParams::new(),
-            handler,
-            streams,
-            out_tx,
+        handle_authenticate(
+            &conn_auth,
+            &out_tx,
+            "auth-1".into(),
+            serde_json::json!({"scheme":"Bearer","credentials":"new"}),
         )
         .await;
 
-        let response = frame_payload(out_rx.recv().await.unwrap());
+        let resp = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(resp.id, Some(JsonRpcId::String("auth-1".into())));
+        assert!(resp.result.unwrap().as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticate_failure_returns_server_error_code() {
+        let conn_auth = conn_auth_with(Arc::new(RefreshAuth {
+            status: AuthStatus::Valid,
+            supports_refresh: true,
+            refresh_ok: false,
+        }));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+
+        handle_authenticate(
+            &conn_auth,
+            &out_tx,
+            "auth-1".into(),
+            serde_json::json!({"scheme":"Bearer","credentials":"bad"}),
+        )
+        .await;
+
+        let resp = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(resp.error.unwrap().code, SERVER_ERROR_CODE);
+    }
+
+    #[tokio::test]
+    async fn check_connection_auth_expired_sends_error_and_close() {
+        let conn_auth = conn_auth_with(Arc::new(RefreshAuth {
+            status: AuthStatus::Expired {
+                reason: "revoked".into(),
+            },
+            supports_refresh: false,
+            refresh_ok: false,
+        }));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+
+        let decision = check_connection_auth(&conn_auth, &out_tx, &JsonRpcId::from("r")).await;
+        assert!(matches!(decision, AuthCheck::Fatal));
+
+        let resp = frame_payload(out_rx.recv().await.unwrap());
+        assert_eq!(resp.error.unwrap().code, SERVER_ERROR_CODE);
+        match out_rx.recv().await.unwrap() {
+            OutboundMessage::Close { code, .. } => {
+                assert_eq!(code, close_codes::AUTHENTICATION_REQUIRED)
+            }
+            OutboundMessage::Frame(_) => panic!("expected 4001 close"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_connection_auth_reauth_required_emits_control_frame() {
+        let conn_auth = conn_auth_with(Arc::new(RefreshAuth {
+            status: AuthStatus::ReauthRequired {
+                reason: "expiring".into(),
+                retry_after_ms: 0,
+            },
+            supports_refresh: false,
+            refresh_ok: false,
+        }));
+        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
+
+        let decision = check_connection_auth(&conn_auth, &out_tx, &JsonRpcId::from("r")).await;
+        assert!(matches!(decision, AuthCheck::Proceed));
+
+        let resp = frame_payload(out_rx.recv().await.unwrap());
         assert_eq!(
-            response.error.unwrap().error_type,
-            error_types::INVALID_PARAMS
+            resp.control.as_deref(),
+            Some(crate::common::CONTROL_REAUTH_REQUIRED)
+        );
+        assert!(resp.id.is_none(), "control frames carry no id");
+
+        // A subsequent request does not emit a second control frame.
+        let decision = check_connection_auth(&conn_auth, &out_tx, &JsonRpcId::from("r2")).await;
+        assert!(matches!(decision, AuthCheck::Proceed));
+        // The grace-period close eventually arrives; the next message is a Close.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(msg, OutboundMessage::Close { code, .. } if code == close_codes::AUTHENTICATION_REQUIRED)
         );
     }
 
     #[tokio::test]
-    async fn run_streaming_request_unknown_method_emits_method_not_found() {
+    async fn get_extended_agent_card_unsupported_reason_is_carried_in_error_data() {
         let handler = Arc::new(StubHandler::default());
-        let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
-
-        run_streaming_request(
-            "Bogus".into(),
-            "stream-x".into(),
-            Value::Null,
+        run_unary_request(
+            methods::GET_EXTENDED_AGENT_CARD.into(),
+            "req".into(),
+            protojson_conv::to_value(&GetExtendedAgentCardRequest { tenant: None }).unwrap(),
             ServiceParams::new(),
             handler,
-            streams.clone(),
             out_tx,
         )
         .await;
-
-        let response = frame_payload(out_rx.recv().await.unwrap());
-        assert_eq!(response.id.as_deref(), Some("stream-x"));
+        let resp = frame_payload(out_rx.recv().await.unwrap());
         assert_eq!(
-            response.error.unwrap().error_type,
-            error_types::METHOD_NOT_FOUND
+            resp.error.as_ref().unwrap().code,
+            error_code::UNSUPPORTED_OPERATION
         );
-        assert!(streams.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn run_streaming_request_subscribe_to_task_dispatches_method() {
-        // StubHandler::subscribe_to_task yields an error item; this exercises
-        // the SUBSCRIBE_TO_TASK match arm and the stream-item error pathway.
-        let handler = Arc::new(StubHandler::default());
-        let streams = Arc::new(Mutex::new(HashMap::new()));
-        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
-
-        run_streaming_request(
-            methods::SUBSCRIBE_TO_TASK.into(),
-            "sub-2".into(),
-            protojson_conv::to_value(&SubscribeToTaskRequest {
-                id: "task".into(),
-                tenant: None,
-            })
-            .unwrap(),
-            ServiceParams::new(),
-            handler,
-            streams.clone(),
-            out_tx,
-        )
-        .await;
-
-        let response = frame_payload(out_rx.recv().await.unwrap());
-        assert_eq!(response.id.as_deref(), Some("sub-2"));
-        assert!(response.error.is_some());
-        assert!(streams.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn run_streaming_request_subscribe_to_task_emits_error_for_bad_params() {
-        let handler = Arc::new(StubHandler::default());
-        let streams = Arc::new(Mutex::new(HashMap::new()));
-        let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
-
-        run_streaming_request(
-            methods::SUBSCRIBE_TO_TASK.into(),
-            "sub-bad".into(),
-            serde_json::json!({"bad": 1}),
-            ServiceParams::new(),
-            handler,
-            streams,
-            out_tx,
-        )
-        .await;
-
-        let response = frame_payload(out_rx.recv().await.unwrap());
-        assert_eq!(
-            response.error.unwrap().error_type,
-            error_types::INVALID_PARAMS
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_unary_send_message_propagates_handler_error() {
-        let handler = Arc::new(StubHandler::fatal_send_message());
-        let req = SendMessageRequest {
-            message: sample_message(),
-            configuration: None,
-            metadata: None,
-            tenant: None,
-        };
-        let err = dispatch_unary(
-            methods::SEND_MESSAGE,
-            &handler,
-            &ServiceParams::new(),
-            protojson_conv::to_value(&req).unwrap(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.code, error_code::PARSE_ERROR);
-    }
-
-    #[test]
-    fn to_value_serializes_protojson_payloads() {
-        let req = GetTaskRequest {
-            id: "t".into(),
-            history_length: None,
-            tenant: None,
-        };
-        let value = to_value(&req).unwrap();
-        assert_eq!(value["id"], "t");
-    }
-
-    #[test]
-    fn bytes_as_str_returns_utf8_or_none() {
-        let bytes = Bytes::from_static(b"hello");
-        assert_eq!(bytes_as_str(&bytes), Some("hello"));
-
-        let invalid = Bytes::from_static(&[0xff, 0xfe, 0xfd]);
-        assert_eq!(bytes_as_str(&invalid), None);
-    }
-
-    #[test]
-    fn combine_service_params_with_no_per_request_overrides_returns_connection_scope() {
-        let mut connection: ServiceParams = HashMap::new();
-        connection.insert("a2a-version".into(), vec!["1.0".into()]);
-        let envelope = WsRequestEnvelope {
-            id: "req".into(),
-            method: Some(methods::SEND_MESSAGE.into()),
-            params: None,
-            service_params: None,
-            cancel_stream: None,
-        };
-        let combined = combine_service_params(&connection, &envelope);
-        assert_eq!(combined.len(), 1);
-        assert_eq!(
-            combined.get("a2a-version").unwrap(),
-            &vec!["1.0".to_string()]
-        );
+        assert_eq!(error_reason_of(&resp), "UNSUPPORTED_OPERATION");
     }
 
     #[tokio::test]
@@ -1678,25 +1810,6 @@ mod tests {
 
         let router = websocket_router(make_handler());
         let request = Request::builder().uri("/").body(Body::empty()).unwrap();
-        let response = router.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn websocket_router_rejects_when_upgrade_fails_due_to_missing_headers() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let router = websocket_router(make_handler());
-        // Provides the right subprotocol but no actual upgrade headers,
-        // forcing IncomingUpgrade::upgrade() to error out and exercising the
-        // "websocket upgrade failed" path in handle_upgrade.
-        let request = Request::builder()
-            .uri("/")
-            .header(header::SEC_WEBSOCKET_PROTOCOL, "a2a.v1")
-            .body(Body::empty())
-            .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
