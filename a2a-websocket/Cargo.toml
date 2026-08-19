@@ -11,6 +11,18 @@ rust-version.workspace = true
 [lib]
 name = "a2a_websocket"
 
+[features]
+default = ["tls"]
+# Native `wss://` (TLS) client support, built on rustls with the `ring` crypto
+# provider (avoids the aws-lc-rs native build).
+tls = [
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:webpki-roots",
+    "dep:rustls-pemfile",
+]
+
 [dependencies]
 a2a = { workspace = true }
 a2a-client = { workspace = true }
@@ -32,7 +44,26 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+], optional = true }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+webpki-roots = { version = "1", optional = true }
+rustls-pemfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tower = { workspace = true }
+axum = { workspace = true }
+async-trait = { workspace = true }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["server", "server-auto", "http1", "tokio"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "ring"] }
