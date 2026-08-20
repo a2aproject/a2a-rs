@@ -18,8 +18,9 @@ use a2a_websocket::auth::{
     AuthContext, AuthError, AuthStatus, AuthenticateParams, User, WsAuthenticator,
 };
 use a2a_websocket::{
-    ConnectOptions, CredentialProvider, RateLimit, RateLimitPolicy, WebSocketConfig,
-    WebSocketTransport, server::websocket_router, server::websocket_router_with_auth,
+    Backoff, ConnectOptions, ConnectionLimitPolicy, ConnectionLimits, CredentialProvider, Liveness,
+    LivenessPolicy, RateLimit, RateLimitPolicy, WebSocketConfig, WebSocketTransport,
+    server::websocket_router, server::websocket_router_with_auth,
     server::websocket_router_with_config,
 };
 use async_trait::async_trait;
@@ -401,6 +402,65 @@ async fn end_to_end_concurrent_unary_requests_are_multiplexed_on_one_socket() {
     shutdown.send(()).unwrap();
 }
 
+/// Large frames in both directions at the same time.
+///
+/// A payload this size cannot be read in a single syscall, so the server is
+/// always partway through an inbound frame while it writes an echo back. That
+/// is only safe because reads and writes own separate halves of the socket:
+/// sharing one half across a `select!` would abandon the half-read frame and
+/// desynchronize the stream, surfacing here as a protocol error or a response
+/// that fails to parse.
+#[tokio::test]
+async fn end_to_end_large_frames_survive_traffic_in_both_directions() {
+    let (url, shutdown) = start_server(EchoExecutor).await;
+    let transport = Arc::new(WebSocketTransport::connect(&url).await.unwrap());
+
+    // Comfortably over a TCP segment and the 8 KiB read buffer, but under the
+    // default 1 MiB message cap once JSON encoding is accounted for.
+    let filler = "x".repeat(256 * 1024);
+
+    let mut handles = Vec::new();
+    for index in 0..8 {
+        let transport = transport.clone();
+        let filler = filler.clone();
+        handles.push(tokio::spawn(async move {
+            let mut req = SendMessageRequest {
+                message: Message::new(Role::User, vec![Part::text(&filler)]),
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            };
+            req.message.task_id = Some(format!("large-{index}"));
+            req.message.context_id = Some(format!("ctx-large-{index}"));
+            transport.send_message(&ServiceParams::new(), &req).await
+        }));
+    }
+
+    for handle in handles {
+        let response = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("request timed out")
+            .unwrap()
+            .expect("large request failed");
+        match response {
+            SendMessageResponse::Task(task) => {
+                assert_eq!(task.status.state, TaskState::Completed);
+                // The echo came back whole rather than truncated at a frame
+                // boundary, which is what a desynchronized stream would give.
+                let echoed = task.status.message.expect("echoed message");
+                match &echoed.parts[0].content {
+                    PartContent::Text(text) => assert_eq!(text.len(), filler.len()),
+                    other => panic!("expected a text part, got {other:?}"),
+                }
+            }
+            other => panic!("expected a Task response, got {other:?}"),
+        }
+    }
+
+    transport.destroy().await.unwrap();
+    shutdown.send(()).unwrap();
+}
+
 #[tokio::test]
 async fn end_to_end_subprotocol_negotiation_uses_a2a_v1() {
     let (url, shutdown) = start_server(EchoExecutor).await;
@@ -644,6 +704,72 @@ async fn end_to_end_message_under_the_size_limit_is_still_accepted() {
     let response: serde_json::Value = serde_json::from_slice(&frame.payload).unwrap();
     assert_eq!(response["id"], "big-but-ok");
     assert_eq!(response["error"]["code"], error_code::METHOD_NOT_FOUND);
+
+    shutdown.send(()).unwrap();
+}
+
+/// Keep-alive ping/pong support is required by Section 2.4.
+///
+/// Worth covering explicitly because the pong is not written by the read half:
+/// once the socket is split, `fastwebsockets` hands back the frames it owes the
+/// peer and the binding queues them to the writer task.
+#[tokio::test]
+async fn end_to_end_server_answers_a_ping_with_a_pong() {
+    let (url, shutdown) = start_server(EchoExecutor).await;
+    let mut ws = raw_connect(&url).await;
+    ws.set_auto_close(false);
+
+    ws.write_frame(Frame::new(
+        true,
+        OpCode::Ping,
+        None,
+        Payload::Owned(b"keep-alive".to_vec()),
+    ))
+    .await
+    .unwrap();
+
+    let frame = ws
+        .read_frame()
+        .await
+        .expect("server should answer the ping");
+    assert_eq!(frame.opcode, OpCode::Pong);
+    assert_eq!(&*frame.payload, b"keep-alive");
+
+    // A keep-alive must not disturb request handling on the same connection.
+    ws.write_frame(Frame::text(Payload::Owned(
+        br#"{"jsonrpc":"2.0","id":"after-ping","method":"Bogus","params":{}}"#.to_vec(),
+    )))
+    .await
+    .unwrap();
+    let frame = ws.read_frame().await.unwrap();
+    assert_eq!(frame.opcode, OpCode::Text);
+    let response: serde_json::Value = serde_json::from_slice(&frame.payload).unwrap();
+    assert_eq!(response["id"], "after-ping");
+
+    shutdown.send(()).unwrap();
+}
+
+/// A client-initiated Close is echoed back before the connection goes away,
+/// which is the same queued-control-frame path as the pong above.
+#[tokio::test]
+async fn end_to_end_client_initiated_close_is_echoed() {
+    let (url, shutdown) = start_server(EchoExecutor).await;
+    let mut ws = raw_connect(&url).await;
+    ws.set_auto_close(false);
+
+    ws.write_frame(Frame::close(
+        a2a_websocket::close_codes::NORMAL_CLOSURE,
+        b"client done",
+    ))
+    .await
+    .unwrap();
+
+    let frame = ws.read_frame().await.expect("server should echo the close");
+    assert_eq!(frame.opcode, OpCode::Close);
+    assert_eq!(
+        close_code_of(&frame),
+        a2a_websocket::close_codes::NORMAL_CLOSURE
+    );
 
     shutdown.send(()).unwrap();
 }
@@ -1190,4 +1316,560 @@ async fn end_to_end_in_band_refresh_updates_the_identity_seen_by_the_handler() {
     assert_eq!(observed_caller(&transport, &params).await, "bob");
 
     shutdown.send(()).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Keep-alive and idle timeouts (spec Section 2.4)
+// ---------------------------------------------------------------------------
+
+/// Emits events on a timer, so a stream can be made to outlive a short idle
+/// timeout.
+struct SlowStreamingExecutor {
+    events: usize,
+    gap: Duration,
+}
+
+impl AgentExecutor for SlowStreamingExecutor {
+    fn execute(
+        &self,
+        ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        let total = self.events;
+        let gap = self.gap;
+        let task_id = ctx.task_id.clone();
+        let context_id = ctx.context_id.clone();
+        Box::pin(stream::unfold(0usize, move |sent| {
+            let task_id = task_id.clone();
+            let context_id = context_id.clone();
+            async move {
+                if sent > total {
+                    return None;
+                }
+                tokio::time::sleep(gap).await;
+                let item = if sent == total {
+                    Ok(StreamResponse::Task(Task {
+                        id: task_id,
+                        context_id,
+                        status: TaskStatus {
+                            state: TaskState::Completed,
+                            message: None,
+                            timestamp: None,
+                        },
+                        artifacts: None,
+                        history: None,
+                        metadata: None,
+                    }))
+                } else {
+                    Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                        task_id,
+                        context_id,
+                        status: TaskStatus {
+                            state: TaskState::Working,
+                            message: None,
+                            timestamp: None,
+                        },
+                        metadata: None,
+                    }))
+                };
+                Some((item, sent + 1))
+            }
+        }))
+    }
+
+    fn cancel(
+        &self,
+        _ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        Box::pin(stream::empty())
+    }
+}
+
+/// Short timings so the liveness paths can be exercised in milliseconds rather
+/// than the minutes the spec recommends for production.
+fn test_liveness(ping_interval_ms: u64, pong_timeout_ms: u64, idle_timeout_ms: u64) -> Liveness {
+    Liveness {
+        ping_interval: Duration::from_millis(ping_interval_ms),
+        pong_timeout: Duration::from_millis(pong_timeout_ms),
+        idle_timeout: Duration::from_millis(idle_timeout_ms),
+    }
+}
+
+#[tokio::test]
+async fn end_to_end_server_sends_keep_alive_pings() {
+    let (url, shutdown) = start_server_with_config(
+        EchoExecutor,
+        WebSocketConfig {
+            liveness: LivenessPolicy::Custom(test_liveness(30, 500, 60_000)),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut ws = raw_connect(&url).await;
+    // Observe the ping rather than letting the library answer it silently.
+    ws.set_auto_pong(false);
+
+    let frame = ws.read_frame().await.expect("server should ping");
+    assert_eq!(
+        frame.opcode,
+        OpCode::Ping,
+        "the server must send keep-alive pings (spec Section 2.4)"
+    );
+
+    shutdown.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn end_to_end_a_peer_that_never_pongs_is_closed() {
+    let (url, shutdown) = start_server_with_config(
+        EchoExecutor,
+        WebSocketConfig {
+            liveness: LivenessPolicy::Custom(test_liveness(30, 40, 60_000)),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut ws = raw_connect(&url).await;
+    ws.set_auto_pong(false);
+    ws.set_auto_close(false);
+
+    // Ping first, then the close once the pong never arrives.
+    let ping = ws.read_frame().await.unwrap();
+    assert_eq!(ping.opcode, OpCode::Ping);
+
+    let frame = ws
+        .read_frame()
+        .await
+        .expect("server should close, not just hang up");
+    assert_eq!(
+        close_code_of(&frame),
+        a2a_websocket::close_codes::GOING_AWAY,
+        "an unanswered ping must close the connection"
+    );
+
+    shutdown.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn end_to_end_an_idle_connection_is_closed() {
+    let (url, shutdown) = start_server_with_config(
+        EchoExecutor,
+        WebSocketConfig {
+            liveness: LivenessPolicy::Custom(test_liveness(20, 30, 40)),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut ws = raw_connect(&url).await;
+    ws.set_auto_close(false);
+
+    // `auto_pong` stays on, so the connection is answering pings and is closed
+    // for being idle rather than unresponsive.
+    let frame = loop {
+        let frame = ws.read_frame().await.expect("server should close");
+        if frame.opcode == OpCode::Close {
+            break frame;
+        }
+    };
+    assert_eq!(
+        close_code_of(&frame),
+        a2a_websocket::close_codes::GOING_AWAY,
+        "a connection with no application traffic must be closed"
+    );
+
+    shutdown.send(()).unwrap();
+}
+
+/// A stream pushing events is busy, not idle, even though the client says
+/// nothing for the whole exchange.
+#[tokio::test]
+async fn end_to_end_an_active_stream_is_not_closed_as_idle() {
+    const EVENTS: usize = 8;
+    let (url, shutdown) = start_server_with_config(
+        SlowStreamingExecutor {
+            events: EVENTS,
+            gap: Duration::from_millis(20),
+        },
+        WebSocketConfig {
+            // The stream runs for roughly 180ms, well past this idle timeout.
+            liveness: LivenessPolicy::Custom(test_liveness(15, 200, 60)),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let transport = WebSocketTransport::connect(&url).await.unwrap();
+    let mut stream = transport
+        .send_streaming_message(&ServiceParams::new(), &send_message_request())
+        .await
+        .unwrap();
+
+    let mut received = 0;
+    while let Some(item) = stream.next().await {
+        item.expect("the stream must not be interrupted by the idle timeout");
+        received += 1;
+    }
+    assert_eq!(
+        received,
+        EVENTS + 1,
+        "every event must arrive; outbound traffic counts as activity"
+    );
+
+    transport.destroy().await.unwrap();
+    shutdown.send(()).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Connection and stream limits (spec Section 13.5)
+// ---------------------------------------------------------------------------
+
+/// Maps each bearer token to an identity of the same name, so a test can hold
+/// connections open as several distinct principals.
+struct NamedTokenAuth;
+
+#[async_trait]
+impl WsAuthenticator for NamedTokenAuth {
+    async fn authenticate(&self, headers: &HeaderMap) -> Result<AuthContext, AuthError> {
+        let token = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .ok_or_else(|| AuthError::unauthorized("missing Authorization header"))?;
+        Ok(AuthContext::for_user(User::authenticated(token)))
+    }
+}
+
+async fn start_limited_server<E: AgentExecutor>(
+    executor: E,
+    limits: ConnectionLimits,
+) -> (String, oneshot::Sender<()>) {
+    let handler = Arc::new(DefaultRequestHandler::new(
+        executor,
+        InMemoryTaskStore::new(),
+    ));
+    let config = WebSocketConfig {
+        authenticator: Some(Arc::new(NamedTokenAuth)),
+        connection_limits: ConnectionLimitPolicy::Custom(limits),
+        // Irrelevant here, and short timings would only add flake.
+        liveness: LivenessPolicy::Disabled,
+        ..Default::default()
+    };
+    let app = axum::Router::new().nest("/a2a/ws", websocket_router_with_config(handler, config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    (format!("ws://{address}/a2a/ws"), shutdown_tx)
+}
+
+#[tokio::test]
+async fn end_to_end_connections_beyond_the_per_identity_cap_are_refused() {
+    let (url, shutdown) = start_limited_server(
+        EchoExecutor,
+        ConnectionLimits {
+            max_connections_per_identity: 1,
+            max_streams_per_connection: 16,
+        },
+    )
+    .await;
+
+    let first =
+        WebSocketTransport::connect_with_options(&url, ConnectOptions::with_bearer_token("alice"))
+            .await
+            .expect("the first connection must be admitted");
+
+    let second =
+        WebSocketTransport::connect_with_options(&url, ConnectOptions::with_bearer_token("alice"))
+            .await;
+    assert!(
+        second.is_err(),
+        "a second connection for the same identity must be refused (spec Section 13.5)"
+    );
+
+    // The cap is per identity, so another principal is unaffected.
+    let other =
+        WebSocketTransport::connect_with_options(&url, ConnectOptions::with_bearer_token("bob"))
+            .await
+            .expect("a different identity must not be blocked by alice's connections");
+
+    other.destroy().await.unwrap();
+    first.destroy().await.unwrap();
+    shutdown.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn end_to_end_a_closed_connection_frees_its_slot() {
+    let (url, shutdown) = start_limited_server(
+        EchoExecutor,
+        ConnectionLimits {
+            max_connections_per_identity: 1,
+            max_streams_per_connection: 16,
+        },
+    )
+    .await;
+
+    let first =
+        WebSocketTransport::connect_with_options(&url, ConnectOptions::with_bearer_token("alice"))
+            .await
+            .unwrap();
+    assert!(
+        WebSocketTransport::connect_with_options(&url, ConnectOptions::with_bearer_token("alice"))
+            .await
+            .is_err()
+    );
+
+    first.destroy().await.unwrap();
+
+    // The slot is released when the connection task ends, which happens shortly
+    // after the close is written.
+    let mut reconnected = None;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Ok(transport) = WebSocketTransport::connect_with_options(
+            &url,
+            ConnectOptions::with_bearer_token("alice"),
+        )
+        .await
+        {
+            reconnected = Some(transport);
+            break;
+        }
+    }
+    let reconnected = reconnected.expect("capacity must return once a connection closes");
+
+    reconnected.destroy().await.unwrap();
+    shutdown.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn end_to_end_streams_beyond_the_per_connection_cap_are_refused() {
+    let (url, shutdown) = start_limited_server(
+        SlowStreamingExecutor {
+            events: 50,
+            gap: Duration::from_millis(50),
+        },
+        ConnectionLimits {
+            max_connections_per_identity: 8,
+            max_streams_per_connection: 1,
+        },
+    )
+    .await;
+
+    let mut ws = raw_connect_as(&url, Some("alice")).await;
+    ws.set_auto_close(false);
+
+    let params = a2a_pb::protojson_conv::to_value(&send_message_request()).unwrap();
+    let request = |id: &str| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": a2a_websocket::methods::SEND_STREAMING_MESSAGE,
+            "params": params,
+        })
+        .to_string()
+    };
+
+    // The first stream stays active for seconds, so the second arrives while the
+    // single slot is taken.
+    ws.write_frame(Frame::text(Payload::Owned(
+        request("stream-one").into_bytes(),
+    )))
+    .await
+    .unwrap();
+    let first = ws.read_frame().await.unwrap();
+    assert_eq!(first.opcode, OpCode::Text);
+    let first: serde_json::Value = serde_json::from_slice(&first.payload).unwrap();
+    assert_eq!(first["id"], "stream-one");
+    assert!(
+        first["result"].is_object(),
+        "the first stream must be admitted, got {first}"
+    );
+
+    ws.write_frame(Frame::text(Payload::Owned(
+        request("stream-two").into_bytes(),
+    )))
+    .await
+    .unwrap();
+
+    // Skip any further chunks belonging to the first stream.
+    let rejection = loop {
+        let frame = ws.read_frame().await.unwrap();
+        assert_eq!(frame.opcode, OpCode::Text);
+        let value: serde_json::Value = serde_json::from_slice(&frame.payload).unwrap();
+        if value["id"] == "stream-two" {
+            break value;
+        }
+    };
+    assert_eq!(
+        rejection["error"]["code"],
+        a2a_websocket::SERVER_ERROR_CODE,
+        "an over-cap stream must be refused with a server error, got {rejection}"
+    );
+    assert_eq!(rejection["error"]["message"], "Too many concurrent streams");
+
+    shutdown.send(()).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Reconnection (spec Section 8.4)
+// ---------------------------------------------------------------------------
+
+/// Short delays with jitter off, so retry behaviour can be asserted without
+/// waiting the seconds the spec recommends for production.
+fn test_backoff(max_attempts: u32) -> Backoff {
+    Backoff {
+        initial: Duration::from_millis(10),
+        max: Duration::from_millis(40),
+        multiplier: 2,
+        jitter: 0.0,
+        max_attempts: Some(max_attempts),
+    }
+}
+
+#[tokio::test]
+async fn end_to_end_connect_with_retry_succeeds_against_a_live_server() {
+    let (url, shutdown) = start_server(EchoExecutor).await;
+
+    let transport =
+        WebSocketTransport::connect_with_retry(&url, ConnectOptions::default(), test_backoff(3))
+            .await
+            .expect("a reachable server must connect on the first attempt");
+
+    let response = transport
+        .send_message(&ServiceParams::new(), &send_message_request())
+        .await
+        .unwrap();
+    assert!(matches!(response, SendMessageResponse::Task(_)));
+
+    transport.destroy().await.unwrap();
+    shutdown.send(()).unwrap();
+}
+
+/// A client that returns while an interrupted connection's slot is still held
+/// gets a `503`, which is the retryable case the backoff exists for.
+#[tokio::test]
+async fn end_to_end_connect_with_retry_waits_out_a_busy_server() {
+    let (url, shutdown) = start_limited_server(
+        EchoExecutor,
+        ConnectionLimits {
+            max_connections_per_identity: 1,
+            max_streams_per_connection: 16,
+        },
+    )
+    .await;
+
+    let holder =
+        WebSocketTransport::connect_with_options(&url, ConnectOptions::with_bearer_token("alice"))
+            .await
+            .unwrap();
+
+    // Release the slot shortly, while the retry loop is still backing off.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = holder.destroy().await;
+    });
+
+    let reconnected = WebSocketTransport::connect_with_retry(
+        &url,
+        ConnectOptions::with_bearer_token("alice"),
+        Backoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+            multiplier: 2,
+            jitter: 0.0,
+            max_attempts: Some(20),
+        },
+    )
+    .await
+    .expect("the retry loop must wait out a temporarily full server");
+
+    reconnected.destroy().await.unwrap();
+    shutdown.send(()).unwrap();
+}
+
+/// Rejected credentials will be rejected again, so they must not be retried —
+/// a backoff loop against an auth server is worse than a prompt failure.
+#[tokio::test]
+async fn end_to_end_connect_with_retry_does_not_retry_rejected_credentials() {
+    let (url, shutdown) = start_authenticated_server(EchoExecutor).await;
+
+    let started = std::time::Instant::now();
+    let result = WebSocketTransport::connect_with_retry(
+        &url,
+        ConnectOptions::with_bearer_token("wrong-token"),
+        // Attempts here would take at least a second in total.
+        Backoff {
+            initial: Duration::from_millis(500),
+            max: Duration::from_millis(500),
+            multiplier: 1,
+            jitter: 0.0,
+            max_attempts: Some(10),
+        },
+    )
+    .await;
+
+    assert!(result.is_err(), "bad credentials must not connect");
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "a rejected token must fail immediately rather than back off"
+    );
+
+    shutdown.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn end_to_end_connect_with_retry_gives_up_after_the_attempt_limit() {
+    // Nothing is listening on this port, so every attempt fails at the transport
+    // level, which is the retryable case.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let url = format!("ws://{address}/a2a/ws");
+
+    let result =
+        WebSocketTransport::connect_with_retry(&url, ConnectOptions::default(), test_backoff(2))
+            .await;
+
+    let err = match result {
+        Ok(_) => panic!("an unreachable endpoint must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.message.contains("after 3 attempts"),
+        "the error should say how many attempts were made, got: {}",
+        err.message
+    );
+}
+
+/// A malformed endpoint cannot become valid, so it is reported at once.
+#[tokio::test]
+async fn end_to_end_connect_with_retry_rejects_an_unusable_endpoint_immediately() {
+    let started = std::time::Instant::now();
+    let result = WebSocketTransport::connect_with_retry(
+        "http://example.test/a2a/ws",
+        ConnectOptions::default(),
+        Backoff {
+            initial: Duration::from_secs(5),
+            max: Duration::from_secs(5),
+            multiplier: 1,
+            jitter: 0.0,
+            max_attempts: Some(5),
+        },
+    )
+    .await;
+
+    assert!(result.is_err(), "an http:// endpoint must be rejected");
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "an unusable endpoint must not be retried"
+    );
 }
