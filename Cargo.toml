@@ -6,6 +6,7 @@ members = [
     "a2a-pb",
     "a2a-grpc",
     "a2a-slimrpc",
+    "a2a-websocket",
     "a2acli",
     "examples",
 ]
@@ -17,6 +18,7 @@ default-members = [
     "a2a-pb",
     "a2a-grpc",
     "a2a-slimrpc",
+    "a2a-websocket",
     "a2acli",
     "examples",
 ]
@@ -37,6 +39,7 @@ a2a-server = { package = "a2a-server-lf", path = "a2a-server", version = "0.4.1"
 a2a-pb = { package = "a2a-pb", path = "a2a-pb", version = "0.2.0" }
 a2a-grpc = { package = "a2a-grpc", path = "a2a-grpc", version = "0.3.2", default-features = false }
 a2a-slimrpc = { package = "a2a-slimrpc", path = "a2a-slimrpc", version = "0.2.4" }
+a2a-websocket = { package = "a2a-websocket", path = "a2a-websocket", version = "0.1.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -81,12 +84,25 @@ slim_service = { package = "agntcy-slim-service", version = "0.12.6", features =
 slim_datapath = { package = "agntcy-slim-datapath", version = "0.18.2" }
 slim_auth = { package = "agntcy-slim-auth", version = "0.14.6" }
 
+# WebSocket
+fastwebsockets = { version = "0.10", features = [
+    "upgrade",
+    "with_axum",
+    # Reads and writes are driven by separate tasks so that an in-flight
+    # `read_frame` is never cancelled; its parser is not cancellation safe.
+    "unstable-split",
+] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+bytes = "1"
+
 # Utilities
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 rustls-pemfile = "2"
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 thiserror = "2"
+parking_lot = "0.12"
 uuid = { version = "1", features = ["v7"] }
 semver = "1"
 tracing = "0.1"

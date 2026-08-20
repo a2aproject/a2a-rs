@@ -16,6 +16,7 @@ The workspace supports:
 - REST / HTTP+JSON
 - gRPC via `tonic`
 - SLIMRPC via `slim_bindings`
+- WebSocket custom protocol binding via `fastwebsockets`
 - Server-Sent Events for streaming responses
 - Protobuf-based interop with other SDKs and runtimes
 
@@ -29,6 +30,7 @@ The workspace supports:
 | `a2a-pb` | Protobuf schema, generated types, ProtoJSON-capable generated types, and native <-> protobuf conversion helpers |
 | `a2a-grpc` | gRPC client and server bindings built on `tonic` |
 | `a2a-slimrpc` | SLIMRPC client and server bindings built on `slim_bindings` |
+| `a2a-websocket` | WebSocket custom protocol binding (client and server) built on `fastwebsockets` and `axum` |
 | `a2acli` | Standalone A2A client CLI, published as `a2a-cli`, for inspecting agent cards, sending messages, managing tasks, and handling push configs |
 | `examples/helloworld` | Minimal runnable example agent |
 
@@ -40,6 +42,7 @@ The workspace supports:
 | HTTP+JSON / REST | `a2a-client` | `a2a-server` |
 | gRPC | `a2a-grpc` | `a2a-grpc` |
 | SLIMRPC | `a2a-slimrpc` | `a2a-slimrpc` |
+| WebSocket | `a2a-websocket` | `a2a-websocket` |
 
 The gRPC support uses the schema in `a2a-pb/proto/a2a.proto`. The REST and
 JSON-RPC bindings are intended to stay wire-compatible with other A2A SDKs,
@@ -167,6 +170,7 @@ a2a-server = { package = "a2a-server-lf", git = "https://github.com/a2aproject/a
 a2a-pb = { package = "a2a-pb", git = "https://github.com/a2aproject/a2a-rs.git" }
 a2a-grpc = { package = "a2a-grpc", git = "https://github.com/a2aproject/a2a-rs.git" }
 a2a-slimrpc = { package = "a2a-slimrpc", git = "https://github.com/a2aproject/a2a-rs.git" }
+a2a-websocket = { package = "a2a-websocket", git = "https://github.com/a2aproject/a2a-rs.git" }
 ```
 
 Typical usage is:
@@ -176,6 +180,7 @@ Typical usage is:
 - `a2a-server` for agent implementations on `axum`
 - `a2a-grpc` when you need gRPC transport support
 - `a2a-slimrpc` when you need SLIMRPC transport support
+- `a2a-websocket` when you need the WebSocket custom protocol binding
 - `a2a-pb` when you need direct access to protobuf messages or conversion helpers
 
 ## Repository Layout
@@ -186,6 +191,7 @@ Typical usage is:
 - `a2a-pb/`: protobuf schema and conversion layer
 - `a2a-grpc/`: tonic-based bindings
 - `a2a-slimrpc/`: SLIMRPC bindings
+- `a2a-websocket/`: WebSocket custom protocol bindings
 - `a2acli/`: standalone A2A client CLI and published binary package
 - `examples/helloworld/`: runnable sample agent
 

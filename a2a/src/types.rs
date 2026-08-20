@@ -690,6 +690,10 @@ pub const TRANSPORT_PROTOCOL_GRPC: &str = "GRPC";
 pub const TRANSPORT_PROTOCOL_HTTP_JSON: &str = "HTTP+JSON";
 /// SLIMRPC transport protocol constant.
 pub const TRANSPORT_PROTOCOL_SLIMRPC: &str = "SLIMRPC";
+/// WebSocket transport protocol constant (Agent Card `protocolBinding` value
+/// for the A2A WebSocket custom protocol binding). The binding carries
+/// JSON-RPC 2.0 messages on the wire, but the identifier is simply `WEBSOCKET`.
+pub const TRANSPORT_PROTOCOL_WEBSOCKET: &str = "WEBSOCKET";
 
 /// Protocol version string (e.g., "1.0").
 pub type ProtocolVersion = String;
@@ -1060,6 +1064,850 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: SubscribeToTaskRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // Error / edge-case deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_role_deserialize_unknown_variant_errors() {
+        let result = serde_json::from_str::<Role>("\"ROLE_UNKNOWN\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_task_state_deserialize_unknown_variant_errors() {
+        let result = serde_json::from_str::<TaskState>("\"TASK_STATE_BOGUS\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_part_deserialize_missing_content_errors() {
+        let json = r#"{"filename": "f.txt"}"#;
+        let result = serde_json::from_str::<Part>(json);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Part must have one of")
+        );
+    }
+
+    #[test]
+    fn test_part_raw_deserialize_invalid_base64_errors() {
+        let json = r#"{"raw": "not-valid-base64!!!"}"#;
+        let result = serde_json::from_str::<Part>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_part_deserialize_uses_first_present_content_field() {
+        let json = r#"{"text": "hello", "raw": "AQID", "url": "https://example.com"}"#;
+        let part: Part = serde_json::from_str(json).unwrap();
+        assert_eq!(part.content, PartContent::Text("hello".into()));
+    }
+
+    #[test]
+    fn test_part_deserialize_ignores_non_object_metadata() {
+        let json = r#"{"text": "hello", "metadata": "not-an-object"}"#;
+        let part: Part = serde_json::from_str(json).unwrap();
+        assert_eq!(part.as_text(), Some("hello"));
+        assert_eq!(part.metadata, None);
+    }
+
+    #[test]
+    fn test_send_message_response_deserialize_missing_both_errors() {
+        let json = r#"{"something": 1}"#;
+        let result = serde_json::from_str::<SendMessageResponse>(json);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("SendMessageResponse must have")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Part metadata round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_part_with_metadata_round_trip() {
+        let mut meta = HashMap::new();
+        meta.insert("key".to_string(), serde_json::json!("value"));
+        meta.insert("num".to_string(), serde_json::json!(42));
+        let part = Part {
+            content: PartContent::Text("hi".into()),
+            filename: None,
+            media_type: None,
+            metadata: Some(meta.clone()),
+        };
+        let json = serde_json::to_string(&part).unwrap();
+        let back: Part = serde_json::from_str(&json).unwrap();
+        let back_meta = back.metadata.unwrap();
+        assert_eq!(back_meta["key"], "value");
+        assert_eq!(back_meta["num"], 42);
+    }
+
+    #[test]
+    fn test_part_empty_metadata_omitted_in_json() {
+        let part = Part {
+            content: PartContent::Text("hi".into()),
+            filename: None,
+            media_type: None,
+            metadata: Some(HashMap::new()),
+        };
+        let json = serde_json::to_string(&part).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        // Empty metadata map should not appear in output
+        assert!(v.get("metadata").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Struct serde round-trips for previously untested types
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_task_request_serde() {
+        let req = GetTaskRequest {
+            id: "t1".to_string(),
+            history_length: Some(5),
+            tenant: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: GetTaskRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn test_get_extended_agent_card_request_serde() {
+        let req = GetExtendedAgentCardRequest {
+            tenant: Some("t".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: GetExtendedAgentCardRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn test_list_tasks_response_serde() {
+        let resp = ListTasksResponse {
+            tasks: vec![Task {
+                id: "t1".into(),
+                context_id: "c1".into(),
+                status: TaskStatus {
+                    state: TaskState::Submitted,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            }],
+            next_page_token: "tok".into(),
+            page_size: 10,
+            total_size: 1,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: ListTasksResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn test_authentication_info_serde() {
+        let auth = AuthenticationInfo {
+            scheme: "Bearer".to_string(),
+            credentials: Some("tok123".to_string()),
+        };
+        let json = serde_json::to_string(&auth).unwrap();
+        let back: AuthenticationInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(auth, back);
+    }
+
+    #[test]
+    fn test_authentication_info_no_credentials_serde() {
+        let auth = AuthenticationInfo {
+            scheme: "Basic".to_string(),
+            credentials: None,
+        };
+        let json = serde_json::to_string(&auth).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("credentials").is_none());
+        let back: AuthenticationInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(auth, back);
+    }
+
+    #[test]
+    fn test_task_push_notification_config_serde() {
+        let cfg = TaskPushNotificationConfig {
+            task_id: "t1".into(),
+            url: "https://example.com/hook".into(),
+            id: Some("cfg1".into()),
+            token: None,
+            authentication: None,
+            tenant: Some("ten".into()),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: TaskPushNotificationConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn test_get_task_push_notification_config_request_serde() {
+        let req = GetTaskPushNotificationConfigRequest {
+            task_id: "t1".into(),
+            id: "cfg1".into(),
+            tenant: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: GetTaskPushNotificationConfigRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn test_list_task_push_notification_configs_request_serde() {
+        let req = ListTaskPushNotificationConfigsRequest {
+            task_id: "t1".into(),
+            page_size: Some(20),
+            page_token: Some("pt".into()),
+            tenant: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ListTaskPushNotificationConfigsRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn test_list_task_push_notification_configs_response_serde() {
+        let resp = ListTaskPushNotificationConfigsResponse {
+            configs: vec![],
+            next_page_token: Some("next".into()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: ListTaskPushNotificationConfigsResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn test_create_task_push_notification_config_serde() {
+        let req = TaskPushNotificationConfig {
+            task_id: "t1".into(),
+            url: "https://x.com/hook".into(),
+            id: None,
+            token: None,
+            authentication: None,
+            tenant: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: TaskPushNotificationConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn test_delete_task_push_notification_config_request_serde() {
+        let req = DeleteTaskPushNotificationConfigRequest {
+            task_id: "t1".into(),
+            id: "cfg1".into(),
+            tenant: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: DeleteTaskPushNotificationConfigRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // TaskStatus standalone
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_task_status_serde() {
+        let ts = TaskStatus {
+            state: TaskState::InputRequired,
+            message: Some(Message::new(Role::Agent, vec![Part::text("need input")])),
+            timestamp: Some(Utc::now()),
+        };
+        let json = serde_json::to_string(&ts).unwrap();
+        let back: TaskStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.state, TaskState::InputRequired);
+        assert!(back.message.is_some());
+        assert!(back.timestamp.is_some());
+    }
+
+    #[test]
+    fn test_task_status_optional_fields_omitted() {
+        let ts = TaskStatus {
+            state: TaskState::Submitted,
+            message: None,
+            timestamp: None,
+        };
+        let json = serde_json::to_string(&ts).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("message").is_none());
+        assert!(v.get("timestamp").is_none());
+        let back: TaskStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(ts, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // Artifact standalone
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_artifact_serde() {
+        let a = Artifact {
+            artifact_id: "a1".into(),
+            name: Some("report".into()),
+            description: Some("A summary".into()),
+            parts: vec![Part::text("contents")],
+            metadata: None,
+            extensions: Some(vec!["ext-a".into()]),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: Artifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(a, back);
+    }
+
+    #[test]
+    fn test_artifact_minimal_serde() {
+        let a = Artifact {
+            artifact_id: "a2".into(),
+            name: None,
+            description: None,
+            parts: vec![],
+            metadata: None,
+            extensions: None,
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("name").is_none());
+        assert!(v.get("description").is_none());
+        assert!(v.get("extensions").is_none());
+        let back: Artifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(a, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // SendMessageConfiguration standalone
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_send_message_configuration_all_none() {
+        let cfg = SendMessageConfiguration {
+            accepted_output_modes: None,
+            task_push_notification_config: None,
+            history_length: None,
+            return_immediately: None,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(json, "{}");
+        let back: SendMessageConfiguration = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn test_send_message_configuration_full_serde() {
+        let cfg = SendMessageConfiguration {
+            accepted_output_modes: Some(vec!["text/plain".into(), "application/json".into()]),
+            task_push_notification_config: Some(TaskPushNotificationConfig {
+                url: "https://hook.example.com".into(),
+                id: None,
+                task_id: "t1".into(),
+                token: None,
+                authentication: None,
+                tenant: None,
+            }),
+            history_length: Some(20),
+            return_immediately: Some(false),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: SendMessageConfiguration = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task with all optional fields None
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_task_minimal_serde() {
+        let task = Task {
+            id: "t1".into(),
+            context_id: "c1".into(),
+            status: TaskStatus {
+                state: TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("artifacts").is_none());
+        assert!(v.get("history").is_none());
+        assert!(v.get("metadata").is_none());
+        let back: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(task, back);
+    }
+
+    #[test]
+    fn test_task_with_metadata_serde() {
+        let mut meta = HashMap::new();
+        meta.insert("custom".to_string(), serde_json::json!("data"));
+        let task = Task {
+            id: "t2".into(),
+            context_id: "c2".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: Some(meta),
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        let back: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(task, back);
+        assert_eq!(back.metadata.unwrap()["custom"], "data");
+    }
+
+    // -----------------------------------------------------------------------
+    // Message edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_message_text_returns_none_when_no_text_parts() {
+        let msg = Message::new(Role::User, vec![Part::raw(vec![0, 1, 2])]);
+        assert_eq!(msg.text(), None);
+    }
+
+    #[test]
+    fn test_message_text_returns_first_text_part() {
+        let msg = Message::new(
+            Role::User,
+            vec![
+                Part::raw(vec![0]),
+                Part::text("first"),
+                Part::text("second"),
+            ],
+        );
+        assert_eq!(msg.text(), Some("first"));
+    }
+
+    #[test]
+    fn test_message_all_optional_fields_serde() {
+        let mut meta = HashMap::new();
+        meta.insert("k".to_string(), serde_json::json!(true));
+        let msg = Message {
+            message_id: "m1".into(),
+            context_id: Some("c1".into()),
+            task_id: Some("t1".into()),
+            role: Role::User,
+            parts: vec![Part::text("hi")],
+            metadata: Some(meta),
+            extensions: Some(vec!["ext1".into()]),
+            reference_task_ids: Some(vec!["t2".into(), "t3".into()]),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn test_message_no_optional_fields_serde() {
+        let msg = Message {
+            message_id: "m2".into(),
+            context_id: None,
+            task_id: None,
+            role: Role::Agent,
+            parts: vec![],
+            metadata: None,
+            extensions: None,
+            reference_task_ids: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("contextId").is_none());
+        assert!(v.get("taskId").is_none());
+        assert!(v.get("metadata").is_none());
+        assert!(v.get("extensions").is_none());
+        assert!(v.get("referenceTaskIds").is_none());
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // Part builder chains
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_part_builder_chain() {
+        let part = Part::raw(vec![1, 2])
+            .with_media_type("application/octet-stream")
+            .with_filename("data.bin");
+        assert_eq!(part.media_type.as_deref(), Some("application/octet-stream"));
+        assert_eq!(part.filename.as_deref(), Some("data.bin"));
+        assert!(matches!(part.content, PartContent::Raw(_)));
+    }
+
+    #[test]
+    fn test_part_url_builder_serde() {
+        let part = Part::url("https://example.com/img.png").with_media_type("image/png");
+        let json = serde_json::to_string(&part).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["url"], "https://example.com/img.png");
+        assert_eq!(v["mediaType"], "image/png");
+        let back: Part = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.media_type.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn test_part_data_builder_serde() {
+        let part = Part::data(serde_json::json!({"nested": {"a": 1}}))
+            .with_media_type("application/json")
+            .with_filename("data.json");
+        let json = serde_json::to_string(&part).unwrap();
+        let back: Part = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.filename.as_deref(), Some("data.json"));
+        assert_eq!(back.media_type.as_deref(), Some("application/json"));
+        if let PartContent::Data(d) = &back.content {
+            assert_eq!(d["nested"]["a"], 1);
+        } else {
+            panic!("expected PartContent::Data");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Part raw edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_part_raw_empty_data_serde() {
+        let part = Part::raw(vec![]);
+        let json = serde_json::to_string(&part).unwrap();
+        let back: Part = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.content, PartContent::Raw(vec![]));
+    }
+
+    #[test]
+    fn test_part_raw_large_data_serde() {
+        let data: Vec<u8> = (0..=255).collect();
+        let part = Part::raw(data.clone());
+        let json = serde_json::to_string(&part).unwrap();
+        let back: Part = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.content, PartContent::Raw(data));
+    }
+
+    // -----------------------------------------------------------------------
+    // Part as_text on non-text variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_part_as_text_url_returns_none() {
+        let part = Part::url("https://example.com");
+        assert_eq!(part.as_text(), None);
+    }
+
+    #[test]
+    fn test_part_as_text_data_returns_none() {
+        let part = Part::data(serde_json::json!(42));
+        assert_eq!(part.as_text(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Transport protocol constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_transport_protocol_constants() {
+        assert_eq!(TRANSPORT_PROTOCOL_JSONRPC, "JSONRPC");
+        assert_eq!(TRANSPORT_PROTOCOL_GRPC, "GRPC");
+        assert_eq!(TRANSPORT_PROTOCOL_HTTP_JSON, "HTTP+JSON");
+        assert_eq!(TRANSPORT_PROTOCOL_SLIMRPC, "SLIMRPC");
+        assert_eq!(TRANSPORT_PROTOCOL_WEBSOCKET, "WEBSOCKET");
+    }
+
+    // -----------------------------------------------------------------------
+    // Clone / trait coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_role_clone_and_eq() {
+        let r1 = Role::User;
+        let r2 = r1.clone();
+        assert_eq!(r1, r2);
+        assert_ne!(r1, Role::Agent);
+    }
+
+    #[test]
+    fn test_task_state_clone_and_eq() {
+        let s1 = TaskState::Working;
+        let s2 = s1.clone();
+        assert_eq!(s1, s2);
+        assert_ne!(s1, TaskState::Completed);
+    }
+
+    #[test]
+    fn test_role_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(Role::User);
+        set.insert(Role::Agent);
+        set.insert(Role::Unspecified);
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&Role::User));
+    }
+
+    #[test]
+    fn test_task_state_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(TaskState::Submitted);
+        set.insert(TaskState::Working);
+        set.insert(TaskState::Completed);
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&TaskState::Working));
+    }
+
+    // -----------------------------------------------------------------------
+    // Debug trait coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_role_debug() {
+        assert_eq!(format!("{:?}", Role::User), "User");
+        assert_eq!(format!("{:?}", Role::Agent), "Agent");
+        assert_eq!(format!("{:?}", Role::Unspecified), "Unspecified");
+    }
+
+    #[test]
+    fn test_task_state_debug() {
+        assert!(format!("{:?}", TaskState::Completed).contains("Completed"));
+    }
+
+    #[test]
+    fn test_part_debug() {
+        let part = Part::text("hello");
+        let dbg = format!("{:?}", part);
+        assert!(dbg.contains("Text"));
+        assert!(dbg.contains("hello"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SendMessageResponse edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_send_message_response_task_variant_deserialize_from_value() {
+        let json = serde_json::json!({
+            "task": {
+                "id": "t1",
+                "contextId": "c1",
+                "status": {
+                    "state": "TASK_STATE_COMPLETED"
+                }
+            }
+        });
+        let resp: SendMessageResponse = serde_json::from_value(json).unwrap();
+        if let SendMessageResponse::Task(t) = resp {
+            assert_eq!(t.id, "t1");
+            assert_eq!(t.status.state, TaskState::Completed);
+        } else {
+            panic!("expected Task variant");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // camelCase field naming verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_message_camel_case_field_names() {
+        let msg = Message {
+            message_id: "m1".into(),
+            context_id: Some("c1".into()),
+            task_id: Some("t1".into()),
+            role: Role::User,
+            parts: vec![],
+            metadata: None,
+            extensions: None,
+            reference_task_ids: Some(vec!["ref1".into()]),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        // Verify camelCase
+        assert!(v.get("messageId").is_some());
+        assert!(v.get("contextId").is_some());
+        assert!(v.get("taskId").is_some());
+        assert!(v.get("referenceTaskIds").is_some());
+        // Verify snake_case is NOT present
+        assert!(v.get("message_id").is_none());
+        assert!(v.get("context_id").is_none());
+        assert!(v.get("task_id").is_none());
+        assert!(v.get("reference_task_ids").is_none());
+    }
+
+    #[test]
+    fn test_task_camel_case_field_names() {
+        let task = Task {
+            id: "t1".into(),
+            context_id: "c1".into(),
+            status: TaskStatus {
+                state: TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("contextId").is_some());
+        assert!(v.get("context_id").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // TaskPushNotificationConfig field name: "taskPushNotificationConfig"
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_send_message_configuration_task_push_notification_config_field_name() {
+        let cfg = SendMessageConfiguration {
+            accepted_output_modes: None,
+            task_push_notification_config: Some(TaskPushNotificationConfig {
+                url: "https://hook.example.com".into(),
+                id: None,
+                task_id: "t1".into(),
+                token: None,
+                authentication: None,
+                tenant: None,
+            }),
+            history_length: None,
+            return_immediately: None,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        // Verify the explicit rename to "taskPushNotificationConfig"
+        assert!(v.get("taskPushNotificationConfig").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // ListTasksRequest with all None fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_list_tasks_request_all_none_serde() {
+        let req = ListTasksRequest {
+            context_id: None,
+            status: None,
+            page_size: None,
+            page_token: None,
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: None,
+            tenant: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, "{}");
+        let back: ListTasksRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // ID uniqueness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_new_ids_are_unique() {
+        let ids: Vec<String> = (0..100).map(|_| new_task_id()).collect();
+        let set: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), set.len(), "generated IDs must be unique");
+    }
+
+    // -----------------------------------------------------------------------
+    // Part deserialization from JSON with extra unknown fields (tolerant)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_part_deserialize_ignores_unknown_fields() {
+        let json = r#"{"text": "hello", "unknownField": 123}"#;
+        let part: Part = serde_json::from_str(json).unwrap();
+        assert_eq!(part.as_text(), Some("hello"));
+    }
+
+    // -----------------------------------------------------------------------
+    // CancelTaskRequest with metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cancel_task_request_with_metadata_serde() {
+        let mut meta = HashMap::new();
+        meta.insert("reason".to_string(), serde_json::json!("timeout"));
+        let req = CancelTaskRequest {
+            id: "t1".into(),
+            metadata: Some(meta),
+            tenant: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: CancelTaskRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // TaskPushNotificationConfig minimal (all optional None)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_task_push_notification_config_minimal_serde() {
+        let cfg = TaskPushNotificationConfig {
+            url: "https://hook.test".into(),
+            id: None,
+            task_id: "t1".into(),
+            token: None,
+            authentication: None,
+            tenant: None,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("id").is_none());
+        assert!(v.get("token").is_none());
+        assert!(v.get("authentication").is_none());
+        let back: TaskPushNotificationConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // GetTaskRequest with no optional fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_task_request_minimal_serde() {
+        let req = GetTaskRequest {
+            id: "task-x".into(),
+            history_length: None,
+            tenant: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("historyLength").is_none());
+        assert!(v.get("tenant").is_none());
+        let back: GetTaskRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn test_get_extended_agent_card_request_no_tenant() {
+        let req = GetExtendedAgentCardRequest { tenant: None };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, "{}");
+        let back: GetExtendedAgentCardRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }
 }
