@@ -85,7 +85,13 @@ slim_datapath = { package = "agntcy-slim-datapath", version = "0.18.2" }
 slim_auth = { package = "agntcy-slim-auth", version = "0.14.6" }
 
 # WebSocket
-fastwebsockets = { version = "0.10", features = ["upgrade", "with_axum"] }
+fastwebsockets = { version = "0.10", features = [
+    "upgrade",
+    "with_axum",
+    # Reads and writes are driven by separate tasks so that an in-flight
+    # `read_frame` is never cancelled; its parser is not cancellation safe.
+    "unstable-split",
+] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 bytes = "1"
