@@ -11,7 +11,9 @@ use a2a::*;
 use a2a_client::transport::{ServiceParams, Transport, TransportFactory};
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use async_trait::async_trait;
-use fastwebsockets::{FragmentCollector, Frame, OpCode, Payload, WebSocketError, handshake};
+use fastwebsockets::{
+    FragmentCollectorRead, Frame, OpCode, Payload, WebSocketError, WebSocketWrite, handshake,
+};
 use futures::Stream;
 use futures::stream::BoxStream;
 use http::Request;
@@ -22,6 +24,7 @@ use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
 use serde_json::Value;
+use tokio::io::WriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -33,6 +36,7 @@ use crate::common::{
     methods, service_params_to_envelope,
 };
 use crate::errors::jsonrpc_error_to_a2a;
+use crate::reconnect::Backoff;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_BUFFER_CAPACITY: usize = 64;
@@ -185,7 +189,26 @@ fn id_key_of(id: &str) -> String {
 #[derive(Debug)]
 enum OutboundClient {
     Frame(String),
-    Close,
+    /// A control frame the read half owes the server — a pong answering a ping,
+    /// or the echo of a Close. Queued rather than written directly because the
+    /// write half belongs to another task.
+    Control {
+        opcode: OpCode,
+        payload: Vec<u8>,
+    },
+    Close {
+        code: u16,
+        reason: String,
+    },
+}
+
+impl OutboundClient {
+    fn normal_closure() -> Self {
+        OutboundClient::Close {
+            code: crate::common::close_codes::NORMAL_CLOSURE,
+            reason: "client closing".to_string(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -268,7 +291,7 @@ impl ConnectionInner {
     }
 
     async fn close(&self) {
-        let _ = self.send_outbound(OutboundClient::Close).await;
+        let _ = self.send_outbound(OutboundClient::normal_closure()).await;
     }
 
     /// Issue a unary JSON-RPC request and await its correlated response.
@@ -317,6 +340,51 @@ pub struct WebSocketTransport {
     inner: Arc<ConnectionInner>,
 }
 
+/// A failed connection attempt, and whether trying again could change the
+/// outcome (spec Section 8.4).
+enum ConnectFailure {
+    /// The transport failed, or the server said it was busy.
+    Retryable(A2AError),
+    /// The attempt would fail the same way again.
+    Permanent(A2AError),
+}
+
+impl ConnectFailure {
+    fn into_error(self) -> A2AError {
+        match self {
+            ConnectFailure::Retryable(err) | ConnectFailure::Permanent(err) => err,
+        }
+    }
+}
+
+/// Classify a failed upgrade.
+///
+/// A server that refused the request outright will refuse it again, with two
+/// exceptions worth retrying: `429` and the `5xx` range, which say the server is
+/// loaded rather than that the request is wrong. `503` is what this binding's
+/// own server returns once an identity holds its maximum number of connections
+/// (Section 13.5), so a client that backs off and returns is doing the right
+/// thing. Everything else here is an I/O or framing failure, which a retry may
+/// well survive.
+fn handshake_failure(err: WebSocketError) -> ConnectFailure {
+    let message = A2AError::internal(format!("websocket handshake failed: {err}"));
+    match err {
+        WebSocketError::InvalidStatusCode(status) => {
+            if status == 429 || (500..=599).contains(&status) {
+                ConnectFailure::Retryable(message)
+            } else {
+                ConnectFailure::Permanent(message)
+            }
+        }
+        // The peer answered, but not as a WebSocket server speaking our version.
+        WebSocketError::InvalidUpgradeHeader
+        | WebSocketError::InvalidConnectionHeader
+        | WebSocketError::InvalidSecWebsocketVersion
+        | WebSocketError::MissingSecWebSocketKey => ConnectFailure::Permanent(message),
+        _ => ConnectFailure::Retryable(message),
+    }
+}
+
 impl WebSocketTransport {
     /// Connect to the agent at the given endpoint URL with default options.
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self, A2AError> {
@@ -333,10 +401,65 @@ impl WebSocketTransport {
         endpoint: impl Into<String>,
         options: ConnectOptions,
     ) -> Result<Self, A2AError> {
-        let endpoint = endpoint.into();
-        let parsed = parse_endpoint(&endpoint)?;
+        Self::try_connect(endpoint.into(), options)
+            .await
+            .map_err(ConnectFailure::into_error)
+    }
 
-        let stream = connect_tcp(&parsed.host, parsed.port).await?;
+    /// Connect, retrying transient failures on an exponential backoff with
+    /// jitter (spec Section 8.4).
+    ///
+    /// Use this to re-establish a connection that was interrupted. Failures that
+    /// would recur — rejected credentials, an endpoint that is not a WebSocket
+    /// server, a sub-protocol the server will not speak — are returned
+    /// immediately rather than retried.
+    ///
+    /// Resubscribing to in-progress tasks afterwards is the caller's
+    /// responsibility: issue `SubscribeToTask` for the task ids you still care
+    /// about, and be ready for events you have already seen (Section 8.4 steps
+    /// 2 and 3).
+    pub async fn connect_with_retry(
+        endpoint: impl Into<String>,
+        options: ConnectOptions,
+        backoff: Backoff,
+    ) -> Result<Self, A2AError> {
+        let endpoint = endpoint.into();
+        let mut attempt = 0u32;
+        loop {
+            match Self::try_connect(endpoint.clone(), options.clone()).await {
+                Ok(transport) => return Ok(transport),
+                Err(ConnectFailure::Permanent(err)) => return Err(err),
+                Err(ConnectFailure::Retryable(err)) => {
+                    attempt += 1;
+                    if !backoff.allows(attempt) {
+                        return Err(A2AError::internal(format!(
+                            "could not connect to {endpoint} after {attempt} attempts: {}",
+                            err.message
+                        )));
+                    }
+                    let delay = backoff.delay_for(attempt);
+                    tracing::debug!(
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %err.message,
+                        "websocket connect failed; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    async fn try_connect(
+        endpoint: String,
+        options: ConnectOptions,
+    ) -> Result<Self, ConnectFailure> {
+        // A malformed endpoint will not become valid on a retry.
+        let parsed = parse_endpoint(&endpoint).map_err(ConnectFailure::Permanent)?;
+
+        let stream = connect_tcp(&parsed.host, parsed.port)
+            .await
+            .map_err(ConnectFailure::Retryable)?;
 
         let host_header = if uses_default_port(&parsed.scheme, parsed.port) {
             parsed.host.clone()
@@ -356,37 +479,41 @@ impl WebSocketTransport {
         for (name, value) in &options.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
-        let req = builder
-            .body(Empty::<Bytes>::new())
-            .map_err(|err| A2AError::internal(format!("failed to build upgrade request: {err}")))?;
+        let req = builder.body(Empty::<Bytes>::new()).map_err(|err| {
+            ConnectFailure::Permanent(A2AError::internal(format!(
+                "failed to build upgrade request: {err}"
+            )))
+        })?;
 
         let (ws, response) = if parsed.scheme == "wss" {
             #[cfg(feature = "tls")]
             {
-                let tls = tls::connect(&parsed.host, stream, &options.tls).await?;
+                // A rejected certificate or an unusable TLS configuration will be
+                // rejected again on the next attempt.
+                let tls = tls::connect(&parsed.host, stream, &options.tls)
+                    .await
+                    .map_err(ConnectFailure::Permanent)?;
                 handshake::client(&SpawnExecutor, req, tls)
                     .await
-                    .map_err(|err| {
-                        A2AError::internal(format!("websocket handshake failed: {err}"))
-                    })?
+                    .map_err(handshake_failure)?
             }
             #[cfg(not(feature = "tls"))]
             {
                 let _ = (stream, req);
-                return Err(A2AError::internal(
+                return Err(ConnectFailure::Permanent(A2AError::internal(
                     "wss:// requires the `tls` feature of a2a-websocket to be enabled",
-                ));
+                )));
             }
         } else {
             handshake::client(&SpawnExecutor, req, stream)
                 .await
-                .map_err(|err| A2AError::internal(format!("websocket handshake failed: {err}")))?
+                .map_err(handshake_failure)?
         };
 
         if !response_subprotocol_matches(&response) {
-            return Err(A2AError::internal(format!(
+            return Err(ConnectFailure::Permanent(A2AError::internal(format!(
                 "server did not negotiate the '{SUBPROTOCOL}' sub-protocol"
-            )));
+            ))));
         }
 
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundClient>(OUTBOUND_BUFFER_CAPACITY);
@@ -657,7 +784,7 @@ fn uses_default_port(scheme: &str, port: u16) -> bool {
 
 async fn run_connection(
     mut ws: fastwebsockets::WebSocket<TokioIo<Upgraded>>,
-    mut outbound_rx: mpsc::Receiver<OutboundClient>,
+    outbound_rx: mpsc::Receiver<OutboundClient>,
     pending: Arc<Mutex<Pending>>,
     inner: Weak<ConnectionInner>,
     reauth: Option<ReauthPolicy>,
@@ -665,41 +792,59 @@ async fn run_connection(
     ws.set_max_message_size(DEFAULT_MAX_FRAME_BYTES);
     ws.set_auto_close(true);
     ws.set_auto_pong(true);
-    let mut ws = FragmentCollector::new(ws);
+
+    // As on the server, reads and writes get a task each: `read_frame` is not
+    // cancellation safe, so it must never be the losing branch of a `select!`
+    // that goes on to reuse the socket.
+    let (read_half, write_half) = ws.split(tokio::io::split);
+    let mut ws = FragmentCollectorRead::new(read_half);
+    let (stop_writer, stop_rx) = oneshot::channel();
+    let mut writer = tokio::spawn(run_writer(write_half, outbound_rx, stop_rx));
+
+    // Obligated control frames are queued through the shared connection state
+    // rather than a sender this task holds, because a sender held here would
+    // keep the outbound channel open and stop the writer from ever noticing
+    // that the transport was dropped.
+    let mut obligated_send = {
+        let inner = inner.clone();
+        move |frame: Frame<'_>| {
+            let inner = inner.clone();
+            let message = OutboundClient::Control {
+                opcode: frame.opcode,
+                payload: frame.payload.to_vec(),
+            };
+            async move {
+                let Some(inner) = inner.upgrade() else {
+                    return Err(std::io::Error::other("transport dropped"));
+                };
+                inner
+                    .send_outbound(message)
+                    .await
+                    .map_err(|_| std::io::Error::other("outbound channel closed"))
+            }
+        }
+    };
 
     // Error reported to in-flight requests once the loop exits, refined by the
     // server's Close code when one is received.
     let mut close_error = A2AError::internal("websocket connection closed");
 
+    // Tracked so the writer is not polled again after it has completed, which
+    // panics with "JoinHandle polled after completion".
+    let mut writer_finished = false;
+
     loop {
         tokio::select! {
-            biased;
-
-            outbound = outbound_rx.recv() => {
-                match outbound {
-                    Some(OutboundClient::Frame(text)) => {
-                        if let Err(err) = ws
-                            .write_frame(Frame::text(Payload::Owned(text.into_bytes())))
-                            .await
-                        {
-                            tracing::debug!(error = %err, "client write failed; closing");
-                            break;
-                        }
-                    }
-                    Some(OutboundClient::Close) => {
-                        let _ = ws
-                            .write_frame(Frame::close(
-                                crate::common::close_codes::NORMAL_CLOSURE,
-                                b"client closing",
-                            ))
-                            .await;
-                        break;
-                    }
-                    None => break,
-                }
+            // The writer stops once the transport is dropped and its channel
+            // closes, which is this task's cue to stop reading. Abandoning an
+            // in-flight `read_frame` is safe here, and only here, because this
+            // branch is terminal: the socket is never read again.
+            _ = &mut writer => {
+                writer_finished = true;
+                break;
             }
 
-            incoming = ws.read_frame() => {
+            incoming = ws.read_frame::<_, std::io::Error>(&mut obligated_send) => {
                 match incoming {
                     Ok(frame) => match frame.opcode {
                         OpCode::Close => {
@@ -713,14 +858,18 @@ async fn run_connection(
                             tracing::debug!(
                                 "received unexpected binary frame from server; closing"
                             );
-                            let _ = ws
-                                .write_frame(Frame::close(
-                                    close_codes::UNSUPPORTED_DATA,
-                                    b"binary frames are reserved for future use",
-                                ))
-                                .await;
+                            if let Some(inner) = inner.upgrade() {
+                                let _ = inner
+                                    .send_outbound(OutboundClient::Close {
+                                        code: close_codes::UNSUPPORTED_DATA,
+                                        reason: "binary frames are reserved for future use"
+                                            .to_string(),
+                                    })
+                                    .await;
+                            }
                             break;
                         }
+                        // Ping is answered through `obligated_send`.
                         _ => {}
                     },
                     Err(WebSocketError::ConnectionClosed) => break,
@@ -733,8 +882,61 @@ async fn run_connection(
         }
     }
 
+    // Release the socket now rather than leaving the write half parked on an
+    // idle channel until the transport happens to be dropped. The writer drains
+    // what is already queued before it observes this.
+    if !writer_finished {
+        let _ = stop_writer.send(());
+        let _ = writer.await;
+    }
+
     let mut pending = pending.lock();
     pending.fail_all(close_error);
+}
+
+/// Owns the write half for the lifetime of the connection.
+///
+/// Stops as soon as a Close frame is written, when the transport is dropped and
+/// the outbound channel closes, or when the read half signals that it is done.
+async fn run_writer(
+    mut ws: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
+    mut outbound_rx: mpsc::Receiver<OutboundClient>,
+    mut stop_rx: oneshot::Receiver<()>,
+) {
+    loop {
+        // Queued frames take priority over the stop signal, so a connection
+        // being torn down still flushes what it has already accepted. Both
+        // branches are cancellation safe, unlike a read.
+        let message = tokio::select! {
+            biased;
+
+            outbound = outbound_rx.recv() => match outbound {
+                Some(message) => message,
+                None => return,
+            },
+
+            _ = &mut stop_rx => return,
+        };
+
+        let write = match message {
+            OutboundClient::Frame(text) => {
+                ws.write_frame(Frame::text(Payload::Owned(text.into_bytes())))
+                    .await
+            }
+            OutboundClient::Control { opcode, payload } => {
+                ws.write_frame(Frame::new(true, opcode, None, Payload::Owned(payload)))
+                    .await
+            }
+            OutboundClient::Close { code, reason } => {
+                let _ = ws.write_frame(Frame::close(code, reason.as_bytes())).await;
+                return;
+            }
+        };
+        if let Err(err) = write {
+            tracing::debug!(error = %err, "client write failed; closing");
+            return;
+        }
+    }
 }
 
 /// Translate a Close frame into the error surfaced to in-flight requests, so an
@@ -1340,7 +1542,7 @@ mod tests {
                 let key = id_key(env.id.as_ref().unwrap());
                 (env, key)
             }
-            OutboundClient::Close => panic!("expected request frame"),
+            other => panic!("expected a request frame, got {other:?}"),
         };
         assert_eq!(envelope.jsonrpc, "2.0");
         assert_eq!(envelope.method.as_deref(), Some(methods::GET_TASK));
@@ -1504,7 +1706,7 @@ mod tests {
                 assert_eq!(envelope.id, Some(JsonRpcId::String("s1".into())));
                 assert_eq!(envelope.cancel_stream, Some(true));
             }
-            OutboundClient::Close => panic!("expected cancel frame"),
+            other => panic!("expected a cancel frame, got {other:?}"),
         }
     }
 
@@ -1512,7 +1714,10 @@ mod tests {
     async fn transport_destroy_emits_close_message() {
         let (transport, _pending, mut outbound_rx) = make_mock_transport();
         transport.destroy().await.unwrap();
-        assert!(matches!(outbound_rx.try_recv(), Ok(OutboundClient::Close)));
+        assert!(matches!(
+            outbound_rx.try_recv(),
+            Ok(OutboundClient::Close { .. })
+        ));
     }
 
     #[tokio::test]

@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Keep-alive pings and idle timeouts (spec Section 2.4), previously absent.**
+  `WebSocketConfig::liveness` takes a `Liveness { ping_interval, pong_timeout,
+  idle_timeout }`. A monitor task pings on the interval, closes with `1001`
+  (Going Away) when the pong does not arrive in time, and closes with `1001`
+  when the connection has carried no application-level message for
+  `idle_timeout`. Outbound frames count as activity as well as inbound ones, so
+  a long-running stream that pushes events while the client stays quiet is
+  treated as busy rather than idle. On by default with the intervals Section 2.4
+  recommends (30s / 10s / 5min); `LivenessPolicy::Disabled` opts out, which
+  suits deployments where a proxy already does this.
+- **Connection and stream limits (spec Section 13.5), previously absent.**
+  `WebSocketConfig::connection_limits` caps concurrent connections per
+  authenticated identity and concurrent streams per connection. An identity at
+  its connection limit is refused during the upgrade with `503`, so it can back
+  off rather than be handed a connection that closes immediately; the slot is
+  released however the connection ends. A request that would exceed the stream
+  cap is answered with a `-32000` error and the message `"Too many concurrent
+  streams"`, leaving the connection and its existing streams intact. Stream
+  slots are claimed before the handler is invoked, so the cap is decided under a
+  single lock rather than after the work has started. On by default with
+  deliberately generous values (256 connections per identity, 128 streams per
+  connection), since Section 13.5 recommends no figures;
+  `ConnectionLimitPolicy::Disabled` opts out. Registering the stream earlier
+  also means a `cancelStream` arriving while the handler is still starting up is
+  now honoured instead of missed.
+- **Reconnection backoff (spec Section 8.4), previously absent.**
+  `WebSocketTransport::connect_with_retry` retries a failed connection on an
+  exponential backoff with jitter, defaulting to the schedule Section 8.4
+  recommends (1s, doubling, capped at 30s). Failures that would recur are not
+  retried: a rejected token, an endpoint that is not a WebSocket server, or a
+  sub-protocol the server will not speak fail immediately, so a client cannot
+  end up hammering an auth server. `429` and `5xx` are retried, which covers the
+  `503` this binding's own server returns for a per-identity connection cap.
+  Resubscribing to in-progress tasks after reconnecting stays with the
+  application, since only it knows which tasks still matter and whether
+  duplicate events are safe to apply twice (Section 8.4 steps 2 and 3).
 - **Inbound message rate limiting (spec Section 13.3), previously absent.**
   `WebSocketConfig::rate_limit` takes a `RateLimit { max_messages, window }` and
   enforces it with a token bucket in both scopes the spec recommends: once per
@@ -35,6 +71,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Server connections leaked their task and socket when the peer closed
+  first.** Teardown dropped its own outbound sender but not the one captured by
+  the callback that answers pings and echoes closes, so the outbound channel
+  never closed, the writer task never saw the end of its stream, and the
+  connection task waited on it forever. Nothing surfaced at the time — the close
+  had already been written — but the task, the socket, and anything it held
+  stayed alive for the life of the process. Found while testing the per-identity
+  connection cap, which never freed a slot.
+- **A connection could panic during teardown, silently abandoning in-flight
+  requests.** The reader watches the writer task so it stops reading once the
+  socket is gone, and then awaited the same `JoinHandle` again on the way out.
+  Polling a `JoinHandle` after it has completed panics, and because the
+  connection runs in a spawned task the panic was swallowed: pending requests
+  were never failed and simply hung. Whether it triggered depended on which of
+  the reader and writer finished first, so it did not reproduce reliably.
+- **Frames could be corrupted when traffic flowed in both directions at once.**
+  Each connection drove reads and writes from a single task, with both branches
+  of a `tokio::select!` borrowing the same socket, so whenever an outbound frame
+  won the race the in-flight `read_frame` future was dropped.
+  `fastwebsockets::read_frame` does not tolerate that: it consumes header bytes
+  out of a persistent buffer into local variables, so a cancellation partway
+  through a frame leaves the parser positioned mid-frame and the next read
+  interprets payload bytes as a frame header. The connection then failed with a
+  spurious protocol error or a response that would not parse. Anything large
+  enough to span more than one read was affected — messages approaching the size
+  cap, slow or lossy links, or a peer that writes the header and payload
+  separately — which is why it showed up under load rather than in ordinary use.
+  Both the server and the client now split the socket, giving the read half and
+  the write half a task each, so no read is ever cancelled. The one remaining
+  `select!` over a read, in the client, is terminal: it stops reading for good
+  rather than resuming against a corrupted parser.
+
+  This also removes the head-of-line blocking that came with the old structure.
+  Reads and writes now progress concurrently instead of taking turns, and
+  because outbound frames no longer take priority over inbound ones, a
+  `cancelStream` sent while the server is busy streaming is read promptly
+  instead of waiting for the outbound queue to drain.
 - **A request can no longer overwrite the identity its connection authenticated
   with.** Per-request `serviceParams` were merged over the connection-scoped
   ones unconditionally, including keys the authenticator had established. A
@@ -81,6 +154,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `WebSocketConfig` gained `liveness` and `connection_limits`. Code that builds
+  the struct with `..Default::default()` is unaffected; code that lists every
+  field must add the two new ones. Both default to enforcing their limits, so
+  existing servers pick up keep-alive pings, idle timeouts, and the Section 13.5
+  caps on upgrade.
+- The `fastwebsockets` dependency now enables its `unstable-split` feature, which
+  provides the independent read and write halves each connection needs. The
+  feature is marked unstable upstream, so the split API surface is confined to
+  the two connection loops.
 - `WebSocketConfig` gained `max_frame_bytes: Option<usize>` to configure the
   inbound message size limit; `None` keeps the spec's recommended 1 MiB
   (`DEFAULT_MAX_FRAME_BYTES`), which is now re-exported at the crate root.

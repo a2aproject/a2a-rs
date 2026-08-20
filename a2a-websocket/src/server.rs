@@ -15,12 +15,14 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use fastwebsockets::{
-    FragmentCollector, Frame, OpCode, Payload, WebSocketError, upgrade::IncomingUpgrade,
+    FragmentCollectorRead, Frame, OpCode, Payload, WebSocketError, WebSocketWrite,
+    upgrade::IncomingUpgrade,
 };
 use futures::stream::{BoxStream, StreamExt};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use serde_json::Value;
+use tokio::io::WriteHalf;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::auth::{AuthContext, AuthStatus, AuthenticateParams, WsAuthenticator};
@@ -30,10 +32,19 @@ use crate::common::{
     service_params_from_envelope,
 };
 use crate::errors::{a2a_error_to_jsonrpc, close_code_for_fatal, close_code_for_read_error};
+use crate::limits::{ConnectionLimitPolicy, IdentityConnectionCounter};
+use crate::liveness::{ActivityTracker, Liveness, LivenessPolicy};
 use crate::ratelimit::{ConnectionRateLimiter, IdentityRateLimiter, RateLimitPolicy};
 
 const SEC_WEBSOCKET_PROTOCOL: &str = "sec-websocket-protocol";
 const OUTBOUND_BUFFER_CAPACITY: usize = 64;
+
+/// Payload carried by keep-alive pings, so a pong can be recognized in a capture.
+const PING_PAYLOAD: &[u8] = b"a2a-keepalive";
+
+/// Error message returned when a connection already has its maximum number of
+/// active streams (spec Section 13.5).
+const TOO_MANY_STREAMS: &str = "Too many concurrent streams";
 
 /// Error message returned when an inbound rate limit is exceeded. The exact
 /// wording is prescribed by spec Section 13.3.
@@ -61,6 +72,19 @@ pub struct WebSocketConfig {
     ///
     /// [`DEFAULT_RATE_LIMIT`]: crate::ratelimit::DEFAULT_RATE_LIMIT
     pub rate_limit: RateLimitPolicy,
+    /// Keep-alive pings and idle timeouts (spec Section 2.4). Defaults to
+    /// [`DEFAULT_LIVENESS`]; switch it off explicitly with
+    /// [`LivenessPolicy::Disabled`].
+    ///
+    /// [`DEFAULT_LIVENESS`]: crate::liveness::DEFAULT_LIVENESS
+    pub liveness: LivenessPolicy,
+    /// Caps on concurrent connections per identity and concurrent streams per
+    /// connection (spec Section 13.5). Defaults to
+    /// [`DEFAULT_CONNECTION_LIMITS`]; switch them off explicitly with
+    /// [`ConnectionLimitPolicy::Disabled`].
+    ///
+    /// [`DEFAULT_CONNECTION_LIMITS`]: crate::limits::DEFAULT_CONNECTION_LIMITS
+    pub connection_limits: ConnectionLimitPolicy,
 }
 
 impl WebSocketConfig {
@@ -77,6 +101,9 @@ pub struct WebSocketState<H: RequestHandler> {
     /// Rate-limit buckets keyed by authenticated identity, shared across every
     /// connection served by this router (spec Section 13.3).
     pub identity_rate_limiter: Option<Arc<IdentityRateLimiter>>,
+    /// Live connection counts keyed by authenticated identity, shared across
+    /// every connection served by this router (spec Section 13.5).
+    pub identity_connections: Option<Arc<IdentityConnectionCounter>>,
 }
 
 impl<H: RequestHandler> Clone for WebSocketState<H> {
@@ -85,6 +112,7 @@ impl<H: RequestHandler> Clone for WebSocketState<H> {
             handler: self.handler.clone(),
             config: self.config.clone(),
             identity_rate_limiter: self.identity_rate_limiter.clone(),
+            identity_connections: self.identity_connections.clone(),
         }
     }
 }
@@ -140,10 +168,16 @@ pub fn websocket_router_with_config<H: RequestHandler>(
         .rate_limit
         .limit()
         .map(|limit| Arc::new(IdentityRateLimiter::new(limit)));
+    let identity_connections = config.connection_limits.limits().map(|limits| {
+        Arc::new(IdentityConnectionCounter::new(
+            limits.max_connections_per_identity,
+        ))
+    });
     let state = WebSocketState {
         handler,
         config: Arc::new(config),
         identity_rate_limiter,
+        identity_connections,
     };
     axum::Router::new()
         .route("/", axum::routing::any(handle_upgrade::<H>))
@@ -185,6 +219,32 @@ async fn handle_upgrade<H: RequestHandler>(
         None => AuthContext::default(),
     };
 
+    // Per-identity connection cap (spec Section 13.5). Checked after
+    // authentication, since an identity is what the cap is attributed to, and
+    // before the 101 response so an over-quota client is told to retry rather
+    // than handed a connection that is immediately closed. Anonymous
+    // connections are not counted — there is no identity to charge them to.
+    let connection_slot = match (
+        state.identity_connections.as_ref(),
+        auth_ctx.user.as_ref().map(|user| user.name.as_str()),
+    ) {
+        (Some(counter), Some(identity)) => match counter.try_acquire(identity) {
+            Some(slot) => Some(slot),
+            None => {
+                tracing::debug!(
+                    identity,
+                    "per-identity connection limit reached; refusing upgrade"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "too many concurrent connections for this identity",
+                )
+                    .into_response();
+            }
+        },
+        _ => None,
+    };
+
     let connection_params = ConnectionParams::new(&headers, &auth_ctx);
 
     let (mut response, fut) = match upgrade.upgrade() {
@@ -211,6 +271,12 @@ async fn handle_upgrade<H: RequestHandler>(
             state.identity_rate_limiter.clone(),
         )
     });
+    let liveness = state.config.liveness.liveness();
+    let max_streams = state
+        .config
+        .connection_limits
+        .limits()
+        .map(|limits| limits.max_streams_per_connection);
     let conn_auth = Arc::new(ConnAuth {
         authenticator: state.config.authenticator.clone(),
         ctx: StdMutex::new(auth_ctx),
@@ -218,8 +284,24 @@ async fn handle_upgrade<H: RequestHandler>(
         reauth_signaled: AtomicBool::new(false),
     });
     tokio::spawn(async move {
+        // Held for the life of the connection so the identity's slot is
+        // released however the connection ends.
+        let _connection_slot = connection_slot;
         match fut.await {
-            Ok(ws) => run_connection(ws, handler, conn_auth, max_frame_bytes, rate_limiter).await,
+            Ok(ws) => {
+                run_connection(
+                    ws,
+                    handler,
+                    conn_auth,
+                    ConnectionOptions {
+                        max_frame_bytes,
+                        rate_limiter,
+                        liveness,
+                        max_streams,
+                    },
+                )
+                .await
+            }
             Err(err) => tracing::warn!(error = %err, "websocket upgrade future failed"),
         }
     });
@@ -276,112 +358,260 @@ fn is_internal_header(name: &str) -> bool {
 #[derive(Debug)]
 enum OutboundMessage {
     Frame(String),
-    Close { code: u16, reason: String },
+    /// A control frame the read half owes the peer — a pong answering a ping,
+    /// or the echo of a Close. `fastwebsockets` hands these to a callback
+    /// instead of writing them itself once the socket is split, so they are
+    /// queued like any other outbound frame.
+    Control {
+        opcode: OpCode,
+        payload: Vec<u8>,
+    },
+    Close {
+        code: u16,
+        reason: String,
+    },
 }
 
 type StreamRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;
+
+/// Per-connection settings resolved from [`WebSocketConfig`] at upgrade time.
+struct ConnectionOptions {
+    max_frame_bytes: usize,
+    rate_limiter: Option<ConnectionRateLimiter>,
+    liveness: Option<Liveness>,
+    max_streams: Option<usize>,
+}
 
 async fn run_connection<H: RequestHandler>(
     mut ws: fastwebsockets::WebSocket<TokioIo<Upgraded>>,
     handler: Arc<H>,
     conn_auth: Arc<ConnAuth>,
-    max_frame_bytes: usize,
-    mut rate_limiter: Option<ConnectionRateLimiter>,
+    options: ConnectionOptions,
 ) {
+    let ConnectionOptions {
+        max_frame_bytes,
+        mut rate_limiter,
+        liveness,
+        max_streams,
+    } = options;
+
     ws.set_max_message_size(max_frame_bytes);
     ws.set_auto_close(true);
     ws.set_auto_pong(true);
-    let mut ws = FragmentCollector::new(ws);
 
-    let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(OUTBOUND_BUFFER_CAPACITY);
+    let (read_half, write_half) = ws.split(tokio::io::split);
+    let mut ws = FragmentCollectorRead::new(read_half);
+
+    let (out_tx, out_rx) = mpsc::channel::<OutboundMessage>(OUTBOUND_BUFFER_CAPACITY);
     let streams: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let activity = Arc::new(ActivityTracker::new());
+    let mut writer = tokio::spawn(run_writer(write_half, out_rx, activity.clone()));
 
-    // Set when the connection is torn down after queueing a final error and
-    // Close frame, which still have to be written before the socket goes away.
-    let mut flush_pending = false;
+    // Keep-alive pings and idle timeouts (spec Section 2.4). The monitor holds a
+    // sender, so it has to be stopped during teardown or the outbound channel
+    // would never close and the writer would never exit.
+    let monitor = liveness.map(|liveness| {
+        tokio::spawn(run_liveness_monitor(
+            liveness,
+            activity.clone(),
+            out_tx.clone(),
+        ))
+    });
+
+    let mut obligated_send = {
+        let out_tx = out_tx.clone();
+        move |frame: Frame<'_>| {
+            let out_tx = out_tx.clone();
+            let message = OutboundMessage::Control {
+                opcode: frame.opcode,
+                payload: frame.payload.to_vec(),
+            };
+            async move {
+                out_tx
+                    .send(message)
+                    .await
+                    .map_err(|_| std::io::Error::other("outbound channel closed"))
+            }
+        }
+    };
+
+    // Tracked so the writer is not polled again after it has completed, which
+    // panics with "JoinHandle polled after completion".
+    let mut writer_finished = false;
 
     loop {
-        tokio::select! {
-            biased;
-
-            outbound = out_rx.recv() => {
-                let Some(message) = outbound else { break };
-                match message {
-                    OutboundMessage::Frame(text) => {
-                        if let Err(err) = ws
-                            .write_frame(Frame::text(Payload::Owned(text.into_bytes())))
-                            .await
-                        {
-                            tracing::debug!(error = %err, "failed to write frame; closing");
-                            break;
-                        }
-                    }
-                    OutboundMessage::Close { code, reason } => {
-                        let _ = ws
-                            .write_frame(Frame::close(code, reason.as_bytes()))
-                            .await;
-                        break;
-                    }
-                }
+        let incoming = tokio::select! {
+            // The writer returns after it writes a Close, including one queued
+            // by the liveness monitor, so this is how an idle or unresponsive
+            // connection stops being read. Abandoning an in-flight `read_frame`
+            // is safe here, and only here, because the branch is terminal.
+            _ = &mut writer => {
+                writer_finished = true;
+                break;
             }
 
-            incoming = ws.read_frame() => {
-                match incoming {
-                    Ok(frame) => match frame.opcode {
-                        OpCode::Close => break,
-                        OpCode::Text => {
-                            if !rate_limit_allows(rate_limiter.as_mut(), &out_tx).await {
-                                flush_pending = true;
-                                break;
-                            }
-                            if !handle_text_frame(
-                                &frame.payload,
-                                &handler,
-                                &streams,
-                                &conn_auth,
-                                &out_tx,
-                            )
-                            .await
-                            {
-                                flush_pending = true;
-                                break;
-                            }
-                        }
-                        OpCode::Binary => {
-                            let _ = ws
-                                .write_frame(Frame::close(
-                                    close_codes::UNSUPPORTED_DATA,
-                                    b"binary frames are reserved for future use",
-                                ))
-                                .await;
-                            break;
-                        }
-                        // Ping/pong are handled internally when auto_pong = true.
-                        _ => {}
-                    },
-                    Err(WebSocketError::ConnectionClosed) => break,
-                    Err(err) => {
-                        tracing::debug!(error = %err, "websocket read error; closing");
-                        // An oversize message must be answered with 1009 and a
-                        // framing violation with 1002, rather than a bare
-                        // disconnect (spec Sections 3.6 and 2.3).
-                        if let Some(code) = close_code_for_read_error(&err) {
-                            let _ = ws
-                                .write_frame(Frame::close(code, err.to_string().as_bytes()))
-                                .await;
-                        }
+            incoming = ws.read_frame::<_, std::io::Error>(&mut obligated_send) => incoming,
+        };
+
+        match incoming {
+            Ok(frame) => match frame.opcode {
+                OpCode::Close => break,
+                OpCode::Text => {
+                    activity.record_message();
+                    if !rate_limit_allows(rate_limiter.as_mut(), &out_tx).await {
+                        break;
+                    }
+                    if !handle_text_frame(
+                        &frame.payload,
+                        &handler,
+                        &streams,
+                        &conn_auth,
+                        &out_tx,
+                        max_streams,
+                    )
+                    .await
+                    {
                         break;
                     }
                 }
+                OpCode::Binary => {
+                    send_outbound(
+                        &out_tx,
+                        OutboundMessage::Close {
+                            code: close_codes::UNSUPPORTED_DATA,
+                            reason: "binary frames are reserved for future use".to_string(),
+                        },
+                    )
+                    .await;
+                    break;
+                }
+                // Ping is answered through `obligated_send`; a pong tells the
+                // liveness monitor the peer is still there.
+                OpCode::Pong => activity.record_pong(),
+                _ => {}
+            },
+            Err(WebSocketError::ConnectionClosed) => break,
+            Err(err) => {
+                tracing::debug!(error = %err, "websocket read error; closing");
+                // An oversize message must be answered with 1009 and a framing
+                // violation with 1002, rather than a bare disconnect (spec
+                // Sections 3.6 and 2.3).
+                if let Some(code) = close_code_for_read_error(&err) {
+                    send_outbound(
+                        &out_tx,
+                        OutboundMessage::Close {
+                            code,
+                            reason: err.to_string(),
+                        },
+                    )
+                    .await;
+                }
+                break;
             }
         }
     }
 
-    if flush_pending {
-        flush_outbound(&mut ws, &mut out_rx).await;
+    // Cancel in-flight streams first so their tasks release their senders, then
+    // release ours. The writer drains whatever is still queued — including a
+    // final error and Close frame, in the order they were produced — and exits
+    // once the last sender is gone.
+    if let Some(monitor) = monitor {
+        monitor.abort();
     }
-
     cancel_all_streams(&streams).await;
+    // Every sender has to go before the writer can see the channel close, and
+    // the obligated-send callback holds one of them.
+    drop(obligated_send);
+    drop(out_tx);
+    if !writer_finished {
+        let _ = writer.await;
+    }
+}
+
+/// Send keep-alive pings and close connections that go quiet (spec Section 2.4).
+///
+/// Runs alongside the reader and writer, queueing its frames through the same
+/// outbound channel so it never touches the socket directly.
+async fn run_liveness_monitor(
+    liveness: Liveness,
+    activity: Arc<ActivityTracker>,
+    out_tx: mpsc::Sender<OutboundMessage>,
+) {
+    loop {
+        tokio::time::sleep(liveness.ping_interval).await;
+
+        // A connection nobody is using is closed rather than pinged; there is
+        // no point keeping it alive.
+        if activity.idle_for() >= liveness.idle_timeout {
+            tracing::debug!("connection idle past the timeout; closing");
+            let _ = out_tx
+                .send(OutboundMessage::Close {
+                    code: close_codes::GOING_AWAY,
+                    reason: "idle timeout".to_string(),
+                })
+                .await;
+            return;
+        }
+
+        let pongs_before = activity.pong_count();
+        if out_tx
+            .send(OutboundMessage::Control {
+                opcode: OpCode::Ping,
+                payload: PING_PAYLOAD.to_vec(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        tokio::time::sleep(liveness.pong_timeout).await;
+        if activity.pong_count() == pongs_before {
+            tracing::debug!("peer did not answer the keep-alive ping; closing");
+            let _ = out_tx
+                .send(OutboundMessage::Close {
+                    code: close_codes::GOING_AWAY,
+                    reason: "no pong received".to_string(),
+                })
+                .await;
+            return;
+        }
+    }
+}
+
+/// Owns the write half for the lifetime of the connection.
+///
+/// Every outbound frame passes through here, which is what keeps writes off the
+/// read path. Returns as soon as a Close frame is written, since nothing may
+/// follow it, and otherwise runs until every sender has been dropped.
+async fn run_writer(
+    mut ws: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
+    mut out_rx: mpsc::Receiver<OutboundMessage>,
+    activity: Arc<ActivityTracker>,
+) {
+    while let Some(message) = out_rx.recv().await {
+        let write = match message {
+            OutboundMessage::Frame(text) => {
+                // Counts as activity: a connection streaming events outbound is
+                // busy, even if the peer has said nothing for minutes.
+                activity.record_message();
+                ws.write_frame(Frame::text(Payload::Owned(text.into_bytes())))
+                    .await
+            }
+            OutboundMessage::Control { opcode, payload } => {
+                ws.write_frame(Frame::new(true, opcode, None, Payload::Owned(payload)))
+                    .await
+            }
+            OutboundMessage::Close { code, reason } => {
+                let _ = ws.write_frame(Frame::close(code, reason.as_bytes())).await;
+                return;
+            }
+        };
+        if let Err(err) = write {
+            tracing::debug!(error = %err, "failed to write frame; closing");
+            return;
+        }
+    }
 }
 
 /// Admit one inbound message, or queue the `-32000` error and the `1008` close
@@ -420,29 +650,6 @@ async fn rate_limit_allows(
 /// Write everything already queued on the outbound channel, stopping after a
 /// Close frame. Without this, a fatal error response and its Close frame would
 /// be dropped when the read loop exits, leaving the peer to guess why.
-async fn flush_outbound(
-    ws: &mut FragmentCollector<TokioIo<Upgraded>>,
-    out_rx: &mut mpsc::Receiver<OutboundMessage>,
-) {
-    while let Ok(message) = out_rx.try_recv() {
-        match message {
-            OutboundMessage::Frame(text) => {
-                if ws
-                    .write_frame(Frame::text(Payload::Owned(text.into_bytes())))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            OutboundMessage::Close { code, reason } => {
-                let _ = ws.write_frame(Frame::close(code, reason.as_bytes())).await;
-                return;
-            }
-        }
-    }
-}
-
 async fn cancel_all_streams(streams: &StreamRegistry) {
     let mut map = streams.lock().await;
     for (_id, tx) in map.drain() {
@@ -602,6 +809,7 @@ async fn handle_text_frame<H: RequestHandler>(
     streams: &StreamRegistry,
     conn_auth: &Arc<ConnAuth>,
     out_tx: &mpsc::Sender<OutboundMessage>,
+    max_streams: Option<usize>,
 ) -> bool {
     let envelope: WsRequestEnvelope = match serde_json::from_slice(payload) {
         Ok(envelope) => envelope,
@@ -715,9 +923,12 @@ async fn handle_text_frame<H: RequestHandler>(
                 id,
                 raw_params,
                 combined_params,
-                handler,
-                streams,
-                out_tx_task,
+                StreamContext {
+                    handler,
+                    streams,
+                    out_tx: out_tx_task,
+                    max_streams,
+                },
             )
             .await;
         } else {
@@ -900,15 +1111,55 @@ async fn dispatch_unary<H: RequestHandler>(
     }
 }
 
+/// The connection-scoped handles a streaming request works against.
+struct StreamContext<H: RequestHandler> {
+    handler: Arc<H>,
+    streams: StreamRegistry,
+    out_tx: mpsc::Sender<OutboundMessage>,
+    /// Cap on concurrent streams for this connection (spec Section 13.5).
+    max_streams: Option<usize>,
+}
+
 async fn run_streaming_request<H: RequestHandler>(
     method: String,
     id: JsonRpcId,
     raw_params: Value,
     params: ServiceParams,
-    handler: Arc<H>,
-    streams: StreamRegistry,
-    out_tx: mpsc::Sender<OutboundMessage>,
+    ctx: StreamContext<H>,
 ) {
+    let StreamContext {
+        handler,
+        streams,
+        out_tx,
+        max_streams,
+    } = ctx;
+
+    let key = id_key(&id);
+    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+
+    // Claim the stream slot before invoking the handler, so the per-connection
+    // cap (spec Section 13.5) is decided under one lock rather than after the
+    // work has already started. Registering this early also means a
+    // `cancelStream` that arrives while the handler is still setting up is
+    // honoured instead of missed.
+    {
+        let mut map = streams.lock().await;
+        if let Some(max) = max_streams {
+            if map.len() >= max {
+                drop(map);
+                tracing::debug!(max, "per-connection stream limit reached; refusing stream");
+                send_error(
+                    &out_tx,
+                    Some(id),
+                    &A2AError::new(SERVER_ERROR_CODE, TOO_MANY_STREAMS),
+                )
+                .await;
+                return;
+            }
+        }
+        map.insert(key.clone(), cancel_tx);
+    }
+
     let stream_result: Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> =
         match method.as_str() {
             methods::SEND_STREAMING_MESSAGE => match parse_params(raw_params) {
@@ -925,17 +1176,12 @@ async fn run_streaming_request<H: RequestHandler>(
     let mut stream = match stream_result {
         Ok(stream) => stream,
         Err(err) => {
+            // Release the slot the failed stream reserved.
+            streams.lock().await.remove(&key);
             send_error(&out_tx, Some(id), &err).await;
             return;
         }
     };
-
-    let key = id_key(&id);
-    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
-    {
-        let mut map = streams.lock().await;
-        map.insert(key.clone(), cancel_tx);
-    }
 
     let mut errored = false;
     loop {
@@ -1136,11 +1382,30 @@ mod tests {
         }
     }
 
-    fn frame_payload(message: OutboundMessage) -> WsResponseEnvelope {
+    fn describe(message: &OutboundMessage) -> String {
         match message {
-            OutboundMessage::Frame(text) => serde_json::from_str(&text).unwrap(),
-            OutboundMessage::Close { .. } => panic!("expected frame"),
+            OutboundMessage::Frame(text) => format!("frame {text}"),
+            OutboundMessage::Control { opcode, .. } => format!("control {opcode:?}"),
+            OutboundMessage::Close { code, .. } => format!("close {code}"),
         }
+    }
+
+    fn frame_text(message: OutboundMessage) -> String {
+        match message {
+            OutboundMessage::Frame(text) => text,
+            other => panic!("expected a frame, got {}", describe(&other)),
+        }
+    }
+
+    fn close_code_of(message: OutboundMessage) -> u16 {
+        match message {
+            OutboundMessage::Close { code, .. } => code,
+            other => panic!("expected a close, got {}", describe(&other)),
+        }
+    }
+
+    fn frame_payload(message: OutboundMessage) -> WsResponseEnvelope {
+        serde_json::from_str(&frame_text(message)).unwrap()
     }
 
     fn error_reason_of(resp: &WsResponseEnvelope) -> String {
@@ -1469,22 +1734,21 @@ mod tests {
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
 
-        assert!(!handle_text_frame(b"{not json", &handler, &streams, &no_auth(), &out_tx).await);
+        assert!(
+            !handle_text_frame(b"{not json", &handler, &streams, &no_auth(), &out_tx, None).await
+        );
 
         // The wire frame MUST carry an explicit `"id": null` per spec Section 3.3.
-        let raw = match out_rx.try_recv().unwrap() {
-            OutboundMessage::Frame(text) => text,
-            OutboundMessage::Close { .. } => panic!("expected frame"),
-        };
+        let raw = frame_text(out_rx.try_recv().unwrap());
         let value: Value = serde_json::from_str(&raw).unwrap();
         assert!(value["id"].is_null());
         assert!(value.as_object().unwrap().contains_key("id"));
         assert_eq!(value["error"]["code"], error_code::PARSE_ERROR);
 
-        match out_rx.try_recv().unwrap() {
-            OutboundMessage::Close { code, .. } => assert_eq!(code, close_codes::PROTOCOL_ERROR),
-            OutboundMessage::Frame(_) => panic!("expected close frame"),
-        }
+        assert_eq!(
+            close_code_of(out_rx.try_recv().unwrap()),
+            close_codes::PROTOCOL_ERROR
+        );
     }
 
     #[tokio::test]
@@ -1494,7 +1758,7 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_BUFFER_CAPACITY);
         let payload = br#"{"jsonrpc":"1.0","id":"r","method":"GetTask"}"#;
 
-        assert!(handle_text_frame(payload, &handler, &streams, &no_auth(), &out_tx).await);
+        assert!(handle_text_frame(payload, &handler, &streams, &no_auth(), &out_tx, None).await);
         let resp = frame_payload(out_rx.try_recv().unwrap());
         assert_eq!(resp.error.unwrap().code, error_code::INVALID_REQUEST);
     }
@@ -1510,7 +1774,7 @@ mod tests {
         };
         let payload = serde_json::to_vec(&envelope).unwrap();
 
-        assert!(handle_text_frame(&payload, &handler, &streams, &no_auth(), &out_tx).await);
+        assert!(handle_text_frame(&payload, &handler, &streams, &no_auth(), &out_tx, None).await);
         let response = frame_payload(out_rx.try_recv().unwrap());
         assert_eq!(response.id, Some(JsonRpcId::String("req-1".into())));
         assert_eq!(response.error.unwrap().code, error_code::INVALID_REQUEST);
@@ -1528,7 +1792,7 @@ mod tests {
         };
         let payload = serde_json::to_vec(&envelope).unwrap();
 
-        assert!(handle_text_frame(&payload, &handler, &streams, &no_auth(), &out_tx).await);
+        assert!(handle_text_frame(&payload, &handler, &streams, &no_auth(), &out_tx, None).await);
         let response = frame_payload(out_rx.try_recv().unwrap());
         assert_eq!(response.error.unwrap().code, error_code::METHOD_NOT_FOUND);
     }
@@ -1550,7 +1814,7 @@ mod tests {
         };
         let payload = serde_json::to_vec(&envelope).unwrap();
 
-        assert!(handle_text_frame(&payload, &handler, &streams, &no_auth(), &out_tx).await);
+        assert!(handle_text_frame(&payload, &handler, &streams, &no_auth(), &out_tx, None).await);
         cancel_rx.await.unwrap();
         assert!(out_rx.try_recv().is_err());
         assert!(streams.lock().await.is_empty());
@@ -1579,10 +1843,10 @@ mod tests {
 
         let response = frame_payload(out_rx.recv().await.unwrap());
         assert_eq!(response.error.unwrap().code, error_code::PARSE_ERROR);
-        match out_rx.recv().await.unwrap() {
-            OutboundMessage::Close { code, .. } => assert_eq!(code, close_codes::PROTOCOL_ERROR),
-            OutboundMessage::Frame(_) => panic!("expected close after fatal error"),
-        }
+        assert_eq!(
+            close_code_of(out_rx.recv().await.unwrap()),
+            close_codes::PROTOCOL_ERROR
+        );
     }
 
     #[tokio::test]
@@ -1602,9 +1866,12 @@ mod tests {
             "stream-1".into(),
             protojson_conv::to_value(&req).unwrap(),
             ServiceParams::new(),
-            handler,
-            streams.clone(),
-            out_tx,
+            StreamContext {
+                handler,
+                streams: streams.clone(),
+                out_tx,
+                max_streams: None,
+            },
         )
         .await;
 
@@ -1633,9 +1900,12 @@ mod tests {
             "stream-cancel".into(),
             protojson_conv::to_value(&req).unwrap(),
             ServiceParams::new(),
-            handler,
-            task_streams,
-            out_tx,
+            StreamContext {
+                handler,
+                streams: task_streams,
+                out_tx,
+                max_streams: None,
+            },
         ));
 
         let cancel_tx = loop {
@@ -1738,12 +2008,10 @@ mod tests {
 
         let resp = frame_payload(out_rx.recv().await.unwrap());
         assert_eq!(resp.error.unwrap().code, SERVER_ERROR_CODE);
-        match out_rx.recv().await.unwrap() {
-            OutboundMessage::Close { code, .. } => {
-                assert_eq!(code, close_codes::AUTHENTICATION_REQUIRED)
-            }
-            OutboundMessage::Frame(_) => panic!("expected 4001 close"),
-        }
+        assert_eq!(
+            close_code_of(out_rx.recv().await.unwrap()),
+            close_codes::AUTHENTICATION_REQUIRED
+        );
     }
 
     #[tokio::test]
