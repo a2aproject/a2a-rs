@@ -23,9 +23,30 @@ This crate is published as `a2a-websocket` and imported in Rust as
   for reacting to a reauthentication request.
 - Inbound message rate limiting (`RateLimit`) applied per connection and per
   authenticated identity, plus an inbound message size cap.
+- Keep-alive pings and idle timeouts (`Liveness`), and caps on connections per
+  identity and streams per connection (`ConnectionLimits`).
+- Reconnection backoff with jitter (`Backoff`,
+  `WebSocketTransport::connect_with_retry`).
 - Mapping between `a2a::A2AError` and JSON-RPC 2.0 error objects (numeric
   `code` + structured `data`), including close-code selection for fatal
   failures.
+
+## Connection Model
+
+Each connection is genuinely full duplex. Requests are correlated by JSON-RPC
+`id`, so a server can push stream chunks while the client sends new requests over
+the same socket, and a `cancelStream` arriving mid-stream is acted on
+immediately.
+
+Internally, each connection runs two tasks: one owns the read half of the socket
+and one owns the write half, with every outbound frame — responses, stream
+chunks, and the control frames owed to the peer such as pongs and close echoes —
+queued through a channel to the writer. Driving both directions from a single
+task instead would mean racing a read against a write and discarding whichever
+loses, and `fastwebsockets::read_frame` cannot be cancelled safely: it consumes
+frame headers from a persistent buffer into local variables, so abandoning it
+partway through desynchronizes the parser. Splitting removes that hazard, and it
+also keeps a large write from stalling reads.
 
 ## Wire Format
 
@@ -196,6 +217,88 @@ be enabled with `WebSocketConfig::allowed_origins`.
 
 Inbound messages larger than `WebSocketConfig::max_frame_bytes` (1 MiB by
 default, Section 3.6) are rejected with a `1009` close.
+
+## Keep-Alive and Idle Timeouts
+
+Servers ping on an interval and close connections that stop answering or stop
+being used (Section 2.4). This is **on by default** with the intervals the spec
+recommends — ping every 30s, expect a pong within 10s, close after 5 minutes with
+no application-level message:
+
+```rust,ignore
+use std::time::Duration;
+use a2a_websocket::{Liveness, LivenessPolicy, WebSocketConfig};
+
+let config = WebSocketConfig {
+    liveness: LivenessPolicy::Custom(Liveness {
+        ping_interval: Duration::from_secs(15),
+        pong_timeout: Duration::from_secs(5),
+        idle_timeout: Duration::from_secs(120),
+    }),
+    ..Default::default()
+};
+```
+
+Both timeouts close with `1001` (Going Away). Traffic in *either* direction
+counts as activity, so a long-running stream pushing events to a quiet client is
+never mistaken for idle. `LivenessPolicy::Disabled` switches this off, which
+suits deployments where a proxy already handles it.
+
+## Connection and Stream Limits
+
+Servers cap concurrent connections per authenticated identity and concurrent
+streams per connection (Section 13.5). Both are **on by default** with
+deliberately generous values (256 and 128), since the spec recommends no
+figures — they exist to stop one identity exhausting a server, not to shape
+normal traffic:
+
+```rust,ignore
+use a2a_websocket::{ConnectionLimitPolicy, ConnectionLimits, WebSocketConfig};
+
+let config = WebSocketConfig {
+    connection_limits: ConnectionLimitPolicy::Custom(ConnectionLimits {
+        max_connections_per_identity: 4,
+        max_streams_per_connection: 16,
+    }),
+    ..Default::default()
+};
+```
+
+An identity at its connection limit is refused during the upgrade with `503`, so
+a client can back off and return rather than being handed a connection that
+closes immediately. A request that would exceed the stream cap gets a `-32000`
+error with message `"Too many concurrent streams"`; the connection and its
+existing streams are unaffected. Anonymous connections are not counted against
+any identity, so set `allowed_origins` or an authenticator if you rely on this.
+
+## Reconnection
+
+`connect_with_retry` re-establishes a connection on an exponential backoff with
+jitter, defaulting to the schedule Section 8.4 recommends (1s, doubling, capped
+at 30s):
+
+```rust,ignore
+use a2a_websocket::{Backoff, ConnectOptions, WebSocketTransport};
+
+let transport = WebSocketTransport::connect_with_retry(
+    "wss://agent.example.com/a2a/ws",
+    ConnectOptions::with_bearer_token(token),
+    Backoff::default(),
+)
+.await?;
+```
+
+Failures that would recur are **not** retried — a rejected token, an endpoint
+that is not a WebSocket server, or a sub-protocol the server will not speak fail
+immediately, so a reconnect loop cannot end up hammering an auth server. `429`
+and `5xx` are retried, which covers the `503` returned by a per-identity
+connection cap.
+
+Resubscribing after a reconnect is left to you: issue `SubscribeToTask` for the
+task ids you still care about, and be ready for events you have already seen
+(Section 8.4 steps 2 and 3). The transport does not do this itself, because only
+the application knows which tasks still matter and whether replaying an event is
+safe.
 
 ## Agent Card Endpoint Format
 

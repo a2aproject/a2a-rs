@@ -24,7 +24,9 @@ use a2a::*;
 use a2a_server::*;
 use a2a_websocket::auth::{AuthContext, AuthError, AuthStatus, User, WsAuthenticator};
 use a2a_websocket::server::{WebSocketConfig, websocket_router_with_config};
-use a2a_websocket::{RateLimit, RateLimitPolicy};
+use a2a_websocket::{
+    ConnectionLimitPolicy, ConnectionLimits, Liveness, LivenessPolicy, RateLimit, RateLimitPolicy,
+};
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 use examples_lib::{EchoExecutor, build_agent_card};
@@ -230,6 +232,20 @@ async fn main() {
         // shared across every connection of the same identity, so opening more
         // sockets does not buy more throughput.
         rate_limit: RateLimitPolicy::Custom(RateLimit::new(50, Duration::from_secs(1))),
+        // Keep-alive is on by default with the spec's recommended intervals
+        // (ping every 30s, pong within 10s, close after 5 minutes idle). Shortened
+        // here so the behaviour is visible while playing with the example.
+        liveness: LivenessPolicy::Custom(Liveness {
+            ping_interval: Duration::from_secs(10),
+            pong_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(60),
+        }),
+        // Also on by default, with far more generous values. Tightened here so
+        // that running the client twice at once shows the cap taking effect.
+        connection_limits: ConnectionLimitPolicy::Custom(ConnectionLimits {
+            max_connections_per_identity: 4,
+            max_streams_per_connection: 8,
+        }),
     };
 
     let app = axum::Router::new()
