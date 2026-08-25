@@ -24,13 +24,6 @@ path = "src/helloworld_tls/server.rs"
 name = "helloworld-tls-client"
 path = "src/helloworld_tls/client.rs"
 
-[[bin]]
-name = "stdio-agent"
-path = "src/stdio/agent.rs"
-[[bin]]
-name = "stdio-host"
-path = "src/stdio/host.rs"
-
 [dependencies]
 a2a = { workspace = true }
 a2a-client = { workspace = true, features = ["rustls-tls"] }
