@@ -1,6 +1,7 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // SPDX-License-Identifier: Apache-2.0
 pub mod agent_card;
+pub mod dispatch;
 pub mod executor;
 pub mod handler;
 pub mod jsonrpc;

@@ -3,16 +3,15 @@
 use std::sync::Arc;
 
 use a2a::*;
-use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use axum::{
     Json,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use futures::{StreamExt, stream::BoxStream};
 use serde_json::Value;
 
+use crate::dispatch;
 use crate::handler::RequestHandler;
 use crate::middleware::{ServiceParams, extract_service_params};
 use crate::sse;
@@ -69,98 +68,8 @@ async fn handle_unary_request<H: RequestHandler>(
     let id = request.id.clone();
     let raw_params = request.params.clone().unwrap_or(Value::Null);
 
-    let result: Result<Value, A2AError> = match request.method.as_str() {
-        methods::SEND_MESSAGE => match protojson_conv::from_value::<SendMessageRequest>(raw_params)
-        {
-            Ok(req) => state
-                .handler
-                .send_message(params, req)
-                .await
-                .and_then(|r| protojson_value(&r)),
-            Err(e) => Err(parse_error(e)),
-        },
-        methods::GET_TASK => match protojson_conv::from_value::<GetTaskRequest>(raw_params) {
-            Ok(req) => state
-                .handler
-                .get_task(params, req)
-                .await
-                .and_then(|r| protojson_value(&r)),
-            Err(e) => Err(parse_error(e)),
-        },
-        methods::LIST_TASKS => match protojson_conv::from_value::<ListTasksRequest>(raw_params) {
-            Ok(req) => state
-                .handler
-                .list_tasks(params, req)
-                .await
-                .and_then(|r| protojson_value(&r)),
-            Err(e) => Err(parse_error(e)),
-        },
-        methods::CANCEL_TASK => match protojson_conv::from_value::<CancelTaskRequest>(raw_params) {
-            Ok(req) => state
-                .handler
-                .cancel_task(params, req)
-                .await
-                .and_then(|r| protojson_value(&r)),
-            Err(e) => Err(parse_error(e)),
-        },
-        methods::CREATE_PUSH_CONFIG => match parse_create_push_config_request(raw_params) {
-            Ok(req) => state
-                .handler
-                .create_push_config(params, req)
-                .await
-                .and_then(|r| protojson_value(&r)),
-            Err(e) => Err(parse_error(e)),
-        },
-        methods::GET_PUSH_CONFIG => {
-            match protojson_conv::from_value::<GetTaskPushNotificationConfigRequest>(raw_params) {
-                Ok(req) => state
-                    .handler
-                    .get_push_config(params, req)
-                    .await
-                    .and_then(|r| protojson_value(&r)),
-                Err(e) => Err(parse_error(e)),
-            }
-        }
-        methods::LIST_PUSH_CONFIGS => {
-            match protojson_conv::from_value::<ListTaskPushNotificationConfigsRequest>(raw_params) {
-                Ok(req) => state
-                    .handler
-                    .list_push_configs(params, req)
-                    .await
-                    .and_then(|r| protojson_value(&r)),
-                Err(e) => Err(parse_error(e)),
-            }
-        }
-        methods::DELETE_PUSH_CONFIG => {
-            match protojson_conv::from_value::<DeleteTaskPushNotificationConfigRequest>(raw_params)
-            {
-                Ok(req) => state
-                    .handler
-                    .delete_push_config(params, req)
-                    .await
-                    .map(|_| Value::Null),
-                Err(e) => Err(parse_error(e)),
-            }
-        }
-        methods::GET_EXTENDED_AGENT_CARD => {
-            match protojson_conv::from_value::<GetExtendedAgentCardRequest>(raw_params) {
-                Ok(req) => state
-                    .handler
-                    .get_extended_agent_card(params, req)
-                    .await
-                    .and_then(|r| protojson_value(&r)),
-                Err(e) => Err(parse_error(e)),
-            }
-        }
-        "" => Err(A2AError::invalid_request("method is required")),
-        _ => Err(A2AError::method_not_found(&request.method)),
-    };
-
-    match result {
-        Ok(value) => {
-            let resp = JsonRpcResponse::success(id, value);
-            Json(resp).into_response()
-        }
+    match dispatch::dispatch_unary(&*state.handler, params, &request.method, raw_params).await {
+        Ok(value) => Json(JsonRpcResponse::success(id, value)).into_response(),
         Err(e) => error_response(id, e),
     }
 }
@@ -173,67 +82,15 @@ async fn handle_streaming_request<H: RequestHandler>(
     let id = request.id.clone();
     let raw_params = request.params.clone().unwrap_or(Value::Null);
 
-    match request.method.as_str() {
-        methods::SEND_STREAMING_MESSAGE => {
-            match protojson_conv::from_value::<SendMessageRequest>(raw_params) {
-                Ok(req) => match state.handler.send_streaming_message(params, req).await {
-                    Ok(stream) => {
-                        sse::sse_jsonrpc_stream(id, protojson_stream(stream)).into_response()
-                    }
-                    Err(e) => error_response(id, e),
-                },
-                Err(e) => error_response(id, parse_error(e)),
-            }
-        }
-        methods::SUBSCRIBE_TO_TASK => {
-            match protojson_conv::from_value::<SubscribeToTaskRequest>(raw_params) {
-                Ok(req) => match state.handler.subscribe_to_task(params, req).await {
-                    Ok(stream) => {
-                        sse::sse_jsonrpc_stream(id, protojson_stream(stream)).into_response()
-                    }
-                    Err(e) => error_response(id, e),
-                },
-                Err(e) => error_response(id, parse_error(e)),
-            }
-        }
-        _ => error_response(id, A2AError::method_not_found(&request.method)),
+    match dispatch::dispatch_streaming(&*state.handler, params, &request.method, raw_params).await {
+        Ok(stream) => sse::sse_jsonrpc_stream(id, stream).into_response(),
+        Err(e) => error_response(id, e),
     }
 }
 
 fn error_response(id: JsonRpcId, err: A2AError) -> axum::response::Response {
     let resp = JsonRpcResponse::error(id, err.to_jsonrpc_error());
     (StatusCode::OK, Json(resp)).into_response()
-}
-
-fn protojson_value<T: ProtoJsonPayload>(value: &T) -> Result<Value, A2AError> {
-    protojson_conv::to_value(value)
-        .map_err(|e| A2AError::internal(format!("failed to serialize ProtoJSON payload: {e}")))
-}
-
-fn protojson_stream(
-    stream: BoxStream<'static, Result<StreamResponse, A2AError>>,
-) -> BoxStream<'static, Result<Value, A2AError>> {
-    Box::pin(stream.map(|item| {
-        item.and_then(|value| {
-            protojson_conv::to_value(&value).map_err(|e| {
-                A2AError::internal(format!("failed to serialize ProtoJSON stream payload: {e}"))
-            })
-        })
-    }))
-}
-
-fn parse_create_push_config_request(
-    raw_params: Value,
-) -> Result<TaskPushNotificationConfig, String> {
-    protojson_conv::from_value::<TaskPushNotificationConfig>(raw_params).map_err(|e| e.to_string())
-}
-
-fn parse_error(e: impl std::fmt::Display) -> A2AError {
-    A2AError {
-        code: error_code::PARSE_ERROR,
-        message: format!("invalid params: {e}"),
-        details: None,
-    }
 }
 
 #[cfg(test)]
