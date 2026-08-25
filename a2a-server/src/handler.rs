@@ -750,16 +750,19 @@ impl RequestHandler for DefaultRequestHandler {
         let mut configs = self.push_config_store()?.list(&req.task_id).await?;
         configs.sort_by(|left, right| left.id.cmp(&right.id));
 
+        // Cap the page size (max 100, default 50) like the task list path.
         let page_size = match req.page_size {
-            Some(size) if size > 0 => size as usize,
+            Some(size) if size > 0 => (size as usize).min(100),
             _ => 50,
         };
-        let start = req
-            .page_token
-            .as_deref()
-            .and_then(|token| token.parse::<usize>().ok())
-            .unwrap_or(0)
-            .min(configs.len());
+        let start = if let Some(ref token) = req.page_token {
+            token
+                .parse::<usize>()
+                .map_err(|_| A2AError::invalid_params("invalid page token"))?
+        } else {
+            0
+        };
+        let start = start.min(configs.len());
         let end = (start + page_size).min(configs.len());
         let next_page_token = (end < configs.len()).then(|| end.to_string());
 
@@ -1340,6 +1343,82 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_push_configs_invalid_page_token_errors() {
+        install_crypto_provider();
+        let handler = make_handler_with_push_configs();
+        let params = ServiceParams::new();
+        handler
+            .create_push_config(
+                &params,
+                TaskPushNotificationConfig {
+                    task_id: "t1".into(),
+                    url: "https://example.com/callback".into(),
+                    id: Some("cfg-1".into()),
+                    token: None,
+                    authentication: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = handler
+            .list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: None,
+                    page_token: Some("not-a-number".into()),
+                    tenant: None,
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, error_code::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn test_list_push_configs_page_size_is_capped() {
+        install_crypto_provider();
+        let handler = make_handler_with_push_configs();
+        let params = ServiceParams::new();
+        // Keep the count below the per-task push config cap (50) so this test
+        // stays valid once push config limits are enforced.
+        for i in 0..40 {
+            handler
+                .create_push_config(
+                    &params,
+                    TaskPushNotificationConfig {
+                        task_id: "t1".into(),
+                        url: format!("https://example.com/callback/{i}"),
+                        id: Some(format!("cfg-{i:03}")),
+                        token: None,
+                        authentication: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // Requesting a huge page size must not error and returns everything
+        // available (the hard page-size cap of 100 is enforced in the store).
+        let resp = handler
+            .list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: Some(1000),
+                    page_token: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.configs.len(), 40);
     }
 
     #[tokio::test]
