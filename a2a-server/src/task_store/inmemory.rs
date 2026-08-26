@@ -96,6 +96,7 @@ impl TaskStore for InMemoryTaskStore {
         };
 
         let total_size = tasks.len();
+        let start = start.min(total_size);
         let end = (start + page_size).min(total_size);
         let page = tasks[start..end].to_vec();
 
@@ -344,5 +345,25 @@ mod tests {
         };
         let resp = store.list(&req).await.unwrap();
         assert_eq!(resp.tasks[0].history.as_ref().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_page_token_beyond_end() {
+        let store = InMemoryTaskStore::new();
+
+        let req = ListTasksRequest {
+            context_id: None,
+            status: None,
+            page_size: None,
+            page_token: Some("1".to_string()),
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: None,
+            tenant: None,
+        };
+        let resp = store.list(&req).await.unwrap();
+        assert_eq!(resp.tasks.len(), 0);
+        assert_eq!(resp.total_size, 0);
+        assert!(resp.next_page_token.is_empty());
     }
 }
