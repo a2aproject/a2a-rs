@@ -147,6 +147,33 @@ impl JsonRpcTransport {
             .await
             .map_err(|e| A2AError::internal(format!("HTTP request failed: {e}")))?;
 
+        // A JSON-RPC error answering a streaming call arrives as a normal
+        // (non-SSE) JSON body with HTTP 200, since JSON-RPC reports failures
+        // in the envelope rather than via status code. Detect that case by
+        // content type before handing the body to the SSE parser, which
+        // would otherwise find no `data:` frames and yield an empty stream.
+        // A response with no content type is still treated as a stream:
+        // reading it to inspect it would hang on a stream that has not sent
+        // anything yet.
+        let is_event_stream = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .map(|v| v.as_bytes().starts_with(b"text/event-stream"))
+            .unwrap_or(true);
+
+        if !is_event_stream {
+            let rpc_response: JsonRpcResponse = response.json().await.map_err(|e| {
+                A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
+            })?;
+
+            return match rpc_response.error {
+                Some(err) => Err(parse_jsonrpc_error(err)),
+                None => Err(A2AError::internal(
+                    "expected streaming response but got non-streaming JSON-RPC result",
+                )),
+            };
+        }
+
         let stream = response.bytes_stream();
         let event_stream = parse_sse_stream(stream);
         Ok(event_stream)
@@ -1245,6 +1272,39 @@ mod tests {
 
         assert_eq!(error.code, error_code::INVALID_PARAMS);
         assert_eq!(error.message, "invalid params");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_task_surfaces_jsonrpc_error_on_plain_json_response() {
+        // A JSON-RPC error answering a streaming call arrives as a plain
+        // `application/json` body (HTTP 200), not as an SSE `data:` frame.
+        // Regression test for https://github.com/a2aproject/a2a-rs/issues/134.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "error": {
+                "code": error_code::TASK_NOT_FOUND,
+                "message": "task already terminal",
+                "data": null
+            }
+        })
+        .to_string();
+        let (endpoint, _request_rx) = spawn_jsonrpc_server(response).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+
+        let req = SubscribeToTaskRequest {
+            id: "task-1".into(),
+            tenant: None,
+        };
+
+        let error = match transport.subscribe_to_task(&ServiceParams::new(), &req).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected error, got a stream"),
+        };
+
+        assert_eq!(error.code, error_code::TASK_NOT_FOUND);
+        assert_eq!(error.message, "task already terminal");
     }
 
     #[tokio::test]
