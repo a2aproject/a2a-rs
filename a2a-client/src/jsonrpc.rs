@@ -1308,6 +1308,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_subscribe_to_task_rejects_non_streaming_success_result() {
+        // A plain `application/json` body with a `result` (no `error`) is not
+        // a valid answer to a streaming call, but it is not an SSE stream
+        // either — surface it as an error instead of silently yielding an
+        // empty stream.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {}
+        })
+        .to_string();
+        let (endpoint, _request_rx) = spawn_jsonrpc_server(response).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+
+        let req = SubscribeToTaskRequest {
+            id: "task-1".into(),
+            tenant: None,
+        };
+
+        let error = match transport.subscribe_to_task(&ServiceParams::new(), &req).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected error, got a stream"),
+        };
+
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert_eq!(
+            error.message,
+            "expected streaming response but got non-streaming JSON-RPC result"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_task_surfaces_unparseable_non_streaming_body() {
+        // A non-SSE body that isn't valid JSON-RPC either (e.g. a raw error
+        // page from a proxy) should surface as an error, not an empty stream.
+        let (endpoint, _request_rx) = spawn_jsonrpc_server("not json".into()).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+
+        let req = SubscribeToTaskRequest {
+            id: "task-1".into(),
+            tenant: None,
+        };
+
+        let error = match transport.subscribe_to_task(&ServiceParams::new(), &req).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected error, got a stream"),
+        };
+
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert!(error.message.contains("failed to parse JSON-RPC response"));
+    }
+
+    #[tokio::test]
     async fn test_create_push_config_rejects_missing_result() {
         let response = json!({
             "jsonrpc": "2.0",
