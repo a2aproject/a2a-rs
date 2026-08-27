@@ -1254,6 +1254,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_active_execution_publishes_events_with_snapshot_updates() {
+        let initial_task = Task {
+            id: "t-snapshot-update".into(),
+            context_id: "c-snapshot-update".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let active = ActiveExecution::new(initial_task.clone());
+        let mut receiver = active.subscribe();
+
+        let updated_task = Task {
+            id: "t-snapshot-update".into(),
+            context_id: "c-snapshot-update".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+
+        let event = StreamResponse::Task(updated_task.clone());
+        active.publish(Ok(&event), Some(updated_task.clone())).await;
+
+        // Verify event was published to subscriber
+        let published = receiver.recv().await.unwrap();
+        assert_eq!(published.sequence, 1);
+        match published.result {
+            Ok(StreamResponse::Task(task)) => {
+                assert_eq!(task.id, "t-snapshot-update");
+            }
+            _ => panic!("expected Ok(Task) event"),
+        }
+
+        // Verify snapshot was updated
+        let (_, snapshot_task, sequence) = active.resubscribe().await;
+        assert_eq!(snapshot_task.unwrap().id, "t-snapshot-update");
+        assert_eq!(sequence, 1);
+    }
+
+
+
+    #[tokio::test]
     async fn test_get_task_not_found() {
         let handler = make_handler();
         let params = ServiceParams::new();
