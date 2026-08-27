@@ -1303,6 +1303,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_active_execution_broadcasts_to_multiple_subscribers() {
+        let task = Task {
+            id: "t-multi-sub".into(),
+            context_id: "c-multi-sub".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let active = ActiveExecution::new(task.clone());
+
+        // Create two subscribers
+        let mut sub1 = active.subscribe();
+        let mut sub2 = active.subscribe();
+
+        let event = StreamResponse::Task(task);
+        active.publish(Ok(&event), None).await;
+
+        // Both subscribers should receive the same event
+        let evt1 = sub1.recv().await.unwrap();
+        let evt2 = sub2.recv().await.unwrap();
+
+        assert_eq!(evt1.sequence, 1);
+        assert_eq!(evt2.sequence, 1);
+        assert!(matches!(evt1.result, Ok(StreamResponse::Task(_))));
+        assert!(matches!(evt2.result, Ok(StreamResponse::Task(_))));
+    }
+
+    #[tokio::test]
     async fn test_get_task_not_found() {
         let handler = make_handler();
         let params = ServiceParams::new();
