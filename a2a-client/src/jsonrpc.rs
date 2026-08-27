@@ -1298,7 +1298,10 @@ mod tests {
             tenant: None,
         };
 
-        let error = match transport.subscribe_to_task(&ServiceParams::new(), &req).await {
+        let error = match transport
+            .subscribe_to_task(&ServiceParams::new(), &req)
+            .await
+        {
             Err(e) => e,
             Ok(_) => panic!("expected error, got a stream"),
         };
@@ -1328,7 +1331,10 @@ mod tests {
             tenant: None,
         };
 
-        let error = match transport.subscribe_to_task(&ServiceParams::new(), &req).await {
+        let error = match transport
+            .subscribe_to_task(&ServiceParams::new(), &req)
+            .await
+        {
             Err(e) => e,
             Ok(_) => panic!("expected error, got a stream"),
         };
@@ -1353,7 +1359,10 @@ mod tests {
             tenant: None,
         };
 
-        let error = match transport.subscribe_to_task(&ServiceParams::new(), &req).await {
+        let error = match transport
+            .subscribe_to_task(&ServiceParams::new(), &req)
+            .await
+        {
             Err(e) => e,
             Ok(_) => panic!("expected error, got a stream"),
         };
