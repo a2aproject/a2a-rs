@@ -1227,6 +1227,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_active_execution_drops_errors_without_subscribers() {
+        let task = Task {
+            id: "t-error-no-sub".into(),
+            context_id: "c-error-no-sub".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let active = ActiveExecution::new(task.clone());
+        let error = A2AError::internal("execution failed");
+
+        // Publish error without any subscribers
+        active.publish(Err(&error), Some(task.clone())).await;
+
+        // Resubscribe to verify snapshot was updated but no event was buffered
+        let (mut receiver, snapshot_task, sequence) = active.resubscribe().await;
+        assert_eq!(snapshot_task.unwrap().id, "t-error-no-sub");
+        assert_eq!(sequence, 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn test_get_task_not_found() {
         let handler = make_handler();
         let params = ServiceParams::new();
