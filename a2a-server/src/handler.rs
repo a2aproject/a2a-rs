@@ -1302,8 +1302,6 @@ mod tests {
         assert_eq!(sequence, 1);
     }
 
-
-
     #[tokio::test]
     async fn test_get_task_not_found() {
         let handler = make_handler();
