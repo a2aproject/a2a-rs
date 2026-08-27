@@ -28,13 +28,12 @@ pub use task_store::{InMemoryTaskStore, TaskStore};
 /// ever see a generic message. Client-input errors (parse errors, invalid
 /// params, task-not-found, ...) pass through unchanged so callers still get
 /// actionable validation feedback.
-pub(crate) fn sanitize_client_error(err: a2a::A2AError) -> a2a::A2AError {
+pub(crate) fn sanitize_client_error(mut err: a2a::A2AError) -> a2a::A2AError {
     if err.code == a2a::error_code::INTERNAL_ERROR {
-        tracing::error!(error = %err.message, "returning sanitized internal error to client");
-        a2a::A2AError::internal("Internal error")
-    } else {
-        err
+        tracing::error!(code = err.code, error = %err.message, "returning sanitized internal error to client");
+        err.message = "Internal error".to_string();
     }
+    err
 }
 
 #[cfg(test)]
