@@ -161,22 +161,21 @@ impl JsonRpcTransport {
             .map(|v| v.as_bytes().starts_with(b"text/event-stream"))
             .unwrap_or(true);
 
-        if !is_event_stream {
+        if is_event_stream {
+            let stream = response.bytes_stream();
+            Ok(parse_sse_stream(stream))
+        } else {
             let rpc_response: JsonRpcResponse = response.json().await.map_err(|e| {
                 A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
             })?;
 
-            return match rpc_response.error {
+            match rpc_response.error {
                 Some(err) => Err(parse_jsonrpc_error(err)),
                 None => Err(A2AError::internal(
                     "expected streaming response but got non-streaming JSON-RPC result",
                 )),
-            };
+            }
         }
-
-        let stream = response.bytes_stream();
-        let event_stream = parse_sse_stream(stream);
-        Ok(event_stream)
     }
 }
 
@@ -562,6 +561,24 @@ mod tests {
         });
 
         (format!("http://{addr}"), request_rx)
+    }
+
+    async fn spawn_jsonrpc_sse_server(sse_body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n{}",
+                sse_body.len(),
+                sse_body,
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        format!("http://{addr}")
     }
 
     async fn read_http_request(socket: &mut TcpStream) -> String {
@@ -1272,6 +1289,44 @@ mod tests {
 
         assert_eq!(error.code, error_code::INVALID_PARAMS);
         assert_eq!(error.message, "invalid params");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_task_streams_on_text_event_stream_response() {
+        // A `text/event-stream` response is still handed to the SSE parser,
+        // end to end through the real HTTP call, not just via the parser's
+        // own unit tests.
+        let status_update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "task-1".into(),
+            context_id: "ctx-1".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        let rpc_resp = JsonRpcResponse::success(
+            JsonRpcId::Number(1),
+            protojson_conv::to_value(&status_update).unwrap(),
+        );
+        let sse_body = format!("data: {}\n\n", serde_json::to_string(&rpc_resp).unwrap());
+        let endpoint = spawn_jsonrpc_sse_server(sse_body).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+
+        let req = SubscribeToTaskRequest {
+            id: "task-1".into(),
+            tenant: None,
+        };
+
+        let mut stream = transport
+            .subscribe_to_task(&ServiceParams::new(), &req)
+            .await
+            .unwrap();
+
+        let item = stream.next().await.unwrap().unwrap();
+        assert!(matches!(item, StreamResponse::StatusUpdate(_)));
     }
 
     #[tokio::test]
