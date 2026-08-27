@@ -192,7 +192,7 @@ impl ItkExecutor {
 
         // Build client factory with gRPC support
         let client = A2AClientFactory::builder()
-            .register(Arc::new(GrpcTransportFactory {}))
+            .register(Arc::new(GrpcTransportFactory::new()))
             .preferred_bindings(Self::transport_preference(&call.transport))
             .build()
             .create_from_card(&card)
