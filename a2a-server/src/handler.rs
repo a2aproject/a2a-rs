@@ -49,17 +49,29 @@ impl ActiveExecution {
         (receiver, state.snapshot_task.clone(), state.sequence)
     }
 
-    async fn publish(&self, result: Result<StreamResponse, A2AError>, snapshot_task: Option<Task>) {
-        let event = {
+    async fn publish(
+        &self,
+        result: Result<&StreamResponse, &A2AError>,
+        snapshot_task: Option<Task>,
+    ) {
+        let sequence = {
             let mut state = self.state.write().await;
             if let Some(task) = snapshot_task {
                 state.snapshot_task = Some(task);
             }
             state.sequence += 1;
-            ExecutionEvent {
-                sequence: state.sequence,
-                result,
-            }
+            state.sequence
+        };
+
+        // Task state remains available for a later subscription, but transient
+        // events do not need to be allocated when no subscriber is listening.
+        if self.sender.receiver_count() == 0 {
+            return;
+        }
+
+        let event = ExecutionEvent {
+            sequence,
+            result: result.cloned().map_err(Clone::clone),
         };
         let _ = self.sender.send(event);
     }
@@ -319,22 +331,22 @@ async fn drive_execution(
                         )
                         .await
                         {
-                            active.publish(Err(error), None).await;
+                            active.publish(Err(&error), None).await;
                             break;
                         }
-                        active.publish(Ok(event.clone()), updated_task).await;
+                        active.publish(Ok(&event), updated_task).await;
                         if is_terminal_event(&event) {
                             break;
                         }
                     }
                     Err(error) => {
-                        active.publish(Err(error), None).await;
+                        active.publish(Err(&error), None).await;
                         break;
                     }
                 }
             }
             Err(error) => {
-                active.publish(Err(error), None).await;
+                active.publish(Err(&error), None).await;
                 break;
             }
         }
@@ -690,7 +702,7 @@ impl RequestHandler for DefaultRequestHandler {
                     .await?;
 
                     if let Some(active) = &active_execution {
-                        active.publish(Ok(event.clone()), updated_task).await;
+                        active.publish(Ok(&event), updated_task).await;
                     }
 
                     if is_terminal_event(&event) {
@@ -699,7 +711,7 @@ impl RequestHandler for DefaultRequestHandler {
                 }
                 Err(error) => {
                     if let Some(active) = &active_execution {
-                        active.publish(Err(error.clone()), None).await;
+                        active.publish(Err(&error), None).await;
                     }
                     return Err(error);
                 }
@@ -1103,6 +1115,115 @@ mod tests {
         let mut stream = handler.send_streaming_message(&params, req).await.unwrap();
         let event = stream.next().await.unwrap().unwrap();
         assert!(matches!(event, StreamResponse::Task(_)));
+    }
+
+    #[tokio::test]
+    async fn test_stream_disconnect_preserves_execution_for_resubscription() {
+        use futures::StreamExt;
+
+        let (handler, release) = make_resumable_handler();
+        let params = ServiceParams::new();
+        let mut message = make_message();
+        message.task_id = Some("t-disconnect".into());
+        message.context_id = Some("c-disconnect".into());
+
+        let mut stream = handler
+            .send_streaming_message(
+                &params,
+                SendMessageRequest {
+                    message,
+                    configuration: None,
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let initial = stream.next().await.unwrap().unwrap();
+        match initial {
+            StreamResponse::Task(task) => assert_eq!(task.status.state, TaskState::Working),
+            _ => panic!("expected initial working task"),
+        }
+        drop(stream);
+
+        let mut resumed = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: "t-disconnect".into(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let snapshot = resumed.next().await.unwrap().unwrap();
+        match snapshot {
+            StreamResponse::Task(task) => assert_eq!(task.status.state, TaskState::Working),
+            _ => panic!("expected working task snapshot"),
+        }
+
+        release.notify_waiters();
+
+        let terminal = resumed.next().await.unwrap().unwrap();
+        match terminal {
+            StreamResponse::Task(task) => {
+                assert_eq!(task.status.state, TaskState::Completed)
+            }
+            _ => panic!("expected terminal task"),
+        }
+        assert!(resumed.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_active_execution_keeps_snapshot_without_subscribers() {
+        let task = Task {
+            id: "t-buffering".into(),
+            context_id: "c-buffering".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let active = ActiveExecution::new(task.clone());
+
+        let event = StreamResponse::Task(task.clone());
+        active.publish(Ok(&event), Some(task)).await;
+
+        let (mut receiver, snapshot_task, sequence) = active.resubscribe().await;
+        assert_eq!(snapshot_task.unwrap().id, "t-buffering");
+        assert_eq!(sequence, 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_active_execution_publishes_errors_to_subscribers() {
+        let task = Task {
+            id: "t-buffering-error".into(),
+            context_id: "c-buffering-error".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        let active = ActiveExecution::new(task);
+        let mut receiver = active.subscribe();
+        let error = A2AError::internal("execution failed");
+
+        active.publish(Err(&error), None).await;
+
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.sequence, 1);
+        assert_eq!(event.result.unwrap_err().code, error.code);
     }
 
     #[tokio::test]
