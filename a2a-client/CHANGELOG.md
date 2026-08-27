@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.2.2...a2a-client-lf-v0.2.3) - 2026-08-27
+
+### Fixed
+
+- *(a2a-client)* surface JSON-RPC errors on streaming calls ([#146](https://github.com/a2aproject/a2a-rs/pull/146))
+
 ## [0.2.2](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.2.1...a2a-client-lf-v0.2.2) - 2026-08-25
 
 ### Fixed

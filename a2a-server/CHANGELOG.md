@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.4.2...a2a-server-lf-v0.4.3) - 2026-08-27
+
+### Fixed
+
+- *(server)* avoid buffering without subscribers ([#147](https://github.com/a2aproject/a2a-rs/pull/147))
+
 ## [0.4.2](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.4.1...a2a-server-lf-v0.4.2) - 2026-08-26
 
 ### Other
