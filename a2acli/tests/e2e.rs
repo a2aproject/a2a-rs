@@ -663,11 +663,13 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
     let (_stdout, stderr) = run_cli_failure(&server, &["cancel-task", "missing"]);
     assert!(stderr.contains("a2a error -32001: task not found: missing"));
 
+    // The server sanitizes internal (-32603) error details before they
+    // reach the wire, so the CLI reports the generic message.
     let (_stdout, stderr) = run_cli_failure(&server, &["subscribe", "stream-error"]);
-    assert!(stderr.contains("a2a error -32603: stream failed"));
+    assert!(stderr.contains("a2a error -32603: Internal error"));
 
     let (_stdout, stderr) = run_cli_failure(&server, &["--compact", "stream", "stream-error"]);
-    assert!(stderr.contains("a2a error -32603: stream failed"));
+    assert!(stderr.contains("a2a error -32603: Internal error"));
 
     let (_stdout, stderr) = run_cli_failure(
         &server,

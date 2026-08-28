@@ -775,10 +775,12 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["error"]["message"], "Internal error");
-        assert!(!payload["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("internal details"));
+        assert!(
+            !payload["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("internal details")
+        );
 
         // Non-internal errors keep their message (client-validation feedback).
         let resp = rest_error_response(A2AError::task_not_found("t1"));

@@ -393,10 +393,7 @@ mod tests {
         let resp = error_response(JsonRpcId::Number(1), A2AError::task_not_found("t1"));
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            rpc_resp.error.unwrap().message,
-            "task not found: t1"
-        );
+        assert_eq!(rpc_resp.error.unwrap().message, "task not found: t1");
     }
 
     #[tokio::test]
