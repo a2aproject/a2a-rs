@@ -5,10 +5,12 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
+/// Maximum number of push notification configs allowed per task (BUG-42).
+const MAX_PUSH_CONFIGS_PER_TASK: usize = 50;
+
 /// Interface for persisting push notification configurations.
 #[async_trait]
-pub trait PushConfigStore: Send + Sync + 'static {
-    /// Save a push config for a task. Generates an ID if none provided.
+pub trait PushConfigStore: Send + Sync + 'static {    /// Save a push config for a task. Generates an ID if none provided.
     async fn save(
         &self,
         config: TaskPushNotificationConfig,
@@ -72,6 +74,16 @@ impl PushConfigStore for InMemoryPushConfigStore {
         let mut store = self.configs.write().await;
         let task_configs = store.entry(config.task_id.clone()).or_default();
         let config_id = config.id.clone().unwrap();
+        // Enforce a per-task cap so a client cannot register unbounded
+        // configs, each consuming memory and triggering outbound requests.
+        // Replacing an existing config by ID is still allowed at the cap.
+        if !task_configs.contains_key(&config_id)
+            && task_configs.len() >= MAX_PUSH_CONFIGS_PER_TASK
+        {
+            return Err(A2AError::invalid_params(format!(
+                "too many push notification configs for task (max {MAX_PUSH_CONFIGS_PER_TASK})"
+            )));
+        }
         task_configs.insert(config_id, config.clone());
         Ok(config)
     }
@@ -227,5 +239,52 @@ mod tests {
         store.delete_all("t1").await.unwrap();
         let configs = store.list("t1").await.unwrap();
         assert_eq!(configs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_save_caps_configs_per_task() {
+        let store = InMemoryPushConfigStore::new();
+        for i in 0..MAX_PUSH_CONFIGS_PER_TASK {
+            store
+                .save(make_config("t1", &format!("https://example.com/hook/{i}")))
+                .await
+                .unwrap();
+        }
+
+        // The (cap + 1)-th distinct config is rejected.
+        let result = store
+            .save(make_config("t1", "https://example.com/over-limit"))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, error_code::INVALID_PARAMS);
+
+        // Other tasks are not affected.
+        store
+            .save(make_config("t2", "https://example.com/hook"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_save_can_replace_existing_config_at_cap() {
+        let store = InMemoryPushConfigStore::new();
+        let mut first = make_config("t1", "https://example.com/hook/0");
+        first.id = Some("cfg-keep".to_string());
+        store.save(first).await.unwrap();
+        for i in 1..MAX_PUSH_CONFIGS_PER_TASK {
+            store
+                .save(make_config("t1", &format!("https://example.com/hook/{i}")))
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.list("t1").await.unwrap().len(), MAX_PUSH_CONFIGS_PER_TASK);
+
+        // Updating an existing config by ID is allowed even at the cap.
+        let mut config = make_config("t1", "https://example.com/replaced");
+        config.id = Some("cfg-keep".to_string());
+        let saved = store.save(config).await.unwrap();
+        assert_eq!(saved.id.as_deref(), Some("cfg-keep"));
+        assert_eq!(saved.url, "https://example.com/replaced");
+        assert_eq!(store.list("t1").await.unwrap().len(), MAX_PUSH_CONFIGS_PER_TASK);
     }
 }

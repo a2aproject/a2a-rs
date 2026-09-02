@@ -3,5 +3,5 @@
 mod sender;
 mod store;
 
-pub use sender::HttpPushSender;
+pub use sender::{HttpPushSender, HttpPushSenderConfig};
 pub use store::{InMemoryPushConfigStore, PushConfigStore};

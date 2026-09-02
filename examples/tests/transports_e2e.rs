@@ -12,8 +12,9 @@ use a2a_client::rest::RestTransport;
 use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::rest::rest_router;
 use a2a_server::{
-    DefaultRequestHandler, ExecutorContext, HttpPushSender, InMemoryPushConfigStore,
-    InMemoryTaskStore, RequestHandler, ServiceParams, WELL_KNOWN_AGENT_CARD_PATH,
+    DefaultRequestHandler, ExecutorContext, HttpPushSender, HttpPushSenderConfig,
+    InMemoryPushConfigStore, InMemoryTaskStore, RequestHandler, ServiceParams,
+    WELL_KNOWN_AGENT_CARD_PATH,
 };
 use async_trait::async_trait;
 use axum::body::Bytes;
@@ -338,9 +339,18 @@ async fn spawn_http_server() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 async fn spawn_push_http_server() -> (String, tokio::task::JoinHandle<()>) {
+    // URL validation is disabled here because the e2e webhook runs on
+    // 127.0.0.1; the default HttpPushSender rejects loopback targets (SSRF
+    // guard, see push/sender.rs validate_push_url).
     let handler = Arc::new(
         DefaultRequestHandler::new(PushTransportExecutor, InMemoryTaskStore::new())
-            .with_push_notifications(InMemoryPushConfigStore::new(), HttpPushSender::new(None)),
+            .with_push_notifications(
+                InMemoryPushConfigStore::new(),
+                HttpPushSender::new(Some(HttpPushSenderConfig {
+                    validate_urls: false,
+                    ..Default::default()
+                })),
+            ),
     );
     let app = Router::new()
         .nest("/rest", rest_router(handler.clone()))

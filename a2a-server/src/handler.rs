@@ -1009,8 +1009,16 @@ mod tests {
     }
 
     fn make_push_delivery_handler() -> DefaultRequestHandler {
+        // URL validation is disabled because the test webhook runs on
+        // 127.0.0.1; the default HttpPushSender rejects loopback targets.
         DefaultRequestHandler::new(PushEventExecutor, InMemoryTaskStore::new())
-            .with_push_config_store(InMemoryPushConfigStore::new())
+            .with_push_notifications(
+                InMemoryPushConfigStore::new(),
+                crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                    validate_urls: false,
+                    ..Default::default()
+                })),
+            )
     }
 
     fn make_resumable_handler() -> (DefaultRequestHandler, Arc<Notify>) {
