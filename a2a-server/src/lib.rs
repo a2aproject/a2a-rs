@@ -20,6 +20,22 @@ pub use middleware::{CallContext, CallInterceptor, InterceptedHandler, ServicePa
 pub use push::{HttpPushSender, InMemoryPushConfigStore, PushConfigStore};
 pub use task_store::{InMemoryTaskStore, TaskStore};
 
+/// Replace the message of internal errors with a generic one before it is
+/// exposed to clients, logging the original details (BUG-12 / CWE-209).
+///
+/// Internal errors (`INTERNAL_ERROR` code) may embed server-side details such
+/// as serialization internals, library names, or paths; clients should only
+/// ever see a generic message. Client-input errors (parse errors, invalid
+/// params, task-not-found, ...) pass through unchanged so callers still get
+/// actionable validation feedback.
+pub(crate) fn sanitize_client_error(mut err: a2a::A2AError) -> a2a::A2AError {
+    if err.code == a2a::error_code::INTERNAL_ERROR {
+        tracing::error!(code = err.code, error = %err.message, "returning sanitized internal error to client");
+        err.message = "Internal error".to_string();
+    }
+    err
+}
+
 #[cfg(test)]
 pub(crate) mod test_util {
     use std::collections::HashMap;

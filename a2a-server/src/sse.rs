@@ -16,6 +16,7 @@ pub fn sse_from_stream<T: serde::Serialize + Send + 'static>(
                 Event::default().data(data)
             }
             Err(err) => {
+                let err = crate::sanitize_client_error(err);
                 let error_json = serde_json::to_string(&err.to_jsonrpc_error()).unwrap_or_default();
                 Event::default().data(error_json)
             }
@@ -38,6 +39,7 @@ pub fn sse_jsonrpc_stream<T: serde::Serialize + Send + 'static>(
                 serde_json::to_string(&resp).unwrap_or_default()
             }
             Err(err) => {
+                let err = crate::sanitize_client_error(err);
                 let resp = a2a::JsonRpcResponse::error(request_id.clone(), err.to_jsonrpc_error());
                 serde_json::to_string(&resp).unwrap_or_default()
             }
@@ -79,7 +81,9 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("data:"));
-        assert!(body_str.contains("fail"));
+        // Internal error messages are sanitized before reaching clients.
+        assert!(body_str.contains("Internal error"));
+        assert!(!body_str.contains("fail"));
     }
 
     #[tokio::test]
@@ -105,7 +109,9 @@ mod tests {
         let resp = sse.into_response();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body_str.contains("fail"));
+        // Internal error messages are sanitized before reaching clients.
+        assert!(body_str.contains("Internal error"));
+        assert!(!body_str.contains("fail"));
         assert!(body_str.contains("error"));
     }
 
