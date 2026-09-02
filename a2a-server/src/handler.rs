@@ -663,11 +663,27 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: CancelTaskRequest,
     ) -> Result<Task, A2AError> {
-        let task = self.load_task(&req.id).await?;
-
-        if task.status.state.is_terminal() {
-            return Err(A2AError::task_not_cancelable(&req.id));
+        // Idempotent: canceling a task that is already in a terminal state
+        // returns the current terminal task instead of an error (BUG-52).
+        if let Some(task) = self.task_store.get(&req.id).await? {
+            if task.status.state.is_terminal() {
+                return Ok(task);
+            }
+        } else {
+            return Err(A2AError::task_not_found(&req.id));
         }
+
+        // Atomically transition the task to CANCELED so two concurrent cancel
+        // requests cannot both pass the check-then-act window (BUG-44).
+        let task = match self.task_store.begin_cancel(&req.id).await {
+            Ok(task) => task,
+            Err(error) if error.code == error_code::TASK_NOT_CANCELABLE => {
+                // Raced with another cancel or with task completion: return
+                // the current task (idempotent).
+                return self.load_task(&req.id).await;
+            }
+            Err(error) => return Err(error),
+        };
 
         let active_execution = self.execution_manager.get(&req.id).await;
 
@@ -1435,6 +1451,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cancel_task_concurrent_both_succeed_idempotently() {
+        let handler = Arc::new(make_handler());
+        let params = ServiceParams::new();
+        let task = Task {
+            id: "t-race".into(),
+            context_id: "c-race".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        handler.task_store.create(task).await.unwrap();
+
+        let handlers = vec![Arc::clone(&handler), Arc::clone(&handler)];
+        let mut results = Vec::new();
+        for handler in handlers {
+            let params = params.clone();
+            let req = CancelTaskRequest {
+                id: "t-race".into(),
+                metadata: None,
+                tenant: None,
+            };
+            results.push(tokio::spawn(async move {
+                handler.cancel_task(&params, req).await
+            }));
+        }
+        for result in results {
+            let task = result.await.unwrap().unwrap();
+            assert_eq!(task.status.state, TaskState::Canceled);
+        }
+    }
+
+    #[tokio::test]
     async fn test_cancel_task_already_completed() {
         let handler = make_handler();
         let params = ServiceParams::new();
@@ -1456,8 +1509,9 @@ mod tests {
             metadata: None,
             tenant: None,
         };
-        let result = handler.cancel_task(&params, req).await;
-        assert!(result.is_err());
+        // Cancel on a terminal task is idempotent: the current task is returned.
+        let result = handler.cancel_task(&params, req).await.unwrap();
+        assert_eq!(result.status.state, TaskState::Completed);
     }
 
     #[tokio::test]

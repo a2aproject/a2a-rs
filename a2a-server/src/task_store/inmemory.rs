@@ -48,9 +48,36 @@ impl TaskStore for InMemoryTaskStore {
         let entry = store
             .get_mut(&task.id)
             .ok_or_else(|| A2AError::task_not_found(&task.id))?;
+        // BUG-43: a terminal task's state is immutable. Re-applying the same
+        // terminal state is allowed so idempotent re-emission (e.g. cancel
+        // flows) keeps working, but a terminal state can never be overwritten
+        // by a different state.
+        if entry.task.status.state.is_terminal() && entry.task.status.state != task.status.state {
+            return Err(A2AError::invalid_request(format!(
+                "task {} is in terminal state {:?} and cannot transition to {:?}",
+                task.id, entry.task.status.state, task.status.state
+            )));
+        }
         entry.version += 1;
         entry.task = task;
         Ok(entry.version)
+    }
+
+    async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError> {
+        // Hold the write lock across the check and the state transition so two
+        // concurrent cancel requests cannot both pass the check-then-act window
+        // (BUG-44).
+        let mut store = self.tasks.write().await;
+        let entry = store
+            .get_mut(task_id)
+            .ok_or_else(|| A2AError::task_not_found(task_id))?;
+        if entry.task.status.state.is_terminal() {
+            return Err(A2AError::task_not_cancelable(task_id));
+        }
+        entry.version += 1;
+        entry.task.status.state = TaskState::Canceled;
+        entry.task.status.timestamp = Some(chrono::Utc::now());
+        Ok(entry.task.clone())
     }
 
     async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
@@ -196,6 +223,86 @@ mod tests {
         let task = make_task("t1", "c1", TaskState::Working);
         let result = store.update(task).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_terminal_state_rejected() {
+        let store = InMemoryTaskStore::new();
+        store
+            .create(make_task("t1", "c1", TaskState::Completed))
+            .await
+            .unwrap();
+
+        // A terminal task cannot transition to a different state.
+        for state in [
+            TaskState::Submitted,
+            TaskState::Working,
+            TaskState::Canceled,
+            TaskState::Failed,
+        ] {
+            let result = store.update(make_task("t1", "c1", state.clone())).await;
+            assert!(
+                result.is_err(),
+                "expected {state:?} update to be rejected"
+            );
+            assert_eq!(
+                result.unwrap_err().code,
+                error_code::INVALID_REQUEST,
+                "unexpected code for {state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_terminal_same_state_allowed() {
+        let store = InMemoryTaskStore::new();
+        let mut task = make_task("t1", "c1", TaskState::Canceled);
+        store.create(task.clone()).await.unwrap();
+
+        // Re-applying the same terminal state (idempotent re-emission) is fine.
+        task.status.message = Some(Message::new(Role::Agent, vec![Part::text("after cancel")]));
+        let ver = store.update(task).await.unwrap();
+        assert_eq!(ver, 2);
+        let got = store.get("t1").await.unwrap().unwrap();
+        assert_eq!(got.status.state, TaskState::Canceled);
+        assert!(got.status.message.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_begin_cancel_transitions_non_terminal() {
+        let store = InMemoryTaskStore::new();
+        store
+            .create(make_task("t1", "c1", TaskState::Working))
+            .await
+            .unwrap();
+
+        let task = store.begin_cancel("t1").await.unwrap();
+        assert_eq!(task.status.state, TaskState::Canceled);
+
+        // A second cancel on the now-terminal task fails.
+        let result = store.begin_cancel("t1").await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, error_code::TASK_NOT_CANCELABLE);
+    }
+
+    #[tokio::test]
+    async fn test_begin_cancel_terminal_rejected() {
+        let store = InMemoryTaskStore::new();
+        store
+            .create(make_task("t1", "c1", TaskState::Completed))
+            .await
+            .unwrap();
+        let result = store.begin_cancel("t1").await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, error_code::TASK_NOT_CANCELABLE);
+    }
+
+    #[tokio::test]
+    async fn test_begin_cancel_not_found() {
+        let store = InMemoryTaskStore::new();
+        let result = store.begin_cancel("nonexistent").await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, error_code::TASK_NOT_FOUND);
     }
 
     #[tokio::test]
