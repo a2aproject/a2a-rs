@@ -1,36 +1,49 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // SPDX-License-Identifier: Apache-2.0
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use std::convert::Infallible;
+use std::time::Duration;
 
 /// Convert a boxed stream of serializable items into an SSE response.
+///
+/// Each event carries a monotonic, counter-based `id` so clients can resume
+/// interrupted subscriptions, and the response sends a keep-alive comment
+/// frame every 15 seconds so intermediaries do not terminate idle
+/// connections (BUG-57).
 pub fn sse_from_stream<T: serde::Serialize + Send + 'static>(
     stream: BoxStream<'static, Result<T, a2a::A2AError>>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let sse_stream = stream.map(|item| {
+    let mut counter = 0u64;
+    let sse_stream = stream.map(move |item| {
+        counter += 1;
         let event = match item {
             Ok(val) => {
                 let data = serde_json::to_string(&val).unwrap_or_default();
-                Event::default().data(data)
+                Event::default().id(counter.to_string()).data(data)
             }
             Err(err) => {
                 let error_json = serde_json::to_string(&err.to_jsonrpc_error()).unwrap_or_default();
-                Event::default().data(error_json)
+                Event::default().id(counter.to_string()).data(error_json)
             }
         };
         Ok::<_, Infallible>(event)
     });
-    Sse::new(sse_stream)
+    Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
 /// Convert a boxed stream of JSON-RPC responses into an SSE response.
+///
+/// Each event carries a monotonic, counter-based `id` and the response sends
+/// a keep-alive comment frame every 15 seconds (BUG-57).
 pub fn sse_jsonrpc_stream<T: serde::Serialize + Send + 'static>(
     request_id: a2a::JsonRpcId,
     stream: BoxStream<'static, Result<T, a2a::A2AError>>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let mut counter = 0u64;
     let sse_stream = stream.map(move |item| {
+        counter += 1;
         let data = match item {
             Ok(val) => {
                 let result_val = serde_json::to_value(&val).unwrap_or_default();
@@ -42,9 +55,9 @@ pub fn sse_jsonrpc_stream<T: serde::Serialize + Send + 'static>(
                 serde_json::to_string(&resp).unwrap_or_default()
             }
         };
-        Ok::<_, Infallible>(Event::default().data(data))
+        Ok::<_, Infallible>(Event::default().id(counter.to_string()).data(data))
     });
-    Sse::new(sse_stream)
+    Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
 #[cfg(test)]
@@ -68,6 +81,7 @@ mod tests {
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("data:"));
         assert!(body_str.contains("value"));
+        assert!(body_str.contains("id: 1"));
     }
 
     #[tokio::test]
@@ -80,6 +94,7 @@ mod tests {
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("data:"));
         assert!(body_str.contains("fail"));
+        assert!(body_str.contains("id: 1"));
     }
 
     #[tokio::test]
@@ -95,6 +110,7 @@ mod tests {
         assert!(body_str.contains("data:"));
         assert!(body_str.contains("jsonrpc"));
         assert!(body_str.contains("2.0"));
+        assert!(body_str.contains("id: 1"));
     }
 
     #[tokio::test]
@@ -107,6 +123,7 @@ mod tests {
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("fail"));
         assert!(body_str.contains("error"));
+        assert!(body_str.contains("id: 1"));
     }
 
     #[tokio::test]
@@ -127,5 +144,9 @@ mod tests {
             data_count >= 3,
             "expected >= 3 data lines, got {data_count}"
         );
+        // Event IDs must be present and monotonic.
+        assert!(body_str.contains("id: 1"));
+        assert!(body_str.contains("id: 2"));
+        assert!(body_str.contains("id: 3"));
     }
 }

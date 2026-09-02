@@ -6,7 +6,7 @@ use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -115,6 +115,9 @@ pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
             REST_EXTENDED_AGENT_CARD_LEGACY_PATH,
             axum::routing::get(handle_get_extended_agent_card::<H>),
         )
+        // Cap the request body size at 10 MB instead of relying on the
+        // framework's implicit default (BUG-60).
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -594,6 +597,27 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_body_over_limit_rejected() {
+        let app = make_app();
+        let body = serde_json::json!({
+            "message": {
+                "messageId": "m1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "x".repeat(11 * 1024 * 1024)}]
+            }
+        });
+        let body = serde_json::to_string(&body).unwrap();
+        let req = Request::builder()
+            .uri(REST_SEND_MESSAGE_PATH)
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

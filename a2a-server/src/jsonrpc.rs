@@ -6,7 +6,7 @@ use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use axum::{
     Json,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -38,6 +38,9 @@ pub fn jsonrpc_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
     let state = JsonRpcState { handler };
     axum::Router::new()
         .route("/", axum::routing::post(handle_jsonrpc::<H>))
+        // Cap the request body size at 10 MB instead of relying on the
+        // framework's implicit default (BUG-60).
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -344,6 +347,31 @@ mod tests {
         let result =
             protojson_conv::from_value::<SendMessageResponse>(resp.result.unwrap()).unwrap();
         assert!(matches!(result, SendMessageResponse::Task(_)));
+    }
+
+    #[tokio::test]
+    async fn test_send_message_body_over_limit_rejected() {
+        let app = make_app();
+        let body = serde_json::json!({
+            "message": {
+                "messageId": "m1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "x".repeat(11 * 1024 * 1024)}]
+            }
+        });
+        let rpc = JsonRpcRequest::new(
+            JsonRpcId::Number(1),
+            methods::SEND_MESSAGE,
+            Some(body),
+        );
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
