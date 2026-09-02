@@ -436,6 +436,7 @@ pub struct DefaultRequestHandler {
     push_config_store: Option<Arc<dyn crate::PushConfigStore>>,
     push_sender: Option<Arc<crate::HttpPushSender>>,
     capabilities: AgentCapabilities,
+    require_authentication: bool,
 }
 
 impl DefaultRequestHandler {
@@ -447,6 +448,7 @@ impl DefaultRequestHandler {
             push_config_store: None,
             push_sender: None,
             capabilities: AgentCapabilities::default(),
+            require_authentication: false,
         }
     }
 
@@ -474,6 +476,43 @@ impl DefaultRequestHandler {
     pub fn with_capabilities(mut self, capabilities: AgentCapabilities) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Require every task-related request to carry authentication information.
+    ///
+    /// This is a progressive authorization step: by default the handler does
+    /// not enforce anything (default deployments behave exactly as before).
+    /// When enabled, requests that do not present an `Authorization` header
+    /// (surfaced through [`ServiceParams`]) are rejected. The check is meant
+    /// to be extended later with owner/tenant-based validation once tasks
+    /// carry ownership metadata — see [`DefaultRequestHandler::authorize`].
+    pub fn require_authentication(mut self) -> Self {
+        self.require_authentication = true;
+        self
+    }
+
+    /// Authorize a request against the caller's [`ServiceParams`].
+    ///
+    /// Progressive implementation: a no-op unless the handler was built with
+    /// [`DefaultRequestHandler::require_authentication`]. When enabled, the
+    /// caller must present authentication information (an `authorization`
+    /// header). The `task_id` parameter is reserved for future owner-based
+    /// checks once tasks carry ownership metadata.
+    async fn authorize(
+        &self,
+        params: &ServiceParams,
+        _task_id: Option<&str>,
+    ) -> Result<(), A2AError> {
+        if !self.require_authentication {
+            return Ok(());
+        }
+        let has_auth = params
+            .get("authorization")
+            .is_some_and(|values| values.iter().any(|v| !v.trim().is_empty()));
+        if !has_auth {
+            return Err(A2AError::invalid_request("authentication required"));
+        }
+        Ok(())
     }
 
     fn push_config_store(&self) -> Result<&dyn crate::PushConfigStore, A2AError> {
@@ -597,6 +636,7 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
+        self.authorize(params, None).await?;
         let (task_id, mut stream) = self.start_execution(params, req.clone(), true).await?;
         let mut last_event = None;
 
@@ -635,26 +675,50 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        self.authorize(params, None).await?;
         let (_, stream) = self.start_execution(params, req, false).await?;
         Ok(stream)
     }
 
     async fn get_task(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
-        self.task_store
+        self.authorize(params, Some(&req.id)).await?;
+
+        let mut task = self
+            .task_store
             .get(&req.id)
             .await?
-            .ok_or_else(|| A2AError::task_not_found(&req.id))
+            .ok_or_else(|| A2AError::task_not_found(&req.id))?;
+
+        // Apply historyLength truncation, matching list_tasks. Negative
+        // values are treated as an empty history instead of wrapping to a
+        // huge usize (BUG-53 semantics).
+        if let Some(hl) = req.history_length {
+            if let Some(ref mut history) = task.history {
+                if hl <= 0 {
+                    *history = Vec::new();
+                } else {
+                    let hl = hl as usize;
+                    if history.len() > hl {
+                        let start = history.len() - hl;
+                        *history = history[start..].to_vec();
+                    }
+                }
+            }
+        }
+
+        Ok(task)
     }
 
     async fn list_tasks(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
+        self.authorize(params, None).await?;
         self.task_store.list(&req).await
     }
 
@@ -663,10 +727,15 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: CancelTaskRequest,
     ) -> Result<Task, A2AError> {
+        self.authorize(params, Some(&req.id)).await?;
+
         let task = self.load_task(&req.id).await?;
 
+        // Idempotent: canceling a task that is already in a terminal state
+        // returns the current terminal task instead of an error, matching
+        // the TypeScript and Go SDKs (BUG-52).
         if task.status.state.is_terminal() {
-            return Err(A2AError::task_not_cancelable(&req.id));
+            return Ok(task);
         }
 
         let active_execution = self.execution_manager.get(&req.id).await;
@@ -727,9 +796,10 @@ impl RequestHandler for DefaultRequestHandler {
 
     async fn subscribe_to_task(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        self.authorize(params, Some(&req.id)).await?;
         let (receiver, snapshot_task, sequence) = self
             .execution_manager
             .resubscribe(&req.id)
@@ -740,25 +810,28 @@ impl RequestHandler for DefaultRequestHandler {
 
     async fn create_push_config(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
+        self.authorize(params, Some(&req.task_id)).await?;
         self.push_config_store()?.save(req).await
     }
 
     async fn get_push_config(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
+        self.authorize(params, Some(&req.task_id)).await?;
         self.push_config_store()?.get(&req.task_id, &req.id).await
     }
 
     async fn list_push_configs(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
+        self.authorize(params, Some(&req.task_id)).await?;
         let mut configs = self.push_config_store()?.list(&req.task_id).await?;
         configs.sort_by(|left, right| left.id.cmp(&right.id));
 
@@ -783,9 +856,10 @@ impl RequestHandler for DefaultRequestHandler {
 
     async fn delete_push_config(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
+        self.authorize(params, Some(&req.task_id)).await?;
         self.push_config_store()?
             .delete(&req.task_id, &req.id)
             .await
@@ -1456,8 +1530,143 @@ mod tests {
             metadata: None,
             tenant: None,
         };
-        let result = handler.cancel_task(&params, req).await;
+        // Cancel on a terminal task is idempotent: the current task is returned.
+        let result = handler.cancel_task(&params, req).await.unwrap();
+        assert_eq!(result.status.state, TaskState::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_get_task_applies_history_length() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        let mut task = Task {
+            id: "t-hist".into(),
+            context_id: "c-hist".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: Some(vec![
+                Message::new(Role::User, vec![Part::text("1")]),
+                Message::new(Role::Agent, vec![Part::text("2")]),
+                Message::new(Role::User, vec![Part::text("3")]),
+            ]),
+            metadata: None,
+        };
+        handler.task_store.create(task.clone()).await.unwrap();
+
+        task = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: "t-hist".into(),
+                    history_length: Some(1),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.history.as_ref().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_task_negative_history_length_returns_empty_history() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        let task = Task {
+            id: "t-neg".into(),
+            context_id: "c-neg".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: Some(vec![Message::new(Role::User, vec![Part::text("1")])]),
+            metadata: None,
+        };
+        handler.task_store.create(task).await.unwrap();
+
+        let task = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: "t-neg".into(),
+                    history_length: Some(-1),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.history.as_ref().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_require_authentication_rejects_unauthenticated_requests() {
+        let handler = make_handler().require_authentication();
+        let params = ServiceParams::new();
+        let req = GetTaskRequest {
+            id: "t1".into(),
+            history_length: None,
+            tenant: None,
+        };
+        let result = handler.get_task(&params, req).await;
         assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, error_code::INVALID_REQUEST);
+
+        let result = handler
+            .list_tasks(
+                &params,
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, error_code::INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_require_authentication_allows_authenticated_requests() {
+        let handler = make_handler().require_authentication();
+        let params = ServiceParams::from([(
+            "authorization".to_string(),
+            vec!["Bearer token-abc".to_string()],
+        )]);
+        let task = Task {
+            id: "t-auth".into(),
+            context_id: "c-auth".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        handler.task_store.create(task).await.unwrap();
+
+        let result = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: "t-auth".into(),
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
