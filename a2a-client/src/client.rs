@@ -14,6 +14,7 @@ pub struct A2AClient<T: Transport> {
     transport: T,
     interceptors: Vec<Arc<dyn CallInterceptor>>,
     default_params: ServiceParams,
+    tenant: Option<String>,
 }
 
 impl<T: Transport> A2AClient<T> {
@@ -24,11 +25,17 @@ impl<T: Transport> A2AClient<T> {
             transport,
             interceptors: Vec::new(),
             default_params,
+            tenant: None,
         }
     }
 
     pub fn with_interceptors(mut self, interceptors: Vec<Arc<dyn CallInterceptor>>) -> Self {
         self.interceptors = interceptors;
+        self
+    }
+
+    pub fn with_tenant(mut self, tenant: Option<String>) -> Self {
+        self.tenant = tenant;
         self
     }
 
@@ -72,92 +79,109 @@ impl<T: Transport> A2AClient<T> {
 
     pub async fn send_message(
         &self,
-        req: &SendMessageRequest,
+        mut req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
         let params = self.apply_before(methods::SEND_MESSAGE).await?;
-        let result = self.transport.send_message(&params, req).await;
+        req.tenant = self.tenant.clone();
+        let result = self.transport.send_message(&params, &req).await;
         self.finish_call(methods::SEND_MESSAGE, result).await
     }
 
     pub async fn send_streaming_message(
         &self,
-        req: &SendMessageRequest,
+        mut req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let params = self.apply_before(methods::SEND_STREAMING_MESSAGE).await?;
-        let result = self.transport.send_streaming_message(&params, req).await;
+        req.tenant = self.tenant.clone();
+        let result = self.transport.send_streaming_message(&params, &req).await;
         self.finish_call(methods::SEND_STREAMING_MESSAGE, result)
             .await
     }
 
-    pub async fn get_task(&self, req: &GetTaskRequest) -> Result<Task, A2AError> {
+    pub async fn get_task(&self, mut req: GetTaskRequest) -> Result<Task, A2AError> {
         let params = self.apply_before(methods::GET_TASK).await?;
-        let result = self.transport.get_task(&params, req).await;
+        req.tenant = self.tenant.clone();
+        let result = self.transport.get_task(&params, &req).await;
         self.finish_call(methods::GET_TASK, result).await
     }
 
-    pub async fn list_tasks(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+    pub async fn list_tasks(
+        &self,
+        mut req: ListTasksRequest,
+    ) -> Result<ListTasksResponse, A2AError> {
         let params = self.apply_before(methods::LIST_TASKS).await?;
-        let result = self.transport.list_tasks(&params, req).await;
+        req.tenant = self.tenant.clone();
+        let result = self.transport.list_tasks(&params, &req).await;
         self.finish_call(methods::LIST_TASKS, result).await
     }
 
-    pub async fn cancel_task(&self, req: &CancelTaskRequest) -> Result<Task, A2AError> {
+    pub async fn cancel_task(&self, mut req: CancelTaskRequest) -> Result<Task, A2AError> {
         let params = self.apply_before(methods::CANCEL_TASK).await?;
-        let result = self.transport.cancel_task(&params, req).await;
+        req.tenant = self.tenant.clone();
+        let result = self.transport.cancel_task(&params, &req).await;
         self.finish_call(methods::CANCEL_TASK, result).await
     }
 
     pub async fn subscribe_to_task(
         &self,
-        req: &SubscribeToTaskRequest,
+        mut req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let params = self.apply_before(methods::SUBSCRIBE_TO_TASK).await?;
-        let result = self.transport.subscribe_to_task(&params, req).await;
+        req.tenant = self.tenant.clone();
+        let result = self.transport.subscribe_to_task(&params, &req).await;
         self.finish_call(methods::SUBSCRIBE_TO_TASK, result).await
     }
 
     pub async fn create_push_config(
         &self,
-        req: &TaskPushNotificationConfig,
+        mut req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let params = self.apply_before(methods::CREATE_PUSH_CONFIG).await?;
-        let result = self.transport.create_push_config(&params, req).await;
+        req.tenant = self.tenant.clone();
+        let result = self.transport.create_push_config(&params, &req).await;
         self.finish_call(methods::CREATE_PUSH_CONFIG, result).await
     }
 
     pub async fn get_push_config(
         &self,
-        req: &GetTaskPushNotificationConfigRequest,
+        mut req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let params = self.apply_before(methods::GET_PUSH_CONFIG).await?;
-        let result = self.transport.get_push_config(&params, req).await;
+        req.tenant = self.tenant.clone();
+        let result = self.transport.get_push_config(&params, &req).await;
         self.finish_call(methods::GET_PUSH_CONFIG, result).await
     }
 
     pub async fn list_push_configs(
         &self,
-        req: &ListTaskPushNotificationConfigsRequest,
+        mut req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
         let params = self.apply_before(methods::LIST_PUSH_CONFIGS).await?;
-        let result = self.transport.list_push_configs(&params, req).await;
+        req.tenant = self.tenant.clone();
+        let result = self.transport.list_push_configs(&params, &req).await;
         self.finish_call(methods::LIST_PUSH_CONFIGS, result).await
     }
 
     pub async fn delete_push_config(
         &self,
-        req: &DeleteTaskPushNotificationConfigRequest,
+        mut req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
         let params = self.apply_before(methods::DELETE_PUSH_CONFIG).await?;
-        let result = self.transport.delete_push_config(&params, req).await;
+        req.tenant = self.tenant.clone();
+        let result = self.transport.delete_push_config(&params, &req).await;
         self.finish_call(methods::DELETE_PUSH_CONFIG, result).await
     }
 
     pub async fn get_extended_agent_card(
         &self,
-        req: &GetExtendedAgentCardRequest,
+        mut req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
         let params = self.apply_before(methods::GET_EXTENDED_AGENT_CARD).await?;
-        let result = self.transport.get_extended_agent_card(&params, req).await;
+        req.tenant = self.tenant.clone();
+        let result = self
+            .transport
+            .get_extended_agent_card(&params, &req)
+            .await;
         self.finish_call(methods::GET_EXTENDED_AGENT_CARD, result)
             .await
     }
@@ -189,7 +213,7 @@ impl<T: Transport> SendMessageExt for A2AClient<T> {
             metadata: None,
             tenant: None,
         };
-        self.send_message(&req).await
+        self.send_message(req).await
     }
 }
 
@@ -476,7 +500,7 @@ mod tests {
             metadata: None,
             tenant: None,
         };
-        let resp = client.send_message(&req).await.unwrap();
+        let resp = client.send_message(req).await.unwrap();
         assert!(matches!(resp, SendMessageResponse::Task(_)));
     }
 
@@ -502,7 +526,7 @@ mod tests {
             tenant: None,
         };
 
-        client.send_message(&req).await.unwrap();
+        client.send_message(req).await.unwrap();
 
         let calls = state.calls.lock().unwrap();
         let params = &calls[0].1;
@@ -541,7 +565,7 @@ mod tests {
             tenant: None,
         };
 
-        let err = client.send_message(&req).await.unwrap_err();
+        let err = client.send_message(req).await.unwrap_err();
         assert_eq!(err.message, "boom");
 
         let events = events.lock().unwrap().clone();
@@ -561,7 +585,7 @@ mod tests {
             metadata: None,
             tenant: None,
         };
-        let mut stream = client.send_streaming_message(&req).await.unwrap();
+        let mut stream = client.send_streaming_message(req).await.unwrap();
         let item = stream.next().await.unwrap().unwrap();
         assert!(matches!(item, StreamResponse::StatusUpdate(_)));
     }
@@ -574,7 +598,7 @@ mod tests {
             history_length: None,
             tenant: None,
         };
-        let task = client.get_task(&req).await.unwrap();
+        let task = client.get_task(req).await.unwrap();
         assert_eq!(task.id, "t1");
     }
 
@@ -591,7 +615,7 @@ mod tests {
             include_artifacts: None,
             tenant: None,
         };
-        let resp = client.list_tasks(&req).await.unwrap();
+        let resp = client.list_tasks(req).await.unwrap();
         assert!(resp.tasks.is_empty());
     }
 
@@ -603,7 +627,7 @@ mod tests {
             metadata: None,
             tenant: None,
         };
-        let task = client.cancel_task(&req).await.unwrap();
+        let task = client.cancel_task(req).await.unwrap();
         assert_eq!(task.status.state, TaskState::Canceled);
     }
 
@@ -614,7 +638,7 @@ mod tests {
             id: "t1".into(),
             tenant: None,
         };
-        let _stream = client.subscribe_to_task(&req).await.unwrap();
+        let _stream = client.subscribe_to_task(req).await.unwrap();
     }
 
     #[tokio::test]
@@ -628,7 +652,7 @@ mod tests {
             authentication: None,
             tenant: None,
         };
-        let resp = client.create_push_config(&req).await.unwrap();
+        let resp = client.create_push_config(req).await.unwrap();
         assert_eq!(resp.task_id, "t1");
     }
 
@@ -640,7 +664,7 @@ mod tests {
             id: "cfg1".into(),
             tenant: None,
         };
-        let resp = client.get_push_config(&req).await.unwrap();
+        let resp = client.get_push_config(req).await.unwrap();
         assert_eq!(resp.id, Some("cfg1".into()));
     }
 
@@ -653,7 +677,7 @@ mod tests {
             page_token: None,
             tenant: None,
         };
-        let resp = client.list_push_configs(&req).await.unwrap();
+        let resp = client.list_push_configs(req).await.unwrap();
         assert!(resp.configs.is_empty());
     }
 
@@ -665,14 +689,14 @@ mod tests {
             id: "cfg1".into(),
             tenant: None,
         };
-        client.delete_push_config(&req).await.unwrap();
+        client.delete_push_config(req).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_get_extended_agent_card() {
         let client = make_client();
         let req = GetExtendedAgentCardRequest { tenant: None };
-        let card = client.get_extended_agent_card(&req).await.unwrap();
+        let card = client.get_extended_agent_card(req).await.unwrap();
         assert_eq!(card.name, "Test");
     }
 

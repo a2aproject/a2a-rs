@@ -100,9 +100,9 @@ impl A2AClientFactory {
         for (_prio, iface, factory) in &candidates {
             match factory.create(card, iface).await {
                 Ok(transport) => {
-                    return Ok(
-                        A2AClient::new(transport).with_interceptors(self.interceptors.clone())
-                    );
+                    return Ok(A2AClient::new(transport)
+                        .with_tenant(iface.tenant.clone())
+                        .with_interceptors(self.interceptors.clone()));
                 }
                 Err(e) => {
                     tracing::debug!(

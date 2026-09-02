@@ -367,12 +367,8 @@ impl RequestHandler for TestHandler {
     async fn get_extended_agent_card(
         &self,
         _params: &ServiceParams,
-        req: GetExtendedAgentCardRequest,
+        _req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
-        if req.tenant.as_deref() == Some("error") {
-            return Err(A2AError::unsupported_operation("extended card denied"));
-        }
-
         Ok(self.extended_card.clone())
     }
 }
@@ -428,17 +424,15 @@ fn make_task(task_id: &str, context_id: &str, state: TaskState, text: &str) -> T
     }
 }
 
-fn run_cli_success(server: &TestServer, args: &[&str]) -> String {
-    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
-    command.args(["--base-url", server.base_url.as_str()]);
+fn run_cli_success(args: &[&str]) -> String {
+    let mut command = StdCommand::cargo_bin("a2a").unwrap();
     command.args(args);
     let output = command.assert().success().get_output().stdout.clone();
     String::from_utf8(output).unwrap()
 }
 
-fn run_cli_failure(server: &TestServer, args: &[&str]) -> (String, String) {
-    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
-    command.args(["--base-url", server.base_url.as_str()]);
+fn run_cli_failure(args: &[&str]) -> (String, String) {
+    let mut command = StdCommand::cargo_bin("a2a").unwrap();
     command.args(args);
     let output = command.assert().failure().get_output().clone();
     (
@@ -465,17 +459,16 @@ async fn unused_base_url() -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn card_and_extended_card_commands_work() {
     let server = TestServer::spawn().await;
+    let base_url = server.base_url.as_str();
 
-    let stdout = run_cli_success(
-        &server,
-        &[
-            "--bearer-token",
-            "secret",
-            "--header",
-            "X-Test: abc",
-            "card",
-        ],
-    );
+    let stdout = run_cli_success(&[
+        "--bearer-token",
+        "secret",
+        "--header",
+        "X-Test: abc",
+        "discover",
+        base_url,
+    ]);
     let card: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(card["name"], "Fixture Agent");
 
@@ -484,10 +477,15 @@ async fn card_and_extended_card_commands_work() {
     assert_eq!(headers[0].0.as_deref(), Some("Bearer secret"));
     assert_eq!(headers[0].1.as_deref(), Some("abc"));
 
-    let compact = run_cli_success(
-        &server,
-        &["--binding", "http-json", "--compact", "extended-card"],
-    );
+    let compact = run_cli_success(&[
+        "--enabled-binding",
+        "http-json",
+        "-o",
+        "json",
+        "discover",
+        base_url,
+        "--extended",
+    ]);
     assert!(!compact.trim_end().contains('\n'));
     let card: Value = serde_json::from_str(compact.trim()).unwrap();
     assert_eq!(card["name"], "Fixture Agent (extended)");
@@ -496,25 +494,24 @@ async fn card_and_extended_card_commands_work() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_task_list_and_cancel_commands_work() {
     let server = TestServer::spawn().await;
+    let base_url = server.base_url.as_str();
 
-    let send = run_cli_success(
-        &server,
-        &[
-            "--bearer-token",
-            "secret",
-            "--header",
-            "X-Trace: 123",
-            "send",
-            "hello from cli",
-            "--task-id",
-            "task-send",
-            "--context-id",
-            "ctx-send",
-            "--accept-output",
-            "text/plain",
-            "--return-immediately",
-        ],
-    );
+    let send = run_cli_success(&[
+        "--bearer-token",
+        "secret",
+        "--header",
+        "X-Trace: 123",
+        "send",
+        base_url,
+        "hello from cli",
+        "--task-id",
+        "task-send",
+        "--context-id",
+        "ctx-send",
+        "--accept-output",
+        "text/plain",
+        "--return-immediately",
+    ]);
     let send_json: Value = serde_json::from_str(&send).unwrap();
     assert_eq!(send_json["task"]["id"], "task-send");
     assert_eq!(
@@ -522,25 +519,25 @@ async fn send_task_list_and_cancel_commands_work() {
         "Echo: hello from cli"
     );
 
-    let get_task = run_cli_success(&server, &["get-task", "task-send", "--history-length", "1"]);
+    let get_task = run_cli_success(&["task", "get", base_url, "task-send", "--history-length", "1"]);
     let task_json: Value = serde_json::from_str(&get_task).unwrap();
     assert_eq!(task_json["id"], "task-send");
 
-    let list = run_cli_success(
-        &server,
-        &[
-            "--compact",
-            "list-tasks",
-            "--context-id",
-            "ctx-send",
-            "--status",
-            "completed",
-        ],
-    );
+    let list = run_cli_success(&[
+        "-o",
+        "json",
+        "task",
+        "list",
+        base_url,
+        "--context-id",
+        "ctx-send",
+        "--status",
+        "completed",
+    ]);
     let list_json: Value = serde_json::from_str(list.trim()).unwrap();
     assert_eq!(list_json["tasks"].as_array().unwrap().len(), 1);
 
-    let cancel = run_cli_success(&server, &["cancel-task", "task-send"]);
+    let cancel = run_cli_success(&["task", "cancel", base_url, "task-send"]);
     let cancel_json: Value = serde_json::from_str(&cancel).unwrap();
     assert_eq!(cancel_json["status"]["state"], "TASK_STATE_CANCELED");
 }
@@ -548,19 +545,19 @@ async fn send_task_list_and_cancel_commands_work() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_and_subscribe_commands_work() {
     let server = TestServer::spawn().await;
+    let base_url = server.base_url.as_str();
 
-    let stream_output = run_cli_success(
-        &server,
-        &[
-            "--compact",
-            "stream",
-            "streaming request",
-            "--task-id",
-            "task-stream",
-            "--context-id",
-            "ctx-stream",
-        ],
-    );
+    let stream_output = run_cli_success(&[
+        "-o",
+        "json",
+        "stream",
+        base_url,
+        "streaming request",
+        "--task-id",
+        "task-stream",
+        "--context-id",
+        "ctx-stream",
+    ]);
     let stream_events = parse_json_lines(&stream_output);
     assert_eq!(stream_events.len(), 2);
     assert_eq!(
@@ -569,7 +566,8 @@ async fn stream_and_subscribe_commands_work() {
     );
     assert_eq!(stream_events[1]["task"]["id"], "task-stream");
 
-    let subscribe_output = run_cli_success(&server, &["--compact", "subscribe", "task-stream"]);
+    let subscribe_output =
+        run_cli_success(&["-o", "json", "task", "subscribe", base_url, "task-stream"]);
     let subscribe_events = parse_json_lines(&subscribe_output);
     assert_eq!(subscribe_events.len(), 2);
     assert_eq!(subscribe_events[1]["task"]["id"], "task-stream");
@@ -578,57 +576,63 @@ async fn stream_and_subscribe_commands_work() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn push_config_crud_commands_work() {
     let server = TestServer::spawn().await;
+    let base_url = server.base_url.as_str();
 
-    let create = run_cli_success(
-        &server,
-        &[
-            "--compact",
-            "--tenant",
-            "tenant-1",
-            "push-config",
-            "create",
-            "task-1",
-            "https://example.com/callback",
-            "--config-id",
-            "cfg-1",
-            "--token",
-            "tok-1",
-            "--auth-scheme",
-            "Bearer",
-            "--auth-credentials",
-            "secret",
-        ],
-    );
+    let create = run_cli_success(&[
+        "-o",
+        "json",
+        "push-config",
+        "create",
+        base_url,
+        "task-1",
+        "https://example.com/callback",
+        "--config-id",
+        "cfg-1",
+        "--token",
+        "tok-1",
+        "--auth-scheme",
+        "Bearer",
+        "--auth-credentials",
+        "secret",
+    ]);
     let create_json: Value = serde_json::from_str(create.trim()).unwrap();
     assert_eq!(create_json["taskId"], "task-1");
     assert_eq!(create_json["id"], "cfg-1");
-    assert_eq!(create_json["tenant"], "tenant-1");
 
-    let get = run_cli_success(
-        &server,
-        &["--compact", "push-config", "get", "task-1", "cfg-1"],
-    );
+    let get = run_cli_success(&[
+        "-o",
+        "json",
+        "push-config",
+        "get",
+        base_url,
+        "task-1",
+        "cfg-1",
+    ]);
     let get_json: Value = serde_json::from_str(get.trim()).unwrap();
     assert_eq!(get_json["authentication"]["scheme"], "Bearer");
 
-    let list = run_cli_success(
-        &server,
-        &[
-            "--compact",
-            "push-config",
-            "list",
-            "task-1",
-            "--page-size",
-            "10",
-        ],
-    );
+    let list = run_cli_success(&[
+        "-o",
+        "json",
+        "push-config",
+        "list",
+        base_url,
+        "task-1",
+        "--page-size",
+        "10",
+    ]);
     let list_json: Value = serde_json::from_str(list.trim()).unwrap();
     assert_eq!(list_json["configs"].as_array().unwrap().len(), 1);
 
-    let delete = run_cli_success(
-        &server,
-        &["--compact", "push-config", "delete", "task-1", "cfg-1"],
-    );
+    let delete = run_cli_success(&[
+        "-o",
+        "json",
+        "push-config",
+        "delete",
+        base_url,
+        "task-1",
+        "cfg-1",
+    ]);
     let delete_json: Value = serde_json::from_str(delete.trim()).unwrap();
     assert_eq!(delete_json["deleted"], true);
 }
@@ -636,11 +640,12 @@ async fn push_config_crud_commands_work() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn binary_reports_a2a_and_non_a2a_errors() {
     let server = TestServer::spawn().await;
+    let base_url = server.base_url.as_str();
 
-    let base_url = unused_base_url().await;
-    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let unreachable_url = unused_base_url().await;
+    let mut command = StdCommand::cargo_bin("a2a").unwrap();
     let output = command
-        .args(["--base-url", base_url.as_str(), "card"])
+        .args(["discover", unreachable_url.as_str()])
         .assert()
         .failure()
         .get_output()
@@ -648,60 +653,79 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("http request failed:"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["extended-card", "--tenant", "error"]);
-    assert!(stderr.contains("a2a error -32004: extended card denied"));
-
-    let (_stdout, stderr) = run_cli_failure(&server, &["send", "send-error"]);
+    let (_stdout, stderr) = run_cli_failure(&["send", base_url, "send-error"]);
     assert!(stderr.contains("a2a error -32600: send failed"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["list-tasks", "--context-id", "error"]);
+    let (_stdout, stderr) =
+        run_cli_failure(&["task", "list", base_url, "--context-id", "error"]);
     assert!(stderr.contains("a2a error -32602: list failed"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["get-task", "missing"]);
+    let (_stdout, stderr) = run_cli_failure(&["task", "get", base_url, "missing"]);
     assert!(stderr.contains("a2a error -32001: task not found: missing"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["cancel-task", "missing"]);
+    let (_stdout, stderr) = run_cli_failure(&["task", "cancel", base_url, "missing"]);
     assert!(stderr.contains("a2a error -32001: task not found: missing"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["subscribe", "stream-error"]);
+    let (_stdout, stderr) = run_cli_failure(&["task", "subscribe", base_url, "stream-error"]);
     assert!(stderr.contains("a2a error -32603: stream failed"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["--compact", "stream", "stream-error"]);
+    let (_stdout, stderr) =
+        run_cli_failure(&["-o", "json", "stream", base_url, "stream-error"]);
     assert!(stderr.contains("a2a error -32603: stream failed"));
 
-    let (_stdout, stderr) = run_cli_failure(
-        &server,
-        &[
-            "push-config",
-            "create",
-            "missing",
-            "https://example.com/callback",
-            "--config-id",
-            "cfg-missing",
-        ],
-    );
-    assert!(stderr.contains("a2a error -32001: task not found: missing"));
-
-    let (_stdout, stderr) = run_cli_failure(&server, &["push-config", "get", "task-1", "missing"]);
-    assert!(stderr.contains("a2a error -32001: task not found: task-1"));
-
-    let (_stdout, stderr) = run_cli_failure(&server, &["push-config", "list", "missing"]);
+    let (_stdout, stderr) = run_cli_failure(&[
+        "push-config",
+        "create",
+        base_url,
+        "missing",
+        "https://example.com/callback",
+        "--config-id",
+        "cfg-missing",
+    ]);
     assert!(stderr.contains("a2a error -32001: task not found: missing"));
 
     let (_stdout, stderr) =
-        run_cli_failure(&server, &["push-config", "delete", "task-1", "missing"]);
+        run_cli_failure(&["push-config", "get", base_url, "task-1", "missing"]);
     assert!(stderr.contains("a2a error -32001: task not found: task-1"));
 
-    let (_stdout, stderr) = run_cli_failure(
-        &server,
-        &[
-            "push-config",
-            "create",
-            "task-1",
-            "https://example.com/callback",
-            "--auth-credentials",
-            "secret",
-        ],
-    );
+    let (_stdout, stderr) = run_cli_failure(&["push-config", "list", base_url, "missing"]);
+    assert!(stderr.contains("a2a error -32001: task not found: missing"));
+
+    let (_stdout, stderr) =
+        run_cli_failure(&["push-config", "delete", base_url, "task-1", "missing"]);
+    assert!(stderr.contains("a2a error -32001: task not found: task-1"));
+
+    let (_stdout, stderr) = run_cli_failure(&[
+        "push-config",
+        "create",
+        base_url,
+        "task-1",
+        "https://example.com/callback",
+        "--auth-credentials",
+        "secret",
+    ]);
     assert!(stderr.contains("invalid input: --auth-credentials requires --auth-scheme"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_file_sets_output_format() {
+    let server = TestServer::spawn().await;
+    let base_url = &server.base_url;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join(".a2a.yaml"), "output: json\n").unwrap();
+
+    let output = StdCommand::cargo_bin("a2a")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["discover", base_url])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    // compact JSON (output: json) is a single line; pretty-printed JSON spans multiple lines
+    assert_eq!(stdout.trim().lines().count(), 1);
 }
