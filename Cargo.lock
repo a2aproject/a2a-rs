@@ -146,6 +146,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "a2acli-transport-slimrpc"
+version = "0.1.0"
+dependencies = [
+ "a2a-client-lf",
+ "a2a-grpc",
+ "a2a-lf",
+ "a2a-pb",
+ "a2a-server-lf",
+ "a2a-slimrpc",
+ "agntcy-slim-auth",
+ "agntcy-slim-config",
+ "agntcy-slim-datapath",
+ "agntcy-slim-service",
+ "async-trait",
+ "clap",
+ "futures",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tonic-tls",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "agntcy-slim-auth"
 version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
