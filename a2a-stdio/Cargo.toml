@@ -1,0 +1,35 @@
+[package]
+name = "a2a-stdio"
+version = "0.1.0"
+description = "A2A v1 STDIO protocol binding for client and server"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "a2a_stdio"
+
+
+[dependencies]
+a2a = { workspace = true }
+# No TLS features are forwarded: this binding has no network layer (12).
+a2a-client = { workspace = true, default-features = false }
+a2a-server = { workspace = true, default-features = false }
+a2a-pb = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+# 2.1 wants a UUID session id, generated once per spawn.
+uuid = { workspace = true }
+
+[dev-dependencies]
+# `test-util` is not part of tokio's `full`, and the shutdown grace window is
+# only testable by pausing the clock.
+tokio = { workspace = true, features = ["test-util"] }

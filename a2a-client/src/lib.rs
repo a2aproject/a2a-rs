@@ -44,7 +44,12 @@ pub fn default_reqwest_client(
         .map_err(|e| a2a::A2AError::internal(format!("failed to build HTTP client: {e}")))
 }
 
-pub(crate) fn a2a_error_from_details(
+/// Rebuild an [`a2a::A2AError`] from a wire error plus its typed details.
+///
+/// Public so that protocol bindings living in other crates map errors the same
+/// way this one does; a binding that reimplemented it would quietly disagree
+/// about codes for the same server response.
+pub fn a2a_error_from_details(
     code: i32,
     message: String,
     details: Vec<a2a::TypedDetail>,

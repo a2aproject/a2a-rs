@@ -6,6 +6,7 @@ members = [
     "a2a-pb",
     "a2a-grpc",
     "a2a-slimrpc",
+    "a2a-stdio",
     "a2acli",
     "examples",
     "itk",
@@ -18,6 +19,7 @@ default-members = [
     "a2a-pb",
     "a2a-grpc",
     "a2a-slimrpc",
+    "a2a-stdio",
     "a2acli",
     "examples",
 ]
@@ -38,6 +40,7 @@ a2a-server = { package = "a2a-server-lf", path = "a2a-server", version = "0.4.3"
 a2a-pb = { package = "a2a-pb", path = "a2a-pb", version = "0.2.0" }
 a2a-grpc = { package = "a2a-grpc", path = "a2a-grpc", version = "0.3.5", default-features = false }
 a2a-slimrpc = { package = "a2a-slimrpc", path = "a2a-slimrpc", version = "0.2.7" }
+a2a-stdio = { package = "a2a-stdio", path = "a2a-stdio", version = "0.1.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -52,6 +55,7 @@ futures = "0.3"
 async-stream = "0.3"
 async-trait = "0.1"
 pin-project-lite = "0.2"
+tokio-util = { version = "0.7", features = ["codec"] }
 
 # HTTP
 axum = { version = "0.8", features = ["macros"] }
@@ -93,3 +97,4 @@ semver = "1"
 tracing = "0.1"
 auto_impl = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
