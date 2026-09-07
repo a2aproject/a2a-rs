@@ -57,7 +57,7 @@ pin-project-lite = "0.2"
 axum = { version = "0.8", features = ["macros"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "query"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 http = "1"
 hyper = "1"
 axum-server = {version = "0.8", default-features = false }
@@ -86,7 +86,7 @@ slim_auth = { package = "agntcy-slim-auth", version = "0.15.3" }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 rustls-pemfile = "2"
 chrono = { version = "0.4", features = ["serde"] }
-base64 = "0.22"
+base64 = "0.23"
 thiserror = "2"
 uuid = { version = "1", features = ["v7"] }
 semver = "1"

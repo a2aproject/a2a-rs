@@ -19,16 +19,16 @@ a2a-pb     = { package = "a2a-pb",        path = "../a2a-pb" }
 async-trait        = "0.1"
 async-stream       = "0.3"
 axum               = "0.8"
-base64             = "0.22"
+base64             = "0.23"
 futures            = "0.3"
-prost              = "0.13"
+prost              = "0.14"
 serde_json         = "1"
 tokio              = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-stream       = { version = "0.1", features = ["net"] }
 tonic              = "0.14"
-tower-http         = { version = "0.6", features = ["normalize-path"] }
+tower-http         = { version = "0.7", features = ["normalize-path"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
-prost-build = "0.13"
+prost-build = "0.14"
