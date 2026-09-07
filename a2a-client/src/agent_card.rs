@@ -1,6 +1,7 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // SPDX-License-Identifier: Apache-2.0
 use a2a::{A2AError, AgentCard};
+use a2a_pb::protojson_conv;
 use reqwest::Client;
 
 /// Resolves agent cards from `.well-known/agent-card.json` endpoints.
@@ -39,8 +40,11 @@ impl AgentCardResolver {
             )));
         }
 
-        resp.json::<AgentCard>()
+        let value = resp
+            .json::<serde_json::Value>()
             .await
+            .map_err(|e| A2AError::internal(format!("failed to parse agent card: {e}")))?;
+        protojson_conv::from_value(value)
             .map_err(|e| A2AError::internal(format!("failed to parse agent card: {e}")))
     }
 }
@@ -98,5 +102,35 @@ mod tests {
 
         assert!(card.skills.is_empty());
         assert_eq!(card.supported_interfaces[0].protocol_binding, "JSONRPC");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_accepts_protojson_empty_security_scopes() {
+        let server = spawn_agent_card_server(
+            r#"{
+                "name": "Test Agent",
+                "description": "Canonical empty scope fixture",
+                "version": "1",
+                "supportedInterfaces": [{
+                    "url": "http://127.0.0.1:3000/jsonrpc",
+                    "protocolBinding": "JSONRPC",
+                    "protocolVersion": "1.0"
+                }],
+                "capabilities": {},
+                "defaultInputModes": ["text/plain"],
+                "defaultOutputModes": ["text/plain"],
+                "securitySchemes": {
+                    "peer": {"httpAuthSecurityScheme": {"scheme": "bearer"}}
+                },
+                "securityRequirements": [{"schemes": {"peer": {}}}]
+            }"#,
+        )
+        .await;
+        let resolver = AgentCardResolver::new(None);
+        let card = resolver
+            .resolve(&server)
+            .await
+            .expect("an empty generated StringList is a valid declared authentication scope");
+        assert!(card.security_requirements.unwrap()[0]["peer"].is_empty());
     }
 }

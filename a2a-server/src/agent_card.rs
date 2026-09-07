@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use a2a::AgentCard;
+use a2a_pb::protojson_conv;
 use axum::{
     Json,
     extract::State,
@@ -49,8 +50,9 @@ pub fn agent_card_router<P: AgentCardProducer>(producer: Arc<P>) -> axum::Router
 async fn handle_agent_card<P: AgentCardProducer>(
     State(producer): State<Arc<P>>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    let card = producer.card();
+) -> Result<impl IntoResponse, StatusCode> {
+    let card = protojson_conv::to_value(&producer.card())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut resp_headers = HeaderMap::new();
 
     // CORS headers for public discovery
@@ -73,7 +75,7 @@ async fn handle_agent_card<P: AgentCardProducer>(
         resp_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
     }
 
-    (StatusCode::OK, resp_headers, Json(card))
+    Ok((StatusCode::OK, resp_headers, Json(card)))
 }
 
 #[cfg(test)]

@@ -54,6 +54,18 @@ async fn handle_jsonrpc<H: RequestHandler>(
         return error_response(id, A2AError::invalid_request("invalid jsonrpc version"));
     }
 
+    // A missing or empty version selects legacy 0.3, which this v1 interface
+    // does not implement. Reject it before dispatching any protocol operation.
+    let mut versions = headers.get_all(SVC_PARAM_VERSION).iter();
+    let version = versions
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("0.3");
+    if version != VERSION || versions.next().is_some() {
+        return error_response(id, A2AError::version_not_supported(version));
+    }
+
     if methods::is_streaming(method) {
         return handle_streaming_request(&state, &params, &request).await;
     }
@@ -322,6 +334,7 @@ mod tests {
             .uri("/")
             .method("POST")
             .header("content-type", "application/json")
+            .header(SVC_PARAM_VERSION, VERSION)
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -399,6 +412,7 @@ mod tests {
             .uri("/")
             .method("POST")
             .header("content-type", "application/json")
+            .header(SVC_PARAM_VERSION, VERSION)
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -531,6 +545,7 @@ mod tests {
             .uri("/")
             .method("POST")
             .header("content-type", "application/json")
+            .header(SVC_PARAM_VERSION, VERSION)
             .header("accept", "text/event-stream")
             .body(Body::from(serde_json::to_string(&rpc).unwrap()))
             .unwrap();
@@ -551,6 +566,7 @@ mod tests {
             .uri("/")
             .method("POST")
             .header("content-type", "application/json")
+            .header(SVC_PARAM_VERSION, VERSION)
             .body(Body::from(serde_json::to_string(&rpc).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -573,6 +589,7 @@ mod tests {
             .uri("/")
             .method("POST")
             .header("content-type", "application/json")
+            .header(SVC_PARAM_VERSION, VERSION)
             .header("accept", "text/event-stream")
             .body(Body::from(serde_json::to_string(&rpc).unwrap()))
             .unwrap();
@@ -607,6 +624,7 @@ mod tests {
             .uri("/")
             .method("POST")
             .header("content-type", "application/json")
+            .header(SVC_PARAM_VERSION, VERSION)
             .header("authorization", "Bearer jsonrpc-token")
             .header("x-tenant-id", "acme")
             .body(Body::from(serde_json::to_string(&rpc).unwrap()))
@@ -643,6 +661,7 @@ mod tests {
             .uri("/")
             .method("POST")
             .header("content-type", "application/json")
+            .header(SVC_PARAM_VERSION, VERSION)
             .header("accept", "text/event-stream")
             .header("authorization", "Bearer jsonrpc-streaming-token")
             .header("x-tenant-id", "acme")
@@ -714,6 +733,7 @@ mod tests {
                 .uri("/")
                 .method("POST")
                 .header("content-type", "application/json")
+                .header(SVC_PARAM_VERSION, VERSION)
                 .header("authorization", &token)
                 .body(Body::from(serde_json::to_string(&rpc).unwrap()))
                 .unwrap();
@@ -736,6 +756,7 @@ mod tests {
             .uri("/")
             .method("POST")
             .header("content-type", "application/json")
+            .header(SVC_PARAM_VERSION, VERSION)
             .header("authorization", "Bearer subscribe-token")
             .body(Body::from(serde_json::to_string(&rpc).unwrap()))
             .unwrap();
@@ -763,6 +784,7 @@ mod tests {
             .uri("/")
             .method("POST")
             .header("content-type", "application/json")
+            .header(SVC_PARAM_VERSION, VERSION)
             .body(Body::from(serde_json::to_string(&rpc).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();

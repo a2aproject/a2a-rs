@@ -162,6 +162,26 @@ fn task_id_for_event(event: &StreamResponse) -> Option<&str> {
     }
 }
 
+fn requested_history_length(value: Option<i32>) -> Result<Option<usize>, A2AError> {
+    value
+        .map(|value| {
+            usize::try_from(value)
+                .map_err(|_| A2AError::invalid_params("historyLength must be non-negative"))
+        })
+        .transpose()
+}
+
+fn with_history_length(mut task: Task, history_length: Option<usize>) -> Task {
+    if let Some(length) = history_length {
+        if length == 0 {
+            task.history = None;
+        } else if let Some(history) = task.history.as_mut() {
+            history.drain(..history.len().saturating_sub(length));
+        }
+    }
+    task
+}
+
 fn should_interrupt_non_streaming(
     req: &SendMessageRequest,
     event: &StreamResponse,
@@ -495,6 +515,26 @@ impl DefaultRequestHandler {
     ) -> Result<(Task, Option<Task>, String), A2AError> {
         let task_id = req.message.task_id.clone().unwrap_or_else(new_task_id);
         let stored = self.task_store.get(&task_id).await?;
+        if req.message.task_id.is_some() && stored.is_none() {
+            return Err(A2AError::task_not_found(&task_id));
+        }
+        if let Some(task) = &stored {
+            if req
+                .message
+                .context_id
+                .as_ref()
+                .is_some_and(|context_id| context_id != &task.context_id)
+            {
+                return Err(A2AError::invalid_params(
+                    "context ID does not match the referenced task",
+                ));
+            }
+            if task.status.state.is_terminal() {
+                return Err(A2AError::unsupported_operation(
+                    "terminal tasks cannot accept messages",
+                ));
+            }
+        }
         let context_id = stored
             .as_ref()
             .map(|task| task.context_id.clone())
@@ -597,6 +637,11 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
+        let history_length = requested_history_length(
+            req.configuration
+                .as_ref()
+                .and_then(|config| config.history_length),
+        )?;
         let (task_id, mut stream) = self.start_execution(params, req.clone(), true).await?;
         let mut last_event = None;
 
@@ -604,9 +649,10 @@ impl RequestHandler for DefaultRequestHandler {
             let event = item?;
 
             if let Some(interrupt_task_id) = should_interrupt_non_streaming(&req, &event) {
-                return Ok(SendMessageResponse::Task(
+                return Ok(SendMessageResponse::Task(with_history_length(
                     self.load_task(&interrupt_task_id).await?,
-                ));
+                    history_length,
+                )));
             }
 
             match event {
@@ -628,6 +674,12 @@ impl RequestHandler for DefaultRequestHandler {
             Some(StreamResponse::Message(message)) => Ok(SendMessageResponse::Message(message)),
             None => Ok(SendMessageResponse::Task(self.load_task(&task_id).await?)),
         }
+        .map(|response| match response {
+            SendMessageResponse::Task(task) => {
+                SendMessageResponse::Task(with_history_length(task, history_length))
+            }
+            other => other,
+        })
     }
 
     async fn send_streaming_message(
@@ -635,8 +687,20 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        let history_length = requested_history_length(
+            req.configuration
+                .as_ref()
+                .and_then(|config| config.history_length),
+        )?;
         let (_, stream) = self.start_execution(params, req, false).await?;
-        Ok(stream)
+        Ok(Box::pin(stream.map(move |event| {
+            event.map(|event| match event {
+                StreamResponse::Task(task) => {
+                    StreamResponse::Task(with_history_length(task, history_length))
+                }
+                other => other,
+            })
+        })))
     }
 
     async fn get_task(
@@ -644,10 +708,11 @@ impl RequestHandler for DefaultRequestHandler {
         _params: &ServiceParams,
         req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
-        self.task_store
-            .get(&req.id)
-            .await?
-            .ok_or_else(|| A2AError::task_not_found(&req.id))
+        let history_length = requested_history_length(req.history_length)?;
+        Ok(with_history_length(
+            self.load_task(&req.id).await?,
+            history_length,
+        ))
     }
 
     async fn list_tasks(
@@ -655,6 +720,7 @@ impl RequestHandler for DefaultRequestHandler {
         _params: &ServiceParams,
         req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
+        let _ = requested_history_length(req.history_length)?;
         self.task_store.list(&req).await
     }
 
@@ -1124,7 +1190,6 @@ mod tests {
         let (handler, release) = make_resumable_handler();
         let params = ServiceParams::new();
         let mut message = make_message();
-        message.task_id = Some("t-disconnect".into());
         message.context_id = Some("c-disconnect".into());
 
         let mut stream = handler
@@ -1141,17 +1206,20 @@ mod tests {
             .unwrap();
 
         let initial = stream.next().await.unwrap().unwrap();
-        match initial {
-            StreamResponse::Task(task) => assert_eq!(task.status.state, TaskState::Working),
+        let task_id = match initial {
+            StreamResponse::Task(task) => {
+                assert_eq!(task.status.state, TaskState::Working);
+                task.id
+            }
             _ => panic!("expected initial working task"),
-        }
+        };
         drop(stream);
 
         let mut resumed = handler
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
-                    id: "t-disconnect".into(),
+                    id: task_id,
                     tenant: None,
                 },
             )
@@ -1353,7 +1421,6 @@ mod tests {
         let handler = make_handler();
         let params = ServiceParams::new();
         let mut msg = make_message();
-        msg.task_id = Some("t1".into());
         msg.context_id = Some("c1".into());
         let req = SendMessageRequest {
             message: msg,
@@ -1361,19 +1428,22 @@ mod tests {
             metadata: None,
             tenant: None,
         };
-        handler.send_message(&params, req).await.unwrap();
+        let task_id = match handler.send_message(&params, req).await.unwrap() {
+            SendMessageResponse::Task(task) => task.id,
+            _ => panic!("expected Task response"),
+        };
         let task = handler
             .get_task(
                 &params,
                 GetTaskRequest {
-                    id: "t1".into(),
+                    id: task_id.clone(),
                     history_length: None,
                     tenant: None,
                 },
             )
             .await
             .unwrap();
-        assert_eq!(task.id, "t1");
+        assert_eq!(task.id, task_id);
     }
 
     #[tokio::test]
@@ -1482,7 +1552,6 @@ mod tests {
         let (handler, release) = make_resumable_handler();
         let params = ServiceParams::new();
         let mut message = make_message();
-        message.task_id = Some("t-resume".into());
         message.context_id = Some("c-resume".into());
 
         let response = handler
@@ -1503,18 +1572,19 @@ mod tests {
             .await
             .unwrap();
 
-        match response {
+        let task_id = match response {
             SendMessageResponse::Task(task) => {
                 assert_eq!(task.status.state, TaskState::Working);
+                task.id
             }
             _ => panic!("expected Task response"),
-        }
+        };
 
         let mut subscription = handler
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
-                    id: "t-resume".into(),
+                    id: task_id.clone(),
                     tenant: None,
                 },
             )
@@ -1541,7 +1611,7 @@ mod tests {
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
-                    id: "t-resume".into(),
+                    id: task_id,
                     tenant: None,
                 },
             )
@@ -1688,7 +1758,6 @@ mod tests {
         let handler = make_push_delivery_handler();
         let params = ServiceParams::new();
         let mut message = make_message();
-        message.task_id = Some("t-push-request".into());
         message.context_id = Some("c-push-request".into());
 
         let response = handler
@@ -1719,16 +1788,19 @@ mod tests {
             .await
             .unwrap();
 
-        match response {
-            SendMessageResponse::Task(task) => assert_eq!(task.status.state, TaskState::Completed),
+        let task_id = match response {
+            SendMessageResponse::Task(task) => {
+                assert_eq!(task.status.state, TaskState::Completed);
+                task.id
+            }
             _ => panic!("expected Task response"),
-        }
+        };
 
         let saved = handler
             .get_push_config(
                 &params,
                 GetTaskPushNotificationConfigRequest {
-                    task_id: "t-push-request".into(),
+                    task_id: task_id.clone(),
                     id: "cfg-request".into(),
                     tenant: None,
                 },
@@ -1742,7 +1814,7 @@ mod tests {
         assert_eq!(first.notification_token.as_deref(), Some("notify-token"));
         match first.event {
             StreamResponse::StatusUpdate(update) => {
-                assert_eq!(update.task_id, "t-push-request");
+                assert_eq!(update.task_id, task_id);
                 assert_eq!(update.status.state, TaskState::Working);
             }
             _ => panic!("expected status update push"),
@@ -1753,7 +1825,7 @@ mod tests {
         assert_eq!(second.notification_token.as_deref(), Some("notify-token"));
         match second.event {
             StreamResponse::Task(task) => {
-                assert_eq!(task.id, "t-push-request");
+                assert_eq!(task.id, task_id);
                 assert_eq!(task.status.state, TaskState::Completed);
             }
             _ => panic!("expected final task push"),
@@ -1769,6 +1841,23 @@ mod tests {
         let (url, mut receiver, shutdown_tx, server) = start_push_webhook().await;
         let handler = make_push_delivery_handler();
         let params = ServiceParams::new();
+
+        handler
+            .task_store
+            .create(Task {
+                id: "t-push-stored".into(),
+                context_id: "c-push-stored".into(),
+                status: TaskStatus {
+                    state: TaskState::InputRequired,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
 
         handler
             .create_push_config(

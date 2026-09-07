@@ -13,7 +13,7 @@ use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::rest::rest_router;
 use a2a_server::{
     DefaultRequestHandler, ExecutorContext, HttpPushSender, InMemoryPushConfigStore,
-    InMemoryTaskStore, RequestHandler, ServiceParams, WELL_KNOWN_AGENT_CARD_PATH,
+    InMemoryTaskStore, RequestHandler, ServiceParams, TaskStore, WELL_KNOWN_AGENT_CARD_PATH,
 };
 use async_trait::async_trait;
 use axum::body::Bytes;
@@ -337,9 +337,15 @@ async fn spawn_http_server() -> (String, tokio::task::JoinHandle<()>) {
     (format!("http://{addr}"), handle)
 }
 
-async fn spawn_push_http_server() -> (String, tokio::task::JoinHandle<()>) {
+async fn spawn_push_http_server(
+    existing_task: Option<Task>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let store = InMemoryTaskStore::new();
+    if let Some(task) = existing_task {
+        store.create(task).await.unwrap();
+    }
     let handler = Arc::new(
-        DefaultRequestHandler::new(PushTransportExecutor, InMemoryTaskStore::new())
+        DefaultRequestHandler::new(PushTransportExecutor, store)
             .with_push_notifications(InMemoryPushConfigStore::new(), HttpPushSender::new(None)),
     );
     let app = Router::new()
@@ -609,14 +615,15 @@ async fn rest_transport_end_to_end() {
 async fn jsonrpc_transport_end_to_end() {
     let (base_url, handle) = spawn_http_server().await;
     let transport = JsonRpcTransport::new(Client::new(), format!("{base_url}/rpc"));
+    let params = ServiceParams::from([(SVC_PARAM_VERSION.into(), vec![VERSION.into()])]);
 
     let send_resp = transport
-        .send_message(&ServiceParams::new(), &send_message_request())
+        .send_message(&params, &send_message_request())
         .await;
     assert!(matches!(send_resp.unwrap(), SendMessageResponse::Task(_)));
 
     let stream = transport
-        .send_streaming_message(&ServiceParams::new(), &send_message_request())
+        .send_streaming_message(&params, &send_message_request())
         .await
         .unwrap();
     let items: Vec<_> = stream.collect().await;
@@ -624,7 +631,7 @@ async fn jsonrpc_transport_end_to_end() {
 
     let task = transport
         .get_task(
-            &ServiceParams::new(),
+            &params,
             &GetTaskRequest {
                 id: "task-1".to_string(),
                 history_length: Some(2),
@@ -637,7 +644,7 @@ async fn jsonrpc_transport_end_to_end() {
 
     let not_found = transport
         .get_task(
-            &ServiceParams::new(),
+            &params,
             &GetTaskRequest {
                 id: "missing".to_string(),
                 history_length: None,
@@ -650,7 +657,7 @@ async fn jsonrpc_transport_end_to_end() {
 
     let list = transport
         .list_tasks(
-            &ServiceParams::new(),
+            &params,
             &ListTasksRequest {
                 context_id: Some("ctx-1".to_string()),
                 status: Some(TaskState::Completed),
@@ -668,7 +675,7 @@ async fn jsonrpc_transport_end_to_end() {
 
     let canceled = transport
         .cancel_task(
-            &ServiceParams::new(),
+            &params,
             &CancelTaskRequest {
                 id: "task-1".to_string(),
                 metadata: None,
@@ -681,7 +688,7 @@ async fn jsonrpc_transport_end_to_end() {
 
     let cancel_missing = transport
         .cancel_task(
-            &ServiceParams::new(),
+            &params,
             &CancelTaskRequest {
                 id: "missing".to_string(),
                 metadata: None,
@@ -694,7 +701,7 @@ async fn jsonrpc_transport_end_to_end() {
 
     let subscribed = transport
         .subscribe_to_task(
-            &ServiceParams::new(),
+            &params,
             &SubscribeToTaskRequest {
                 id: "task-1".to_string(),
                 tenant: None,
@@ -706,14 +713,14 @@ async fn jsonrpc_transport_end_to_end() {
     assert_eq!(events.len(), 1);
 
     let created = transport
-        .create_push_config(&ServiceParams::new(), &sample_push_config("cfg-1"))
+        .create_push_config(&params, &sample_push_config("cfg-1"))
         .await
         .unwrap();
     assert_eq!(created.task_id, "task-1");
 
     let created_missing = transport
         .create_push_config(
-            &ServiceParams::new(),
+            &params,
             &TaskPushNotificationConfig {
                 task_id: "missing".to_string(),
                 ..sample_push_config("cfg-1")
@@ -725,7 +732,7 @@ async fn jsonrpc_transport_end_to_end() {
 
     let fetched = transport
         .get_push_config(
-            &ServiceParams::new(),
+            &params,
             &GetTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "cfg-1".to_string(),
@@ -738,7 +745,7 @@ async fn jsonrpc_transport_end_to_end() {
 
     let fetched_missing = transport
         .get_push_config(
-            &ServiceParams::new(),
+            &params,
             &GetTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "missing".to_string(),
@@ -751,7 +758,7 @@ async fn jsonrpc_transport_end_to_end() {
 
     let listed = transport
         .list_push_configs(
-            &ServiceParams::new(),
+            &params,
             &ListTaskPushNotificationConfigsRequest {
                 task_id: "task-1".to_string(),
                 page_size: Some(5),
@@ -765,7 +772,7 @@ async fn jsonrpc_transport_end_to_end() {
 
     transport
         .delete_push_config(
-            &ServiceParams::new(),
+            &params,
             &DeleteTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "cfg-1".to_string(),
@@ -777,7 +784,7 @@ async fn jsonrpc_transport_end_to_end() {
 
     let delete_missing = transport
         .delete_push_config(
-            &ServiceParams::new(),
+            &params,
             &DeleteTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "missing".to_string(),
@@ -789,10 +796,7 @@ async fn jsonrpc_transport_end_to_end() {
     assert_eq!(delete_missing.code, error_code::TASK_NOT_FOUND);
 
     let card = transport
-        .get_extended_agent_card(
-            &ServiceParams::new(),
-            &GetExtendedAgentCardRequest { tenant: None },
-        )
+        .get_extended_agent_card(&params, &GetExtendedAgentCardRequest { tenant: None })
         .await
         .unwrap();
     assert_eq!(card.name, "Test Agent");
@@ -802,7 +806,10 @@ async fn jsonrpc_transport_end_to_end() {
 
 #[tokio::test]
 async fn rest_transport_push_delivery_end_to_end() {
-    let (base_url, server_handle) = spawn_push_http_server().await;
+    let mut existing_task = sample_task("task-rest-push", TaskState::InputRequired);
+    existing_task.context_id = "ctx-rest-push".into();
+    existing_task.status.message = None;
+    let (base_url, server_handle) = spawn_push_http_server(Some(existing_task)).await;
     let (webhook_url, mut receiver, webhook_handle) = spawn_webhook_server().await;
     let transport = RestTransport::new(Client::new(), format!("{base_url}/rest"));
 
@@ -868,12 +875,13 @@ async fn rest_transport_push_delivery_end_to_end() {
 
 #[tokio::test]
 async fn jsonrpc_transport_push_delivery_end_to_end() {
-    let (base_url, server_handle) = spawn_push_http_server().await;
+    let (base_url, server_handle) = spawn_push_http_server(None).await;
     let (webhook_url, mut receiver, webhook_handle) = spawn_webhook_server().await;
     let transport = JsonRpcTransport::new(Client::new(), format!("{base_url}/rpc"));
+    let params = ServiceParams::from([(SVC_PARAM_VERSION.into(), vec![VERSION.into()])]);
 
     let mut request = send_message_request();
-    request.message.task_id = Some("task-rpc-push".to_string());
+    request.message.task_id = None;
     request.message.context_id = Some("ctx-rpc-push".to_string());
     request.configuration = Some(SendMessageConfiguration {
         accepted_output_modes: None,
@@ -892,17 +900,17 @@ async fn jsonrpc_transport_push_delivery_end_to_end() {
         return_immediately: None,
     });
 
-    let response = transport
-        .send_message(&ServiceParams::new(), &request)
-        .await
-        .unwrap();
-    assert!(matches!(response, SendMessageResponse::Task(_)));
+    let response = transport.send_message(&params, &request).await.unwrap();
+    let task_id = match response {
+        SendMessageResponse::Task(task) => task.id,
+        _ => panic!("expected Task response"),
+    };
 
     let saved = transport
         .get_push_config(
-            &ServiceParams::new(),
+            &params,
             &GetTaskPushNotificationConfigRequest {
-                task_id: "task-rpc-push".to_string(),
+                task_id: task_id.clone(),
                 id: "cfg-rpc".to_string(),
                 tenant: None,
             },
@@ -916,7 +924,7 @@ async fn jsonrpc_transport_push_delivery_end_to_end() {
     assert_eq!(first.notification_token.as_deref(), Some("rpc-token"));
     match first.event {
         StreamResponse::StatusUpdate(update) => {
-            assert_eq!(update.task_id, "task-rpc-push");
+            assert_eq!(update.task_id, task_id);
             assert_eq!(update.status.state, TaskState::Working);
         }
         _ => panic!("expected status update push"),
@@ -927,7 +935,7 @@ async fn jsonrpc_transport_push_delivery_end_to_end() {
     assert_eq!(second.notification_token.as_deref(), Some("rpc-token"));
     match second.event {
         StreamResponse::Task(task) => {
-            assert_eq!(task.id, "task-rpc-push");
+            assert_eq!(task.id, task_id);
             assert_eq!(task.status.state, TaskState::Completed);
         }
         _ => panic!("expected final task push"),
