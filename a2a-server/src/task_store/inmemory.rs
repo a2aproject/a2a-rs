@@ -125,10 +125,9 @@ impl TaskStore for InMemoryTaskStore {
         };
 
         let total_size = tasks.len();
-        // Clamp the start offset so a stale or oversized token cannot cause a
-        // slice out-of-bounds panic below.
+        // Make sure start is within bounds
         let start = start.min(total_size);
-        let end = (start + page_size).min(total_size);
+        let end = start.saturating_add(page_size).min(total_size);
         let page = tasks[start..end].to_vec();
 
         let next_page_token = if end < total_size {
@@ -452,7 +451,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_page_token_beyond_total_clamps() {
+    async fn test_list_out_of_range_page_token_returns_empty_page() {
         let store = InMemoryTaskStore::new();
         for i in 0..3 {
             store
@@ -464,15 +463,20 @@ mod tests {
         let req = ListTasksRequest {
             context_id: None,
             status: None,
-            page_size: Some(2),
-            page_token: Some("10".into()),
+            page_size: None,
+            page_token: Some("999".to_string()),
             history_length: None,
             status_timestamp_after: None,
             include_artifacts: None,
             tenant: None,
         };
         let resp = store.list(&req).await.unwrap();
+
         assert!(resp.tasks.is_empty());
+        assert!(
+            resp.next_page_token.is_empty(),
+            "must not hand back another token"
+        );
         assert_eq!(resp.total_size, 3);
     }
 }
