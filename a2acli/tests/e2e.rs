@@ -131,6 +131,32 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
+        let text = req.message.text().unwrap_or_default();
+        if text == "send-error" {
+            return Err(A2AError::invalid_request("send failed"));
+        }
+
+        // A2A §3.4.3: an explicit --task-id must reference an existing
+        // task, and a --context-id given alongside it must match that
+        // task's actual context — the server rejects a mismatch rather
+        // than reconciling it (SPEC.md §8.1, INTERACT_002).
+        if let Some(requested_task_id) = &req.message.task_id {
+            let tasks = self.state.tasks.lock().unwrap();
+            match tasks.get(requested_task_id) {
+                None => return Err(A2AError::task_not_found(requested_task_id)),
+                Some(existing) => {
+                    if let Some(requested_context_id) = &req.message.context_id {
+                        if requested_context_id != &existing.context_id {
+                            return Err(A2AError::invalid_params(format!(
+                                "task {requested_task_id} belongs to context {}, not {requested_context_id}",
+                                existing.context_id
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
         let task_id = req
             .message
             .task_id
@@ -141,10 +167,6 @@ impl RequestHandler for TestHandler {
             .context_id
             .clone()
             .unwrap_or_else(|| "ctx-send".to_string());
-        let text = req.message.text().unwrap_or_default();
-        if text == "send-error" {
-            return Err(A2AError::invalid_request("send failed"));
-        }
         if text == "reply-only" {
             // No task created: a direct Message reply (SEND_003 — the tool
             // must exit cleanly with it rather than waiting on a task that
@@ -633,6 +655,11 @@ async fn card_and_extended_card_commands_work() {
 async fn send_task_list_and_cancel_commands_work() {
     let server = TestServer::spawn().await;
 
+    // No --task-id/--context-id: this starts a *new* task (the server
+    // assigns "task-send"/"ctx-send" per the fixture's defaults). A2A
+    // §4.1 forbids a client from inventing a taskId for a new task, so
+    // an explicit --task-id here would have to name an *existing* task
+    // (see the INTERACT_002 rejection tests below).
     let send = run_cli_success(
         &server,
         &[
@@ -642,10 +669,6 @@ async fn send_task_list_and_cancel_commands_work() {
             "X-Trace: 123",
             "send",
             "hello from cli",
-            "--task-id",
-            "task-send",
-            "--context-id",
-            "ctx-send",
             "--accept-output",
             "text/plain",
             "--return-immediately",
@@ -1355,4 +1378,123 @@ async fn json_output_is_still_available_via_output_flag() {
     let task: Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(task["id"], "task-1");
     assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED");
+}
+
+// INTERACT_002: a rejected --task-id surfaces the protocol error, exits
+// non-zero, and never falls back to silently starting a new task.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_rejects_unknown_task_id_without_creating_one() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr, code) =
+        run_cli_failure_status(&server, &["send", "hello", "--task-id", "no-such-task"]);
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "TASK_NOT_FOUND");
+    assert_ne!(code, 0);
+
+    // The rejected attempt must not have silently created "no-such-task".
+    let (_stdout, stderr) = run_cli_failure(&server, &["task", "get", "no-such-task"]);
+    assert_eq!(
+        parse_error_envelope(&stderr)["error"]["code"],
+        "TASK_NOT_FOUND"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_rejects_task_id_with_mismatched_context_id() {
+    let server = TestServer::spawn().await;
+
+    // task-1 actually belongs to ctx-1 (seeded by TestServer::spawn).
+    let (_stdout, stderr, code) = run_cli_failure_status(
+        &server,
+        &[
+            "send",
+            "hello",
+            "--task-id",
+            "task-1",
+            "--context-id",
+            "ctx-wrong",
+        ],
+    );
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "INVALID_PARAMS");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ctx-1")
+    );
+    assert_ne!(code, 0);
+
+    // task-1 itself must be unchanged by the rejected attempt.
+    let stdout = run_cli_success(&server, &["task", "get", "task-1"]);
+    let task: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(task["contextId"], "ctx-1");
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_accepts_task_id_alone_without_requiring_context_id() {
+    // §8.1: --task-id MAY be given without --context-id; the server
+    // resolves the task's own context, so this must succeed.
+    let server = TestServer::spawn().await;
+
+    let stdout = run_cli_success(
+        &server,
+        &["--compact", "send", "hello", "--task-id", "task-1"],
+    );
+    let response: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(response["task"]["id"], "task-1");
+    assert_eq!(response["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+}
+
+// INTERACT_005: the CLI is completely stateless — it never remembers a
+// previous run's identifiers and replays them absent an explicit flag.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_sends_without_explicit_ids_never_reuse_a_previous_task() {
+    let server = TestServer::spawn().await;
+
+    // Two independent `send` invocations, neither passing --task-id: if the
+    // CLI remembered the first run's task id and replayed it, the second
+    // call would be rejected as "continuing" a task that belongs to a
+    // different, non-existent context. Since neither run passes any
+    // identifier, the server's own defaults apply identically both times,
+    // and both must succeed exactly the same way.
+    let first = run_cli_success(&server, &["--compact", "send", "hello once"]);
+    let second = run_cli_success(&server, &["--compact", "send", "hello twice"]);
+
+    let first: Value = serde_json::from_str(first.trim()).unwrap();
+    let second: Value = serde_json::from_str(second.trim()).unwrap();
+    assert_eq!(first["task"]["id"], second["task"]["id"]);
+    assert_eq!(
+        second["task"]["status"]["message"]["parts"][0]["text"],
+        "Echo: hello twice"
+    );
+}
+
+// INTERACT_001/003: contextId is an opaque, server-assigned grouping value
+// the CLI passes through unchanged — never fabricated, and never assumed to
+// mean a "chat session" (e.g. reused across unrelated task ids).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_id_is_passed_through_opaquely_to_a_new_task() {
+    let server = TestServer::spawn().await;
+
+    // A fresh --context-id with no --task-id starts a new task grouped
+    // under that context; the CLI must forward it verbatim rather than
+    // validating, transforming, or fabricating one of its own.
+    let stdout = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "send",
+            "hello",
+            "--context-id",
+            "ctx-custom-123",
+        ],
+    );
+    let response: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(response["task"]["contextId"], "ctx-custom-123");
 }
