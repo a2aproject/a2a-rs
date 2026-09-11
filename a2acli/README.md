@@ -30,6 +30,9 @@ cargo install a2a-cli
 - Create, fetch, list, and delete task push notification configs
 - Request an extended agent card when the server exposes one
 - Add bearer-token or custom-header authentication to all requests
+- Human-readable `text` output by default, or the protocol's own JSON
+  (`-o/--output json`); every failure is a machine-readable error object
+  with a stable code and exit status
 
 ## Run
 
@@ -89,6 +92,37 @@ an inline JSON string. `--media-type` sets the media type of the part flag
 immediately preceding it. The plain positional form (`send "hello"`) is
 shorthand for a single `--text-part` and cannot be combined with the part
 flags above.
+
+### Output and errors
+
+`text` (labeled `Label: value` fields, with a copy-pasteable resume command
+whenever a task pauses at `INPUT_REQUIRED`/`AUTH_REQUIRED`) is the default,
+human-readable format. Pass `-o json` (or `--output json`) for the protocol's
+own JSON types instead — `--stream` then switches its cardinality from one
+document to JSON Lines (one object per event); `--compact` only affects the
+single-document form.
+
+```sh
+cargo run --bin a2acli -- task get task-123            # text (default)
+cargo run --bin a2acli -- task get task-123 -o json    # one JSON document
+cargo run --bin a2acli -- send "hello" --stream -o json  # JSONL, one event per line
+```
+
+A failure — from the agent or from the tool itself — always prints one
+compact JSON error object to stderr, in every output mode:
+
+```json
+{"error":{"code":"TASK_NOT_FOUND","message":"task not found: t-1","a2aCode":-32001}}
+```
+
+`code` is the A2A protocol's own error name for a protocol failure (with the
+numeric `a2aCode` alongside it), or an `A2ACLI_ERR_*` symbol for a failure
+the protocol never saw (a bad flag, an unreachable agent, a `--timeout`
+expiry). The exit status reports only whether the CLI did its job — `0` even
+when a task ends `FAILED`/`REJECTED` or pauses at
+`INPUT_REQUIRED`/`AUTH_REQUIRED` — while `1`/`2`/`3`/`4`/`5` distinguish a
+generic failure, a usage error, an unreachable agent, a rejected credential,
+and a timeout respectively.
 
 ## Conformance
 

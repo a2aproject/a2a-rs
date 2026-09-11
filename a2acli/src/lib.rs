@@ -14,7 +14,18 @@ use serde::Serialize;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
-#[command(name = "a2acli", version, about = "Standalone A2A client CLI")]
+#[command(
+    name = "a2acli",
+    version,
+    about = "Standalone A2A client CLI",
+    after_help = "\
+Default behavior (SPEC.md §6.5):
+  - Transport: the agent card's first supported interface (--binding overrides)
+  - Task completion: wait until terminal/interrupted state (--async returns immediately)
+  - Output: human-readable text (-o/--output json switches to protocol JSON)
+  - Protocol version: negotiated automatically on every request
+  - Transport security: TLS verification on; no override yet (tracked in #169)"
+)]
 pub struct Cli {
     /// Base URL used to resolve /.well-known/agent-card.json.
     #[arg(long, global = true, default_value = "http://localhost:3000")]
@@ -36,7 +47,16 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub tenant: Option<String>,
 
-    /// Emit compact JSON instead of pretty-printed JSON.
+    /// Output format: human-readable `text` (default) or the protocol's own
+    /// `json` types. Cardinality (one document vs. JSONL) follows `--stream`,
+    /// not this flag (§11.3).
+    #[arg(short = 'o', long, global = true, value_enum, default_value_t = OutputFormat::Text)]
+    pub output: OutputFormat,
+
+    /// With `-o json` (and no `--stream`), emit compact JSON instead of
+    /// pretty-printed JSON. Has no effect on `-o text` or on `--stream`
+    /// JSONL, which is always one compact object per line regardless of
+    /// this flag (§11.3).
     #[arg(long, global = true)]
     pub compact: bool,
 
@@ -282,6 +302,15 @@ pub struct HeaderArg {
     pub value: String,
 }
 
+/// Output format (§6.5, §11.2, §11.3). `Text` is the default, human-readable
+/// floor; `Json` emits the protocol's own response types, one document or
+/// JSONL depending on `--stream`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Json,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Binding {
     Jsonrpc,
@@ -346,6 +375,142 @@ pub enum CliError {
     Timeout { task_id: String, timeout: Duration },
 }
 
+/// The Appendix B error envelope: the one result shape this specification
+/// defines of its own, for a failure that never reached the protocol.
+#[derive(Debug, Clone, Serialize)]
+struct ErrorEnvelope {
+    error: ErrorDetail,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ErrorDetail {
+    code: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+    #[serde(rename = "a2aCode", skip_serializing_if = "Option::is_none")]
+    a2a_code: Option<i64>,
+}
+
+impl CliError {
+    /// The exit status this failure maps to (§11.6, Appendix D). `0` is
+    /// never returned here — success never constructs a `CliError`.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            CliError::A2A(_) => 1,
+            CliError::Http(error) => http_error_exit_code(error),
+            CliError::Json(_) => 1,
+            CliError::InvalidInput(_) => 2,
+            CliError::ReadFile { .. } => 2,
+            CliError::Timeout { .. } => 5,
+        }
+    }
+
+    /// The Appendix B error envelope for this failure: a protocol failure
+    /// carries the A2A error name unchanged (§11.4); a CLI-local failure
+    /// carries an `A2ACLI_ERR_*` symbol from Appendix D.
+    fn envelope(&self) -> ErrorEnvelope {
+        let (code, hint, a2a_code) = match self {
+            CliError::A2A(error) => (
+                error_reason(error.code).to_string(),
+                None,
+                Some(error.code as i64),
+            ),
+            CliError::Http(error) => http_error_code_and_hint(error),
+            CliError::Json(_) => ("A2ACLI_ERR_INTERNAL".to_string(), None, None),
+            CliError::InvalidInput(_) => ("A2ACLI_ERR_USAGE".to_string(), None, None),
+            CliError::ReadFile { .. } => (
+                "A2ACLI_ERR_USAGE".to_string(),
+                Some(
+                    "check that the --file-part/--data-part path exists and is readable"
+                        .to_string(),
+                ),
+                None,
+            ),
+            CliError::Timeout { .. } => (
+                "A2ACLI_ERR_TIMEOUT".to_string(),
+                Some(
+                    "increase --timeout/--poll-interval, or check the task later with `task get <id> --wait`"
+                        .to_string(),
+                ),
+                None,
+            ),
+        };
+
+        ErrorEnvelope {
+            error: ErrorDetail {
+                code,
+                message: self.to_string(),
+                hint,
+                a2a_code,
+            },
+        }
+    }
+
+    /// Print the Appendix B error envelope to stderr as one compact JSON
+    /// line, in every output mode: §11.4 requires errors to be
+    /// machine-readable unconditionally, not only under `-o json`.
+    pub fn report(&self) {
+        match serde_json::to_string(&self.envelope()) {
+            Ok(json) => eprintln!("{json}"),
+            Err(_) => eprintln!(
+                "{{\"error\":{{\"code\":\"A2ACLI_ERR_INTERNAL\",\"message\":{:?}}}}}",
+                self.to_string()
+            ),
+        }
+    }
+}
+
+/// `reqwest::Error` from resolving the Agent Card (the only place it's
+/// produced) classified against Appendix D: a connection/DNS/TLS failure is
+/// `UNREACHABLE`; a non-2xx response is `CARD_NOT_FOUND` (or `AUTH_FAILED`
+/// for 401/403); a body that failed to deserialize as an `AgentCard` is
+/// `CARD_INVALID`.
+fn http_error_code_and_hint(error: &reqwest::Error) -> (String, Option<String>, Option<i64>) {
+    if error.is_decode() {
+        return (
+            "A2ACLI_ERR_CARD_INVALID".to_string(),
+            Some("the agent card did not match the expected schema".to_string()),
+            None,
+        );
+    }
+
+    if let Some(status) = error.status() {
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return (
+                "A2ACLI_ERR_AUTH_FAILED".to_string(),
+                Some("credentials were rejected fetching the agent card".to_string()),
+                None,
+            );
+        }
+        return (
+            "A2ACLI_ERR_CARD_NOT_FOUND".to_string(),
+            Some("check --agent-card/--base-url resolves to a valid agent".to_string()),
+            None,
+        );
+    }
+
+    (
+        "A2ACLI_ERR_UNREACHABLE".to_string(),
+        Some("check --base-url and network connectivity".to_string()),
+        None,
+    )
+}
+
+fn http_error_exit_code(error: &reqwest::Error) -> i32 {
+    if error.is_decode() {
+        return 1;
+    }
+    if let Some(status) = error.status() {
+        return if status.as_u16() == 401 || status.as_u16() == 403 {
+            4
+        } else {
+            3
+        };
+    }
+    3
+}
+
 /// Parse `args` the same way the real binary parses `std::env::args_os()`, then
 /// run the resulting command. Kept separate from [`run`] because recovering
 /// the interleaved order of `send`'s repeatable part flags
@@ -375,7 +540,7 @@ pub async fn run(cli: Cli, matches: &ArgMatches) -> Result<(), CliError> {
             if command.stream {
                 match client.send_streaming_message(&request).await {
                     Ok(stream) => {
-                        consume_stream(client, stream, cli.compact).await?;
+                        consume_stream(client, stream, &cli).await?;
                     }
                     Err(error) if error.code == a2a::error_code::UNSUPPORTED_OPERATION => {
                         // The agent doesn't advertise the streaming
@@ -385,7 +550,7 @@ pub async fn run(cli: Cli, matches: &ArgMatches) -> Result<(), CliError> {
                         // failure and must be reported as such, not masked
                         // by a silent retry.
                         let response = send_and_maybe_wait(client, &request, &cli).await?;
-                        print_json(&response, cli.compact)?;
+                        print_output(&response, &cli)?;
                     }
                     Err(error) => {
                         let _ = client.destroy().await;
@@ -394,7 +559,7 @@ pub async fn run(cli: Cli, matches: &ArgMatches) -> Result<(), CliError> {
                 }
             } else {
                 let response = send_and_maybe_wait(client, &request, &cli).await?;
-                print_json(&response, cli.compact)?;
+                print_output(&response, &cli)?;
             }
         }
         Command::Task { command } => run_task_command(&cli, command).await?,
@@ -524,10 +689,10 @@ async fn run_card_command(cli: &Cli, command: &CardCommand) -> Result<(), CliErr
                     })
                     .await;
                 let card = finish_client_call(client, result).await?;
-                print_json(&card, cli.compact)?;
+                print_output(&card, cli)?;
             } else {
                 let card = resolve_agent_card(cli).await?;
-                print_json(&card, cli.compact)?;
+                print_output(&card, cli)?;
             }
         }
     }
@@ -562,7 +727,7 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
                 cli.timeout,
             )
             .await?;
-            print_json(&task, cli.compact)?;
+            print_output(&task, cli)?;
         }
         TaskCommand::List(command) => {
             let client = resolve_client(cli).await?;
@@ -579,7 +744,7 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
                 })
                 .await;
             let response = finish_client_call(client, result).await?;
-            print_json(&response, cli.compact)?;
+            print_output(&response, cli)?;
         }
         TaskCommand::Cancel(command) => {
             let client = resolve_client(cli).await?;
@@ -591,7 +756,7 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
                 })
                 .await;
             let task = finish_client_call(client, result).await?;
-            print_json(&task, cli.compact)?;
+            print_output(&task, cli)?;
         }
         TaskCommand::Subscribe(command) => {
             let client = resolve_client(cli).await?;
@@ -601,7 +766,7 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
                     tenant: cli.tenant.clone(),
                 })
                 .await?;
-            consume_stream(client, stream, cli.compact).await?;
+            consume_stream(client, stream, cli).await?;
         }
         TaskCommand::PushConfig { command } => {
             run_push_config_command(cli, command).await?;
@@ -774,11 +939,11 @@ fn build_data_part(value: &str) -> Result<Part, CliError> {
                 path: "<stdin>".to_string(),
                 source,
             })?;
-        return Ok(Part::data(serde_json::from_str(&buffer)?));
+        return parse_data_part_json(&buffer, "<stdin>");
     }
 
     match std::fs::read_to_string(value) {
-        Ok(text) => return Ok(Part::data(serde_json::from_str(&text)?)),
+        Ok(text) => return parse_data_part_json(&text, value),
         Err(source) if !means_not_a_readable_path(source.kind()) => {
             // A real file that couldn't be read (permission denied, a
             // directory, invalid UTF-8, ...) — that's a failure to
@@ -795,6 +960,16 @@ fn build_data_part(value: &str) -> Result<Part, CliError> {
         CliError::InvalidInput(format!(
             "--data-part must be a file path, \"-\" for stdin, or inline JSON: {value}"
         ))
+    })
+}
+
+/// Parse `text` (the content of a `--data-part` file or stdin) as JSON,
+/// mapping a parse failure to a usage error naming `source` rather than the
+/// generic internal `CliError::Json` — the caller supplied this content, so
+/// a malformed payload is their input to fix, not the tool's own failure.
+fn parse_data_part_json(text: &str, source: &str) -> Result<Part, CliError> {
+    serde_json::from_str(text).map(Part::data).map_err(|error| {
+        CliError::InvalidInput(format!("--data-part: invalid JSON in {source}: {error}"))
     })
 }
 
@@ -895,7 +1070,7 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
             config.tenant = cli.tenant.clone();
             let result = client.create_push_config(&config).await;
             let response = finish_client_call(client, result).await?;
-            print_json(&response, cli.compact)?;
+            print_output(&response, cli)?;
         }
         PushConfigCommand::Get(command) => {
             let client = resolve_client(cli).await?;
@@ -907,7 +1082,7 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
                 })
                 .await;
             let response = finish_client_call(client, result).await?;
-            print_json(&response, cli.compact)?;
+            print_output(&response, cli)?;
         }
         PushConfigCommand::List(command) => {
             let client = resolve_client(cli).await?;
@@ -920,7 +1095,7 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
                 })
                 .await;
             let response = finish_client_call(client, result).await?;
-            print_json(&response, cli.compact)?;
+            print_output(&response, cli)?;
         }
         PushConfigCommand::Delete(command) => {
             let client = resolve_client(cli).await?;
@@ -932,13 +1107,13 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
                 })
                 .await;
             finish_client_call(client, result).await?;
-            print_json(
-                &serde_json::json!({
-                    "deleted": true,
-                    "taskId": command.task_id,
-                    "id": command.id,
-                }),
-                cli.compact,
+            print_output(
+                &PushConfigDeleted {
+                    deleted: true,
+                    task_id: command.task_id.clone(),
+                    id: command.id.clone(),
+                },
+                cli,
             )?;
         }
     }
@@ -988,6 +1163,331 @@ fn apply_request_auth(mut request: RequestBuilder, cli: &Cli) -> RequestBuilder 
     request
 }
 
+/// Renders `text` mode (§11.2): one `Label: value` field per line, stable
+/// labels across invocations, no terminal control sequences. Content the
+/// field form can't carry on one line (a rendered artifact, a formatted data
+/// part) is a *block*: its own `Label:` line, the content, then a blank
+/// line, never interleaved with field lines.
+trait TextRender {
+    fn render_text(&self) -> String;
+}
+
+/// Accumulates field lines and blocks for [`TextRender`] impls, then joins
+/// them with a single trailing newline trimmed off (`println!` adds it back).
+#[derive(Default)]
+struct TextOutput {
+    lines: Vec<String>,
+}
+
+impl TextOutput {
+    fn field(&mut self, label: &str, value: impl std::fmt::Display) -> &mut Self {
+        self.lines.push(format!("{label}: {value}"));
+        self
+    }
+
+    fn raw(&mut self, line: impl Into<String>) -> &mut Self {
+        self.lines.push(line.into());
+        self
+    }
+
+    /// A block: its own `Label:` line, `content` (each of its lines emitted
+    /// as-is), then a blank line closing it.
+    fn block(&mut self, label: &str, content: &str) -> &mut Self {
+        self.lines.push(format!("{label}:"));
+        self.lines
+            .extend(content.lines().map(|line| line.to_string()));
+        self.lines.push(String::new());
+        self
+    }
+
+    fn finish(self) -> String {
+        let mut text = self.lines.join("\n");
+        while text.ends_with('\n') {
+            text.pop();
+        }
+        text
+    }
+}
+
+/// Short-form label for a task state (§9.1); the wire form
+/// (`TASK_STATE_COMPLETED`, ...) is what `-o json` emits, not this.
+fn task_state_label(state: &TaskState) -> &'static str {
+    match state {
+        TaskState::Unspecified => "UNSPECIFIED",
+        TaskState::Submitted => "SUBMITTED",
+        TaskState::Working => "WORKING",
+        TaskState::Completed => "COMPLETED",
+        TaskState::Failed => "FAILED",
+        TaskState::Canceled => "CANCELED",
+        TaskState::InputRequired => "INPUT_REQUIRED",
+        TaskState::Rejected => "REJECTED",
+        TaskState::AuthRequired => "AUTH_REQUIRED",
+    }
+}
+
+/// Render one message part: a text part as readable text, a data part as
+/// formatted JSON, a file part by name/media type/size (§10.2, §10.3) —
+/// never dumped as raw structure, and never silently discarded.
+fn render_part(out: &mut TextOutput, part: &Part) {
+    match &part.content {
+        PartContent::Text(text) => {
+            out.block("Text", text);
+        }
+        PartContent::Data(value) => {
+            let pretty = serde_json::to_string_pretty(value)
+                .unwrap_or_else(|_| serde_json::Value::Null.to_string());
+            out.block("Data", &pretty);
+        }
+        PartContent::Raw(bytes) => {
+            let name = part.filename.as_deref().unwrap_or("(unnamed)");
+            match &part.media_type {
+                Some(media_type) => out.field(
+                    "File",
+                    format!("{name} ({media_type}, {} bytes)", bytes.len()),
+                ),
+                None => out.field("File", format!("{name} ({} bytes)", bytes.len())),
+            };
+        }
+        PartContent::Url(url) => {
+            match &part.media_type {
+                Some(media_type) => out.field("File", format!("{url} ({media_type})")),
+                None => out.field("File", url),
+            };
+        }
+    }
+}
+
+fn render_message_parts(out: &mut TextOutput, message: &Message) {
+    if message.parts.is_empty() {
+        out.field("Parts", "(none)");
+        return;
+    }
+    for part in &message.parts {
+        render_part(out, part);
+    }
+}
+
+impl TextRender for AgentCard {
+    fn render_text(&self) -> String {
+        let mut out = TextOutput::default();
+        out.field("Name", &self.name)
+            .field("Description", &self.description)
+            .field("Version", &self.version)
+            .field("Streaming", self.capabilities.streaming.unwrap_or(false))
+            .field(
+                "Push Notifications",
+                self.capabilities.push_notifications.unwrap_or(false),
+            )
+            .field(
+                "Extended Card",
+                self.capabilities.extended_agent_card.unwrap_or(false),
+            );
+
+        let interfaces = if self.supported_interfaces.is_empty() {
+            "  (none)".to_string()
+        } else {
+            self.supported_interfaces
+                .iter()
+                .map(|interface| {
+                    format!(
+                        "  - {} {} (v{})",
+                        interface.protocol_binding, interface.url, interface.protocol_version
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        out.block("Interfaces", &interfaces);
+        out.field("Skills", self.skills.len());
+        out.finish()
+    }
+}
+
+impl TextRender for Task {
+    fn render_text(&self) -> String {
+        let mut out = TextOutput::default();
+        out.field("Task ID", &self.id)
+            .field("Context ID", &self.context_id)
+            .field("State", task_state_label(&self.status.state));
+
+        if let Some(message) = &self.status.message {
+            render_message_parts(&mut out, message);
+        }
+
+        if let Some(artifacts) = &self.artifacts {
+            for artifact in artifacts {
+                let label = artifact.name.as_deref().unwrap_or(&artifact.artifact_id);
+                out.raw(format!("Artifact: {label}"));
+                for part in &artifact.parts {
+                    render_part(&mut out, part);
+                }
+            }
+        }
+
+        if matches!(
+            self.status.state,
+            TaskState::InputRequired | TaskState::AuthRequired
+        ) {
+            out.field(
+                "Resume with",
+                format!("a2acli send --task-id {} \"<reply>\"", self.id),
+            );
+        }
+
+        out.finish()
+    }
+}
+
+impl TextRender for Message {
+    fn render_text(&self) -> String {
+        let mut out = TextOutput::default();
+        if let Some(context_id) = &self.context_id {
+            out.field("Context ID", context_id);
+        }
+        if let Some(task_id) = &self.task_id {
+            out.field("Task ID", task_id);
+        }
+        render_message_parts(&mut out, self);
+        out.finish()
+    }
+}
+
+impl TextRender for SendMessageResponse {
+    fn render_text(&self) -> String {
+        match self {
+            SendMessageResponse::Task(task) => task.render_text(),
+            SendMessageResponse::Message(message) => message.render_text(),
+        }
+    }
+}
+
+impl TextRender for ListTasksResponse {
+    fn render_text(&self) -> String {
+        let mut out = TextOutput::default();
+        out.field("Total", self.total_size)
+            .field("Page Size", self.page_size);
+        if !self.next_page_token.is_empty() {
+            out.field("Next Page Token", &self.next_page_token);
+        }
+        if self.tasks.is_empty() {
+            out.field("Tasks", "(none)");
+        } else {
+            for task in &self.tasks {
+                out.block("Task", &task.render_text());
+            }
+        }
+        out.finish()
+    }
+}
+
+impl TextRender for TaskPushNotificationConfig {
+    fn render_text(&self) -> String {
+        let mut out = TextOutput::default();
+        if let Some(id) = &self.id {
+            out.field("Config ID", id);
+        }
+        out.field("Task ID", &self.task_id).field("URL", &self.url);
+        if let Some(token) = &self.token {
+            out.field("Token", token);
+        }
+        if let Some(auth) = &self.authentication {
+            out.field("Auth Scheme", &auth.scheme);
+        }
+        out.finish()
+    }
+}
+
+impl TextRender for ListTaskPushNotificationConfigsResponse {
+    fn render_text(&self) -> String {
+        let mut out = TextOutput::default();
+        if let Some(token) = &self.next_page_token {
+            out.field("Next Page Token", token);
+        }
+        if self.configs.is_empty() {
+            out.field("Configs", "(none)");
+        } else {
+            for config in &self.configs {
+                out.block("Push Config", &config.render_text());
+            }
+        }
+        out.finish()
+    }
+}
+
+/// The result of `task push-config delete`, replacing an ad hoc
+/// `serde_json::json!` value so it can carry both a `-o json` shape and a
+/// `-o text` rendering like every other response type.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PushConfigDeleted {
+    deleted: bool,
+    task_id: String,
+    id: String,
+}
+
+impl TextRender for PushConfigDeleted {
+    fn render_text(&self) -> String {
+        let mut out = TextOutput::default();
+        out.field("Deleted", self.deleted)
+            .field("Task ID", &self.task_id)
+            .field("Config ID", &self.id);
+        out.finish()
+    }
+}
+
+impl TextRender for StreamResponse {
+    fn render_text(&self) -> String {
+        match self {
+            StreamResponse::Task(task) => task.render_text(),
+            StreamResponse::Message(message) => message.render_text(),
+            StreamResponse::StatusUpdate(event) => {
+                let mut out = TextOutput::default();
+                out.field("Task ID", &event.task_id)
+                    .field("Context ID", &event.context_id)
+                    .field("State", task_state_label(&event.status.state));
+                if matches!(
+                    event.status.state,
+                    TaskState::InputRequired | TaskState::AuthRequired
+                ) {
+                    out.field(
+                        "Resume with",
+                        format!("a2acli send --task-id {} \"<reply>\"", event.task_id),
+                    );
+                }
+                out.finish()
+            }
+            StreamResponse::ArtifactUpdate(event) => {
+                let mut out = TextOutput::default();
+                out.field("Task ID", &event.task_id)
+                    .field("Context ID", &event.context_id);
+                let label = event
+                    .artifact
+                    .name
+                    .as_deref()
+                    .unwrap_or(&event.artifact.artifact_id);
+                out.raw(format!("Artifact: {label}"));
+                for part in &event.artifact.parts {
+                    render_part(&mut out, part);
+                }
+                out.finish()
+            }
+        }
+    }
+}
+
+/// Print `value` in the caller-selected format: `text` (default, §11.2) or
+/// `-o json` as one pretty/compact document per §11.3 (never JSONL — that
+/// form is only used by [`consume_stream`] under `--stream`).
+fn print_output<T: Serialize + TextRender>(value: &T, cli: &Cli) -> Result<(), CliError> {
+    match cli.output {
+        OutputFormat::Text => {
+            println!("{}", value.render_text());
+            Ok(())
+        }
+        OutputFormat::Json => print_json(value, cli.compact),
+    }
+}
+
 fn print_json<T: Serialize>(value: &T, compact: bool) -> Result<(), CliError> {
     if compact {
         println!("{}", serde_json::to_string(value)?);
@@ -1031,15 +1531,29 @@ async fn finish_client_call<T: a2a_client::Transport, V>(
     }
 }
 
-async fn consume_stream<T: a2a_client::Transport, V: Serialize>(
+/// Consume a streamed event sequence to completion, printing each event as
+/// it arrives. Under `-o json`, always emits JSONL — one complete, compact
+/// object per line, flushed as produced — regardless of `--compact`, which
+/// only affects the single-document form (§11.3). Under `-o text`, each
+/// event is rendered in the same field-and-block form as a one-shot result.
+async fn consume_stream<T: a2a_client::Transport, V: Serialize + TextRender>(
     client: A2AClient<T>,
     mut stream: BoxStream<'static, Result<V, A2AError>>,
-    compact: bool,
+    cli: &Cli,
 ) -> Result<(), CliError> {
     loop {
         match stream.next().await {
             Some(Ok(value)) => {
-                if let Err(error) = print_json(&value, compact) {
+                let printed = match cli.output {
+                    OutputFormat::Text => {
+                        println!("{}", value.render_text());
+                        Ok(())
+                    }
+                    OutputFormat::Json => serde_json::to_string(&value)
+                        .map(|line| println!("{line}"))
+                        .map_err(CliError::from),
+                };
+                if let Err(error) = printed {
                     let _ = client.destroy().await;
                     return Err(error);
                 }
@@ -1185,6 +1699,12 @@ mod tests {
             S: serde::Serializer,
         {
             Err(ser::Error::custom("serialize failed"))
+        }
+    }
+
+    impl TextRender for FailingSerialize {
+        fn render_text(&self) -> String {
+            String::new()
         }
     }
 
@@ -1854,10 +2374,14 @@ mod tests {
         assert!(matches!(err, CliError::A2A(_)));
     }
 
+    fn json_cli() -> Cli {
+        parse_with_matches(&["--output", "json", "task", "get", "unused"]).0
+    }
+
     #[tokio::test]
     async fn test_consume_stream_reports_json_error() {
         let stream = Box::pin(stream::once(async { Ok(FailingSerialize) }));
-        let err = consume_stream(make_test_client(None), stream, false)
+        let err = consume_stream(make_test_client(None), stream, &json_cli())
             .await
             .unwrap_err();
 
@@ -1866,11 +2390,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_consume_stream_propagates_destroy_error_on_completion() {
-        let stream = Box::pin(stream::empty::<Result<serde_json::Value, A2AError>>());
+        let stream = Box::pin(stream::empty::<Result<Task, A2AError>>());
         let err = consume_stream(
             make_test_client(Some(A2AError::internal("destroy failed"))),
             stream,
-            true,
+            &json_cli(),
         )
         .await
         .unwrap_err();
@@ -2375,5 +2899,107 @@ mod tests {
         let send_matches = matches.subcommand_matches("send").unwrap();
         let err = resolve_message_parts(send_matches, send_command(&cli)).unwrap_err();
         assert!(matches!(err, CliError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn test_cli_error_exit_codes_and_envelope_codes() {
+        let a2a = CliError::A2A(A2AError::task_not_found("t-1"));
+        assert_eq!(a2a.exit_code(), 1);
+        let envelope = a2a.envelope();
+        assert_eq!(envelope.error.code, "TASK_NOT_FOUND");
+        assert_eq!(envelope.error.a2a_code, Some(-32001));
+
+        let usage = CliError::InvalidInput("bad flag".to_string());
+        assert_eq!(usage.exit_code(), 2);
+        assert_eq!(usage.envelope().error.code, "A2ACLI_ERR_USAGE");
+        assert!(usage.envelope().error.a2a_code.is_none());
+
+        let read_file = CliError::ReadFile {
+            path: "missing.bin".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+        };
+        assert_eq!(read_file.exit_code(), 2);
+        assert_eq!(read_file.envelope().error.code, "A2ACLI_ERR_USAGE");
+
+        let timeout = CliError::Timeout {
+            task_id: "t-2".to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        assert_eq!(timeout.exit_code(), 5);
+        assert_eq!(timeout.envelope().error.code, "A2ACLI_ERR_TIMEOUT");
+
+        let json = CliError::Json(serde_json::from_str::<serde_json::Value>("{").unwrap_err());
+        assert_eq!(json.exit_code(), 1);
+        assert_eq!(json.envelope().error.code, "A2ACLI_ERR_INTERNAL");
+    }
+
+    #[test]
+    fn test_cli_error_report_prints_one_json_line_to_stderr() {
+        // report() itself only writes to the real process stderr, which
+        // isn't capturable here; assert on the envelope it serializes
+        // instead, since that's the part the contract cares about.
+        let error = CliError::A2A(A2AError::unsupported_operation("nope"));
+        let json = serde_json::to_string(&error.envelope()).unwrap();
+        assert!(json.contains("\"code\":\"UNSUPPORTED_OPERATION\""));
+        assert!(!json.contains('\n'));
+    }
+
+    #[test]
+    fn test_agent_card_render_text() {
+        let card = AgentCard {
+            name: "Fixture".to_string(),
+            description: "desc".to_string(),
+            version: VERSION.to_string(),
+            supported_interfaces: vec![AgentInterface::new(
+                "http://host/jsonrpc",
+                TRANSPORT_PROTOCOL_JSONRPC,
+            )],
+            capabilities: AgentCapabilities {
+                streaming: Some(true),
+                push_notifications: Some(false),
+                extensions: None,
+                extended_agent_card: None,
+            },
+            default_input_modes: vec![],
+            default_output_modes: vec![],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        };
+
+        let text = card.render_text();
+        assert!(text.contains("Name: Fixture"));
+        assert!(text.contains("Streaming: true"));
+        assert!(text.contains("Push Notifications: false"));
+        assert!(text.contains("Extended Card: false"));
+        assert!(text.contains("Interfaces:"));
+        assert!(text.contains("http://host/jsonrpc"));
+        assert!(text.contains("Skills: 0"));
+    }
+
+    #[test]
+    fn test_message_render_text_renders_every_part_kind() {
+        let mut file_part = Part::raw(vec![1, 2, 3]);
+        file_part.filename = Some("report.bin".to_string());
+        file_part.media_type = Some("application/octet-stream".to_string());
+
+        let message = Message::new(
+            Role::Agent,
+            vec![
+                Part::text("hello"),
+                Part::data(serde_json::json!({"k": 1})),
+                file_part,
+            ],
+        );
+
+        let text = message.render_text();
+        assert!(text.contains("Text:\nhello"));
+        assert!(text.contains("Data:"));
+        assert!(text.contains("\"k\": 1"));
+        assert!(text.contains("File: report.bin (application/octet-stream, 3 bytes)"));
     }
 }
