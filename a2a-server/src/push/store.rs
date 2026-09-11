@@ -10,7 +10,8 @@ const MAX_PUSH_CONFIGS_PER_TASK: usize = 50;
 
 /// Interface for persisting push notification configurations.
 #[async_trait]
-pub trait PushConfigStore: Send + Sync + 'static {    /// Save a push config for a task. Generates an ID if none provided.
+pub trait PushConfigStore: Send + Sync + 'static {
+    /// Save a push config for a task. Generates an ID if none provided.
     async fn save(
         &self,
         config: TaskPushNotificationConfig,
@@ -77,8 +78,7 @@ impl PushConfigStore for InMemoryPushConfigStore {
         // Enforce a per-task cap so a client cannot register unbounded
         // configs, each consuming memory and triggering outbound requests.
         // Replacing an existing config by ID is still allowed at the cap.
-        if !task_configs.contains_key(&config_id)
-            && task_configs.len() >= MAX_PUSH_CONFIGS_PER_TASK
+        if !task_configs.contains_key(&config_id) && task_configs.len() >= MAX_PUSH_CONFIGS_PER_TASK
         {
             return Err(A2AError::invalid_params(format!(
                 "too many push notification configs for task (max {MAX_PUSH_CONFIGS_PER_TASK})"
@@ -277,7 +277,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(store.list("t1").await.unwrap().len(), MAX_PUSH_CONFIGS_PER_TASK);
+        assert_eq!(
+            store.list("t1").await.unwrap().len(),
+            MAX_PUSH_CONFIGS_PER_TASK
+        );
 
         // Updating an existing config by ID is allowed even at the cap.
         let mut config = make_config("t1", "https://example.com/replaced");
@@ -285,6 +288,9 @@ mod tests {
         let saved = store.save(config).await.unwrap();
         assert_eq!(saved.id.as_deref(), Some("cfg-keep"));
         assert_eq!(saved.url, "https://example.com/replaced");
-        assert_eq!(store.list("t1").await.unwrap().len(), MAX_PUSH_CONFIGS_PER_TASK);
+        assert_eq!(
+            store.list("t1").await.unwrap().len(),
+            MAX_PUSH_CONFIGS_PER_TASK
+        );
     }
 }

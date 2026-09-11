@@ -135,13 +135,11 @@ impl HttpPushSender {
 /// loopback, private, link-local, multicast, or unspecified address, nor to a
 /// well-known cloud metadata endpoint.
 fn validate_push_url(url: &str) -> Result<(), A2AError> {
-    let parsed =
-        reqwest::Url::parse(url).map_err(|_| A2AError::invalid_params("invalid push notification URL"))?;
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| A2AError::invalid_params("invalid push notification URL"))?;
 
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err(A2AError::invalid_params(
-            "push URL must be http or https",
-        ));
+        return Err(A2AError::invalid_params("push URL must be http or https"));
     }
 
     if let Some(host) = parsed.host_str() {
@@ -355,7 +353,11 @@ mod tests {
 
     #[test]
     fn test_validate_push_url_rejects_non_http_schemes() {
-        for url in ["file:///etc/passwd", "ftp://example.com/hook", "gopher://example.com/"] {
+        for url in [
+            "file:///etc/passwd",
+            "ftp://example.com/hook",
+            "gopher://example.com/",
+        ] {
             let err = validate_push_url(url).unwrap_err();
             assert_eq!(err.code, error_code::INVALID_PARAMS);
         }
