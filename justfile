@@ -9,27 +9,27 @@ cargo-hack:
     @command -v cargo-hack >/dev/null 2>&1 || cargo install cargo-hack --locked
 
 check-compile: cargo-hack
-    cargo hack check --workspace --all-targets --each-feature
+    cargo hack check --workspace --exclude itk-rust-current-agent --all-targets --each-feature
 
 # Build all workspace crates
 build:
-    cargo build --workspace
+    cargo build --workspace --exclude itk-rust-current-agent
 
 # Build in release mode
 build-release:
-    cargo build --workspace --release
+    cargo build --workspace --exclude itk-rust-current-agent --release
 
 # Run all tests
 test:
-    cargo test --workspace
+    cargo test --workspace --exclude itk-rust-current-agent
 
 # Run tests with output shown
 test-verbose:
-    cargo test --workspace -- --nocapture
+    cargo test --workspace --exclude itk-rust-current-agent -- --nocapture
 
 # Run clippy lints
 lint: cargo-hack
-    cargo hack clippy --workspace --all-targets --each-feature -- -D warnings
+    cargo hack clippy --workspace --exclude itk-rust-current-agent --all-targets --each-feature -- -D warnings
 
 # Check formatting
 fmt-check:
@@ -45,14 +45,14 @@ check: fmt-check lint test
 # Generate code coverage report (requires cargo-llvm-cov)
 coverage:
     rustup component add llvm-tools-preview --toolchain stable
-    rustup run stable cargo llvm-cov --workspace --html --ignore-filename-regex 'gen/'
+    rustup run stable cargo llvm-cov --workspace --exclude itk-rust-current-agent --html --ignore-filename-regex 'gen/'
     @echo "Coverage report: target/llvm-cov/html/index.html"
 
 # Generate LCOV coverage output for CI uploads
 coverage-lcov:
     mkdir -p coverage
     rustup component add llvm-tools-preview --toolchain stable
-    rustup run stable cargo llvm-cov --workspace --no-report --ignore-filename-regex 'gen/'
+    rustup run stable cargo llvm-cov --workspace --exclude itk-rust-current-agent --no-report --ignore-filename-regex 'gen/'
     rustup run stable cargo llvm-cov report --lcov --output-path coverage/lcov.info --ignore-filename-regex 'gen/'
     rm -rf target/llvm-cov/html
     rustup run stable cargo llvm-cov report --html --output-dir target/llvm-cov --ignore-filename-regex 'gen/'

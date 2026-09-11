@@ -28,6 +28,9 @@ PACKAGE_LOCALE = "en-US"
 PUBLISHER = "a2aproject"
 PACKAGE_NAME = "a2acli"
 MONIKER = "a2acli"
+# The MSVC-target binary imports VCRUNTIME140.dll, which a clean Windows
+# install does not carry, so WinGet validation cannot start it.
+VCREDIST_DEPENDENCY = "Microsoft.VCRedist.2015+.x64"
 WINDOWS_ARCHITECTURE = "x64"
 WINDOWS_TARGET = "x86_64-pc-windows-msvc"
 TAG_PATTERN = re.compile(r"^a2a-cli-v(?P<version>[0-9A-Za-z.+-]+)$")
@@ -257,6 +260,9 @@ def render_installer_manifest(release_assets: ReleaseAssets) -> str:
         f"Commands:\n"
         f"- {MONIKER}\n"
         f"ReleaseDate: {release_assets.release_date}\n"
+        f"Dependencies:\n"
+        f"  PackageDependencies:\n"
+        f"  - PackageIdentifier: {VCREDIST_DEPENDENCY}\n"
         f"Installers:\n"
         f"- Architecture: {WINDOWS_ARCHITECTURE}\n"
         f"  InstallerUrl: {release_assets.installer_url}\n"
