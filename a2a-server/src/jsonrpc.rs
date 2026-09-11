@@ -359,11 +359,7 @@ mod tests {
                 "parts": [{"text": "x".repeat(11 * 1024 * 1024)}]
             }
         });
-        let rpc = JsonRpcRequest::new(
-            JsonRpcId::Number(1),
-            methods::SEND_MESSAGE,
-            Some(body),
-        );
+        let rpc = JsonRpcRequest::new(JsonRpcId::Number(1), methods::SEND_MESSAGE, Some(body));
         let req = Request::builder()
             .uri("/")
             .method("POST")
