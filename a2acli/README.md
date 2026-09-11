@@ -29,7 +29,9 @@ cargo install a2a-cli
   subscribe to tasks
 - Create, fetch, list, and delete task push notification configs
 - Request an extended agent card when the server exposes one
-- Add bearer-token or custom-header authentication to all requests
+- Bearer token, API key, and general service-parameter authentication on
+  every request, with an ordered `--transport` preference and an `--insecure`
+  escape hatch (development only, always warns) for self-signed endpoints
 - Human-readable `text` output by default, or the protocol's own JSON
   (`-o/--output json`); every failure is a machine-readable error object
   with a stable code and exit status
@@ -56,10 +58,31 @@ cargo run --bin a2acli -- task push-config create task-123 https://example.com/c
 ```
 
 By default the CLI targets `http://localhost:3000`. Use `--base-url` to point at
-another deployment and `--binding jsonrpc` or `--binding http-json` to pin the
-transport when the agent card exposes more than one compatible interface. The
-global `--tenant`, `--bearer-token`, and repeated `--header Name:Value` options
-also apply to `task push-config` commands.
+another deployment and `--transport jsonrpc` or `--transport rest` (repeatable
+and ordered, highest preference first) to pin the transport when the agent
+card exposes more than one compatible interface. The global `--tenant`,
+`--bearer`, `--api-key`, and repeated `--svc-param Name:Value` options also
+apply to `task push-config` commands.
+
+### Authentication and transport
+
+```sh
+cargo run --bin a2acli -- --bearer "$TOKEN" card get
+cargo run --bin a2acli -- --api-key "$KEY" card get
+cargo run --bin a2acli -- --svc-param "X-Trace-Id:abc123" send "hello"
+cargo run --bin a2acli -- --transport jsonrpc --transport rest card get
+cargo run --bin a2acli -- --insecure --bearer "$TOKEN" card get  # dev only; always warns
+cargo run --bin a2acli -- --debug send "hello"                  # request/response diagnostics to stderr
+```
+
+`--bearer`/`--api-key` (env `A2ACLI_BEARER`/`A2ACLI_API_KEY`) supply credentials;
+`--svc-param` is a separate, general-purpose transport-level key-value pair,
+never itself a credential flag. `--insecure` disables TLS certificate
+verification and always prints a warning naming the risk when a credential is
+also configured — it never disables verification silently. `--debug` never
+prints credential values, regardless of verbosity. `--tenant` overrides the
+routing tenant the selected Agent Card interface may itself declare; omit it
+to use the interface's own value, if it has one.
 
 ### Blocking and polling
 
