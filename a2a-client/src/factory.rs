@@ -73,6 +73,27 @@ impl A2AClientFactory {
         &self,
         card: &AgentCard,
     ) -> Result<A2AClient<Box<dyn crate::Transport>>, A2AError> {
+        self.create_from_card_selecting(card)
+            .await
+            .map(|(client, _)| client)
+    }
+
+    /// Same negotiation as [`Self::create_from_card`], but also returns the
+    /// [`AgentInterface`] that was selected — needed by a caller that must
+    /// honor that interface's own declared routing `tenant` (A2A §8.3.2) on
+    /// every subsequent request, which the interface list alone doesn't
+    /// otherwise surface once a client has been built.
+    pub async fn create_from_card_with_interface(
+        &self,
+        card: &AgentCard,
+    ) -> Result<(A2AClient<Box<dyn crate::Transport>>, AgentInterface), A2AError> {
+        self.create_from_card_selecting(card).await
+    }
+
+    async fn create_from_card_selecting(
+        &self,
+        card: &AgentCard,
+    ) -> Result<(A2AClient<Box<dyn crate::Transport>>, AgentInterface), A2AError> {
         let mut candidates: Vec<(usize, &AgentInterface, &Arc<dyn TransportFactory>)> = Vec::new();
 
         for iface in &card.supported_interfaces {
@@ -100,9 +121,9 @@ impl A2AClientFactory {
         for (_prio, iface, factory) in &candidates {
             match factory.create(card, iface).await {
                 Ok(transport) => {
-                    return Ok(
-                        A2AClient::new(transport).with_interceptors(self.interceptors.clone())
-                    );
+                    let client =
+                        A2AClient::new(transport).with_interceptors(self.interceptors.clone());
+                    return Ok((client, (*iface).clone()));
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -265,5 +286,35 @@ mod tests {
         };
         let result = factory.create_from_card(&card).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_from_card_with_interface_returns_selected_interface() {
+        let factory = A2AClientFactory::builder().build();
+        let mut iface = AgentInterface::new("http://localhost/jsonrpc", TRANSPORT_PROTOCOL_JSONRPC);
+        iface.tenant = Some("tenant-42".to_string());
+        let card = AgentCard {
+            name: "test".into(),
+            description: "test agent".into(),
+            version: "1.0".into(),
+            supported_interfaces: vec![iface],
+            capabilities: AgentCapabilities::default(),
+            default_input_modes: vec!["text".into()],
+            default_output_modes: vec!["text".into()],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        };
+
+        let (_client, selected) = factory
+            .create_from_card_with_interface(&card)
+            .await
+            .unwrap();
+        assert_eq!(selected.protocol_binding, TRANSPORT_PROTOCOL_JSONRPC);
+        assert_eq!(selected.tenant.as_deref(), Some("tenant-42"));
     }
 }
