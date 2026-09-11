@@ -474,6 +474,7 @@ async fn card_and_extended_card_commands_work() {
             "--header",
             "X-Test: abc",
             "card",
+            "get",
         ],
     );
     let card: Value = serde_json::from_str(&stdout).unwrap();
@@ -486,7 +487,14 @@ async fn card_and_extended_card_commands_work() {
 
     let compact = run_cli_success(
         &server,
-        &["--binding", "http-json", "--compact", "extended-card"],
+        &[
+            "--binding",
+            "http-json",
+            "--compact",
+            "card",
+            "get",
+            "--extended",
+        ],
     );
     assert!(!compact.trim_end().contains('\n'));
     let card: Value = serde_json::from_str(compact.trim()).unwrap();
@@ -522,7 +530,10 @@ async fn send_task_list_and_cancel_commands_work() {
         "Echo: hello from cli"
     );
 
-    let get_task = run_cli_success(&server, &["get-task", "task-send", "--history-length", "1"]);
+    let get_task = run_cli_success(
+        &server,
+        &["task", "get", "task-send", "--history-length", "1"],
+    );
     let task_json: Value = serde_json::from_str(&get_task).unwrap();
     assert_eq!(task_json["id"], "task-send");
 
@@ -530,7 +541,8 @@ async fn send_task_list_and_cancel_commands_work() {
         &server,
         &[
             "--compact",
-            "list-tasks",
+            "task",
+            "list",
             "--context-id",
             "ctx-send",
             "--status",
@@ -540,7 +552,7 @@ async fn send_task_list_and_cancel_commands_work() {
     let list_json: Value = serde_json::from_str(list.trim()).unwrap();
     assert_eq!(list_json["tasks"].as_array().unwrap().len(), 1);
 
-    let cancel = run_cli_success(&server, &["cancel-task", "task-send"]);
+    let cancel = run_cli_success(&server, &["task", "cancel", "task-send"]);
     let cancel_json: Value = serde_json::from_str(&cancel).unwrap();
     assert_eq!(cancel_json["status"]["state"], "TASK_STATE_CANCELED");
 }
@@ -553,8 +565,9 @@ async fn stream_and_subscribe_commands_work() {
         &server,
         &[
             "--compact",
-            "stream",
+            "send",
             "streaming request",
+            "--stream",
             "--task-id",
             "task-stream",
             "--context-id",
@@ -569,7 +582,8 @@ async fn stream_and_subscribe_commands_work() {
     );
     assert_eq!(stream_events[1]["task"]["id"], "task-stream");
 
-    let subscribe_output = run_cli_success(&server, &["--compact", "subscribe", "task-stream"]);
+    let subscribe_output =
+        run_cli_success(&server, &["--compact", "task", "subscribe", "task-stream"]);
     let subscribe_events = parse_json_lines(&subscribe_output);
     assert_eq!(subscribe_events.len(), 2);
     assert_eq!(subscribe_events[1]["task"]["id"], "task-stream");
@@ -585,6 +599,7 @@ async fn push_config_crud_commands_work() {
             "--compact",
             "--tenant",
             "tenant-1",
+            "task",
             "push-config",
             "create",
             "task-1",
@@ -606,7 +621,7 @@ async fn push_config_crud_commands_work() {
 
     let get = run_cli_success(
         &server,
-        &["--compact", "push-config", "get", "task-1", "cfg-1"],
+        &["--compact", "task", "push-config", "get", "task-1", "cfg-1"],
     );
     let get_json: Value = serde_json::from_str(get.trim()).unwrap();
     assert_eq!(get_json["authentication"]["scheme"], "Bearer");
@@ -615,6 +630,7 @@ async fn push_config_crud_commands_work() {
         &server,
         &[
             "--compact",
+            "task",
             "push-config",
             "list",
             "task-1",
@@ -627,7 +643,14 @@ async fn push_config_crud_commands_work() {
 
     let delete = run_cli_success(
         &server,
-        &["--compact", "push-config", "delete", "task-1", "cfg-1"],
+        &[
+            "--compact",
+            "task",
+            "push-config",
+            "delete",
+            "task-1",
+            "cfg-1",
+        ],
     );
     let delete_json: Value = serde_json::from_str(delete.trim()).unwrap();
     assert_eq!(delete_json["deleted"], true);
@@ -640,7 +663,7 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
     let base_url = unused_base_url().await;
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
     let output = command
-        .args(["--base-url", base_url.as_str(), "card"])
+        .args(["--base-url", base_url.as_str(), "card", "get"])
         .assert()
         .failure()
         .get_output()
@@ -648,30 +671,33 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("http request failed:"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["extended-card", "--tenant", "error"]);
+    let (_stdout, stderr) =
+        run_cli_failure(&server, &["card", "get", "--extended", "--tenant", "error"]);
     assert!(stderr.contains("a2a error -32004: extended card denied"));
 
     let (_stdout, stderr) = run_cli_failure(&server, &["send", "send-error"]);
     assert!(stderr.contains("a2a error -32600: send failed"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["list-tasks", "--context-id", "error"]);
+    let (_stdout, stderr) = run_cli_failure(&server, &["task", "list", "--context-id", "error"]);
     assert!(stderr.contains("a2a error -32602: list failed"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["get-task", "missing"]);
+    let (_stdout, stderr) = run_cli_failure(&server, &["task", "get", "missing"]);
     assert!(stderr.contains("a2a error -32001: task not found: missing"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["cancel-task", "missing"]);
+    let (_stdout, stderr) = run_cli_failure(&server, &["task", "cancel", "missing"]);
     assert!(stderr.contains("a2a error -32001: task not found: missing"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["subscribe", "stream-error"]);
+    let (_stdout, stderr) = run_cli_failure(&server, &["task", "subscribe", "stream-error"]);
     assert!(stderr.contains("a2a error -32603: stream failed"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["--compact", "stream", "stream-error"]);
+    let (_stdout, stderr) =
+        run_cli_failure(&server, &["--compact", "send", "stream-error", "--stream"]);
     assert!(stderr.contains("a2a error -32603: stream failed"));
 
     let (_stdout, stderr) = run_cli_failure(
         &server,
         &[
+            "task",
             "push-config",
             "create",
             "missing",
@@ -682,19 +708,25 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
     );
     assert!(stderr.contains("a2a error -32001: task not found: missing"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["push-config", "get", "task-1", "missing"]);
+    let (_stdout, stderr) = run_cli_failure(
+        &server,
+        &["task", "push-config", "get", "task-1", "missing"],
+    );
     assert!(stderr.contains("a2a error -32001: task not found: task-1"));
 
-    let (_stdout, stderr) = run_cli_failure(&server, &["push-config", "list", "missing"]);
+    let (_stdout, stderr) = run_cli_failure(&server, &["task", "push-config", "list", "missing"]);
     assert!(stderr.contains("a2a error -32001: task not found: missing"));
 
-    let (_stdout, stderr) =
-        run_cli_failure(&server, &["push-config", "delete", "task-1", "missing"]);
+    let (_stdout, stderr) = run_cli_failure(
+        &server,
+        &["task", "push-config", "delete", "task-1", "missing"],
+    );
     assert!(stderr.contains("a2a error -32001: task not found: task-1"));
 
     let (_stdout, stderr) = run_cli_failure(
         &server,
         &[
+            "task",
             "push-config",
             "create",
             "task-1",

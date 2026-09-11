@@ -44,20 +44,41 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
 pub enum Command {
-    /// Fetch and print the public agent card.
-    Card,
-    /// Fetch and print the extended agent card.
-    ExtendedCard,
-    /// Send a one-shot message.
+    /// Agent Card operations.
+    Card {
+        #[command(subcommand)]
+        command: CardCommand,
+    },
+    /// Send a message to start or continue an interaction.
     Send(MessageCommand),
-    /// Send a streaming message and print each event as it arrives.
-    Stream(MessageCommand),
+    /// Task operations.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
+pub enum CardCommand {
+    /// Fetch and print the Agent Card. Pass --extended for the authenticated extended card.
+    Get(CardGetCommand),
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct CardGetCommand {
+    /// Fetch the authenticated extended agent card instead of the public one.
+    #[arg(long)]
+    pub extended: bool,
+}
+
+#[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
+pub enum TaskCommand {
     /// Fetch a task by ID.
-    GetTask(TaskLookupCommand),
+    Get(TaskLookupCommand),
     /// List tasks with optional filters.
-    ListTasks(ListTasksCommand),
+    List(ListTasksCommand),
     /// Cancel a task by ID.
-    CancelTask(TaskIdCommand),
+    Cancel(TaskIdCommand),
     /// Subscribe to task updates and print each event as it arrives.
     Subscribe(TaskIdCommand),
     /// Manage push notification configs for a task.
@@ -91,6 +112,10 @@ pub struct MessageCommand {
     /// Ask the server to return immediately when it supports queued work.
     #[arg(long)]
     pub return_immediately: bool,
+
+    /// Use the streaming send operation and print each event as it arrives.
+    #[arg(long)]
+    pub stream: bool,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -260,35 +285,53 @@ pub enum CliError {
 
 pub async fn run(cli: Cli) -> Result<(), CliError> {
     match &cli.command {
-        Command::Card => {
-            let card = resolve_agent_card(&cli).await?;
-            print_json(&card, cli.compact)?;
-        }
-        Command::ExtendedCard => {
-            let client = resolve_client(&cli).await?;
-            let result = client
-                .get_extended_agent_card(&GetExtendedAgentCardRequest {
-                    tenant: cli.tenant.clone(),
-                })
-                .await;
-            let card = finish_client_call(client, result).await?;
-            print_json(&card, cli.compact)?;
-        }
+        Command::Card { command } => run_card_command(&cli, command).await?,
         Command::Send(command) => {
-            let request = build_send_message_request(command, cli.tenant.clone());
-            let client = resolve_client(&cli).await?;
-            let result = client.send_message(&request).await;
-            let response = finish_client_call(client, result).await?;
-            print_json(&response, cli.compact)?;
+            if command.stream {
+                let client = resolve_client(&cli).await?;
+                let request = build_send_message_request(command, cli.tenant.clone());
+                let stream = client.send_streaming_message(&request).await?;
+                consume_stream(client, stream, cli.compact).await?;
+            } else {
+                let request = build_send_message_request(command, cli.tenant.clone());
+                let client = resolve_client(&cli).await?;
+                let result = client.send_message(&request).await;
+                let response = finish_client_call(client, result).await?;
+                print_json(&response, cli.compact)?;
+            }
         }
-        Command::Stream(command) => {
-            let client = resolve_client(&cli).await?;
-            let request = build_send_message_request(command, cli.tenant.clone());
-            let stream = client.send_streaming_message(&request).await?;
-            consume_stream(client, stream, cli.compact).await?;
+        Command::Task { command } => run_task_command(&cli, command).await?,
+    }
+
+    Ok(())
+}
+
+async fn run_card_command(cli: &Cli, command: &CardCommand) -> Result<(), CliError> {
+    match command {
+        CardCommand::Get(command) => {
+            if command.extended {
+                let client = resolve_client(cli).await?;
+                let result = client
+                    .get_extended_agent_card(&GetExtendedAgentCardRequest {
+                        tenant: cli.tenant.clone(),
+                    })
+                    .await;
+                let card = finish_client_call(client, result).await?;
+                print_json(&card, cli.compact)?;
+            } else {
+                let card = resolve_agent_card(cli).await?;
+                print_json(&card, cli.compact)?;
+            }
         }
-        Command::GetTask(command) => {
-            let client = resolve_client(&cli).await?;
+    }
+
+    Ok(())
+}
+
+async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliError> {
+    match command {
+        TaskCommand::Get(command) => {
+            let client = resolve_client(cli).await?;
             let result = client
                 .get_task(&GetTaskRequest {
                     id: command.id.clone(),
@@ -299,8 +342,8 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             let task = finish_client_call(client, result).await?;
             print_json(&task, cli.compact)?;
         }
-        Command::ListTasks(command) => {
-            let client = resolve_client(&cli).await?;
+        TaskCommand::List(command) => {
+            let client = resolve_client(cli).await?;
             let result = client
                 .list_tasks(&ListTasksRequest {
                     context_id: command.context_id.clone(),
@@ -316,8 +359,8 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             let response = finish_client_call(client, result).await?;
             print_json(&response, cli.compact)?;
         }
-        Command::CancelTask(command) => {
-            let client = resolve_client(&cli).await?;
+        TaskCommand::Cancel(command) => {
+            let client = resolve_client(cli).await?;
             let result = client
                 .cancel_task(&CancelTaskRequest {
                     id: command.id.clone(),
@@ -328,8 +371,8 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             let task = finish_client_call(client, result).await?;
             print_json(&task, cli.compact)?;
         }
-        Command::Subscribe(command) => {
-            let client = resolve_client(&cli).await?;
+        TaskCommand::Subscribe(command) => {
+            let client = resolve_client(cli).await?;
             let stream = client
                 .subscribe_to_task(&SubscribeToTaskRequest {
                     id: command.id.clone(),
@@ -338,8 +381,8 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
                 .await?;
             consume_stream(client, stream, cli.compact).await?;
         }
-        Command::PushConfig { command } => {
-            run_push_config_command(&cli, command).await?;
+        TaskCommand::PushConfig { command } => {
+            run_push_config_command(cli, command).await?;
         }
     }
 
@@ -1149,6 +1192,7 @@ mod tests {
                 history_length: Some(4),
                 accepted_output_modes: vec!["text/plain".to_string()],
                 return_immediately: true,
+                stream: false,
             },
             Some("tenant-1".to_string()),
         );
@@ -1183,6 +1227,7 @@ mod tests {
                 history_length: None,
                 accepted_output_modes: Vec::new(),
                 return_immediately: false,
+                stream: false,
             },
             None,
         );
@@ -1216,6 +1261,7 @@ mod tests {
     fn test_cli_parse_push_config_create_command() {
         let cli = Cli::try_parse_from([
             "a2acli",
+            "task",
             "push-config",
             "create",
             "task-1",
@@ -1232,8 +1278,11 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Command::PushConfig {
-                command: PushConfigCommand::Create(command),
+            Command::Task {
+                command:
+                    TaskCommand::PushConfig {
+                        command: PushConfigCommand::Create(command),
+                    },
             } => {
                 assert_eq!(command.task_id, "task-1");
                 assert_eq!(command.url, "https://example.com/callback");
@@ -1322,6 +1371,7 @@ mod tests {
             "--header",
             "X-Test: 123",
             "card",
+            "get",
         ])
         .unwrap();
 
@@ -1520,12 +1570,12 @@ mod tests {
     async fn test_run_executes_all_commands_in_lib_tests() {
         let server = RunTestServer::spawn().await;
 
-        run(parse_cli_with_base_url(&server.base_url, &["card"]))
+        run(parse_cli_with_base_url(&server.base_url, &["card", "get"]))
             .await
             .unwrap();
         run(parse_cli_with_base_url(
             &server.base_url,
-            &["--compact", "extended-card"],
+            &["--compact", "card", "get", "--extended"],
         ))
         .await
         .unwrap();
@@ -1552,8 +1602,9 @@ mod tests {
             &server.base_url,
             &[
                 "--compact",
-                "stream",
+                "send",
                 "streaming request",
+                "--stream",
                 "--task-id",
                 "task-stream",
                 "--context-id",
@@ -1564,7 +1615,7 @@ mod tests {
         .unwrap();
         run(parse_cli_with_base_url(
             &server.base_url,
-            &["get-task", "task-send"],
+            &["task", "get", "task-send"],
         ))
         .await
         .unwrap();
@@ -1572,7 +1623,8 @@ mod tests {
             &server.base_url,
             &[
                 "--compact",
-                "list-tasks",
+                "task",
+                "list",
                 "--context-id",
                 "ctx-send",
                 "--status",
@@ -1583,19 +1635,20 @@ mod tests {
         .unwrap();
         run(parse_cli_with_base_url(
             &server.base_url,
-            &["cancel-task", "task-send"],
+            &["task", "cancel", "task-send"],
         ))
         .await
         .unwrap();
         run(parse_cli_with_base_url(
             &server.base_url,
-            &["--compact", "subscribe", "task-stream"],
+            &["--compact", "task", "subscribe", "task-stream"],
         ))
         .await
         .unwrap();
         run(parse_cli_with_base_url(
             &server.base_url,
             &[
+                "task",
                 "push-config",
                 "create",
                 "task-1",
@@ -1608,19 +1661,19 @@ mod tests {
         .unwrap();
         run(parse_cli_with_base_url(
             &server.base_url,
-            &["--compact", "push-config", "get", "task-1", "cfg-1"],
+            &["--compact", "task", "push-config", "get", "task-1", "cfg-1"],
         ))
         .await
         .unwrap();
         run(parse_cli_with_base_url(
             &server.base_url,
-            &["--compact", "push-config", "list", "task-1"],
+            &["--compact", "task", "push-config", "list", "task-1"],
         ))
         .await
         .unwrap();
         run(parse_cli_with_base_url(
             &server.base_url,
-            &["push-config", "delete", "task-1", "cfg-1"],
+            &["task", "push-config", "delete", "task-1", "cfg-1"],
         ))
         .await
         .unwrap();
@@ -1632,7 +1685,7 @@ mod tests {
 
         let err = run(parse_cli_with_base_url(
             &server.base_url,
-            &["extended-card", "--tenant", "error"],
+            &["card", "get", "--extended", "--tenant", "error"],
         ))
         .await
         .unwrap_err();
@@ -1654,7 +1707,7 @@ mod tests {
 
         let err = run(parse_cli_with_base_url(
             &server.base_url,
-            &["list-tasks", "--context-id", "error"],
+            &["task", "list", "--context-id", "error"],
         ))
         .await
         .unwrap_err();
@@ -1665,7 +1718,7 @@ mod tests {
 
         let err = run(parse_cli_with_base_url(
             &server.base_url,
-            &["--compact", "stream", "stream-error"],
+            &["--compact", "send", "stream-error", "--stream"],
         ))
         .await
         .unwrap_err();
@@ -1676,7 +1729,7 @@ mod tests {
 
         let err = run(parse_cli_with_base_url(
             &server.base_url,
-            &["--compact", "subscribe", "stream-error"],
+            &["--compact", "task", "subscribe", "stream-error"],
         ))
         .await
         .unwrap_err();
@@ -1688,6 +1741,7 @@ mod tests {
         let err = run(parse_cli_with_base_url(
             &server.base_url,
             &[
+                "task",
                 "push-config",
                 "create",
                 "missing",
@@ -1705,7 +1759,7 @@ mod tests {
 
         let err = run(parse_cli_with_base_url(
             &server.base_url,
-            &["push-config", "list", "missing"],
+            &["task", "push-config", "list", "missing"],
         ))
         .await
         .unwrap_err();
@@ -1715,7 +1769,7 @@ mod tests {
         ));
 
         let base_url = unused_base_url().await;
-        let err = run(parse_cli_with_base_url(&base_url, &["card"]))
+        let err = run(parse_cli_with_base_url(&base_url, &["card", "get"]))
             .await
             .unwrap_err();
         assert!(matches!(err, CliError::Http(_)));
