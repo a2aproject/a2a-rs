@@ -20,30 +20,58 @@ use thiserror::Error;
     about = "Standalone A2A client CLI",
     after_help = "\
 Default behavior (SPEC.md §6.5):
-  - Transport: the agent card's first supported interface (--binding overrides)
+  - Transport: the agent card's first supported interface (--transport overrides)
   - Task completion: wait until terminal/interrupted state (--async returns immediately)
   - Output: human-readable text (-o/--output json switches to protocol JSON)
   - Protocol version: negotiated automatically on every request
-  - Transport security: TLS verification on; no override yet (tracked in #169)"
+  - Transport security: TLS verification on (--insecure disables it, with a warning)"
 )]
 pub struct Cli {
     /// Base URL used to resolve /.well-known/agent-card.json.
     #[arg(long, global = true, default_value = "http://localhost:3000")]
     pub base_url: String,
 
-    /// Prefer a specific transport when the agent card exposes multiple bindings.
+    /// Client transport preference, repeatable and ordered (highest first):
+    /// e.g. `--transport jsonrpc --transport rest`. Overrides the agent
+    /// card's own preference order; a binding the card doesn't offer is
+    /// skipped.
     #[arg(long, global = true, value_enum)]
-    pub binding: Option<Binding>,
+    pub transport: Vec<Binding>,
 
     /// Bearer token attached to the agent-card fetch and client calls.
-    #[arg(long, global = true, env = "A2A_BEARER_TOKEN")]
-    pub bearer_token: Option<String>,
+    #[arg(long, global = true, env = "A2ACLI_BEARER")]
+    pub bearer: Option<String>,
 
-    /// Extra HTTP header attached to the agent-card fetch and client calls.
-    #[arg(long = "header", global = true, value_parser = parse_header)]
-    pub headers: Vec<HeaderArg>,
+    /// API key attached to the agent-card fetch and client calls (as an
+    /// `X-API-Key` header — a2acli does not yet read the agent card's
+    /// declared security scheme to place it elsewhere per A2A §4.5.2).
+    #[arg(long = "api-key", global = true, env = "A2ACLI_API_KEY")]
+    pub api_key: Option<String>,
 
-    /// Optional tenant forwarded to A2A requests that support it.
+    /// Add an A2A service parameter (a transport-level key-value pair, e.g.
+    /// a header or gRPC metadata) — general-purpose, not authentication-
+    /// specific. Distinct from `--metadata`, which travels in the request
+    /// payload.
+    #[arg(long = "svc-param", global = true, value_parser = parse_header)]
+    pub svc_params: Vec<HeaderArg>,
+
+    /// Disable TLS certificate verification for the negotiated transport.
+    /// Development only — always prints a warning, and never disables
+    /// verification silently.
+    #[arg(long, global = true)]
+    pub insecure: bool,
+
+    /// Verbose diagnostics to stderr: request/response timing and outcome
+    /// for each call. Never includes credential material (bearer token,
+    /// API key, or any --svc-param value), and that redaction cannot be
+    /// defeated by this or any other verbosity flag.
+    #[arg(long, global = true)]
+    pub debug: bool,
+
+    /// Optional tenant forwarded to A2A requests that support it. Overrides
+    /// the routing tenant the selected Agent Card interface may itself
+    /// declare (A2A §8.3.2); omit this to use the interface's own value,
+    /// if it has one.
     #[arg(long, global = true)]
     pub tenant: Option<String>,
 
@@ -314,14 +342,17 @@ pub enum OutputFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Binding {
     Jsonrpc,
-    HttpJson,
+    /// The A2A HTTP+JSON binding — spelled `rest` on the command line to
+    /// match the reference implementation's `--transport` vocabulary.
+    #[value(name = "rest")]
+    Rest,
 }
 
 impl Binding {
     fn protocol(self) -> &'static str {
         match self {
             Binding::Jsonrpc => TRANSPORT_PROTOCOL_JSONRPC,
-            Binding::HttpJson => TRANSPORT_PROTOCOL_HTTP_JSON,
+            Binding::Rest => TRANSPORT_PROTOCOL_HTTP_JSON,
         }
     }
 }
@@ -527,6 +558,17 @@ where
 }
 
 pub async fn run(cli: Cli, matches: &ArgMatches) -> Result<(), CliError> {
+    if cli.debug {
+        // --debug: verbose diagnostics to stderr (§7.2). try_init() rather
+        // than init() because a process embedding `run` more than once
+        // (e.g. this crate's own in-process tests) would otherwise panic
+        // on a second global-subscriber install.
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .try_init();
+    }
+
     match &cli.command {
         Command::Card { command } => run_card_command(&cli, command).await?,
         Command::Send(command) => {
@@ -534,8 +576,8 @@ pub async fn run(cli: Cli, matches: &ArgMatches) -> Result<(), CliError> {
                 .subcommand_matches("send")
                 .expect("send subcommand matches present when cli.command is Command::Send");
             let parts = resolve_message_parts(send_matches, command)?;
-            let request = build_send_message_request(command, parts, cli.tenant.clone());
-            let client = resolve_client(&cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(&cli).await?;
+            let request = build_send_message_request(command, parts, tenant.clone());
 
             if command.stream {
                 match client.send_streaming_message(&request).await {
@@ -549,7 +591,15 @@ pub async fn run(cli: Cli, matches: &ArgMatches) -> Result<(), CliError> {
                         // *other* error opening the stream is a real
                         // failure and must be reported as such, not masked
                         // by a silent retry.
-                        let response = send_and_maybe_wait(client, &request, &cli).await?;
+                        let response = send_and_maybe_wait(
+                            client,
+                            &request,
+                            tenant,
+                            cli.async_mode,
+                            cli.poll_interval,
+                            cli.timeout,
+                        )
+                        .await?;
                         print_output(&response, &cli)?;
                     }
                     Err(error) => {
@@ -558,7 +608,15 @@ pub async fn run(cli: Cli, matches: &ArgMatches) -> Result<(), CliError> {
                     }
                 }
             } else {
-                let response = send_and_maybe_wait(client, &request, &cli).await?;
+                let response = send_and_maybe_wait(
+                    client,
+                    &request,
+                    tenant,
+                    cli.async_mode,
+                    cli.poll_interval,
+                    cli.timeout,
+                )
+                .await?;
                 print_output(&response, &cli)?;
             }
         }
@@ -575,7 +633,10 @@ pub async fn run(cli: Cli, matches: &ArgMatches) -> Result<(), CliError> {
 async fn send_and_maybe_wait<T: a2a_client::Transport>(
     client: A2AClient<T>,
     request: &SendMessageRequest,
-    cli: &Cli,
+    tenant: Option<String>,
+    async_mode: bool,
+    poll_interval: Duration,
+    timeout: Duration,
 ) -> Result<SendMessageResponse, CliError> {
     let result = client.send_message(request).await;
     let response = match result {
@@ -588,15 +649,8 @@ async fn send_and_maybe_wait<T: a2a_client::Transport>(
 
     match response {
         SendMessageResponse::Task(task) => {
-            let task = settle_task(
-                client,
-                task,
-                !cli.async_mode,
-                cli.tenant.clone(),
-                cli.poll_interval,
-                cli.timeout,
-            )
-            .await?;
+            let task =
+                settle_task(client, task, !async_mode, tenant, poll_interval, timeout).await?;
             Ok(SendMessageResponse::Task(task))
         }
         SendMessageResponse::Message(message) => {
@@ -682,11 +736,9 @@ async fn run_card_command(cli: &Cli, command: &CardCommand) -> Result<(), CliErr
     match command {
         CardCommand::Get(command) => {
             if command.extended {
-                let client = resolve_client(cli).await?;
+                let ResolvedClient { client, tenant } = resolve_client(cli).await?;
                 let result = client
-                    .get_extended_agent_card(&GetExtendedAgentCardRequest {
-                        tenant: cli.tenant.clone(),
-                    })
+                    .get_extended_agent_card(&GetExtendedAgentCardRequest { tenant })
                     .await;
                 let card = finish_client_call(client, result).await?;
                 print_output(&card, cli)?;
@@ -703,12 +755,12 @@ async fn run_card_command(cli: &Cli, command: &CardCommand) -> Result<(), CliErr
 async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliError> {
     match command {
         TaskCommand::Get(command) => {
-            let client = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
             let result = client
                 .get_task(&GetTaskRequest {
                     id: command.id.clone(),
                     history_length: command.history_length,
-                    tenant: cli.tenant.clone(),
+                    tenant: tenant.clone(),
                 })
                 .await;
             let task = match result {
@@ -722,7 +774,7 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
                 client,
                 task,
                 cli.wait,
-                cli.tenant.clone(),
+                tenant,
                 cli.poll_interval,
                 cli.timeout,
             )
@@ -730,7 +782,7 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
             print_output(&task, cli)?;
         }
         TaskCommand::List(command) => {
-            let client = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
             let result = client
                 .list_tasks(&ListTasksRequest {
                     context_id: command.context_id.clone(),
@@ -740,30 +792,30 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
                     history_length: command.history_length,
                     status_timestamp_after: None,
                     include_artifacts: command.include_artifacts.then_some(true),
-                    tenant: cli.tenant.clone(),
+                    tenant,
                 })
                 .await;
             let response = finish_client_call(client, result).await?;
             print_output(&response, cli)?;
         }
         TaskCommand::Cancel(command) => {
-            let client = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
             let result = client
                 .cancel_task(&CancelTaskRequest {
                     id: command.id.clone(),
                     metadata: None,
-                    tenant: cli.tenant.clone(),
+                    tenant,
                 })
                 .await;
             let task = finish_client_call(client, result).await?;
             print_output(&task, cli)?;
         }
         TaskCommand::Subscribe(command) => {
-            let client = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
             let stream = client
                 .subscribe_to_task(&SubscribeToTaskRequest {
                     id: command.id.clone(),
-                    tenant: cli.tenant.clone(),
+                    tenant,
                 })
                 .await?;
             consume_stream(client, stream, cli).await?;
@@ -1064,46 +1116,46 @@ fn build_push_notification_config(
 async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Result<(), CliError> {
     match command {
         PushConfigCommand::Create(command) => {
-            let client = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
             let mut config = build_push_notification_config(command)?;
             config.task_id = command.task_id.clone();
-            config.tenant = cli.tenant.clone();
+            config.tenant = tenant;
             let result = client.create_push_config(&config).await;
             let response = finish_client_call(client, result).await?;
             print_output(&response, cli)?;
         }
         PushConfigCommand::Get(command) => {
-            let client = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
             let result = client
                 .get_push_config(&GetTaskPushNotificationConfigRequest {
                     task_id: command.task_id.clone(),
                     id: command.id.clone(),
-                    tenant: cli.tenant.clone(),
+                    tenant,
                 })
                 .await;
             let response = finish_client_call(client, result).await?;
             print_output(&response, cli)?;
         }
         PushConfigCommand::List(command) => {
-            let client = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
             let result = client
                 .list_push_configs(&ListTaskPushNotificationConfigsRequest {
                     task_id: command.task_id.clone(),
                     page_size: command.page_size,
                     page_token: command.page_token.clone(),
-                    tenant: cli.tenant.clone(),
+                    tenant,
                 })
                 .await;
             let response = finish_client_call(client, result).await?;
             print_output(&response, cli)?;
         }
         PushConfigCommand::Delete(command) => {
-            let client = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
             let result = client
                 .delete_push_config(&DeleteTaskPushNotificationConfigRequest {
                     task_id: command.task_id.clone(),
                     id: command.id.clone(),
-                    tenant: cli.tenant.clone(),
+                    tenant,
                 })
                 .await;
             finish_client_call(client, result).await?;
@@ -1121,46 +1173,128 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
     Ok(())
 }
 
-async fn resolve_client(cli: &Cli) -> Result<A2AClient<Box<dyn a2a_client::Transport>>, CliError> {
+/// A negotiated client, plus the tenant to attach to every subsequent
+/// request on it: the caller's explicit `--tenant` when given, otherwise
+/// (per A2A §8.3.2) the routing tenant the *selected* Agent Card interface
+/// itself declares, if any (TX_003).
+struct ResolvedClient {
+    client: A2AClient<Box<dyn a2a_client::Transport>>,
+    tenant: Option<String>,
+}
+
+async fn resolve_client(cli: &Cli) -> Result<ResolvedClient, CliError> {
     let card = resolve_agent_card(cli).await?;
 
     let mut builder = A2AClientFactory::builder();
-    if let Some(binding) = cli.binding {
-        builder = builder.preferred_bindings(vec![binding.protocol().to_string()]);
+    if !cli.transport.is_empty() {
+        let preferred = cli
+            .transport
+            .iter()
+            .map(|binding| binding.protocol().to_string())
+            .collect();
+        builder = builder.preferred_bindings(preferred);
     }
-    if let Some(token) = &cli.bearer_token {
+    if cli.insecure {
+        let insecure = build_insecure_reqwest_client()?;
+        builder = builder
+            .register(Arc::new(a2a_client::jsonrpc::JsonRpcTransportFactory::new(
+                Some(insecure.clone()),
+            )))
+            .register(Arc::new(a2a_client::rest::RestTransportFactory::new(Some(
+                insecure,
+            ))));
+    }
+    if let Some(token) = &cli.bearer {
         builder = builder.with_interceptor(Arc::new(AuthInterceptor::bearer(token.clone())));
     }
-    for header in &cli.headers {
+    if let Some(api_key) = &cli.api_key {
         builder = builder.with_interceptor(Arc::new(AuthInterceptor::custom(
-            header.name.clone(),
-            header.value.clone(),
+            "X-API-Key",
+            api_key.clone(),
         )));
+    }
+    for param in &cli.svc_params {
+        builder = builder.with_interceptor(Arc::new(AuthInterceptor::custom(
+            param.name.clone(),
+            param.value.clone(),
+        )));
+    }
+    if cli.debug {
+        builder = builder.with_interceptor(Arc::new(a2a_client::middleware::LoggingInterceptor));
     }
 
     let factory = builder.build();
-    Ok(factory.create_from_card(&card).await?)
+    let (client, interface) = factory.create_from_card_with_interface(&card).await?;
+    let tenant = cli.tenant.clone().or(interface.tenant);
+    Ok(ResolvedClient { client, tenant })
 }
 
 async fn resolve_agent_card(cli: &Cli) -> Result<AgentCard, CliError> {
+    warn_if_insecure_with_credentials(cli);
+
     let url = format!(
         "{}/.well-known/agent-card.json",
         cli.base_url.trim_end_matches('/')
     );
-    let client = Client::new();
+    let client = if cli.insecure {
+        build_insecure_reqwest_client()?
+    } else {
+        Client::new()
+    };
     let request = apply_request_auth(client.get(url), cli);
     let response = request.send().await?.error_for_status()?;
     Ok(response.json::<AgentCard>().await?)
 }
 
 fn apply_request_auth(mut request: RequestBuilder, cli: &Cli) -> RequestBuilder {
-    if let Some(token) = &cli.bearer_token {
+    if let Some(token) = &cli.bearer {
         request = request.bearer_auth(token);
     }
-    for header in &cli.headers {
-        request = request.header(&header.name, &header.value);
+    if let Some(api_key) = &cli.api_key {
+        request = request.header("X-API-Key", api_key);
+    }
+    for param in &cli.svc_params {
+        request = request.header(&param.name, &param.value);
     }
     request
+}
+
+/// `--insecure` disables TLS certificate verification (development only).
+#[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
+fn build_insecure_reqwest_client() -> Result<Client, CliError> {
+    Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(CliError::Http)
+}
+
+/// No TLS backend compiled in: there is no certificate verification to
+/// disable, so `--insecure` is a no-op rather than a build error.
+#[cfg(not(any(feature = "rustls-tls", feature = "native-tls")))]
+fn build_insecure_reqwest_client() -> Result<Client, CliError> {
+    Client::builder().build().map_err(CliError::Http)
+}
+
+/// §12.1/AUTH_003: never disable TLS verification silently. Warns whenever
+/// `--insecure` is set, and names the specific risk when a credential would
+/// also be sent over that connection.
+fn warn_if_insecure_with_credentials(cli: &Cli) {
+    if !cli.insecure {
+        return;
+    }
+    let sends_credentials = cli.bearer.is_some() || cli.api_key.is_some();
+    if sends_credentials {
+        eprintln!(
+            "warning: --insecure disables TLS certificate verification, and a credential \
+             (--bearer/--api-key) is being sent over this connection — use only against a \
+             trusted development endpoint"
+        );
+    } else {
+        eprintln!(
+            "warning: --insecure disables TLS certificate verification — use only against a \
+             trusted development endpoint"
+        );
+    }
 }
 
 /// Renders `text` mode (§11.2): one `Label: value` field per line, stable
@@ -2217,9 +2351,9 @@ mod tests {
     fn test_cli_parse_send_command() {
         let cli = Cli::try_parse_from([
             "a2acli",
-            "--binding",
+            "--transport",
             "jsonrpc",
-            "--header",
+            "--svc-param",
             "X-Test:123",
             "send",
             "hello",
@@ -2228,8 +2362,8 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(cli.binding, Some(Binding::Jsonrpc));
-        assert_eq!(cli.headers.len(), 1);
+        assert_eq!(cli.transport, vec![Binding::Jsonrpc]);
+        assert_eq!(cli.svc_params.len(), 1);
         assert!(matches!(cli.command, Command::Send(_)));
     }
 
@@ -2335,16 +2469,18 @@ mod tests {
     #[test]
     fn test_binding_protocols() {
         assert_eq!(Binding::Jsonrpc.protocol(), TRANSPORT_PROTOCOL_JSONRPC);
-        assert_eq!(Binding::HttpJson.protocol(), TRANSPORT_PROTOCOL_HTTP_JSON);
+        assert_eq!(Binding::Rest.protocol(), TRANSPORT_PROTOCOL_HTTP_JSON);
     }
 
     #[test]
     fn test_apply_request_auth_builds_headers() {
         let cli = Cli::try_parse_from([
             "a2acli",
-            "--bearer-token",
+            "--bearer",
             "secret",
-            "--header",
+            "--api-key",
+            "key-123",
+            "--svc-param",
             "X-Test: 123",
             "card",
             "get",
@@ -2359,6 +2495,7 @@ mod tests {
             request.headers().get(header::AUTHORIZATION).unwrap(),
             "Bearer secret"
         );
+        assert_eq!(request.headers().get("X-API-Key").unwrap(), "key-123");
         assert_eq!(request.headers().get("X-Test").unwrap(), "123");
     }
 
@@ -2562,11 +2699,11 @@ mod tests {
         run_test_cli(
             &server.base_url,
             &[
-                "--binding",
+                "--transport",
                 "jsonrpc",
-                "--bearer-token",
+                "--bearer",
                 "secret",
-                "--header",
+                "--svc-param",
                 "X-Test: 123",
                 "send",
                 "hello from unit test",

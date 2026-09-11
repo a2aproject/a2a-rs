@@ -22,14 +22,21 @@ use futures::stream::{self, BoxStream};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
+/// (Authorization, x-test, x-api-key) recorded per card fetch.
+type CardHeaders = (Option<String>, Option<String>, Option<String>);
+
 #[derive(Default)]
 struct ServerState {
     tasks: Mutex<BTreeMap<String, Task>>,
     push_configs: Mutex<BTreeMap<(String, String), TaskPushNotificationConfig>>,
-    card_headers: Mutex<Vec<(Option<String>, Option<String>)>>,
+    card_headers: Mutex<Vec<CardHeaders>>,
     /// Number of times `get_task` has been called for each of the
     /// poll-until-settled fixture task ids below.
     poll_counts: Mutex<BTreeMap<String, u32>>,
+    /// The `tenant` field of each `send_message` request received, in
+    /// order — for TX_003's "selected interface's own tenant, absent an
+    /// explicit --tenant" fallback.
+    received_send_tenants: Mutex<Vec<Option<String>>>,
 }
 
 /// Fixture task ids that settle to `COMPLETED` only after this many
@@ -58,6 +65,14 @@ impl Drop for TestServer {
 
 impl TestServer {
     async fn spawn() -> Self {
+        Self::spawn_with_card_tenant(None).await
+    }
+
+    /// Like [`Self::spawn`], but the public card's JSON-RPC interface
+    /// declares the given routing `tenant` (A2A §8.3.2), for exercising
+    /// TX_003's "use the selected interface's own tenant absent an explicit
+    /// --tenant" fallback.
+    async fn spawn_with_card_tenant(tenant: Option<&str>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(ServerState::default());
@@ -79,7 +94,10 @@ impl TestServer {
             );
         }
 
-        let public_card = make_agent_card(&base_url, "Fixture Agent");
+        let mut public_card = make_agent_card(&base_url, "Fixture Agent");
+        if let Some(tenant) = tenant {
+            public_card.supported_interfaces[0].tenant = Some(tenant.to_string());
+        }
         let extended_card = make_agent_card(&base_url, "Fixture Agent (extended)");
         let handler = Arc::new(TestHandler {
             state: state.clone(),
@@ -102,6 +120,10 @@ impl TestServer {
                                 .map(ToOwned::to_owned),
                             headers
                                 .get("x-test")
+                                .and_then(|value| value.to_str().ok())
+                                .map(ToOwned::to_owned),
+                            headers
+                                .get("x-api-key")
                                 .and_then(|value| value.to_str().ok())
                                 .map(ToOwned::to_owned),
                         ));
@@ -131,6 +153,12 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
+        self.state
+            .received_send_tenants
+            .lock()
+            .unwrap()
+            .push(req.tenant.clone());
+
         let text = req.message.text().unwrap_or_default();
         if text == "send-error" {
             return Err(A2AError::invalid_request("send failed"));
@@ -619,9 +647,9 @@ async fn card_and_extended_card_commands_work() {
     let stdout = run_cli_success(
         &server,
         &[
-            "--bearer-token",
+            "--bearer",
             "secret",
-            "--header",
+            "--svc-param",
             "X-Test: abc",
             "card",
             "get",
@@ -638,8 +666,8 @@ async fn card_and_extended_card_commands_work() {
     let compact = run_cli_success(
         &server,
         &[
-            "--binding",
-            "http-json",
+            "--transport",
+            "rest",
             "--compact",
             "card",
             "get",
@@ -663,9 +691,9 @@ async fn send_task_list_and_cancel_commands_work() {
     let send = run_cli_success(
         &server,
         &[
-            "--bearer-token",
+            "--bearer",
             "secret",
-            "--header",
+            "--svc-param",
             "X-Trace: 123",
             "send",
             "hello from cli",
@@ -1497,4 +1525,130 @@ async fn context_id_is_passed_through_opaquely_to_a_new_task() {
     );
     let response: Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(response["task"]["contextId"], "ctx-custom-123");
+}
+
+// AUTH_001/AUTH_003/TX_003 (a2aproject/a2a-rs#169).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_is_attached_as_a_header_to_the_card_fetch() {
+    let server = TestServer::spawn().await;
+
+    run_cli_success(&server, &["--api-key", "key-abc", "card", "get"]);
+
+    let headers = server.state.card_headers.lock().unwrap().clone();
+    assert_eq!(headers.last().unwrap().2.as_deref(), Some("key-abc"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insecure_flag_prints_a_warning_and_names_the_credential_risk() {
+    let server = TestServer::spawn().await;
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--base-url",
+            server.base_url.as_str(),
+            "--insecure",
+            "--bearer",
+            "secret",
+            "card",
+            "get",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--insecure disables TLS certificate verification"));
+    assert!(stderr.contains("--bearer/--api-key"));
+
+    // Without a credential, the warning is still printed but doesn't
+    // mention sending one.
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--base-url",
+            server.base_url.as_str(),
+            "--insecure",
+            "card",
+            "get",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--insecure disables TLS certificate verification"));
+    assert!(!stderr.contains("--bearer/--api-key"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_insecure_flag_means_no_warning() {
+    let server = TestServer::spawn().await;
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args(["--base-url", server.base_url.as_str(), "card", "get"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(String::from_utf8(output.stderr).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_interface_tenant_is_used_absent_an_explicit_tenant_flag() {
+    let server = TestServer::spawn_with_card_tenant(Some("card-declared-tenant")).await;
+
+    run_cli_success(&server, &["--compact", "send", "hello"]);
+
+    let received = server.state.received_send_tenants.lock().unwrap().clone();
+    assert_eq!(received, vec![Some("card-declared-tenant".to_string())]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_tenant_flag_overrides_the_interface_tenant() {
+    let server = TestServer::spawn_with_card_tenant(Some("card-declared-tenant")).await;
+
+    run_cli_success(
+        &server,
+        &["--compact", "--tenant", "explicit-tenant", "send", "hello"],
+    );
+
+    let received = server.state.received_send_tenants.lock().unwrap().clone();
+    assert_eq!(received, vec![Some("explicit-tenant".to_string())]);
+}
+
+// AUTH_004 (a2aproject/a2a-rs#169).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_flag_emits_diagnostics_without_leaking_the_bearer_token() {
+    let server = TestServer::spawn().await;
+
+    // --debug's diagnostics come from the client-call interceptor pipeline
+    // (LoggingInterceptor), which only runs for actual A2A operations —
+    // unlike a bare `card get`, `send` goes through resolve_client and so
+    // exercises it.
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--base-url",
+            server.base_url.as_str(),
+            "--debug",
+            "--bearer",
+            "super-secret-token",
+            "--async",
+            "send",
+            "hello",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    // --debug produces *some* diagnostic output...
+    assert!(!stderr.is_empty());
+    // ...but never the credential value, regardless of verbosity.
+    assert!(!stderr.contains("super-secret-token"));
 }
