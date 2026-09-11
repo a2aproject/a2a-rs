@@ -68,6 +68,15 @@ impl TestServer {
                 "task-1".to_string(),
                 make_task("task-1", "ctx-1", TaskState::Completed, "seeded result"),
             );
+            tasks.insert(
+                "task-needs-input".to_string(),
+                make_task(
+                    "task-needs-input",
+                    "ctx-needs-input",
+                    TaskState::InputRequired,
+                    "what's the destination city?",
+                ),
+            );
         }
 
         let public_card = make_agent_card(&base_url, "Fixture Agent");
@@ -523,9 +532,14 @@ fn make_task_with_parts(
     }
 }
 
+/// Most of this suite asserts on the exact protocol JSON shape the CLI
+/// received/produced, so these helpers default to `-o json` — the same way
+/// the pre-#168 CLI always behaved. Tests that specifically exercise the new
+/// `text` default or the error envelope build their own `StdCommand`
+/// instead of going through these.
 fn run_cli_success(server: &TestServer, args: &[&str]) -> String {
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
-    command.args(["--base-url", server.base_url.as_str()]);
+    command.args(["--base-url", server.base_url.as_str(), "--output", "json"]);
     command.args(args);
     let output = command.assert().success().get_output().stdout.clone();
     String::from_utf8(output).unwrap()
@@ -533,13 +547,32 @@ fn run_cli_success(server: &TestServer, args: &[&str]) -> String {
 
 fn run_cli_failure(server: &TestServer, args: &[&str]) -> (String, String) {
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
-    command.args(["--base-url", server.base_url.as_str()]);
+    command.args(["--base-url", server.base_url.as_str(), "--output", "json"]);
     command.args(args);
     let output = command.assert().failure().get_output().clone();
     (
         String::from_utf8(output.stdout).unwrap(),
         String::from_utf8(output.stderr).unwrap(),
     )
+}
+
+/// Like [`run_cli_failure`], but also returns the process exit code, for the
+/// handful of tests that check §11.6's exit-code contract explicitly.
+fn run_cli_failure_status(server: &TestServer, args: &[&str]) -> (String, String, i32) {
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    command.args(["--base-url", server.base_url.as_str(), "--output", "json"]);
+    command.args(args);
+    let output = command.assert().failure().get_output().clone();
+    (
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+        output.status.code().unwrap(),
+    )
+}
+
+/// Parse the Appendix B error envelope a failing command printed to stderr.
+fn parse_error_envelope(stderr: &str) -> Value {
+    serde_json::from_str(stderr.trim()).unwrap()
 }
 
 fn parse_json_lines(output: &str) -> Vec<Value> {
@@ -755,39 +788,67 @@ async fn push_config_crud_commands_work() {
 async fn binary_reports_a2a_and_non_a2a_errors() {
     let server = TestServer::spawn().await;
 
+    // Unreachable agent: A2ACLI_ERR_UNREACHABLE, exit 3 (Appendix D).
     let base_url = unused_base_url().await;
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
     let output = command
-        .args(["--base-url", base_url.as_str(), "card", "get"])
+        .args([
+            "--base-url",
+            base_url.as_str(),
+            "--output",
+            "json",
+            "card",
+            "get",
+        ])
         .assert()
         .failure()
         .get_output()
         .clone();
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("http request failed:"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_UNREACHABLE");
+    assert_eq!(output.status.code().unwrap(), 3);
 
-    let (_stdout, stderr) =
-        run_cli_failure(&server, &["card", "get", "--extended", "--tenant", "error"]);
-    assert!(stderr.contains("a2a error -32004: extended card denied"));
+    // A protocol failure carries the A2A error name and its numeric code
+    // unchanged (§11.4), and exits 1 — the CLI did its job of conducting
+    // and reporting the call.
+    let (_stdout, stderr, code) =
+        run_cli_failure_status(&server, &["card", "get", "--extended", "--tenant", "error"]);
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "UNSUPPORTED_OPERATION");
+    assert_eq!(envelope["error"]["message"], "extended card denied");
+    assert_eq!(envelope["error"]["a2aCode"], -32004);
+    assert_eq!(code, 1);
 
     let (_stdout, stderr) = run_cli_failure(&server, &["send", "send-error"]);
-    assert!(stderr.contains("a2a error -32600: send failed"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "INVALID_REQUEST");
+    assert_eq!(envelope["error"]["a2aCode"], -32600);
 
     let (_stdout, stderr) = run_cli_failure(&server, &["task", "list", "--context-id", "error"]);
-    assert!(stderr.contains("a2a error -32602: list failed"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "INVALID_PARAMS");
+    assert_eq!(envelope["error"]["a2aCode"], -32602);
 
     let (_stdout, stderr) = run_cli_failure(&server, &["task", "get", "missing"]);
-    assert!(stderr.contains("a2a error -32001: task not found: missing"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "TASK_NOT_FOUND");
+    assert_eq!(envelope["error"]["message"], "task not found: missing");
+    assert_eq!(envelope["error"]["a2aCode"], -32001);
 
     let (_stdout, stderr) = run_cli_failure(&server, &["task", "cancel", "missing"]);
-    assert!(stderr.contains("a2a error -32001: task not found: missing"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "TASK_NOT_FOUND");
 
     let (_stdout, stderr) = run_cli_failure(&server, &["task", "subscribe", "stream-error"]);
-    assert!(stderr.contains("a2a error -32603: stream failed"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "INTERNAL_ERROR");
+    assert_eq!(envelope["error"]["a2aCode"], -32603);
 
     let (_stdout, stderr) =
         run_cli_failure(&server, &["--compact", "send", "stream-error", "--stream"]);
-    assert!(stderr.contains("a2a error -32603: stream failed"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "INTERNAL_ERROR");
 
     let (_stdout, stderr) = run_cli_failure(
         &server,
@@ -801,24 +862,29 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
             "cfg-missing",
         ],
     );
-    assert!(stderr.contains("a2a error -32001: task not found: missing"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "TASK_NOT_FOUND");
 
     let (_stdout, stderr) = run_cli_failure(
         &server,
         &["task", "push-config", "get", "task-1", "missing"],
     );
-    assert!(stderr.contains("a2a error -32001: task not found: task-1"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "TASK_NOT_FOUND");
 
     let (_stdout, stderr) = run_cli_failure(&server, &["task", "push-config", "list", "missing"]);
-    assert!(stderr.contains("a2a error -32001: task not found: missing"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "TASK_NOT_FOUND");
 
     let (_stdout, stderr) = run_cli_failure(
         &server,
         &["task", "push-config", "delete", "task-1", "missing"],
     );
-    assert!(stderr.contains("a2a error -32001: task not found: task-1"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "TASK_NOT_FOUND");
 
-    let (_stdout, stderr) = run_cli_failure(
+    // A CLI-local usage failure: A2ACLI_ERR_USAGE, exit 2, no a2aCode.
+    let (_stdout, stderr, code) = run_cli_failure_status(
         &server,
         &[
             "task",
@@ -830,7 +896,16 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
             "secret",
         ],
     );
-    assert!(stderr.contains("invalid input: --auth-credentials requires --auth-scheme"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_USAGE");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--auth-credentials requires --auth-scheme")
+    );
+    assert!(envelope["error"]["a2aCode"].is_null());
+    assert_eq!(code, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1002,6 +1077,8 @@ async fn send_reads_local_file_part_and_stdin_data_part() {
         .args([
             "--base-url",
             server.base_url.as_str(),
+            "--output",
+            "json",
             "--compact",
             "send",
             "--text-part",
@@ -1169,8 +1246,9 @@ async fn send_stream_propagates_a_non_unsupported_error_instead_of_falling_back(
 
     let (_stdout, stderr) =
         run_cli_failure(&server, &["send", "stream-open-real-error", "--stream"]);
-    assert!(stderr.contains("a2a error"));
-    assert!(stderr.contains("transport exploded"));
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "INTERNAL_ERROR");
+    assert_eq!(envelope["error"]["message"], "transport exploded");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1209,4 +1287,72 @@ async fn data_part_reports_the_real_error_for_an_unreadable_existing_path() {
 
     assert!(stderr.contains("failed to read"));
     assert!(!stderr.contains("must be a file path"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_is_the_default_output_format() {
+    let server = TestServer::spawn().await;
+
+    // No -o/--output flag at all: this is the §6.5 default, not an opt-in.
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--base-url",
+            server.base_url.as_str(),
+            "task",
+            "get",
+            "task-1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.trim_start().starts_with('{'),
+        "expected text, got: {stdout}"
+    );
+    assert!(stdout.contains("Task ID: task-1"));
+    assert!(stdout.contains("Context ID: ctx-1"));
+    assert!(stdout.contains("State: COMPLETED"));
+    assert!(stdout.contains("Text:"));
+    assert!(stdout.contains("seeded result"));
+
+    // §11.1: stderr carries no diagnostics on a successful run.
+    assert!(String::from_utf8(output.stderr).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_output_prints_resume_hint_on_input_required() {
+    let server = TestServer::spawn().await;
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--base-url",
+            server.base_url.as_str(),
+            "task",
+            "get",
+            "task-needs-input",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+
+    assert!(stdout.contains("State: INPUT_REQUIRED"));
+    assert!(stdout.contains("Resume with: a2acli send --task-id task-needs-input \"<reply>\""));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_output_is_still_available_via_output_flag() {
+    let server = TestServer::spawn().await;
+
+    let stdout = run_cli_success(&server, &["task", "get", "task-1"]);
+    let task: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(task["id"], "task-1");
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED");
 }

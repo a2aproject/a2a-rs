@@ -138,8 +138,8 @@ cargo install a2a-cli
 
 The workspace includes a standalone CLI client built on `a2a-client`. It
 resolves the public agent card from a base URL, negotiates JSON-RPC or
-HTTP+JSON, prints responses as JSON, and manages task push notification
-configs.
+HTTP+JSON, prints human-readable text by default (`-o json` for the
+protocol's own JSON types), and manages task push notification configs.
 
 ```sh
 cargo run --bin a2acli -- card get
