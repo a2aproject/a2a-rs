@@ -177,8 +177,9 @@ cargo run --bin a2acli -- task get task-123 -o json    # one JSON document
 cargo run --bin a2acli -- send "hello" --stream -o json  # JSONL, one event per line
 ```
 
-A failure — from the agent or from the tool itself — always prints one
-compact JSON error object to stderr, in every output mode:
+A failure — from the agent or from the tool itself, including a malformed
+flag or a missing subcommand — always prints one compact JSON error object
+to stderr, in every output mode:
 
 ```json
 {"error":{"code":"TASK_NOT_FOUND","message":"task not found: t-1","a2aCode":-32001}}

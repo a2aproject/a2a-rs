@@ -498,6 +498,12 @@ pub enum CliError {
     /// counterpart of a response body that won't deserialize.
     #[error("agent card file is not a valid agent card: {0}")]
     CardInvalid(String),
+    /// A malformed invocation, as clap describes it. §11.4 counts a
+    /// malformed flag among the CLI-local failures that must still be
+    /// machine-readable, so clap's prose becomes the envelope's message
+    /// rather than being printed in its place.
+    #[error("{0}")]
+    Usage(String),
 }
 
 /// A2A §5.3: where an agent publishes its card, appended to a reference
@@ -537,6 +543,7 @@ impl CliError {
             // card came from a URL or a file.
             CliError::CardFile { .. } => 3,
             CliError::CardInvalid(_) => 1,
+            CliError::Usage(_) => 2,
         }
     }
 
@@ -564,6 +571,11 @@ impl CliError {
             CliError::CardFile { .. } => (
                 "A2ACLI_ERR_CARD_NOT_FOUND".to_string(),
                 Some("check that the --agent-card path exists and is readable".to_string()),
+                None,
+            ),
+            CliError::Usage(_) => (
+                "A2ACLI_ERR_USAGE".to_string(),
+                Some("run `a2acli --help`, or `a2acli <command> --help`".to_string()),
                 None,
             ),
             CliError::CardInvalid(_) => (
@@ -669,9 +681,70 @@ where
     // Must happen before parsing: this is how a local/global .env value
     // becomes visible to clap's own `env = "A2ACLI_..."` resolution (§8.3).
     let dotenv_provenance = load_dotenv_config(&args);
-    let matches = Cli::command().get_matches_from(args);
+    // `try_get_matches_from` rather than `get_matches_from`: the latter
+    // prints clap's prose and exits inside clap, which §11.4 forbids for a
+    // malformed flag — that is a CLI-local failure and must still be
+    // machine-readable.
+    let matches = match Cli::command().try_get_matches_from(args) {
+        Ok(matches) => matches,
+        Err(error) => return Err(clap_error_to_cli_error(error)),
+    };
     let cli = Cli::from_arg_matches(&matches).expect("matches were produced by Cli::command()");
     run(cli, &matches, &dotenv_provenance).await
+}
+
+/// clap reports `--help` and `--version` through the same `Err` channel as a
+/// parse failure, so they have to be told apart: those are successful
+/// requests for output (`A2ACLI_CLI_001`) and keep going to stdout with exit
+/// `0`, while everything else is a usage error carrying the Appendix B
+/// envelope.
+fn clap_error_to_cli_error(error: clap::Error) -> CliError {
+    use clap::error::ErrorKind;
+
+    if matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    ) {
+        // Not failures: the caller asked for this output (A2ACLI_CLI_001).
+        // Delegating to clap's own `exit()` keeps them byte-for-byte what
+        // `get_matches_from` produced, since that is just
+        // `try_get_matches_from(..).unwrap_or_else(|e| e.exit())`.
+        error.exit();
+    }
+
+    // `DisplayHelpOnMissingArgumentOrSubcommand` — a bare `a2acli`, or a
+    // group like `a2acli task` with no subcommand — is *not* in
+    // A2ACLI_CLI_001's list of output requests: clap already treats it as a
+    // usage failure and exits 2. So it carries the envelope like every
+    // other usage error rather than being the one that prints prose, and
+    // the hint points at `--help` for the usage text it replaces.
+
+    CliError::Usage(flatten_clap_message(&error.render().to_string()))
+}
+
+/// clap renders a multi-line message: the error line, a blank line, then a
+/// usage block. Keep the part that names what was wrong, as one line, since
+/// §11.4 wants a single JSON object and the usage block is guidance the
+/// `hint` already points at.
+fn flatten_clap_message(rendered: &str) -> String {
+    // Each line is trimmed on both sides before joining: clap indents
+    // continuation lines, and keeping that indentation would leave runs of
+    // spaces inside the JSON message.
+    let first_block: Vec<&str> = rendered
+        .lines()
+        .map(str::trim)
+        .take_while(|line| !line.is_empty())
+        .collect();
+    let joined = first_block.join(" ");
+    let message = if joined.is_empty() {
+        rendered.trim()
+    } else {
+        joined.as_str()
+    };
+    message
+        .strip_prefix("error: ")
+        .unwrap_or(message)
+        .to_string()
 }
 
 pub async fn run(
@@ -5065,5 +5138,41 @@ mod tests {
             metadata: None,
         })
         .warn_outcome();
+    }
+
+    /// clap renders "error: …" then a blank line then a usage block, and
+    /// indents continuation lines. The envelope carries one line, so the
+    /// first block is joined and the redundant `error: ` prefix dropped —
+    /// the envelope already says it is an error.
+    #[test]
+    fn test_flatten_clap_message() {
+        let rendered = "error: unexpected argument '--nope' found\n\nUsage: a2acli [OPTIONS]\n";
+        assert_eq!(
+            flatten_clap_message(rendered),
+            "unexpected argument '--nope' found"
+        );
+
+        // Continuation lines are trimmed before joining, so no run of
+        // spaces survives into the JSON.
+        let rendered = "error: the following required arguments were not provided:\n  <ID>\n\nUsage: a2acli task get <ID>\n";
+        assert_eq!(
+            flatten_clap_message(rendered),
+            "the following required arguments were not provided: <ID>"
+        );
+
+        // A message with no blank line, and one with nothing but a usage
+        // block, both still produce something.
+        assert_eq!(flatten_clap_message("error: bare"), "bare");
+        assert_eq!(flatten_clap_message("\n\nUsage: a2acli"), "Usage: a2acli");
+    }
+
+    #[test]
+    fn test_usage_error_maps_to_the_appendix_d_usage_code() {
+        let error = CliError::Usage("unexpected argument '--nope' found".to_string());
+        assert_eq!(error.exit_code(), 2);
+        let envelope = error.envelope();
+        assert_eq!(envelope.error.code, "A2ACLI_ERR_USAGE");
+        assert_eq!(envelope.error.message, "unexpected argument '--nope' found");
+        assert!(envelope.error.hint.unwrap().contains("--help"));
     }
 }
