@@ -117,6 +117,19 @@ impl TestServer {
                 make_task("task-1", "ctx-1", TaskState::Completed, "seeded result"),
             );
             tasks.insert(
+                "task-failed".to_string(),
+                make_task("task-failed", "ctx-failed", TaskState::Failed, "it broke"),
+            );
+            tasks.insert(
+                "task-rejected".to_string(),
+                make_task(
+                    "task-rejected",
+                    "ctx-rejected",
+                    TaskState::Rejected,
+                    "not allowed",
+                ),
+            );
+            tasks.insert(
                 "task-needs-input".to_string(),
                 make_task(
                     "task-needs-input",
@@ -300,8 +313,15 @@ impl RequestHandler for TestHandler {
         } else {
             vec![Part::text(format!("Echo: {text}"))]
         };
-        let task =
-            make_task_with_parts(&task_id, &context_id, TaskState::Completed, response_parts);
+        // A task that lands FAILED on the first reply, so `send`'s own
+        // reporting path can be observed naming a non-success outcome
+        // (EXIT_002) rather than only `task get`'s.
+        let state = if text == "send-failing" {
+            TaskState::Failed
+        } else {
+            TaskState::Completed
+        };
+        let task = make_task_with_parts(&task_id, &context_id, state, response_parts);
         self.state
             .tasks
             .lock()
@@ -2563,5 +2583,126 @@ async fn config_show_reports_the_effective_a2a_version() {
     assert!(
         stdout.contains("a2a-version: 1.2 (source: flag)"),
         "{stdout}"
+    );
+}
+
+// EXIT_002 / §6.6, §11.6 (a2aproject/a2a-rs#180): a non-success or paused
+// outcome is named on stderr, while the exit status still reports only
+// whether the CLI did its job.
+
+/// Helper: run without `--output` overriding, returning (stdout, stderr, code).
+fn run_cli_capturing(server: &TestServer, args: &[&str]) -> (String, String, i32) {
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args(["--agent-card", server.base_url.as_str()])
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    (
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+        output.status.code().unwrap(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_and_rejected_outcomes_are_named_on_stderr_and_still_exit_zero() {
+    let server = TestServer::spawn().await;
+
+    let (stdout, stderr, code) = run_cli_capturing(&server, &["task", "get", "task-failed"]);
+    // §6.6: the CLI conducted and reported the turn, so it succeeded.
+    assert_eq!(code, 0);
+    assert!(stderr.contains("warning: task task-failed:"), "{stderr}");
+    assert!(stderr.contains("FAILED"), "{stderr}");
+    // The outcome is still carried in the payload on stdout.
+    assert!(stdout.contains("State: FAILED"), "{stdout}");
+
+    let (_stdout, stderr, code) = run_cli_capturing(&server, &["task", "get", "task-rejected"]);
+    assert_eq!(code, 0);
+    assert!(stderr.contains("warning: task task-rejected:"), "{stderr}");
+    assert!(stderr.contains("REJECTED"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_outcome_is_named_on_stderr() {
+    let server = TestServer::spawn().await;
+
+    let (stdout, stderr, code) = run_cli_capturing(&server, &["task", "get", "task-needs-input"]);
+    assert_eq!(code, 0);
+    assert!(stderr.contains("INPUT_REQUIRED"), "{stderr}");
+    assert!(stderr.contains("needs a reply"), "{stderr}");
+    // The resume hint stays on stdout, where it is copy-pasteable
+    // (INTERACT_004); the warning does not replace it.
+    assert!(stdout.contains("Resume with: a2acli send"), "{stdout}");
+}
+
+/// §11.4's rule for the error envelope applies here too: diagnostics are not
+/// gated on the output format.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_outcome_warning_is_emitted_in_json_mode_too() {
+    let server = TestServer::spawn().await;
+
+    let (stdout, stderr, _code) =
+        run_cli_capturing(&server, &["--output", "json", "task", "get", "task-failed"]);
+
+    assert!(stderr.contains("warning: task task-failed:"), "{stderr}");
+    // stdout stays exactly the protocol document — the warning never
+    // contaminates the payload (§11.1).
+    let task: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(task["id"], "task-failed");
+    assert_eq!(task["status"]["state"], "TASK_STATE_FAILED");
+}
+
+/// A successful task says nothing, and neither does a cancel: `CANCELED` is
+/// the outcome `task cancel` was asked for, so warning about it is noise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_and_cancelled_outcomes_stay_silent() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr, code) = run_cli_capturing(&server, &["task", "get", "task-1"]);
+    assert_eq!(code, 0);
+    assert!(
+        stderr.is_empty(),
+        "completed task should be silent: {stderr}"
+    );
+
+    let (stdout, stderr, code) = run_cli_capturing(&server, &["task", "cancel", "task-1"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("State: CANCELED"), "{stdout}");
+    assert!(
+        !stderr.contains("warning: task"),
+        "cancel should not warn about the state it was asked to produce: {stderr}"
+    );
+}
+
+/// `send` reports through the same path, so a task that lands non-successful
+/// is named there too rather than only under `task get`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_names_a_non_success_outcome() {
+    let server = TestServer::spawn().await;
+
+    let (stdout, stderr, code) = run_cli_capturing(&server, &["send", "send-failing"]);
+
+    assert_eq!(code, 0);
+    assert!(stderr.contains("warning: task task-send:"), "{stderr}");
+    assert!(stderr.contains("FAILED"), "{stderr}");
+    assert!(stdout.contains("State: FAILED"), "{stdout}");
+}
+
+/// Streamed status updates carry the outcome too, so `--stream` and
+/// `task subscribe` are not a silent path around the warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streamed_status_updates_name_a_paused_outcome() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr, code) =
+        run_cli_capturing(&server, &["task", "subscribe", "task-needs-input"]);
+
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("warning: task task-needs-input:"),
+        "{stderr}"
     );
 }

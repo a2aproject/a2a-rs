@@ -728,6 +728,7 @@ pub async fn run(
                             cli.timeout,
                         )
                         .await?;
+                        response.warn_outcome();
                         print_output(&response, &cli)?;
                     }
                     Err(error) => {
@@ -745,6 +746,7 @@ pub async fn run(
                     cli.timeout,
                 )
                 .await?;
+                response.warn_outcome();
                 print_output(&response, &cli)?;
             }
         }
@@ -854,6 +856,71 @@ async fn wait_for_task_settled<T: a2a_client::Transport>(
     }
 }
 
+/// §6.6/§11.6: a turn the CLI conducted and reported exits `0` even when the
+/// agent did not succeed, so the exit status alone cannot tell a caller
+/// that. Name a non-success or paused outcome on stderr instead — in every
+/// output mode, like the error envelope (§11.4), and without touching
+/// stdout, which stays the payload (§11.1).
+///
+/// The four states named are exactly the ones `A2ACLI_EXIT_002` enumerates.
+/// `CANCELED` is deliberately not among them: after `task cancel` it is the
+/// outcome the caller asked for, so warning about it would be noise.
+fn task_outcome_note(state: &TaskState) -> Option<&'static str> {
+    match state {
+        TaskState::Failed => Some("the agent reported it FAILED"),
+        TaskState::Rejected => Some("the agent REJECTED it"),
+        TaskState::InputRequired => {
+            Some("it is paused at INPUT_REQUIRED and needs a reply to continue")
+        }
+        TaskState::AuthRequired => {
+            Some("it is paused at AUTH_REQUIRED and needs credentials to continue")
+        }
+        _ => None,
+    }
+}
+
+fn warn_task_outcome(task_id: &str, state: &TaskState) {
+    if let Some(note) = task_outcome_note(state) {
+        eprintln!("warning: task {task_id}: {note}");
+    }
+}
+
+/// Something the CLI reports that may carry a task outcome. A trait rather
+/// than a call at each print site so a new reporting path cannot quietly
+/// skip the warning — it has to satisfy the bound.
+trait TaskOutcome {
+    fn warn_outcome(&self);
+}
+
+impl TaskOutcome for Task {
+    fn warn_outcome(&self) {
+        warn_task_outcome(&self.id, &self.status.state);
+    }
+}
+
+impl TaskOutcome for SendMessageResponse {
+    fn warn_outcome(&self) {
+        match self {
+            SendMessageResponse::Task(task) => task.warn_outcome(),
+            // A `Message`-only reply created no task, so there is no task
+            // outcome to report (SEND_003).
+            SendMessageResponse::Message(_) => {}
+        }
+    }
+}
+
+impl TaskOutcome for StreamResponse {
+    fn warn_outcome(&self) {
+        match self {
+            StreamResponse::Task(task) => task.warn_outcome(),
+            StreamResponse::StatusUpdate(event) => {
+                warn_task_outcome(&event.task_id, &event.status.state);
+            }
+            StreamResponse::Message(_) | StreamResponse::ArtifactUpdate(_) => {}
+        }
+    }
+}
+
 /// A task in a terminal (`COMPLETED`/`FAILED`/`CANCELED`/`REJECTED`) or
 /// interrupted (`INPUT_REQUIRED`/`AUTH_REQUIRED`) state needs no more polling.
 fn is_settled(state: &TaskState) -> bool {
@@ -915,6 +982,7 @@ async fn run_task_command(
                 cli.timeout,
             )
             .await?;
+            task.warn_outcome();
             print_output(&task, cli)?;
         }
         TaskCommand::List(command) => {
@@ -944,6 +1012,7 @@ async fn run_task_command(
                 })
                 .await;
             let task = finish_client_call(client, result).await?;
+            task.warn_outcome();
             print_output(&task, cli)?;
         }
         TaskCommand::Subscribe(command) => {
@@ -2563,7 +2632,7 @@ async fn finish_client_call<T: a2a_client::Transport, V>(
 /// object per line, flushed as produced — regardless of `--compact`, which
 /// only affects the single-document form (§11.3). Under `-o text`, each
 /// event is rendered in the same field-and-block form as a one-shot result.
-async fn consume_stream<T: a2a_client::Transport, V: Serialize + TextRender>(
+async fn consume_stream<T: a2a_client::Transport, V: Serialize + TextRender + TaskOutcome>(
     client: A2AClient<T>,
     mut stream: BoxStream<'static, Result<V, A2AError>>,
     cli: &Cli,
@@ -2571,6 +2640,7 @@ async fn consume_stream<T: a2a_client::Transport, V: Serialize + TextRender>(
     loop {
         match stream.next().await {
             Some(Ok(value)) => {
+                value.warn_outcome();
                 let printed = match cli.output {
                     OutputFormat::Text => {
                         println!("{}", value.render_text());
@@ -2733,6 +2803,10 @@ mod tests {
         fn render_text(&self) -> String {
             String::new()
         }
+    }
+
+    impl TaskOutcome for FailingSerialize {
+        fn warn_outcome(&self) {}
     }
 
     fn make_test_client(destroy_error: Option<A2AError>) -> A2AClient<TestTransport> {
@@ -4925,5 +4999,71 @@ mod tests {
         let negotiated = negotiate_a2a_version(None, "not-a-version", (1, 0));
         assert_eq!(negotiated.version, "1.0");
         assert!(negotiated.note.unwrap().contains("unparseable"));
+    }
+
+    /// EXIT_002 enumerates exactly four outcomes worth naming. `COMPLETED`
+    /// is success and `CANCELED` is what `task cancel` was asked to produce,
+    /// so neither says anything; the remaining states are mid-flight.
+    #[test]
+    fn test_task_outcome_note_names_only_non_success_and_paused_states() {
+        for (state, expected) in [
+            (TaskState::Failed, "FAILED"),
+            (TaskState::Rejected, "REJECTED"),
+            (TaskState::InputRequired, "INPUT_REQUIRED"),
+            (TaskState::AuthRequired, "AUTH_REQUIRED"),
+        ] {
+            let note =
+                task_outcome_note(&state).unwrap_or_else(|| panic!("{state:?} should be named"));
+            assert!(note.contains(expected), "{state:?} -> {note}");
+        }
+
+        for state in [
+            TaskState::Completed,
+            TaskState::Canceled,
+            TaskState::Submitted,
+            TaskState::Working,
+            TaskState::Unspecified,
+        ] {
+            assert!(
+                task_outcome_note(&state).is_none(),
+                "{state:?} should stay silent"
+            );
+        }
+    }
+
+    /// The warning is derived from the response's own shape, so a reply that
+    /// created no task has no outcome to name.
+    #[test]
+    fn test_task_outcome_is_read_from_the_reported_value() {
+        // A `Message`-only reply created no task (SEND_003).
+        let message = Message::new(Role::Agent, vec![Part::text("hi")]);
+        assert!(
+            task_outcome_note(&TaskState::Completed).is_none(),
+            "sanity: COMPLETED is silent"
+        );
+        SendMessageResponse::Message(message.clone()).warn_outcome();
+        StreamResponse::Message(message).warn_outcome();
+
+        // A task-bearing response reads the task's state.
+        let task = make_fixture_task("t-1", "c-1", TaskState::Failed, "broke");
+        assert_eq!(
+            task_outcome_note(&task.status.state),
+            Some("the agent reported it FAILED")
+        );
+        SendMessageResponse::Task(task.clone()).warn_outcome();
+        StreamResponse::Task(task).warn_outcome();
+
+        // A streamed status update reads the event's state.
+        StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "t-2".to_string(),
+            context_id: "c-2".to_string(),
+            status: TaskStatus {
+                state: TaskState::AuthRequired,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        })
+        .warn_outcome();
     }
 }

@@ -184,6 +184,13 @@ compact JSON error object to stderr, in every output mode:
 {"error":{"code":"TASK_NOT_FOUND","message":"task not found: t-1","a2aCode":-32001}}
 ```
 
+A task that the CLI conducted and reported exits `0` even when the agent did
+not succeed, so the exit status alone cannot say that. A `FAILED` or
+`REJECTED` outcome, and a task paused at `INPUT_REQUIRED`/`AUTH_REQUIRED`,
+is therefore also named in a one-line warning on stderr — in every output
+mode, leaving stdout exactly the payload. `CANCELED` is not warned about:
+after `task cancel` it is the outcome you asked for.
+
 `code` is the A2A protocol's own error name for a protocol failure (with the
 numeric `a2aCode` alongside it), or an `A2ACLI_ERR_*` symbol for a failure
 the protocol never saw (a bad flag, an unreachable agent, a `--timeout`
