@@ -147,9 +147,35 @@ impl JsonRpcTransport {
             .await
             .map_err(|e| A2AError::internal(format!("HTTP request failed: {e}")))?;
 
-        let stream = response.bytes_stream();
-        let event_stream = parse_sse_stream(stream);
-        Ok(event_stream)
+        // A JSON-RPC error answering a streaming call arrives as a normal
+        // (non-SSE) JSON body with HTTP 200, since JSON-RPC reports failures
+        // in the envelope rather than via status code. Detect that case by
+        // content type before handing the body to the SSE parser, which
+        // would otherwise find no `data:` frames and yield an empty stream.
+        // A response with no content type is still treated as a stream:
+        // reading it to inspect it would hang on a stream that has not sent
+        // anything yet.
+        let is_event_stream = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .map(|v| v.as_bytes().starts_with(b"text/event-stream"))
+            .unwrap_or(true);
+
+        if is_event_stream {
+            let stream = response.bytes_stream();
+            Ok(parse_sse_stream(stream))
+        } else {
+            let rpc_response: JsonRpcResponse = response.json().await.map_err(|e| {
+                A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
+            })?;
+
+            match rpc_response.error {
+                Some(err) => Err(parse_jsonrpc_error(err)),
+                None => Err(A2AError::internal(
+                    "expected streaming response but got non-streaming JSON-RPC result",
+                )),
+            }
+        }
     }
 }
 
@@ -535,6 +561,24 @@ mod tests {
         });
 
         (format!("http://{addr}"), request_rx)
+    }
+
+    async fn spawn_jsonrpc_sse_server(sse_body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n{}",
+                sse_body.len(),
+                sse_body,
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        format!("http://{addr}")
     }
 
     async fn read_http_request(socket: &mut TcpStream) -> String {
@@ -1245,6 +1289,141 @@ mod tests {
 
         assert_eq!(error.code, error_code::INVALID_PARAMS);
         assert_eq!(error.message, "invalid params");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_task_streams_on_text_event_stream_response() {
+        // A `text/event-stream` response is still handed to the SSE parser,
+        // end to end through the real HTTP call, not just via the parser's
+        // own unit tests.
+        let status_update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "task-1".into(),
+            context_id: "ctx-1".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        let rpc_resp = JsonRpcResponse::success(
+            JsonRpcId::Number(1),
+            protojson_conv::to_value(&status_update).unwrap(),
+        );
+        let sse_body = format!("data: {}\n\n", serde_json::to_string(&rpc_resp).unwrap());
+        let endpoint = spawn_jsonrpc_sse_server(sse_body).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+
+        let req = SubscribeToTaskRequest {
+            id: "task-1".into(),
+            tenant: None,
+        };
+
+        let mut stream = transport
+            .subscribe_to_task(&ServiceParams::new(), &req)
+            .await
+            .unwrap();
+
+        let item = stream.next().await.unwrap().unwrap();
+        assert!(matches!(item, StreamResponse::StatusUpdate(_)));
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_task_surfaces_jsonrpc_error_on_plain_json_response() {
+        // A JSON-RPC error answering a streaming call arrives as a plain
+        // `application/json` body (HTTP 200), not as an SSE `data:` frame.
+        // Regression test for https://github.com/a2aproject/a2a-rs/issues/134.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "error": {
+                "code": error_code::TASK_NOT_FOUND,
+                "message": "task already terminal",
+                "data": null
+            }
+        })
+        .to_string();
+        let (endpoint, _request_rx) = spawn_jsonrpc_server(response).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+
+        let req = SubscribeToTaskRequest {
+            id: "task-1".into(),
+            tenant: None,
+        };
+
+        let error = match transport
+            .subscribe_to_task(&ServiceParams::new(), &req)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("expected error, got a stream"),
+        };
+
+        assert_eq!(error.code, error_code::TASK_NOT_FOUND);
+        assert_eq!(error.message, "task already terminal");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_task_rejects_non_streaming_success_result() {
+        // A plain `application/json` body with a `result` (no `error`) is not
+        // a valid answer to a streaming call, but it is not an SSE stream
+        // either — surface it as an error instead of silently yielding an
+        // empty stream.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {}
+        })
+        .to_string();
+        let (endpoint, _request_rx) = spawn_jsonrpc_server(response).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+
+        let req = SubscribeToTaskRequest {
+            id: "task-1".into(),
+            tenant: None,
+        };
+
+        let error = match transport
+            .subscribe_to_task(&ServiceParams::new(), &req)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("expected error, got a stream"),
+        };
+
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert_eq!(
+            error.message,
+            "expected streaming response but got non-streaming JSON-RPC result"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_task_surfaces_unparseable_non_streaming_body() {
+        // A non-SSE body that isn't valid JSON-RPC either (e.g. a raw error
+        // page from a proxy) should surface as an error, not an empty stream.
+        let (endpoint, _request_rx) = spawn_jsonrpc_server("not json".into()).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+
+        let req = SubscribeToTaskRequest {
+            id: "task-1".into(),
+            tenant: None,
+        };
+
+        let error = match transport
+            .subscribe_to_task(&ServiceParams::new(), &req)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("expected error, got a stream"),
+        };
+
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert!(error.message.contains("failed to parse JSON-RPC response"));
     }
 
     #[tokio::test]
