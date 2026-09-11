@@ -1780,6 +1780,17 @@ impl ConfigScratchDir {
         std::fs::write(self.path.join(".env"), contents).unwrap();
     }
 
+    /// Write the global `.env` at `<xdg>/a2a-cli/.env` inside this scratch
+    /// dir, and return the `<xdg>` directory for the caller to export as
+    /// `XDG_CONFIG_HOME`.
+    fn write_xdg_env(&self, contents: &str) -> std::path::PathBuf {
+        let xdg = self.path.join("xdg");
+        let dir = xdg.join("a2a-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), contents).unwrap();
+        xdg
+    }
+
     fn command(&self, server: &TestServer) -> StdCommand {
         let mut command = StdCommand::cargo_bin("a2acli").unwrap();
         command
@@ -1914,4 +1925,75 @@ async fn config_show_reports_dotenv_file_as_the_source() {
         .clone();
     let stdout = String::from_utf8(output).unwrap();
     assert!(stdout.contains("tenant: file-tenant (source: local .env file)"));
+}
+
+/// The global `.env` lives at `~/.config/a2a-cli/.env`, but `$XDG_CONFIG_HOME`
+/// relocates `~/.config` when it is set — so the lookup has to honor it
+/// rather than hard-coding the home-relative path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn global_dotenv_is_discovered_under_xdg_config_home() {
+    let server = TestServer::spawn().await;
+    let scratch = ConfigScratchDir::new("config-show-xdg");
+    let xdg = scratch.write_xdg_env("A2ACLI_TENANT=xdg-tenant\n");
+
+    let output = scratch
+        .command(&server)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("tenant: xdg-tenant (source: global .env file)"),
+        "{stdout}"
+    );
+}
+
+/// `config show` has to report an explicit `--transport` preference in the
+/// order it will actually be applied — the point of the command is to settle
+/// which transport wins without having to guess.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_show_reports_an_explicit_transport_preference_in_order() {
+    let server = TestServer::spawn().await;
+    let scratch = ConfigScratchDir::new("config-show-transport");
+
+    let output = scratch
+        .command(&server)
+        .args([
+            "--transport",
+            "rest",
+            "--transport",
+            "jsonrpc",
+            "config",
+            "show",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("transport: rest,jsonrpc (source: flag)"),
+        "{stdout}"
+    );
+
+    // Absent the flag, the card's own ordering is reported rather than a
+    // fabricated default preference.
+    let output = scratch
+        .command(&server)
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("transport: (agent card's own order)"),
+        "{stdout}"
+    );
 }
