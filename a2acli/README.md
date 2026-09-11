@@ -35,6 +35,9 @@ cargo install a2a-cli
 - Human-readable `text` output by default, or the protocol's own JSON
   (`-o/--output json`); every failure is a machine-readable error object
   with a stable code and exit status
+- Full configuration precedence (flag > environment variable > local `.env`
+  > global `.env` > built-in default) with a read-only `config show` to
+  inspect it
 
 ## Run
 
@@ -146,6 +149,49 @@ when a task ends `FAILED`/`REJECTED` or pauses at
 `INPUT_REQUIRED`/`AUTH_REQUIRED` — while `1`/`2`/`3`/`4`/`5` distinguish a
 generic failure, a usage error, an unreachable agent, a rejected credential,
 and a timeout respectively.
+
+### Configuration
+
+Every global option listed above can also be set from the environment or a
+`.env` file, so repeated invocations stay short. Precedence, highest wins:
+
+1. an explicit flag,
+2. a real environment variable,
+3. a local `.env` (found by walking up from the working directory, or the
+   file named by `--config <path>`),
+4. the global `.env` at `~/.config/a2a-cli/.env` (`$XDG_CONFIG_HOME` honored),
+5. the built-in default.
+
+The environment variable name is `A2ACLI_` followed by the long flag name,
+upper-snake-cased — `--bearer` → `A2ACLI_BEARER`, `--transport` →
+`A2ACLI_TRANSPORT` (comma-separated: `A2ACLI_TRANSPORT=jsonrpc,rest`),
+`--context-id` → `A2ACLI_CONTEXT_ID`. The same names work in a `.env` file,
+one `KEY=value` per line; blank lines and `#` comments are ignored, a leading
+`export ` is tolerated, and one layer of surrounding quotes is stripped:
+
+```dotenv
+A2ACLI_BASE_URL=https://agent.example.com
+A2ACLI_TRANSPORT=rest,jsonrpc
+A2ACLI_TIMEOUT=60s
+# credentials
+A2ACLI_BEARER="Bearer <token>"
+```
+
+`--stream`, `-h/--help`, and `-v/--version` are never read from the
+environment or a file — they must always be passed explicitly.
+
+```sh
+cargo run --bin a2acli -- config show                  # inspect effective settings
+cargo run --bin a2acli -- config show -o json
+cargo run --bin a2acli -- --config ./prod.env config show
+```
+
+`config show` is read-only: it prints each effective setting and the source
+it resolved from (redacting credential values), so you can confirm
+precedence without guessing. Change settings by exporting the variable or
+editing a `.env` file directly — the command never mutates anything. `a2acli`
+never writes a `.env` file itself, but warns if one it reads is readable by
+users other than its owner (mode should be `0600`).
 
 ## Conformance
 

@@ -1757,3 +1757,243 @@ async fn debug_flag_emits_diagnostics_without_leaking_the_bearer_token() {
     // ...but never the credential value, regardless of verbosity.
     assert!(!stderr.contains("super-secret-token"));
 }
+
+// CONFIG_001 (a2aproject/a2a-rs#170).
+
+/// A scratch working directory with `HOME`/`XDG_CONFIG_HOME` also pointed at
+/// it (so `~/.config/a2a-cli/.env` resolves somewhere empty and controlled)
+/// — isolates `.env`-discovery tests from both the real developer machine
+/// and from each other despite running in parallel.
+struct ConfigScratchDir {
+    path: std::path::PathBuf,
+}
+
+impl ConfigScratchDir {
+    fn new(name: &str) -> Self {
+        let mut path = std::env::temp_dir();
+        path.push(format!("a2acli-test-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn write_local_env(&self, contents: &str) {
+        std::fs::write(self.path.join(".env"), contents).unwrap();
+    }
+
+    /// Write the global `.env` at `<xdg>/a2a-cli/.env` inside this scratch
+    /// dir, and return the `<xdg>` directory for the caller to export as
+    /// `XDG_CONFIG_HOME`.
+    fn write_xdg_env(&self, contents: &str) -> std::path::PathBuf {
+        let xdg = self.path.join("xdg");
+        let dir = xdg.join("a2a-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), contents).unwrap();
+        xdg
+    }
+
+    fn command(&self, server: &TestServer) -> StdCommand {
+        let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+        command
+            .current_dir(&self.path)
+            .env("HOME", &self.path)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("A2ACLI_TENANT")
+            .env_remove("A2ACLI_BASE_URL")
+            .args(["--base-url", server.base_url.as_str()]);
+        command
+    }
+}
+
+impl Drop for ConfigScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_dotenv_file_sets_a_default_without_a_flag() {
+    let server = TestServer::spawn().await;
+    let scratch = ConfigScratchDir::new("local-dotenv");
+    scratch.write_local_env("A2ACLI_TENANT=file-tenant\n");
+
+    let output = scratch
+        .command(&server)
+        .args(["--output", "json", "--compact", "send", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: Value = serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap();
+    assert_eq!(response["task"]["id"], "task-send");
+
+    let received = server.state.received_send_tenants.lock().unwrap().clone();
+    assert_eq!(received.last().unwrap().as_deref(), Some("file-tenant"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_env_var_outranks_a_local_dotenv_file() {
+    let server = TestServer::spawn().await;
+    let scratch = ConfigScratchDir::new("env-outranks-file");
+    scratch.write_local_env("A2ACLI_TENANT=file-tenant\n");
+
+    let output = scratch
+        .command(&server)
+        .env("A2ACLI_TENANT", "real-env-tenant")
+        .args(["--output", "json", "--compact", "send", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: Value = serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap();
+    assert_eq!(response["task"]["id"], "task-send");
+
+    let received = server.state.received_send_tenants.lock().unwrap().clone();
+    assert_eq!(received.last().unwrap().as_deref(), Some("real-env-tenant"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_config_flag_overrides_local_dotenv_discovery() {
+    let server = TestServer::spawn().await;
+    let scratch = ConfigScratchDir::new("explicit-config-flag");
+    // The auto-discovered local .env says one thing...
+    scratch.write_local_env("A2ACLI_TENANT=cwd-tenant\n");
+    // ...but an explicit --config file says another, and must win.
+    let explicit_path = scratch.path.join("prod.env");
+    std::fs::write(&explicit_path, "A2ACLI_TENANT=explicit-tenant\n").unwrap();
+
+    let output = scratch
+        .command(&server)
+        .args([
+            "--config",
+            explicit_path.to_str().unwrap(),
+            "--output",
+            "json",
+            "--compact",
+            "send",
+            "hello",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: Value = serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap();
+    assert_eq!(response["task"]["id"], "task-send");
+
+    let received = server.state.received_send_tenants.lock().unwrap().clone();
+    assert_eq!(received.last().unwrap().as_deref(), Some("explicit-tenant"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_show_reports_effective_settings_and_sources() {
+    let server = TestServer::spawn().await;
+    let scratch = ConfigScratchDir::new("config-show");
+
+    let output = scratch
+        .command(&server)
+        .args(["--bearer", "super-secret", "config", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+
+    // A flag-supplied credential is redacted, and its source is "flag".
+    assert!(stdout.contains("bearer: (set, redacted) (source: flag)"));
+    assert!(!stdout.contains("super-secret"));
+    // An untouched setting reports the built-in default and its source.
+    assert!(stdout.contains("(source: built-in default)"));
+    assert!(stdout.contains("output: text"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_show_reports_dotenv_file_as_the_source() {
+    let server = TestServer::spawn().await;
+    let scratch = ConfigScratchDir::new("config-show-dotenv");
+    scratch.write_local_env("A2ACLI_TENANT=file-tenant\n");
+
+    let output = scratch
+        .command(&server)
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(stdout.contains("tenant: file-tenant (source: local .env file)"));
+}
+
+/// The global `.env` lives at `~/.config/a2a-cli/.env`, but `$XDG_CONFIG_HOME`
+/// relocates `~/.config` when it is set — so the lookup has to honor it
+/// rather than hard-coding the home-relative path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn global_dotenv_is_discovered_under_xdg_config_home() {
+    let server = TestServer::spawn().await;
+    let scratch = ConfigScratchDir::new("config-show-xdg");
+    let xdg = scratch.write_xdg_env("A2ACLI_TENANT=xdg-tenant\n");
+
+    let output = scratch
+        .command(&server)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("tenant: xdg-tenant (source: global .env file)"),
+        "{stdout}"
+    );
+}
+
+/// `config show` has to report an explicit `--transport` preference in the
+/// order it will actually be applied — the point of the command is to settle
+/// which transport wins without having to guess.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_show_reports_an_explicit_transport_preference_in_order() {
+    let server = TestServer::spawn().await;
+    let scratch = ConfigScratchDir::new("config-show-transport");
+
+    let output = scratch
+        .command(&server)
+        .args([
+            "--transport",
+            "rest",
+            "--transport",
+            "jsonrpc",
+            "config",
+            "show",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("transport: rest,jsonrpc (source: flag)"),
+        "{stdout}"
+    );
+
+    // Absent the flag, the card's own ordering is reported rather than a
+    // fabricated default preference.
+    let output = scratch
+        .command(&server)
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("transport: (agent card's own order)"),
+        "{stdout}"
+    );
+}
