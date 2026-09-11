@@ -213,8 +213,15 @@ impl RequestHandler for TestHandler {
             // Unlike "stream-error" (a stream that opens, then yields an
             // error item), this fails *opening* the stream at all — the
             // case send's fallback-to-polling path (TASK_POLL_004) exists
-            // for.
+            // for. UNSUPPORTED_OPERATION specifically, since that's the
+            // only code the fallback should trigger on.
             return Err(A2AError::unsupported_operation("streaming not available"));
+        }
+        if text == "stream-open-real-error" {
+            // A genuine failure opening the stream that is *not*
+            // "streaming unsupported" — this must propagate as an error,
+            // not be silently retried as a one-shot send.
+            return Err(A2AError::internal("transport exploded"));
         }
 
         let task = make_task(
@@ -1152,4 +1159,54 @@ async fn data_part_reports_a_usage_error_when_stdin_is_not_utf8() {
         .clone();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("failed to read <stdin>"));
+}
+
+// Review fixes (a2aproject/a2a-rs#172 review from msardara).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_propagates_a_non_unsupported_error_instead_of_falling_back() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) =
+        run_cli_failure(&server, &["send", "stream-open-real-error", "--stream"]);
+    assert!(stderr.contains("a2a error"));
+    assert!(stderr.contains("transport exploded"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_rejects_a_message_with_no_content_at_all() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(&server, &["send"]);
+    assert!(stderr.contains("message must have at least one part"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn media_type_alone_with_no_other_part_flag_is_rejected() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(&server, &["send", "--media-type", "application/json"]);
+    assert!(stderr.contains("--media-type must immediately follow"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_part_reports_the_real_error_for_an_unreadable_existing_path() {
+    let server = TestServer::spawn().await;
+
+    // A directory exists but can never be read as file content — read_to_string
+    // fails with something other than NotFound, which must be reported as a
+    // ReadFile error rather than silently retried as inline JSON.
+    let mut dir_path = std::env::temp_dir();
+    dir_path.push(format!("a2acli-test-data-part-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir_path).unwrap();
+
+    let (_stdout, stderr) = run_cli_failure(
+        &server,
+        &["send", "--data-part", dir_path.to_str().unwrap()],
+    );
+
+    std::fs::remove_dir_all(&dir_path).unwrap();
+
+    assert!(stderr.contains("failed to read"));
+    assert!(!stderr.contains("must be a file path"));
 }

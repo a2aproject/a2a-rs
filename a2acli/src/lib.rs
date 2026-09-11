@@ -377,12 +377,19 @@ pub async fn run(cli: Cli, matches: &ArgMatches) -> Result<(), CliError> {
                     Ok(stream) => {
                         consume_stream(client, stream, cli.compact).await?;
                     }
-                    Err(_stream_unsupported) => {
-                        // Streaming failed to open (e.g. the agent doesn't
-                        // advertise the capability) — fall back to a
-                        // one-shot send plus polling rather than hanging.
+                    Err(error) if error.code == a2a::error_code::UNSUPPORTED_OPERATION => {
+                        // The agent doesn't advertise the streaming
+                        // capability — fall back to a one-shot send plus
+                        // polling rather than hanging (TASK_POLL_004). Any
+                        // *other* error opening the stream is a real
+                        // failure and must be reported as such, not masked
+                        // by a silent retry.
                         let response = send_and_maybe_wait(client, &request, &cli).await?;
                         print_json(&response, cli.compact)?;
+                    }
+                    Err(error) => {
+                        let _ = client.destroy().await;
+                        return Err(error.into());
                     }
                 }
             } else {
@@ -651,14 +658,27 @@ fn resolve_message_parts(
         );
     }
 
+    if !command.media_types.is_empty() && tokens.is_empty() {
+        // A lone --media-type with no other part flag at all must not be
+        // silently dropped by the "no part flags given" branch below.
+        return Err(CliError::InvalidInput(
+            "--media-type must immediately follow a --text-part/--file-part/--data-part"
+                .to_string(),
+        ));
+    }
+
     if tokens.is_empty() {
         // No part flags given: the positional text (if any) is shorthand for
-        // a single text part.
-        return Ok(command
-            .text
-            .as_deref()
-            .map(|text| vec![Part::text(text)])
-            .unwrap_or_default());
+        // a single text part. A message with no content at all is a usage
+        // error, not a silently empty parts array.
+        return match command.text.as_deref() {
+            Some(text) => Ok(vec![Part::text(text)]),
+            None => Err(CliError::InvalidInput(
+                "message must have at least one part: pass text, or use \
+                 --text-part/--file-part/--data-part"
+                    .to_string(),
+            )),
+        };
     }
 
     if command.text.is_some() {
@@ -737,8 +757,18 @@ fn build_data_part(value: &str) -> Result<Part, CliError> {
         return Ok(Part::data(serde_json::from_str(&buffer)?));
     }
 
-    if let Ok(text) = std::fs::read_to_string(value) {
-        return Ok(Part::data(serde_json::from_str(&text)?));
+    match std::fs::read_to_string(value) {
+        Ok(text) => return Ok(Part::data(serde_json::from_str(&text)?)),
+        Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+            // The path exists but couldn't be read (permission denied, not
+            // a regular file, invalid UTF-8, ...) — that's a real failure
+            // to surface, not a signal to fall back to inline-JSON parsing.
+            return Err(CliError::ReadFile {
+                path: value.to_string(),
+                source,
+            });
+        }
+        Err(_) => {} // no such file — try parsing `value` itself as JSON below
     }
 
     serde_json::from_str(value).map(Part::data).map_err(|_| {
