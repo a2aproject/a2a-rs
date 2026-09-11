@@ -25,11 +25,30 @@ use tokio::net::TcpListener;
 /// (Authorization, x-test, x-api-key) recorded per card fetch.
 type CardHeaders = (Option<String>, Option<String>, Option<String>);
 
-/// (Authorization, x-api-key, x-trace-id) recorded per call to the *agent*.
+/// (Authorization, x-api-key, x-trace-id, A2A-Version) recorded per call to
+/// the *agent*. The version is recorded as every value joined by `,`, so a
+/// test can tell one explicit version from two appended ones.
 /// Kept separate from [`CardHeaders`] because the card fetch and the agent
 /// call go out over different clients: a credential reaching one is no
 /// evidence it reaches the other.
-type AgentHeaders = (Option<String>, Option<String>, Option<String>);
+type AgentHeaders = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Every value sent for `name`, joined by `,` — distinguishes a header set
+/// once from one appended to twice.
+fn joined_header_values(headers: &HeaderMap, name: &str) -> Option<String> {
+    let values: Vec<String> = headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+        .collect();
+    (!values.is_empty()).then(|| values.join(","))
+}
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
@@ -136,6 +155,7 @@ impl TestServer {
                         header_value(&headers, header::AUTHORIZATION.as_str()),
                         header_value(&headers, "x-api-key"),
                         header_value(&headers, "x-trace-id"),
+                        joined_header_values(&headers, "a2a-version"),
                     ));
                     next.run(request).await
                 }
@@ -1605,7 +1625,7 @@ async fn credentials_and_service_params_reach_the_agent_not_only_the_card_fetch(
     );
 
     let headers = server.state.agent_headers.lock().unwrap().clone();
-    let (authorization, api_key, trace_id) = headers
+    let (authorization, api_key, trace_id, _version) = headers
         .last()
         .cloned()
         .expect("the agent call should have been recorded");
@@ -2412,4 +2432,136 @@ async fn config_show_reports_a_local_card_file_as_the_resolved_card() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// VER_001 / §13.2 (a2aproject/a2a-rs#179): protocol version signaling.
+
+/// §13.2: the version is signaled on **every** request, and exactly once —
+/// A2A reads an empty value as 0.3, and two values would leave which one
+/// applies undefined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a2a_version_is_signaled_once_on_every_request() {
+    let server = TestServer::spawn().await;
+
+    run_cli_success(&server, &["task", "get", "task-1"]);
+
+    let headers = server.state.agent_headers.lock().unwrap().clone();
+    assert!(
+        !headers.is_empty(),
+        "the agent call should have been recorded"
+    );
+    for (_, _, _, version) in &headers {
+        // The fixture card declares this build's own version, so nothing is
+        // negotiated away and exactly one value is sent.
+        assert_eq!(version.as_deref(), Some(a2a::VERSION), "{headers:?}");
+    }
+}
+
+/// An explicit `--a2a-version` is what goes on the wire, replacing the
+/// client library's default rather than being appended to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_a2a_version_replaces_the_default_rather_than_appending() {
+    let server = TestServer::spawn().await;
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--agent-card",
+            server.base_url.as_str(),
+            "--output",
+            "json",
+            "--a2a-version",
+            "1.4",
+            "task",
+            "get",
+            "task-1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let headers = server.state.agent_headers.lock().unwrap().clone();
+    let version = headers.last().unwrap().3.clone();
+    // Exactly "1.4" — not "1.0,1.4", which is what appending would produce.
+    assert_eq!(version.as_deref(), Some("1.4"), "{headers:?}");
+
+    // §13.2: no silent change of the signaled version.
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("signaling A2A-Version 1.4"), "{stderr}");
+}
+
+/// §11.6: a bad `--a2a-version` is a usage error, reported before any
+/// network work — it must not need a reachable agent to surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_a2a_version_is_a_usage_error_without_contacting_the_agent() {
+    let server = TestServer::spawn().await;
+
+    for bad in ["0.3", "2.0", "nonsense"] {
+        let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+        let output = command
+            .args([
+                "--agent-card",
+                server.base_url.as_str(),
+                "--a2a-version",
+                bad,
+                "card",
+                "get",
+            ])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+
+        let envelope = parse_error_envelope(&String::from_utf8(output.stderr).unwrap());
+        assert_eq!(
+            envelope["error"]["code"], "A2ACLI_ERR_USAGE",
+            "version {bad}"
+        );
+        assert_eq!(output.status.code().unwrap(), 2, "version {bad}");
+    }
+
+    // No card was ever fetched: the flag was rejected first.
+    assert!(
+        server.state.card_headers.lock().unwrap().is_empty(),
+        "a usage error must not require contacting the agent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_show_reports_the_effective_a2a_version() {
+    let server = TestServer::spawn().await;
+    let scratch = ConfigScratchDir::new("a2a-version");
+
+    let stdout = String::from_utf8(
+        scratch
+            .command(&server)
+            .args(["config", "show"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stdout.contains("a2a-version: (negotiated from the agent card"),
+        "{stdout}"
+    );
+
+    let stdout = String::from_utf8(
+        scratch
+            .command(&server)
+            .args(["--a2a-version", "1.2", "config", "show"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stdout.contains("a2a-version: 1.2 (source: flag)"),
+        "{stdout}"
+    );
 }

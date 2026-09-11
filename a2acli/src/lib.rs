@@ -26,7 +26,7 @@ Default behavior (SPEC.md §6.5):
   - Transport: the agent card's first supported interface (--transport overrides)
   - Task completion: wait until terminal/interrupted state (--async returns immediately)
   - Output: human-readable text (-o/--output json switches to protocol JSON)
-  - Protocol version: negotiated automatically on every request
+  - Protocol version: highest shared 1.x, from the agent card (--a2a-version pins it)
   - Transport security: TLS verification on (--insecure disables it, with a warning)"
 )]
 pub struct Cli {
@@ -87,6 +87,13 @@ pub struct Cli {
     pub transport: Vec<Binding>,
 
     /// Bearer token attached to the agent-card fetch and client calls.
+    /// Protocol version to signal to the server on every request (§13.2).
+    /// Absent this flag the version is negotiated down to the highest one
+    /// both a2acli and the agent's selected interface declare. Must be
+    /// 1.x: A2A reads an empty or pre-1.0 value as 0.3.
+    #[arg(long = "a2a-version", global = true, env = "A2ACLI_A2A_VERSION")]
+    pub a2a_version: Option<String>,
+
     #[arg(long, global = true, env = "A2ACLI_BEARER")]
     pub bearer: Option<String>,
 
@@ -682,6 +689,10 @@ pub async fn run(
             .with_target(false)
             .try_init();
     }
+
+    // §11.6: a bad flag is reported before any network work, so a usage
+    // error never depends on a reachable agent.
+    validate_a2a_version(cli.a2a_version.as_deref())?;
 
     match &cli.command {
         Command::Card { command } => run_card_command(&cli, matches, command).await?,
@@ -1605,6 +1616,14 @@ fn effective_config_settings(
         "A2ACLI_TRANSPORT",
     );
     add(
+        "a2a_version",
+        "a2a-version",
+        cli.a2a_version.clone().unwrap_or_else(|| {
+            format!("(negotiated from the agent card; a2acli supports {VERSION})")
+        }),
+        "A2ACLI_A2A_VERSION",
+    );
+    add(
         "bearer",
         "bearer",
         redact_secret(&cli.bearer),
@@ -1692,6 +1711,137 @@ struct ResolvedClient {
     tenant: Option<String>,
 }
 
+/// §13.2: the A2A protocol version, as a `(major, minor)` pair. A2A
+/// versions are `major.minor`; a trailing patch component is tolerated and
+/// ignored so a card declaring `1.0.2` still negotiates.
+fn parse_protocol_version(value: &str) -> Option<(u32, u32)> {
+    let mut parts = value.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = match parts.next() {
+        Some(minor) => minor.parse().ok()?,
+        None => 0,
+    };
+    Some((major, minor))
+}
+
+/// The version this build of a2acli speaks.
+fn supported_protocol_version() -> (u32, u32) {
+    parse_protocol_version(VERSION).unwrap_or((1, 0))
+}
+
+/// What the negotiation settled on, and why — kept together so the caller
+/// can report a downgrade rather than applying one silently (§13.2).
+struct NegotiatedVersion {
+    version: String,
+    /// Set when the effective version is not simply this build's own, so
+    /// the reason can be surfaced on stderr.
+    note: Option<String>,
+}
+
+/// §13.2: an explicit `--a2a-version` is signaled as given — the caller
+/// asked for it. Absent one, negotiate down to the highest version both
+/// a2acli and the agent's selected interface declare, bounded to 1.x and
+/// never below 1.0, since A2A reads a pre-1.0 value as 0.3 and a downgrade
+/// into 0.x semantics is exactly what §13.2 forbids.
+fn negotiate_a2a_version(
+    explicit: Option<&str>,
+    declared: &str,
+    supported: (u32, u32),
+) -> NegotiatedVersion {
+    // An explicit version is signaled exactly as the caller wrote it. It has
+    // already been rejected unless 1.x by `validate_a2a_version`, which runs
+    // before any network work so a bad flag needs no reachable agent.
+    let supported_label = format!("{}.{}", supported.0, supported.1);
+
+    if let Some(requested) = explicit {
+        let note = (parse_protocol_version(requested) != Some(supported)).then(|| {
+            format!("signaling A2A-Version {requested} (a2acli supports {supported_label})")
+        });
+        return NegotiatedVersion {
+            version: requested.to_string(),
+            note,
+        };
+    }
+
+    let Some(declared_version) = parse_protocol_version(declared) else {
+        return NegotiatedVersion {
+            version: supported_label.clone(),
+            note: Some(format!(
+                "agent card declares an unparseable protocol version ({declared}); \
+                 signaling {supported_label}"
+            )),
+        };
+    };
+
+    // Below 1.0, or a different major: there is nothing to negotiate within
+    // 1.x, so hold the floor rather than following the card down.
+    if declared_version.0 != 1 {
+        return NegotiatedVersion {
+            version: supported_label.clone(),
+            note: Some(format!(
+                "agent card declares protocol version {declared}, which is outside 1.x; \
+                 signaling {supported_label} rather than negotiating below 1.0"
+            )),
+        };
+    }
+
+    if declared_version < supported {
+        let version = format!("{}.{}", declared_version.0, declared_version.1);
+        return NegotiatedVersion {
+            note: Some(format!(
+                "negotiated A2A-Version down to {version} (agent card declares {version}, \
+                 a2acli supports {supported_label})"
+            )),
+            version,
+        };
+    }
+
+    NegotiatedVersion {
+        version: supported_label,
+        note: None,
+    }
+}
+
+/// §13.2 / §11.6: reject a `--a2a-version` a2acli will not signal, before
+/// any network work — a bad flag is a usage error and must not require a
+/// reachable agent to report. A2A reads an empty or pre-1.0 value as 0.3, so
+/// anything outside 1.x is refused rather than quietly downgraded.
+fn validate_a2a_version(value: Option<&str>) -> Result<(), CliError> {
+    let Some(requested) = value else {
+        return Ok(());
+    };
+    match parse_protocol_version(requested) {
+        Some((1, _)) => Ok(()),
+        Some(_) => Err(CliError::InvalidInput(format!(
+            "--a2a-version must be 1.x, got {requested}: A2A reads an empty or pre-1.0 \
+             version as 0.3, and a2acli never signals below 1.0"
+        ))),
+        None => Err(CliError::InvalidInput(format!(
+            "--a2a-version must be a version like 1.0, got {requested}"
+        ))),
+    }
+}
+
+/// Sets `A2A-Version` to exactly the negotiated version, replacing the
+/// client library's default rather than appending to it: §13.2 requires one
+/// explicit version per request, and two values would leave which one
+/// applies undefined.
+struct VersionInterceptor {
+    version: String,
+}
+
+#[async_trait::async_trait]
+impl a2a_client::middleware::CallInterceptor for VersionInterceptor {
+    async fn before(
+        &self,
+        _method: &str,
+        params: &mut a2a_client::ServiceParams,
+    ) -> Result<(), A2AError> {
+        params.insert(SVC_PARAM_VERSION.to_string(), vec![self.version.clone()]);
+        Ok(())
+    }
+}
+
 /// How the caller named the agent (§7.2), validated once so the two forms
 /// can't disagree further down: an Agent Card reference to resolve, or a
 /// single interface to connect to directly.
@@ -1771,29 +1921,52 @@ async fn resolve_client(cli: &Cli, matches: &ArgMatches) -> Result<ResolvedClien
                 insecure,
             ))));
     }
+    // Collected rather than handed to the builder, because the version
+    // interceptor can only be built once the selected interface is known
+    // (§13.2 negotiates against what *that* interface declares) and
+    // `with_interceptors` sets the whole list.
+    let mut interceptors: Vec<Arc<dyn a2a_client::middleware::CallInterceptor>> = Vec::new();
     if let Some(token) = &cli.bearer {
-        builder = builder.with_interceptor(Arc::new(AuthInterceptor::bearer(token.clone())));
+        interceptors.push(Arc::new(AuthInterceptor::bearer(token.clone())));
     }
     if let Some(api_key) = &cli.api_key {
-        builder = builder.with_interceptor(Arc::new(AuthInterceptor::custom(
+        interceptors.push(Arc::new(AuthInterceptor::custom(
             "X-API-Key",
             api_key.clone(),
         )));
     }
     for param in &cli.svc_params {
-        builder = builder.with_interceptor(Arc::new(AuthInterceptor::custom(
+        interceptors.push(Arc::new(AuthInterceptor::custom(
             param.name.clone(),
             param.value.clone(),
         )));
     }
     if cli.debug {
-        builder = builder.with_interceptor(Arc::new(a2a_client::middleware::LoggingInterceptor));
+        interceptors.push(Arc::new(a2a_client::middleware::LoggingInterceptor));
     }
 
     let factory = builder.build();
     let (client, interface) = factory.create_from_card_with_interface(&card).await?;
+
+    let negotiated = negotiate_a2a_version(
+        cli.a2a_version.as_deref(),
+        &interface.protocol_version,
+        supported_protocol_version(),
+    );
+    // §13.2: no silent downgrade. Whenever the effective version isn't
+    // simply this build's own, say so.
+    if let Some(note) = &negotiated.note {
+        eprintln!("warning: {note}");
+    }
+    interceptors.push(Arc::new(VersionInterceptor {
+        version: negotiated.version,
+    }));
+
     let tenant = cli.tenant.clone().or(interface.tenant);
-    Ok(ResolvedClient { client, tenant })
+    Ok(ResolvedClient {
+        client: client.with_interceptors(interceptors),
+        tenant,
+    })
 }
 
 /// An `--agent-card` reference resolved to where the card actually lives
@@ -4664,5 +4837,93 @@ mod tests {
         // No card was read, so nothing is advertised.
         assert_eq!(card.capabilities.streaming, None);
         assert!(card.skills.is_empty());
+    }
+
+    #[test]
+    fn test_parse_protocol_version() {
+        assert_eq!(parse_protocol_version("1"), Some((1, 0)));
+        assert_eq!(parse_protocol_version("1.0"), Some((1, 0)));
+        assert_eq!(parse_protocol_version("1.2"), Some((1, 2)));
+        // A patch component is tolerated and ignored: A2A versions are
+        // major.minor, and a card declaring 1.0.2 must still negotiate.
+        assert_eq!(parse_protocol_version("1.0.2"), Some((1, 0)));
+        assert_eq!(parse_protocol_version(" 1.1 "), Some((1, 1)));
+        assert_eq!(parse_protocol_version("nonsense"), None);
+        assert_eq!(parse_protocol_version(""), None);
+        assert_eq!(parse_protocol_version("1.x"), None);
+    }
+
+    /// §13.2: anything outside 1.x is refused rather than downgraded,
+    /// because A2A reads an empty or pre-1.0 version as 0.3.
+    #[test]
+    fn test_validate_a2a_version() {
+        for accepted in [None, Some("1"), Some("1.0"), Some("1.7")] {
+            assert!(
+                validate_a2a_version(accepted).is_ok(),
+                "should accept {accepted:?}"
+            );
+        }
+
+        for rejected in ["0.3", "0.9", "2.0", "nonsense", ""] {
+            let error = validate_a2a_version(Some(rejected)).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "rejecting {rejected}");
+            assert_eq!(error.envelope().error.code, "A2ACLI_ERR_USAGE");
+        }
+
+        // The pre-1.0 refusal explains itself rather than just failing.
+        let error = validate_a2a_version(Some("0.3")).unwrap_err();
+        assert!(error.to_string().contains("must be 1.x"), "{error}");
+    }
+
+    #[test]
+    fn test_negotiate_a2a_version_uses_an_explicit_flag_verbatim() {
+        // Explicit and equal to what this build speaks: nothing to report.
+        let negotiated = negotiate_a2a_version(Some("1.0"), "1.0", (1, 0));
+        assert_eq!(negotiated.version, "1.0");
+        assert!(negotiated.note.is_none());
+
+        // Explicit and different: used as written, and said out loud, since
+        // §13.2 forbids a silent change of the signaled version.
+        let negotiated = negotiate_a2a_version(Some("1.3"), "1.0", (1, 0));
+        assert_eq!(negotiated.version, "1.3");
+        assert!(negotiated.note.unwrap().contains("1.3"));
+    }
+
+    /// Absent a flag, negotiate down to the highest version both sides
+    /// declare — `supported` is a parameter precisely so this branch is
+    /// exercisable while this build's own VERSION is still 1.0.
+    #[test]
+    fn test_negotiate_a2a_version_takes_the_highest_shared_1x() {
+        // Agent declares less than we support: follow it down, and say so.
+        let negotiated = negotiate_a2a_version(None, "1.1", (1, 3));
+        assert_eq!(negotiated.version, "1.1");
+        assert!(negotiated.note.unwrap().contains("negotiated"));
+
+        // Agent declares more than we support: hold at ours, nothing to say.
+        let negotiated = negotiate_a2a_version(None, "1.5", (1, 3));
+        assert_eq!(negotiated.version, "1.3");
+        assert!(negotiated.note.is_none());
+
+        // Equal: no note.
+        let negotiated = negotiate_a2a_version(None, "1.3", (1, 3));
+        assert_eq!(negotiated.version, "1.3");
+        assert!(negotiated.note.is_none());
+    }
+
+    /// The 1.0 floor: a card declaring a pre-1.0 or non-1.x version does not
+    /// drag the tool into 0.3 semantics, and the refusal is reported.
+    #[test]
+    fn test_negotiate_a2a_version_never_goes_below_the_1x_floor() {
+        for declared in ["0.3", "0.9", "2.0"] {
+            let negotiated = negotiate_a2a_version(None, declared, (1, 0));
+            assert_eq!(negotiated.version, "1.0", "declared {declared}");
+            let note = negotiated.note.unwrap_or_default();
+            assert!(note.contains("outside 1.x"), "declared {declared}: {note}");
+        }
+
+        // An unparseable declaration is also not a reason to downgrade.
+        let negotiated = negotiate_a2a_version(None, "not-a-version", (1, 0));
+        assert_eq!(negotiated.version, "1.0");
+        assert!(negotiated.note.unwrap().contains("unparseable"));
     }
 }
