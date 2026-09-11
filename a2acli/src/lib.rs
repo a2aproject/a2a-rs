@@ -1,12 +1,15 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // SPDX-License-Identifier: Apache-2.0
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use a2a::*;
 use a2a_client::auth::AuthInterceptor;
 use a2a_client::{A2AClient, A2AClientFactory, BoxStream};
+use clap::parser::ValueSource;
 use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use reqwest::{Client, RequestBuilder};
@@ -27,15 +30,32 @@ Default behavior (SPEC.md §6.5):
   - Transport security: TLS verification on (--insecure disables it, with a warning)"
 )]
 pub struct Cli {
+    /// Load configuration from an explicit .env file in place of the local
+    /// .env (found by walking up from the working directory). Real
+    /// environment variables still take precedence over it (§6.5).
+    #[arg(long, global = true)]
+    pub config: Option<String>,
+
     /// Base URL used to resolve /.well-known/agent-card.json.
-    #[arg(long, global = true, default_value = "http://localhost:3000")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "http://localhost:3000",
+        env = "A2ACLI_BASE_URL"
+    )]
     pub base_url: String,
 
     /// Client transport preference, repeatable and ordered (highest first):
     /// e.g. `--transport jsonrpc --transport rest`. Overrides the agent
     /// card's own preference order; a binding the card doesn't offer is
     /// skipped.
-    #[arg(long, global = true, value_enum)]
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        env = "A2ACLI_TRANSPORT",
+        value_delimiter = ','
+    )]
     pub transport: Vec<Binding>,
 
     /// Bearer token attached to the agent-card fetch and client calls.
@@ -58,34 +78,41 @@ pub struct Cli {
     /// Disable TLS certificate verification for the negotiated transport.
     /// Development only — always prints a warning, and never disables
     /// verification silently.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "A2ACLI_INSECURE")]
     pub insecure: bool,
 
     /// Verbose diagnostics to stderr: request/response timing and outcome
     /// for each call. Never includes credential material (bearer token,
     /// API key, or any --svc-param value), and that redaction cannot be
     /// defeated by this or any other verbosity flag.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "A2ACLI_DEBUG")]
     pub debug: bool,
 
     /// Optional tenant forwarded to A2A requests that support it. Overrides
     /// the routing tenant the selected Agent Card interface may itself
     /// declare (A2A §8.3.2); omit this to use the interface's own value,
     /// if it has one.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "A2ACLI_TENANT")]
     pub tenant: Option<String>,
 
     /// Output format: human-readable `text` (default) or the protocol's own
     /// `json` types. Cardinality (one document vs. JSONL) follows `--stream`,
     /// not this flag (§11.3).
-    #[arg(short = 'o', long, global = true, value_enum, default_value_t = OutputFormat::Text)]
+    #[arg(
+        short = 'o',
+        long,
+        global = true,
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        env = "A2ACLI_OUTPUT"
+    )]
     pub output: OutputFormat,
 
     /// With `-o json` (and no `--stream`), emit compact JSON instead of
     /// pretty-printed JSON. Has no effect on `-o text` or on `--stream`
     /// JSONL, which is always one compact object per line regardless of
     /// this flag (§11.3).
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "A2ACLI_COMPACT")]
     pub compact: bool,
 
     /// Do not wait: return the task identifiers immediately instead of blocking
@@ -101,22 +128,28 @@ pub struct Cli {
         long = "async",
         alias = "no-wait",
         global = true,
-        conflicts_with = "wait"
+        conflicts_with = "wait",
+        env = "A2ACLI_ASYNC"
     )]
     pub async_mode: bool,
 
     /// Explicitly block until the task reaches a terminal or interrupted state.
     /// This is already the default for `send`; on `task get` it turns the
     /// one-shot read into a poll loop.
-    #[arg(long, global = true, conflicts_with = "async_mode")]
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "async_mode",
+        env = "A2ACLI_WAIT"
+    )]
     pub wait: bool,
 
     /// Delay between polls while waiting for a task to settle (e.g. "2s", "500ms").
-    #[arg(long, global = true, value_parser = parse_duration, default_value = "2s")]
+    #[arg(long, global = true, value_parser = parse_duration, default_value = "2s", env = "A2ACLI_POLL_INTERVAL")]
     pub poll_interval: Duration,
 
     /// Overall time budget for a blocking wait before reporting a timeout (e.g. "30s", "2m").
-    #[arg(long, global = true, value_parser = parse_duration, default_value = "30s")]
+    #[arg(long, global = true, value_parser = parse_duration, default_value = "30s", env = "A2ACLI_TIMEOUT")]
     pub timeout: Duration,
 
     #[command(subcommand)]
@@ -129,6 +162,11 @@ pub enum Command {
     Card {
         #[command(subcommand)]
         command: CardCommand,
+    },
+    /// Configuration inspection.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
     /// Send a message to start or continue an interaction.
     Send(MessageCommand),
@@ -143,6 +181,15 @@ pub enum Command {
 pub enum CardCommand {
     /// Fetch and print the Agent Card. Pass --extended for the authenticated extended card.
     Get(CardGetCommand),
+}
+
+#[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
+pub enum ConfigCommand {
+    /// Print each effective setting and the source it resolved from
+    /// (flag, environment variable, local .env file, global .env file, or
+    /// built-in default). Read-only: credential values are redacted, and
+    /// this command never edits configuration itself (§8.3).
+    Show,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -197,11 +244,11 @@ pub struct MessageCommand {
     pub media_types: Vec<String>,
 
     /// Optional context identifier to continue an existing conversation.
-    #[arg(long)]
+    #[arg(long, env = "A2ACLI_CONTEXT_ID")]
     pub context_id: Option<String>,
 
     /// Optional task identifier to continue an existing task.
-    #[arg(long)]
+    #[arg(long, env = "A2ACLI_TASK_ID")]
     pub task_id: Option<String>,
 
     /// Ask the server to include up to this many history items in task responses.
@@ -550,14 +597,22 @@ fn http_error_exit_code(error: &reqwest::Error) -> i32 {
 pub async fn run_args<I, T>(args: I) -> Result<(), CliError>
 where
     I: IntoIterator<Item = T>,
-    T: Into<OsString> + Clone,
+    T: Into<OsString>,
 {
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    // Must happen before parsing: this is how a local/global .env value
+    // becomes visible to clap's own `env = "A2ACLI_..."` resolution (§8.3).
+    let dotenv_provenance = load_dotenv_config(&args);
     let matches = Cli::command().get_matches_from(args);
     let cli = Cli::from_arg_matches(&matches).expect("matches were produced by Cli::command()");
-    run(cli, &matches).await
+    run(cli, &matches, &dotenv_provenance).await
 }
 
-pub async fn run(cli: Cli, matches: &ArgMatches) -> Result<(), CliError> {
+pub async fn run(
+    cli: Cli,
+    matches: &ArgMatches,
+    dotenv_provenance: &HashMap<String, ConfigSource>,
+) -> Result<(), CliError> {
     if cli.debug {
         // --debug: verbose diagnostics to stderr (§7.2). try_init() rather
         // than init() because a process embedding `run` more than once
@@ -571,6 +626,9 @@ pub async fn run(cli: Cli, matches: &ArgMatches) -> Result<(), CliError> {
 
     match &cli.command {
         Command::Card { command } => run_card_command(&cli, command).await?,
+        Command::Config { command } => {
+            run_config_command(&cli, matches, dotenv_provenance, command)?
+        }
         Command::Send(command) => {
             let send_matches = matches
                 .subcommand_matches("send")
@@ -1171,6 +1229,354 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Configuration (§8.3): .env discovery/precedence and `config show`.
+// ---------------------------------------------------------------------
+
+/// Where an effective setting's value came from (§8.3's precedence order,
+/// highest first): an explicit flag, a real environment variable, a local
+/// `.env` file, a global `.env` file, or the tool's built-in default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    Flag,
+    EnvVar,
+    LocalFile,
+    GlobalFile,
+    Default,
+}
+
+impl ConfigSource {
+    fn label(self) -> &'static str {
+        match self {
+            ConfigSource::Flag => "flag",
+            ConfigSource::EnvVar => "environment variable",
+            ConfigSource::LocalFile => "local .env file",
+            ConfigSource::GlobalFile => "global .env file",
+            ConfigSource::Default => "built-in default",
+        }
+    }
+}
+
+/// Load `.env` configuration and inject any `A2ACLI_*` key that isn't
+/// already a real environment variable, so clap's own `env = "..."`
+/// resolution on [`Cli`]'s fields sees it — this MUST run before
+/// `Cli::command().get_matches_from(args)`. Returns which keys were
+/// injected from which file, for `config show` to report accurately.
+///
+/// Precedence (§6.5, §8.3): a real environment variable always wins over
+/// either file; a local `.env` (or the file named by `--config`) wins over
+/// the global `~/.config/a2a-cli/.env`.
+fn load_dotenv_config(args: &[OsString]) -> HashMap<String, ConfigSource> {
+    // Snapshot which A2ACLI_* keys are *real* environment variables before
+    // any file-based injection, so a lower-precedence file's value is never
+    // mistaken for "already set" once a higher-precedence file has run.
+    let real_env_keys: HashSet<String> = std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .filter(|key| key.starts_with("A2ACLI_"))
+        .collect();
+
+    let mut provenance = HashMap::new();
+
+    if let Some(global_path) = global_config_path() {
+        apply_dotenv_file(
+            &global_path,
+            ConfigSource::GlobalFile,
+            &real_env_keys,
+            &mut provenance,
+        );
+    }
+
+    let local_path = find_flag_value(args, "--config")
+        .map(PathBuf::from)
+        .or_else(find_local_dotenv);
+    if let Some(local_path) = local_path {
+        apply_dotenv_file(
+            &local_path,
+            ConfigSource::LocalFile,
+            &real_env_keys,
+            &mut provenance,
+        );
+    }
+
+    provenance
+}
+
+/// Look for `--flag value` or `--flag=value` in a raw, unparsed argv —
+/// needed to find `--config` before `Cli` itself has been parsed.
+fn find_flag_value(args: &[OsString], flag: &str) -> Option<String> {
+    let prefix = format!("{flag}=");
+    for (index, arg) in args.iter().enumerate() {
+        let Some(arg) = arg.to_str() else { continue };
+        if arg == flag {
+            return args.get(index + 1)?.to_str().map(str::to_string);
+        }
+        if let Some(value) = arg.strip_prefix(&prefix) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// `~/.config/a2a-cli/.env`, honoring `$XDG_CONFIG_HOME`.
+fn global_config_path() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(xdg).join("a2a-cli").join(".env"));
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("a2a-cli")
+            .join(".env"),
+    )
+}
+
+/// A local `.env`, discovered the way `git` discovers its configuration:
+/// walking up from the working directory (§8.3).
+fn find_local_dotenv() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join(".env");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn apply_dotenv_file(
+    path: &Path,
+    source: ConfigSource,
+    real_env_keys: &HashSet<String>,
+    provenance: &mut HashMap<String, ConfigSource>,
+) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    warn_if_world_readable(path);
+
+    for (key, value) in parse_dotenv(&contents) {
+        if !key.starts_with("A2ACLI_") || real_env_keys.contains(&key) {
+            continue;
+        }
+        // SAFETY: this runs synchronously, at the very start of `run_args`,
+        // before any async work or additional threads have been spawned by
+        // this process — nothing else can be concurrently reading or
+        // writing the environment at this point.
+        unsafe {
+            std::env::set_var(&key, &value);
+        }
+        provenance.insert(key, source);
+    }
+}
+
+/// §8.3: "MUST NOT store secrets in world-readable files". `a2acli` never
+/// writes a `.env` file itself, but it can at least warn when one it reads
+/// is readable by users other than its owner.
+#[cfg(unix)]
+fn warn_if_world_readable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        eprintln!(
+            "warning: {} is readable by other users (mode {:o}); it may contain credentials — \
+             consider `chmod 600 {}`",
+            path.display(),
+            mode & 0o777,
+            path.display()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_world_readable(_path: &Path) {}
+
+/// Parse `.env` (dotenv) syntax: `KEY=value`, one per line. Blank lines and
+/// `#` comments are ignored, a leading `export ` is tolerated, and one
+/// layer of surrounding single or double quotes is stripped (§8.3).
+fn parse_dotenv(contents: &str) -> Vec<(String, String)> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim().to_string();
+            let value = value.trim();
+            let value = ["\"", "'"]
+                .iter()
+                .find_map(|quote| {
+                    value
+                        .strip_prefix(quote)
+                        .and_then(|rest| rest.strip_suffix(quote))
+                })
+                .unwrap_or(value);
+            Some((key, value.to_string()))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConfigSetting {
+    name: String,
+    value: String,
+    source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConfigSettings {
+    settings: Vec<ConfigSetting>,
+}
+
+impl TextRender for ConfigSettings {
+    fn render_text(&self) -> String {
+        let mut out = TextOutput::default();
+        for setting in &self.settings {
+            out.field(
+                &setting.name,
+                format!("{} (source: {})", setting.value, setting.source),
+            );
+        }
+        out.finish()
+    }
+}
+
+fn redact_secret(value: &Option<String>) -> String {
+    match value {
+        Some(_) => "(set, redacted)".to_string(),
+        None => "(not set)".to_string(),
+    }
+}
+
+fn run_config_command(
+    cli: &Cli,
+    matches: &ArgMatches,
+    dotenv_provenance: &HashMap<String, ConfigSource>,
+    command: &ConfigCommand,
+) -> Result<(), CliError> {
+    match command {
+        ConfigCommand::Show => {
+            let settings = effective_config_settings(cli, matches, dotenv_provenance);
+            print_output(&settings, cli)?;
+        }
+    }
+    Ok(())
+}
+
+/// Enumerate every §6.5/§8.3 configurable setting with its current value
+/// and the source it resolved from, for `config show`.
+fn effective_config_settings(
+    cli: &Cli,
+    matches: &ArgMatches,
+    dotenv_provenance: &HashMap<String, ConfigSource>,
+) -> ConfigSettings {
+    let mut settings = Vec::new();
+    let mut add = |id: &str, name: &str, value: String, env_key: &str| {
+        let source = match matches.value_source(id) {
+            Some(ValueSource::CommandLine) => ConfigSource::Flag,
+            Some(ValueSource::EnvVariable) => dotenv_provenance
+                .get(env_key)
+                .copied()
+                .unwrap_or(ConfigSource::EnvVar),
+            _ => ConfigSource::Default,
+        };
+        settings.push(ConfigSetting {
+            name: name.to_string(),
+            value,
+            source: source.label().to_string(),
+        });
+    };
+
+    add(
+        "base_url",
+        "base-url",
+        cli.base_url.clone(),
+        "A2ACLI_BASE_URL",
+    );
+    add(
+        "transport",
+        "transport",
+        if cli.transport.is_empty() {
+            "(agent card's own order)".to_string()
+        } else {
+            cli.transport
+                .iter()
+                .map(|binding| format!("{binding:?}").to_lowercase())
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+        "A2ACLI_TRANSPORT",
+    );
+    add(
+        "bearer",
+        "bearer",
+        redact_secret(&cli.bearer),
+        "A2ACLI_BEARER",
+    );
+    add(
+        "api_key",
+        "api-key",
+        redact_secret(&cli.api_key),
+        "A2ACLI_API_KEY",
+    );
+    add(
+        "insecure",
+        "insecure",
+        cli.insecure.to_string(),
+        "A2ACLI_INSECURE",
+    );
+    add("debug", "debug", cli.debug.to_string(), "A2ACLI_DEBUG");
+    add(
+        "tenant",
+        "tenant",
+        cli.tenant
+            .clone()
+            .unwrap_or_else(|| "(not set)".to_string()),
+        "A2ACLI_TENANT",
+    );
+    add(
+        "output",
+        "output",
+        format!("{:?}", cli.output).to_lowercase(),
+        "A2ACLI_OUTPUT",
+    );
+    add(
+        "compact",
+        "compact",
+        cli.compact.to_string(),
+        "A2ACLI_COMPACT",
+    );
+    add(
+        "async_mode",
+        "async",
+        cli.async_mode.to_string(),
+        "A2ACLI_ASYNC",
+    );
+    add("wait", "wait", cli.wait.to_string(), "A2ACLI_WAIT");
+    add(
+        "poll_interval",
+        "poll-interval",
+        format!("{:?}", cli.poll_interval),
+        "A2ACLI_POLL_INTERVAL",
+    );
+    add(
+        "timeout",
+        "timeout",
+        format!("{:?}", cli.timeout),
+        "A2ACLI_TIMEOUT",
+    );
+
+    ConfigSettings { settings }
 }
 
 /// A negotiated client, plus the tenant to attach to every subsequent
@@ -3591,5 +3997,93 @@ mod tests {
         let error = run_test_cli(&base_url, &["card", "get"]).await.unwrap_err();
         assert_eq!(error.envelope().error.code, "A2ACLI_ERR_UNREACHABLE");
         assert_eq!(error.exit_code(), 3);
+    }
+
+    #[test]
+    fn test_parse_dotenv_basic() {
+        let parsed = parse_dotenv("A2ACLI_BEARER=secret\nA2ACLI_TRANSPORT=jsonrpc,rest\n");
+        assert_eq!(
+            parsed,
+            vec![
+                ("A2ACLI_BEARER".to_string(), "secret".to_string()),
+                ("A2ACLI_TRANSPORT".to_string(), "jsonrpc,rest".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_dotenv_ignores_blank_lines_and_comments() {
+        let parsed = parse_dotenv("\n# a comment\n   \nA2ACLI_TENANT=acme\n# another comment\n");
+        assert_eq!(
+            parsed,
+            vec![("A2ACLI_TENANT".to_string(), "acme".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_parse_dotenv_tolerates_export_prefix() {
+        let parsed = parse_dotenv("export A2ACLI_BASE_URL=https://agent.example.com\n");
+        assert_eq!(
+            parsed,
+            vec![(
+                "A2ACLI_BASE_URL".to_string(),
+                "https://agent.example.com".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_parse_dotenv_strips_one_layer_of_quotes() {
+        let parsed = parse_dotenv("A2ACLI_BEARER=\"Bearer token\"\nA2ACLI_TENANT='acme'\n");
+        assert_eq!(
+            parsed,
+            vec![
+                ("A2ACLI_BEARER".to_string(), "Bearer token".to_string()),
+                ("A2ACLI_TENANT".to_string(), "acme".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_flag_value_supports_space_and_equals_forms() {
+        let space = vec![
+            OsString::from("a2acli"),
+            OsString::from("--config"),
+            OsString::from("prod.env"),
+        ];
+        assert_eq!(
+            find_flag_value(&space, "--config"),
+            Some("prod.env".to_string())
+        );
+
+        let equals = vec![
+            OsString::from("a2acli"),
+            OsString::from("--config=prod.env"),
+        ];
+        assert_eq!(
+            find_flag_value(&equals, "--config"),
+            Some("prod.env".to_string())
+        );
+
+        let absent = vec![OsString::from("a2acli"), OsString::from("send")];
+        assert_eq!(find_flag_value(&absent, "--config"), None);
+    }
+
+    #[test]
+    fn test_config_source_labels() {
+        assert_eq!(ConfigSource::Flag.label(), "flag");
+        assert_eq!(ConfigSource::EnvVar.label(), "environment variable");
+        assert_eq!(ConfigSource::LocalFile.label(), "local .env file");
+        assert_eq!(ConfigSource::GlobalFile.label(), "global .env file");
+        assert_eq!(ConfigSource::Default.label(), "built-in default");
+    }
+
+    #[test]
+    fn test_redact_secret() {
+        assert_eq!(
+            redact_secret(&Some("secret".to_string())),
+            "(set, redacted)"
+        );
+        assert_eq!(redact_secret(&None), "(not set)");
     }
 }
