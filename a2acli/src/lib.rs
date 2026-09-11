@@ -744,6 +744,26 @@ fn build_file_part(value: &str) -> Result<Part, CliError> {
 
 /// `--data-part <path|->` reads JSON from a file path or, for `-`, from
 /// stdin; anything else is parsed as an inline JSON string (§10.2).
+/// Whether a `read_to_string` failure means "this string doesn't name a
+/// readable file here" — so `--data-part` should go on to try parsing it as
+/// inline JSON — rather than "a real file failed to read", which must be
+/// reported.
+///
+/// This can't just test for `NotFound`: Windows rejects a path containing
+/// characters it doesn't allow (`{`, `"`, `:` — precisely what inline JSON
+/// looks like) with `InvalidFilename` *before* ever looking for the file, so
+/// matching only `NotFound` would turn every inline-JSON `--data-part` into
+/// a read error there while working fine on Unix, where those are all legal
+/// filename characters.
+fn means_not_a_readable_path(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::InvalidFilename
+            | std::io::ErrorKind::InvalidInput
+    )
+}
+
 fn build_data_part(value: &str) -> Result<Part, CliError> {
     if value == "-" {
         use std::io::Read;
@@ -759,16 +779,16 @@ fn build_data_part(value: &str) -> Result<Part, CliError> {
 
     match std::fs::read_to_string(value) {
         Ok(text) => return Ok(Part::data(serde_json::from_str(&text)?)),
-        Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
-            // The path exists but couldn't be read (permission denied, not
-            // a regular file, invalid UTF-8, ...) — that's a real failure
-            // to surface, not a signal to fall back to inline-JSON parsing.
+        Err(source) if !means_not_a_readable_path(source.kind()) => {
+            // A real file that couldn't be read (permission denied, a
+            // directory, invalid UTF-8, ...) — that's a failure to
+            // surface, not a signal to fall back to inline-JSON parsing.
             return Err(CliError::ReadFile {
                 path: value.to_string(),
                 source,
             });
         }
-        Err(_) => {} // no such file — try parsing `value` itself as JSON below
+        Err(_) => {} // doesn't name a readable file — try `value` as JSON below
     }
 
     serde_json::from_str(value).map(Part::data).map_err(|_| {
@@ -2213,6 +2233,38 @@ mod tests {
 
         for (input, expected) in cases {
             assert_eq!(TaskState::from(input), expected);
+        }
+    }
+
+    #[test]
+    fn test_means_not_a_readable_path_classification() {
+        use std::io::ErrorKind;
+
+        // "Doesn't name a readable file here" — --data-part goes on to try
+        // the value as inline JSON. InvalidFilename is the Windows answer
+        // for a path containing `{`, `"` or `:`, i.e. inline JSON itself,
+        // and is why this can't just test for NotFound.
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::InvalidFilename,
+            ErrorKind::InvalidInput,
+        ] {
+            assert!(
+                means_not_a_readable_path(kind),
+                "{kind:?} should fall through to inline-JSON parsing"
+            );
+        }
+
+        // A real file that failed to read — must be reported, not masked.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::IsADirectory,
+            ErrorKind::InvalidData,
+        ] {
+            assert!(
+                !means_not_a_readable_path(kind),
+                "{kind:?} should be surfaced as a read error"
+            );
         }
     }
 
