@@ -9,12 +9,15 @@ use a2a::*;
 use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::rest::rest_router;
 use a2a_server::{RequestHandler, ServiceParams, WELL_KNOWN_AGENT_CARD_PATH};
+use assert_cmd::Command as AssertCommand;
 use assert_cmd::assert::OutputAssertExt;
 use assert_cmd::cargo::CommandCargoExt;
 use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::get;
 use axum::{Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::stream::{self, BoxStream};
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -24,7 +27,17 @@ struct ServerState {
     tasks: Mutex<BTreeMap<String, Task>>,
     push_configs: Mutex<BTreeMap<(String, String), TaskPushNotificationConfig>>,
     card_headers: Mutex<Vec<(Option<String>, Option<String>)>>,
+    /// Number of times `get_task` has been called for each of the
+    /// poll-until-settled fixture task ids below.
+    poll_counts: Mutex<BTreeMap<String, u32>>,
 }
+
+/// Fixture task ids that settle to `COMPLETED` only after this many
+/// `get_task` calls, so tests can exercise the blocking-wait/poll loop
+/// instead of a task that is already settled on the first read.
+const POLLS_UNTIL_SETTLED: u32 = 3;
+/// Fixture task id that never settles, for exercising `--timeout`.
+const STUCK_TASK_ID: &str = "task-stuck";
 
 struct TestHandler {
     state: Arc<ServerState>,
@@ -123,12 +136,35 @@ impl RequestHandler for TestHandler {
         if text == "send-error" {
             return Err(A2AError::invalid_request("send failed"));
         }
-        let task = make_task(
-            &task_id,
-            &context_id,
-            TaskState::Completed,
-            &format!("Echo: {text}"),
-        );
+        if text == "start-pending" {
+            // A task that starts WORKING and only settles after
+            // POLLS_UNTIL_SETTLED calls to get_task, so tests can observe
+            // send's blocking-by-default wait actually polling.
+            let task = make_task(
+                "task-pending-send",
+                "ctx-pending-send",
+                TaskState::Working,
+                "pending",
+            );
+            self.state
+                .tasks
+                .lock()
+                .unwrap()
+                .insert("task-pending-send".to_string(), task.clone());
+            return Ok(SendMessageResponse::Task(task));
+        }
+
+        // Multi-part messages are echoed back verbatim so tests can assert
+        // on the exact parts (and their order/media types) the CLI sent;
+        // a single-part message keeps the simpler "Echo: {text}" form so
+        // existing single-part assertions are unaffected.
+        let response_parts = if req.message.parts.len() > 1 {
+            req.message.parts.clone()
+        } else {
+            vec![Part::text(format!("Echo: {text}"))]
+        };
+        let task =
+            make_task_with_parts(&task_id, &context_id, TaskState::Completed, response_parts);
         self.state
             .tasks
             .lock()
@@ -191,6 +227,27 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
+        if req.id == STUCK_TASK_ID {
+            return Ok(make_task(&req.id, "ctx-stuck", TaskState::Working, "stuck"));
+        }
+
+        if req.id == "task-pending" || req.id == "task-pending-send" {
+            let mut counts = self.state.poll_counts.lock().unwrap();
+            let count = counts.entry(req.id.clone()).or_insert(0);
+            *count += 1;
+            let state = if *count >= POLLS_UNTIL_SETTLED {
+                TaskState::Completed
+            } else {
+                TaskState::Working
+            };
+            let context_id = if req.id == "task-pending" {
+                "ctx-pending"
+            } else {
+                "ctx-pending-send"
+            };
+            return Ok(make_task(&req.id, context_id, state, "settled"));
+        }
+
         self.state
             .tasks
             .lock()
@@ -405,6 +462,15 @@ fn make_agent_card(base_url: &str, name: &str) -> AgentCard {
 }
 
 fn make_task(task_id: &str, context_id: &str, state: TaskState, text: &str) -> Task {
+    make_task_with_parts(task_id, context_id, state, vec![Part::text(text)])
+}
+
+fn make_task_with_parts(
+    task_id: &str,
+    context_id: &str,
+    state: TaskState,
+    parts: Vec<Part>,
+) -> Task {
     Task {
         id: task_id.to_string(),
         context_id: context_id.to_string(),
@@ -415,7 +481,7 @@ fn make_task(task_id: &str, context_id: &str, state: TaskState, text: &str) -> T
                 context_id: Some(context_id.to_string()),
                 task_id: Some(task_id.to_string()),
                 role: Role::Agent,
-                parts: vec![Part::text(text)],
+                parts,
                 metadata: None,
                 extensions: None,
                 reference_task_ids: None,
@@ -736,4 +802,231 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
         ],
     );
     assert!(stderr.contains("invalid input: --auth-credentials requires --auth-scheme"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_blocks_by_default_until_task_settles() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "--poll-interval",
+            "10ms",
+            "--timeout",
+            "5s",
+            "send",
+            "start-pending",
+        ],
+    );
+    let response: Value = serde_json::from_str(output.trim()).unwrap();
+    assert_eq!(response["task"]["id"], "task-pending-send");
+    assert_eq!(response["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+
+    // The blocking wait must have actually polled get_task rather than
+    // returning the initial WORKING response.
+    let count = *server
+        .state
+        .poll_counts
+        .lock()
+        .unwrap()
+        .get("task-pending-send")
+        .unwrap_or(&0);
+    assert!(count >= POLLS_UNTIL_SETTLED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_async_returns_immediately_without_waiting() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(&server, &["--compact", "--async", "send", "start-pending"]);
+    let response: Value = serde_json::from_str(output.trim()).unwrap();
+    assert_eq!(response["task"]["id"], "task-pending-send");
+    assert_eq!(response["task"]["status"]["state"], "TASK_STATE_WORKING");
+
+    // --async must skip polling entirely.
+    let count = *server
+        .state
+        .poll_counts
+        .lock()
+        .unwrap()
+        .get("task-pending-send")
+        .unwrap_or(&0);
+    assert_eq!(count, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_get_wait_polls_until_settled() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "--wait",
+            "--poll-interval",
+            "10ms",
+            "--timeout",
+            "5s",
+            "task",
+            "get",
+            "task-pending",
+        ],
+    );
+    let task: Value = serde_json::from_str(output.trim()).unwrap();
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED");
+
+    let count = *server
+        .state
+        .poll_counts
+        .lock()
+        .unwrap()
+        .get("task-pending")
+        .unwrap_or(&0);
+    assert!(count >= POLLS_UNTIL_SETTLED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_get_without_wait_does_not_poll() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(&server, &["--compact", "task", "get", "task-pending"]);
+    let task: Value = serde_json::from_str(output.trim()).unwrap();
+    // Still WORKING: a one-shot read must not have polled to settlement.
+    assert_eq!(task["status"]["state"], "TASK_STATE_WORKING");
+
+    let count = *server
+        .state
+        .poll_counts
+        .lock()
+        .unwrap()
+        .get("task-pending")
+        .unwrap_or(&0);
+    assert_eq!(count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_get_wait_times_out() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(
+        &server,
+        &[
+            "--wait",
+            "--poll-interval",
+            "10ms",
+            "--timeout",
+            "50ms",
+            "task",
+            "get",
+            STUCK_TASK_ID,
+        ],
+    );
+    assert!(stderr.contains("timed out"));
+    assert!(stderr.contains(STUCK_TASK_ID));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_with_ordered_message_parts_and_media_type() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "send",
+            "--text-part",
+            "hello",
+            "--file-part",
+            "https://example.com/doc.pdf",
+            "--media-type",
+            "application/pdf",
+            "--data-part",
+            r#"{"priority":"high"}"#,
+        ],
+    );
+    let response: Value = serde_json::from_str(output.trim()).unwrap();
+    let parts = response["task"]["status"]["message"]["parts"]
+        .as_array()
+        .unwrap();
+
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0]["text"], "hello");
+    assert_eq!(parts[1]["url"], "https://example.com/doc.pdf");
+    assert_eq!(parts[1]["mediaType"], "application/pdf");
+    assert!(parts[1].get("text").is_none());
+    assert_eq!(parts[2]["data"]["priority"], "high");
+    assert!(parts[2].get("mediaType").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_reads_local_file_part_and_stdin_data_part() {
+    let server = TestServer::spawn().await;
+
+    let mut file_path = std::env::temp_dir();
+    file_path.push(format!("a2acli-test-file-part-{}.bin", std::process::id()));
+    std::fs::write(&file_path, b"binary payload").unwrap();
+
+    let output = AssertCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args([
+            "--base-url",
+            server.base_url.as_str(),
+            "--compact",
+            "send",
+            "--text-part",
+            "hello",
+            "--file-part",
+            file_path.to_str().unwrap(),
+            "--data-part",
+            "-",
+        ])
+        .write_stdin(r#"{"ok":true}"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    std::fs::remove_file(&file_path).unwrap();
+
+    let response: Value = serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap();
+    let parts = response["task"]["status"]["message"]["parts"]
+        .as_array()
+        .unwrap();
+
+    assert_eq!(parts.len(), 3);
+    assert_eq!(
+        parts[1]["filename"],
+        file_path.file_name().unwrap().to_str().unwrap()
+    );
+    let decoded = BASE64.decode(parts[1]["raw"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded, b"binary payload");
+    assert_eq!(parts[2]["data"]["ok"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_rejects_media_type_without_preceding_part() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(
+        &server,
+        &[
+            "send",
+            "--media-type",
+            "application/pdf",
+            "--text-part",
+            "hello",
+        ],
+    );
+    assert!(stderr.contains("--media-type must immediately follow"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_rejects_positional_text_combined_with_part_flags() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(&server, &["send", "hello", "--text-part", "world"]);
+    assert!(stderr.contains("cannot be combined"));
 }
