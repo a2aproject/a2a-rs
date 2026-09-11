@@ -241,10 +241,7 @@ mod tests {
             TaskState::Failed,
         ] {
             let result = store.update(make_task("t1", "c1", state.clone())).await;
-            assert!(
-                result.is_err(),
-                "expected {state:?} update to be rejected"
-            );
+            assert!(result.is_err(), "expected {state:?} update to be rejected");
             assert_eq!(
                 result.unwrap_err().code,
                 error_code::INVALID_REQUEST,
