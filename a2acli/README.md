@@ -20,7 +20,9 @@ cargo install a2a-cli
 
 ## What It Provides
 
-- Fetch and print the public agent card for an A2A deployment
+- Fetch and print the public agent card for an A2A deployment, named by
+  `-a/--agent-card` as a host, a full card URL, or a local file — or
+  skipped entirely with `-e/--endpoint`
 - Send one-shot or streaming messages, with multi-part content
   (`--text-part`/`--file-part`/`--data-part`/`--media-type`)
 - Blocks by default until a task settles (terminal or interrupted state);
@@ -60,12 +62,45 @@ cargo run --bin a2acli -- task push-config list task-123
 cargo run --bin a2acli -- task push-config create task-123 https://example.com/callback --auth-scheme Bearer --auth-credentials secret
 ```
 
-By default the CLI targets `http://localhost:3000`. Use `--base-url` to point at
-another deployment and `--transport jsonrpc` or `--transport rest` (repeatable
-and ordered, highest preference first) to pin the transport when the agent
-card exposes more than one compatible interface. The global `--tenant`,
-`--bearer`, `--api-key`, and repeated `--svc-param Name:Value` options also
-apply to `task push-config` commands.
+By default the CLI targets `http://localhost:3000`. Use `--transport jsonrpc`
+or `--transport rest` (repeatable and ordered, highest preference first) to pin
+the transport when the agent card exposes more than one compatible interface.
+The global `--tenant`, `--bearer`, `--api-key`, and repeated
+`--svc-param Name:Value` options also apply to `task push-config` commands.
+
+### Naming the agent
+
+`-a/--agent-card <ref>` names the agent as an **Agent Card reference**, in any
+of three forms:
+
+```sh
+cargo run --bin a2acli -- -a agent.example.com card get      # host or origin
+cargo run --bin a2acli -- -a https://agent.example.com/custom/card.json card get
+cargo run --bin a2acli -- -a ./fixtures/card.json card get   # local file
+cargo run --bin a2acli -- -a file:///etc/a2a/card.json card get
+```
+
+A bare host or origin gets the well-known path `/.well-known/agent-card.json`
+appended, and takes `http://` when it is loopback (`localhost`, `127.0.0.1`,
+`[::1]`) or `https://` otherwise. A reference that already carries a path is a
+full card URL and is used as-is. A `file://` URL or a plain filesystem path is
+read from disk, so the CLI can be driven with no agent running at all — a
+missing file reports `A2ACLI_ERR_CARD_NOT_FOUND` and a file that is not a card
+reports `A2ACLI_ERR_CARD_INVALID`, matching how the HTTP path classifies an
+unreachable card and an unparseable body.
+
+`-e/--endpoint <url>` skips card resolution entirely and connects straight to
+an agent interface. Since no card is fetched, there is nothing to declare the
+protocol binding, so it requires exactly one `--transport` and cannot be
+combined with `--agent-card`:
+
+```sh
+cargo run --bin a2acli -- -e https://agent.example.com/jsonrpc --transport jsonrpc task get task-123
+```
+
+`--base-url` is a deprecated alias for the bare-origin form. It still works so
+existing invocations keep running, but it warns and is hidden from `--help`;
+prefer `--agent-card`, which accepts all three forms.
 
 ### Authentication and transport
 
@@ -170,7 +205,7 @@ one `KEY=value` per line; blank lines and `#` comments are ignored, a leading
 `export ` is tolerated, and one layer of surrounding quotes is stripped:
 
 ```dotenv
-A2ACLI_BASE_URL=https://agent.example.com
+A2ACLI_AGENT_CARD=https://agent.example.com
 A2ACLI_TRANSPORT=rest,jsonrpc
 A2ACLI_TIMEOUT=60s
 # credentials
