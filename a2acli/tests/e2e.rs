@@ -136,6 +136,21 @@ impl RequestHandler for TestHandler {
         if text == "send-error" {
             return Err(A2AError::invalid_request("send failed"));
         }
+        if text == "reply-only" {
+            // No task created: a direct Message reply (SEND_003 — the tool
+            // must exit cleanly with it rather than waiting on a task that
+            // doesn't exist).
+            return Ok(SendMessageResponse::Message(Message {
+                message_id: "msg-reply-only".to_string(),
+                context_id: Some(context_id),
+                task_id: None,
+                role: Role::Agent,
+                parts: vec![Part::text(format!("Echo: {text}"))],
+                metadata: None,
+                extensions: None,
+                reference_task_ids: None,
+            }));
+        }
         if text == "start-pending" {
             // A task that starts WORKING and only settles after
             // POLLS_UNTIL_SETTLED calls to get_task, so tests can observe
@@ -193,6 +208,13 @@ impl RequestHandler for TestHandler {
             return Ok(Box::pin(stream::once(async {
                 Err(A2AError::internal("stream failed"))
             })));
+        }
+        if text == "stream-open-error" {
+            // Unlike "stream-error" (a stream that opens, then yields an
+            // error item), this fails *opening* the stream at all — the
+            // case send's fallback-to-polling path (TASK_POLL_004) exists
+            // for.
+            return Err(A2AError::unsupported_operation("streaming not available"));
         }
 
         let task = make_task(
@@ -1029,4 +1051,105 @@ async fn send_rejects_positional_text_combined_with_part_flags() {
 
     let (_stdout, stderr) = run_cli_failure(&server, &["send", "hello", "--text-part", "world"]);
     assert!(stderr.contains("cannot be combined"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_falls_back_to_polling_when_the_stream_fails_to_open() {
+    let server = TestServer::spawn().await;
+
+    // "stream-open-error" fails send_streaming_message itself (not a
+    // stream item), which must trigger the one-shot-send-plus-poll
+    // fallback rather than propagating the error or hanging.
+    let stdout = run_cli_success(
+        &server,
+        &["--compact", "send", "stream-open-error", "--stream"],
+    );
+    let response: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(response["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_exits_cleanly_on_a_message_only_reply() {
+    let server = TestServer::spawn().await;
+
+    let stdout = run_cli_success(&server, &["--compact", "send", "reply-only"]);
+    let response: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(response["message"]["messageId"], "msg-reply-only");
+    assert!(response.get("task").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_part_reports_a_usage_error_for_a_missing_local_path() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(
+        &server,
+        &["send", "--file-part", "/no/such/file-part-path.bin"],
+    );
+    assert!(stderr.contains("failed to read"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_part_reads_json_from_a_local_file() {
+    let server = TestServer::spawn().await;
+
+    let mut file_path = std::env::temp_dir();
+    file_path.push(format!("a2acli-test-data-part-{}.json", std::process::id()));
+    std::fs::write(&file_path, r#"{"from":"file"}"#).unwrap();
+
+    let stdout = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "send",
+            "--text-part",
+            "hello",
+            "--data-part",
+            file_path.to_str().unwrap(),
+        ],
+    );
+    std::fs::remove_file(&file_path).unwrap();
+
+    let response: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let parts = response["task"]["status"]["message"]["parts"]
+        .as_array()
+        .unwrap();
+    assert_eq!(parts[1]["data"]["from"], "file");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_part_rejects_a_value_that_is_neither_a_file_nor_valid_json() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(
+        &server,
+        &["send", "--data-part", "not json and no such file"],
+    );
+    assert!(stderr.contains("--data-part must be a file path"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_part_reports_a_usage_error_when_stdin_is_not_utf8() {
+    let server = TestServer::spawn().await;
+
+    let output = AssertCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args([
+            "--base-url",
+            server.base_url.as_str(),
+            "send",
+            "--data-part",
+            "-",
+        ])
+        // Invalid UTF-8: read_to_string fails with an io::Error, exercising
+        // --data-part -'s ReadFile error path (distinct from malformed-but-
+        // valid-UTF-8 JSON, covered by the "neither a file nor valid JSON"
+        // case above).
+        .write_stdin(vec![0xFF, 0xFE, 0xFD])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("failed to read <stdin>"));
 }
