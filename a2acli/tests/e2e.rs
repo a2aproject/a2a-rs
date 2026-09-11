@@ -9,12 +9,15 @@ use a2a::*;
 use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::rest::rest_router;
 use a2a_server::{RequestHandler, ServiceParams, WELL_KNOWN_AGENT_CARD_PATH};
+use assert_cmd::Command as AssertCommand;
 use assert_cmd::assert::OutputAssertExt;
 use assert_cmd::cargo::CommandCargoExt;
 use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::get;
 use axum::{Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::stream::{self, BoxStream};
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -24,7 +27,17 @@ struct ServerState {
     tasks: Mutex<BTreeMap<String, Task>>,
     push_configs: Mutex<BTreeMap<(String, String), TaskPushNotificationConfig>>,
     card_headers: Mutex<Vec<(Option<String>, Option<String>)>>,
+    /// Number of times `get_task` has been called for each of the
+    /// poll-until-settled fixture task ids below.
+    poll_counts: Mutex<BTreeMap<String, u32>>,
 }
+
+/// Fixture task ids that settle to `COMPLETED` only after this many
+/// `get_task` calls, so tests can exercise the blocking-wait/poll loop
+/// instead of a task that is already settled on the first read.
+const POLLS_UNTIL_SETTLED: u32 = 3;
+/// Fixture task id that never settles, for exercising `--timeout`.
+const STUCK_TASK_ID: &str = "task-stuck";
 
 struct TestHandler {
     state: Arc<ServerState>,
@@ -123,12 +136,50 @@ impl RequestHandler for TestHandler {
         if text == "send-error" {
             return Err(A2AError::invalid_request("send failed"));
         }
-        let task = make_task(
-            &task_id,
-            &context_id,
-            TaskState::Completed,
-            &format!("Echo: {text}"),
-        );
+        if text == "reply-only" {
+            // No task created: a direct Message reply (SEND_003 — the tool
+            // must exit cleanly with it rather than waiting on a task that
+            // doesn't exist).
+            return Ok(SendMessageResponse::Message(Message {
+                message_id: "msg-reply-only".to_string(),
+                context_id: Some(context_id),
+                task_id: None,
+                role: Role::Agent,
+                parts: vec![Part::text(format!("Echo: {text}"))],
+                metadata: None,
+                extensions: None,
+                reference_task_ids: None,
+            }));
+        }
+        if text == "start-pending" {
+            // A task that starts WORKING and only settles after
+            // POLLS_UNTIL_SETTLED calls to get_task, so tests can observe
+            // send's blocking-by-default wait actually polling.
+            let task = make_task(
+                "task-pending-send",
+                "ctx-pending-send",
+                TaskState::Working,
+                "pending",
+            );
+            self.state
+                .tasks
+                .lock()
+                .unwrap()
+                .insert("task-pending-send".to_string(), task.clone());
+            return Ok(SendMessageResponse::Task(task));
+        }
+
+        // Multi-part messages are echoed back verbatim so tests can assert
+        // on the exact parts (and their order/media types) the CLI sent;
+        // a single-part message keeps the simpler "Echo: {text}" form so
+        // existing single-part assertions are unaffected.
+        let response_parts = if req.message.parts.len() > 1 {
+            req.message.parts.clone()
+        } else {
+            vec![Part::text(format!("Echo: {text}"))]
+        };
+        let task =
+            make_task_with_parts(&task_id, &context_id, TaskState::Completed, response_parts);
         self.state
             .tasks
             .lock()
@@ -157,6 +208,20 @@ impl RequestHandler for TestHandler {
             return Ok(Box::pin(stream::once(async {
                 Err(A2AError::internal("stream failed"))
             })));
+        }
+        if text == "stream-open-error" {
+            // Unlike "stream-error" (a stream that opens, then yields an
+            // error item), this fails *opening* the stream at all — the
+            // case send's fallback-to-polling path (TASK_POLL_004) exists
+            // for. UNSUPPORTED_OPERATION specifically, since that's the
+            // only code the fallback should trigger on.
+            return Err(A2AError::unsupported_operation("streaming not available"));
+        }
+        if text == "stream-open-real-error" {
+            // A genuine failure opening the stream that is *not*
+            // "streaming unsupported" — this must propagate as an error,
+            // not be silently retried as a one-shot send.
+            return Err(A2AError::internal("transport exploded"));
         }
 
         let task = make_task(
@@ -191,6 +256,27 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
+        if req.id == STUCK_TASK_ID {
+            return Ok(make_task(&req.id, "ctx-stuck", TaskState::Working, "stuck"));
+        }
+
+        if req.id == "task-pending" || req.id == "task-pending-send" {
+            let mut counts = self.state.poll_counts.lock().unwrap();
+            let count = counts.entry(req.id.clone()).or_insert(0);
+            *count += 1;
+            let state = if *count >= POLLS_UNTIL_SETTLED {
+                TaskState::Completed
+            } else {
+                TaskState::Working
+            };
+            let context_id = if req.id == "task-pending" {
+                "ctx-pending"
+            } else {
+                "ctx-pending-send"
+            };
+            return Ok(make_task(&req.id, context_id, state, "settled"));
+        }
+
         self.state
             .tasks
             .lock()
@@ -405,6 +491,15 @@ fn make_agent_card(base_url: &str, name: &str) -> AgentCard {
 }
 
 fn make_task(task_id: &str, context_id: &str, state: TaskState, text: &str) -> Task {
+    make_task_with_parts(task_id, context_id, state, vec![Part::text(text)])
+}
+
+fn make_task_with_parts(
+    task_id: &str,
+    context_id: &str,
+    state: TaskState,
+    parts: Vec<Part>,
+) -> Task {
     Task {
         id: task_id.to_string(),
         context_id: context_id.to_string(),
@@ -415,7 +510,7 @@ fn make_task(task_id: &str, context_id: &str, state: TaskState, text: &str) -> T
                 context_id: Some(context_id.to_string()),
                 task_id: Some(task_id.to_string()),
                 role: Role::Agent,
-                parts: vec![Part::text(text)],
+                parts,
                 metadata: None,
                 extensions: None,
                 reference_task_ids: None,
@@ -736,4 +831,382 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
         ],
     );
     assert!(stderr.contains("invalid input: --auth-credentials requires --auth-scheme"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_blocks_by_default_until_task_settles() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "--poll-interval",
+            "10ms",
+            "--timeout",
+            "5s",
+            "send",
+            "start-pending",
+        ],
+    );
+    let response: Value = serde_json::from_str(output.trim()).unwrap();
+    assert_eq!(response["task"]["id"], "task-pending-send");
+    assert_eq!(response["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+
+    // The blocking wait must have actually polled get_task rather than
+    // returning the initial WORKING response.
+    let count = *server
+        .state
+        .poll_counts
+        .lock()
+        .unwrap()
+        .get("task-pending-send")
+        .unwrap_or(&0);
+    assert!(count >= POLLS_UNTIL_SETTLED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_async_returns_immediately_without_waiting() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(&server, &["--compact", "--async", "send", "start-pending"]);
+    let response: Value = serde_json::from_str(output.trim()).unwrap();
+    assert_eq!(response["task"]["id"], "task-pending-send");
+    assert_eq!(response["task"]["status"]["state"], "TASK_STATE_WORKING");
+
+    // --async must skip polling entirely.
+    let count = *server
+        .state
+        .poll_counts
+        .lock()
+        .unwrap()
+        .get("task-pending-send")
+        .unwrap_or(&0);
+    assert_eq!(count, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_get_wait_polls_until_settled() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "--wait",
+            "--poll-interval",
+            "10ms",
+            "--timeout",
+            "5s",
+            "task",
+            "get",
+            "task-pending",
+        ],
+    );
+    let task: Value = serde_json::from_str(output.trim()).unwrap();
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED");
+
+    let count = *server
+        .state
+        .poll_counts
+        .lock()
+        .unwrap()
+        .get("task-pending")
+        .unwrap_or(&0);
+    assert!(count >= POLLS_UNTIL_SETTLED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_get_without_wait_does_not_poll() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(&server, &["--compact", "task", "get", "task-pending"]);
+    let task: Value = serde_json::from_str(output.trim()).unwrap();
+    // Still WORKING: a one-shot read must not have polled to settlement.
+    assert_eq!(task["status"]["state"], "TASK_STATE_WORKING");
+
+    let count = *server
+        .state
+        .poll_counts
+        .lock()
+        .unwrap()
+        .get("task-pending")
+        .unwrap_or(&0);
+    assert_eq!(count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_get_wait_times_out() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(
+        &server,
+        &[
+            "--wait",
+            "--poll-interval",
+            "10ms",
+            "--timeout",
+            "50ms",
+            "task",
+            "get",
+            STUCK_TASK_ID,
+        ],
+    );
+    assert!(stderr.contains("timed out"));
+    assert!(stderr.contains(STUCK_TASK_ID));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_with_ordered_message_parts_and_media_type() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "send",
+            "--text-part",
+            "hello",
+            "--file-part",
+            "https://example.com/doc.pdf",
+            "--media-type",
+            "application/pdf",
+            "--data-part",
+            r#"{"priority":"high"}"#,
+        ],
+    );
+    let response: Value = serde_json::from_str(output.trim()).unwrap();
+    let parts = response["task"]["status"]["message"]["parts"]
+        .as_array()
+        .unwrap();
+
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0]["text"], "hello");
+    assert_eq!(parts[1]["url"], "https://example.com/doc.pdf");
+    assert_eq!(parts[1]["mediaType"], "application/pdf");
+    assert!(parts[1].get("text").is_none());
+    assert_eq!(parts[2]["data"]["priority"], "high");
+    assert!(parts[2].get("mediaType").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_reads_local_file_part_and_stdin_data_part() {
+    let server = TestServer::spawn().await;
+
+    let mut file_path = std::env::temp_dir();
+    file_path.push(format!("a2acli-test-file-part-{}.bin", std::process::id()));
+    std::fs::write(&file_path, b"binary payload").unwrap();
+
+    let output = AssertCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args([
+            "--base-url",
+            server.base_url.as_str(),
+            "--compact",
+            "send",
+            "--text-part",
+            "hello",
+            "--file-part",
+            file_path.to_str().unwrap(),
+            "--data-part",
+            "-",
+        ])
+        .write_stdin(r#"{"ok":true}"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    std::fs::remove_file(&file_path).unwrap();
+
+    let response: Value = serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap();
+    let parts = response["task"]["status"]["message"]["parts"]
+        .as_array()
+        .unwrap();
+
+    assert_eq!(parts.len(), 3);
+    assert_eq!(
+        parts[1]["filename"],
+        file_path.file_name().unwrap().to_str().unwrap()
+    );
+    let decoded = BASE64.decode(parts[1]["raw"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded, b"binary payload");
+    assert_eq!(parts[2]["data"]["ok"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_rejects_media_type_without_preceding_part() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(
+        &server,
+        &[
+            "send",
+            "--media-type",
+            "application/pdf",
+            "--text-part",
+            "hello",
+        ],
+    );
+    assert!(stderr.contains("--media-type must immediately follow"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_rejects_positional_text_combined_with_part_flags() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(&server, &["send", "hello", "--text-part", "world"]);
+    assert!(stderr.contains("cannot be combined"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_falls_back_to_polling_when_the_stream_fails_to_open() {
+    let server = TestServer::spawn().await;
+
+    // "stream-open-error" fails send_streaming_message itself (not a
+    // stream item), which must trigger the one-shot-send-plus-poll
+    // fallback rather than propagating the error or hanging.
+    let stdout = run_cli_success(
+        &server,
+        &["--compact", "send", "stream-open-error", "--stream"],
+    );
+    let response: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(response["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_exits_cleanly_on_a_message_only_reply() {
+    let server = TestServer::spawn().await;
+
+    let stdout = run_cli_success(&server, &["--compact", "send", "reply-only"]);
+    let response: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(response["message"]["messageId"], "msg-reply-only");
+    assert!(response.get("task").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_part_reports_a_usage_error_for_a_missing_local_path() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(
+        &server,
+        &["send", "--file-part", "/no/such/file-part-path.bin"],
+    );
+    assert!(stderr.contains("failed to read"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_part_reads_json_from_a_local_file() {
+    let server = TestServer::spawn().await;
+
+    let mut file_path = std::env::temp_dir();
+    file_path.push(format!("a2acli-test-data-part-{}.json", std::process::id()));
+    std::fs::write(&file_path, r#"{"from":"file"}"#).unwrap();
+
+    let stdout = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "send",
+            "--text-part",
+            "hello",
+            "--data-part",
+            file_path.to_str().unwrap(),
+        ],
+    );
+    std::fs::remove_file(&file_path).unwrap();
+
+    let response: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let parts = response["task"]["status"]["message"]["parts"]
+        .as_array()
+        .unwrap();
+    assert_eq!(parts[1]["data"]["from"], "file");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_part_rejects_a_value_that_is_neither_a_file_nor_valid_json() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(
+        &server,
+        &["send", "--data-part", "not json and no such file"],
+    );
+    assert!(stderr.contains("--data-part must be a file path"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_part_reports_a_usage_error_when_stdin_is_not_utf8() {
+    let server = TestServer::spawn().await;
+
+    let output = AssertCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args([
+            "--base-url",
+            server.base_url.as_str(),
+            "send",
+            "--data-part",
+            "-",
+        ])
+        // Invalid UTF-8: read_to_string fails with an io::Error, exercising
+        // --data-part -'s ReadFile error path (distinct from malformed-but-
+        // valid-UTF-8 JSON, covered by the "neither a file nor valid JSON"
+        // case above).
+        .write_stdin(vec![0xFF, 0xFE, 0xFD])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("failed to read <stdin>"));
+}
+
+// Review fixes (a2aproject/a2a-rs#172 review from msardara).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_propagates_a_non_unsupported_error_instead_of_falling_back() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) =
+        run_cli_failure(&server, &["send", "stream-open-real-error", "--stream"]);
+    assert!(stderr.contains("a2a error"));
+    assert!(stderr.contains("transport exploded"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_rejects_a_message_with_no_content_at_all() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(&server, &["send"]);
+    assert!(stderr.contains("message must have at least one part"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn media_type_alone_with_no_other_part_flag_is_rejected() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(&server, &["send", "--media-type", "application/json"]);
+    assert!(stderr.contains("--media-type must immediately follow"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_part_reports_the_real_error_for_an_unreadable_existing_path() {
+    let server = TestServer::spawn().await;
+
+    // A directory exists but can never be read as file content — read_to_string
+    // fails with something other than NotFound, which must be reported as a
+    // ReadFile error rather than silently retried as inline JSON.
+    let mut dir_path = std::env::temp_dir();
+    dir_path.push(format!("a2acli-test-data-part-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir_path).unwrap();
+
+    let (_stdout, stderr) = run_cli_failure(
+        &server,
+        &["send", "--data-part", dir_path.to_str().unwrap()],
+    );
+
+    std::fs::remove_dir_all(&dir_path).unwrap();
+
+    assert!(stderr.contains("failed to read"));
+    assert!(!stderr.contains("must be a file path"));
 }

@@ -1,11 +1,13 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // SPDX-License-Identifier: Apache-2.0
+use std::ffi::OsString;
 use std::sync::Arc;
+use std::time::Duration;
 
 use a2a::*;
 use a2a_client::auth::AuthInterceptor;
 use a2a_client::{A2AClient, A2AClientFactory, BoxStream};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use reqwest::{Client, RequestBuilder};
 use serde::Serialize;
@@ -37,6 +39,37 @@ pub struct Cli {
     /// Emit compact JSON instead of pretty-printed JSON.
     #[arg(long, global = true)]
     pub compact: bool,
+
+    /// Do not wait: return the task identifiers immediately instead of blocking
+    /// until the task reaches a terminal or interrupted state (the default).
+    ///
+    /// Note: the spec lists `--return-immediately` as an OPTIONAL alias for
+    /// this flag, but that name is already this CLI's flag for the distinct
+    /// protocol-level `SendMessageConfiguration.return_immediately` (a
+    /// request to the *agent* to return early on queued work, not a
+    /// client-side "don't poll" instruction) — so it is deliberately not
+    /// reused here to avoid conflating the two.
+    #[arg(
+        long = "async",
+        alias = "no-wait",
+        global = true,
+        conflicts_with = "wait"
+    )]
+    pub async_mode: bool,
+
+    /// Explicitly block until the task reaches a terminal or interrupted state.
+    /// This is already the default for `send`; on `task get` it turns the
+    /// one-shot read into a poll loop.
+    #[arg(long, global = true, conflicts_with = "async_mode")]
+    pub wait: bool,
+
+    /// Delay between polls while waiting for a task to settle (e.g. "2s", "500ms").
+    #[arg(long, global = true, value_parser = parse_duration, default_value = "2s")]
+    pub poll_interval: Duration,
+
+    /// Overall time budget for a blocking wait before reporting a timeout (e.g. "30s", "2m").
+    #[arg(long, global = true, value_parser = parse_duration, default_value = "30s")]
+    pub timeout: Duration,
 
     #[command(subcommand)]
     pub command: Command,
@@ -90,8 +123,30 @@ pub enum TaskCommand {
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 pub struct MessageCommand {
-    /// Text payload to send as the user message.
-    pub text: String,
+    /// Text payload to send as the user message. Shorthand for a single
+    /// --text-part when no other part flags are given; mutually exclusive
+    /// with --text-part/--file-part/--data-part.
+    pub text: Option<String>,
+
+    /// Add a text part. Repeatable and order-preserving alongside
+    /// --file-part/--data-part.
+    #[arg(long = "text-part")]
+    pub text_parts: Vec<String>,
+
+    /// Add a file part. A local path is inlined as bytes; a URL is carried
+    /// by reference and never fetched by the CLI. Repeatable.
+    #[arg(long = "file-part")]
+    pub file_parts: Vec<String>,
+
+    /// Add a structured JSON data part, read from a file path, parsed from
+    /// an inline JSON string, or "-" to read JSON from stdin. Repeatable.
+    #[arg(long = "data-part")]
+    pub data_parts: Vec<String>,
+
+    /// Media type for the part flag immediately preceding it (--file-part or
+    /// --data-part). Usage error if it follows no part flag.
+    #[arg(long = "media-type")]
+    pub media_types: Vec<String>,
 
     /// Optional context identifier to continue an existing conversation.
     #[arg(long)]
@@ -281,22 +336,64 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("failed to read {path}: {source}")]
+    ReadFile {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("timed out after {timeout:?} waiting for task {task_id} to settle")]
+    Timeout { task_id: String, timeout: Duration },
 }
 
-pub async fn run(cli: Cli) -> Result<(), CliError> {
+/// Parse `args` the same way the real binary parses `std::env::args_os()`, then
+/// run the resulting command. Kept separate from [`run`] because recovering
+/// the interleaved order of `send`'s repeatable part flags
+/// (`--text-part`/`--file-part`/`--data-part`/`--media-type`) needs the raw
+/// [`ArgMatches`], which `Cli::parse()` alone discards.
+pub async fn run_args<I, T>(args: I) -> Result<(), CliError>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let matches = Cli::command().get_matches_from(args);
+    let cli = Cli::from_arg_matches(&matches).expect("matches were produced by Cli::command()");
+    run(cli, &matches).await
+}
+
+pub async fn run(cli: Cli, matches: &ArgMatches) -> Result<(), CliError> {
     match &cli.command {
         Command::Card { command } => run_card_command(&cli, command).await?,
         Command::Send(command) => {
+            let send_matches = matches
+                .subcommand_matches("send")
+                .expect("send subcommand matches present when cli.command is Command::Send");
+            let parts = resolve_message_parts(send_matches, command)?;
+            let request = build_send_message_request(command, parts, cli.tenant.clone());
+            let client = resolve_client(&cli).await?;
+
             if command.stream {
-                let client = resolve_client(&cli).await?;
-                let request = build_send_message_request(command, cli.tenant.clone());
-                let stream = client.send_streaming_message(&request).await?;
-                consume_stream(client, stream, cli.compact).await?;
+                match client.send_streaming_message(&request).await {
+                    Ok(stream) => {
+                        consume_stream(client, stream, cli.compact).await?;
+                    }
+                    Err(error) if error.code == a2a::error_code::UNSUPPORTED_OPERATION => {
+                        // The agent doesn't advertise the streaming
+                        // capability — fall back to a one-shot send plus
+                        // polling rather than hanging (TASK_POLL_004). Any
+                        // *other* error opening the stream is a real
+                        // failure and must be reported as such, not masked
+                        // by a silent retry.
+                        let response = send_and_maybe_wait(client, &request, &cli).await?;
+                        print_json(&response, cli.compact)?;
+                    }
+                    Err(error) => {
+                        let _ = client.destroy().await;
+                        return Err(error.into());
+                    }
+                }
             } else {
-                let request = build_send_message_request(command, cli.tenant.clone());
-                let client = resolve_client(&cli).await?;
-                let result = client.send_message(&request).await;
-                let response = finish_client_call(client, result).await?;
+                let response = send_and_maybe_wait(client, &request, &cli).await?;
                 print_json(&response, cli.compact)?;
             }
         }
@@ -304,6 +401,116 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// Send a message and, unless `--async` was given, block until the resulting
+/// task reaches a terminal or interrupted state (§6.5/§9.3 default-wait
+/// behavior). A `Message`-only response has no task to wait on and is
+/// returned as soon as it arrives. Always destroys `client` before returning.
+async fn send_and_maybe_wait<T: a2a_client::Transport>(
+    client: A2AClient<T>,
+    request: &SendMessageRequest,
+    cli: &Cli,
+) -> Result<SendMessageResponse, CliError> {
+    let result = client.send_message(request).await;
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = client.destroy().await;
+            return Err(error.into());
+        }
+    };
+
+    match response {
+        SendMessageResponse::Task(task) => {
+            let task = settle_task(
+                client,
+                task,
+                !cli.async_mode,
+                cli.tenant.clone(),
+                cli.poll_interval,
+                cli.timeout,
+            )
+            .await?;
+            Ok(SendMessageResponse::Task(task))
+        }
+        SendMessageResponse::Message(message) => {
+            client.destroy().await?;
+            Ok(SendMessageResponse::Message(message))
+        }
+    }
+}
+
+/// If `wait` is true and `task` has not already settled, poll until it
+/// reaches a terminal or interrupted state (or `timeout` expires). Destroys
+/// `client` before returning either way.
+async fn settle_task<T: a2a_client::Transport>(
+    client: A2AClient<T>,
+    task: Task,
+    wait: bool,
+    tenant: Option<String>,
+    poll_interval: Duration,
+    timeout: Duration,
+) -> Result<Task, CliError> {
+    let outcome = if wait && !is_settled(&task.status.state) {
+        wait_for_task_settled(&client, &task.id, tenant, poll_interval, timeout).await
+    } else {
+        Ok(task)
+    };
+
+    match outcome {
+        Ok(task) => {
+            client.destroy().await?;
+            Ok(task)
+        }
+        Err(error) => {
+            let _ = client.destroy().await;
+            Err(error)
+        }
+    }
+}
+
+/// Poll `task get` until the task reaches a terminal or interrupted state
+/// (§9.1/§9.3), sleeping `poll_interval` between attempts and giving up with
+/// [`CliError::Timeout`] once `timeout` has elapsed. `TASK_STATE_UNSPECIFIED`
+/// is treated as neither terminal nor interrupted, so it keeps polling.
+async fn wait_for_task_settled<T: a2a_client::Transport>(
+    client: &A2AClient<T>,
+    task_id: &str,
+    tenant: Option<String>,
+    poll_interval: Duration,
+    timeout: Duration,
+) -> Result<Task, CliError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let task = client
+            .get_task(&GetTaskRequest {
+                id: task_id.to_string(),
+                history_length: None,
+                tenant: tenant.clone(),
+            })
+            .await?;
+
+        if is_settled(&task.status.state) {
+            return Ok(task);
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(CliError::Timeout {
+                task_id: task_id.to_string(),
+                timeout,
+            });
+        }
+
+        tokio::time::sleep(poll_interval.min(deadline.saturating_duration_since(now))).await;
+    }
+}
+
+/// A task in a terminal (`COMPLETED`/`FAILED`/`CANCELED`/`REJECTED`) or
+/// interrupted (`INPUT_REQUIRED`/`AUTH_REQUIRED`) state needs no more polling.
+fn is_settled(state: &TaskState) -> bool {
+    state.is_terminal() || matches!(state, TaskState::InputRequired | TaskState::AuthRequired)
 }
 
 async fn run_card_command(cli: &Cli, command: &CardCommand) -> Result<(), CliError> {
@@ -339,7 +546,22 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
                     tenant: cli.tenant.clone(),
                 })
                 .await;
-            let task = finish_client_call(client, result).await?;
+            let task = match result {
+                Ok(task) => task,
+                Err(error) => {
+                    let _ = client.destroy().await;
+                    return Err(error.into());
+                }
+            };
+            let task = settle_task(
+                client,
+                task,
+                cli.wait,
+                cli.tenant.clone(),
+                cli.poll_interval,
+                cli.timeout,
+            )
+            .await?;
             print_json(&task, cli.compact)?;
         }
         TaskCommand::List(command) => {
@@ -389,11 +611,228 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
     Ok(())
 }
 
+/// Reconstruct `send`'s message parts in the order the caller typed them,
+/// binding each `--media-type` to the part flag immediately preceding it.
+///
+/// `clap`'s derived `MessageCommand` struct only exposes each repeatable flag
+/// (`--text-part`, `--file-part`, `--data-part`, `--media-type`) as its own
+/// `Vec<String>`, which loses the relative order *across* flags. Recovering
+/// that order needs the raw [`ArgMatches`] for the `send` subcommand:
+/// `indices_of` reports, for a given arg id, the token index of each value in
+/// the original command line, which sorts back into the order the caller
+/// wrote them (§10.2: "the part flags are repeatable and order-preserving").
+fn resolve_message_parts(
+    matches: &ArgMatches,
+    command: &MessageCommand,
+) -> Result<Vec<Part>, CliError> {
+    enum Kind {
+        Text,
+        File,
+        Data,
+    }
+    enum Token<'a> {
+        Part(Kind, &'a str),
+        MediaType(&'a str),
+    }
+
+    let mut tokens: Vec<(usize, Token<'_>)> = Vec::new();
+    if let Some(indices) = matches.indices_of("text_parts") {
+        tokens.extend(
+            indices
+                .zip(command.text_parts.iter())
+                .map(|(index, value)| (index, Token::Part(Kind::Text, value.as_str()))),
+        );
+    }
+    if let Some(indices) = matches.indices_of("file_parts") {
+        tokens.extend(
+            indices
+                .zip(command.file_parts.iter())
+                .map(|(index, value)| (index, Token::Part(Kind::File, value.as_str()))),
+        );
+    }
+    if let Some(indices) = matches.indices_of("data_parts") {
+        tokens.extend(
+            indices
+                .zip(command.data_parts.iter())
+                .map(|(index, value)| (index, Token::Part(Kind::Data, value.as_str()))),
+        );
+    }
+
+    if !command.media_types.is_empty() && tokens.is_empty() {
+        // A lone --media-type with no other part flag at all must not be
+        // silently dropped by the "no part flags given" branch below.
+        return Err(CliError::InvalidInput(
+            "--media-type must immediately follow a --text-part/--file-part/--data-part"
+                .to_string(),
+        ));
+    }
+
+    if tokens.is_empty() {
+        // No part flags given: the positional text (if any) is shorthand for
+        // a single text part. A message with no content at all is a usage
+        // error, not a silently empty parts array.
+        return match command.text.as_deref() {
+            Some(text) => Ok(vec![Part::text(text)]),
+            None => Err(CliError::InvalidInput(
+                "message must have at least one part: pass text, or use \
+                 --text-part/--file-part/--data-part"
+                    .to_string(),
+            )),
+        };
+    }
+
+    if command.text.is_some() {
+        return Err(CliError::InvalidInput(
+            "the positional message text cannot be combined with \
+             --text-part/--file-part/--data-part; pass it as --text-part instead"
+                .to_string(),
+        ));
+    }
+
+    if let Some(indices) = matches.indices_of("media_types") {
+        tokens.extend(
+            indices
+                .zip(command.media_types.iter())
+                .map(|(index, value)| (index, Token::MediaType(value.as_str()))),
+        );
+    }
+    tokens.sort_by_key(|(index, _)| *index);
+
+    let mut parts: Vec<Part> = Vec::new();
+    for (_, token) in tokens {
+        match token {
+            Token::Part(kind, value) => {
+                let part = match kind {
+                    Kind::Text => Part::text(value),
+                    Kind::File => build_file_part(value)?,
+                    Kind::Data => build_data_part(value)?,
+                };
+                parts.push(part);
+            }
+            Token::MediaType(media_type) => match parts.last_mut() {
+                Some(part) => part.media_type = Some(media_type.to_string()),
+                None => {
+                    return Err(CliError::InvalidInput(
+                        "--media-type must immediately follow a --text-part/--file-part/--data-part"
+                            .to_string(),
+                    ));
+                }
+            },
+        }
+    }
+
+    Ok(parts)
+}
+
+/// A local filesystem path becomes an inline, base64-encoded file part; a URL
+/// is carried by reference and never fetched by the CLI (§10.2).
+fn build_file_part(value: &str) -> Result<Part, CliError> {
+    if value.contains("://") {
+        return Ok(Part::url(value));
+    }
+
+    let bytes = std::fs::read(value).map_err(|source| CliError::ReadFile {
+        path: value.to_string(),
+        source,
+    })?;
+    let mut part = Part::raw(bytes);
+    part.filename = std::path::Path::new(value)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    Ok(part)
+}
+
+/// `--data-part <path|->` reads JSON from a file path or, for `-`, from
+/// stdin; anything else is parsed as an inline JSON string (§10.2).
+/// Whether a `read_to_string` failure means "this string doesn't name a
+/// readable file here" — so `--data-part` should go on to try parsing it as
+/// inline JSON — rather than "a real file failed to read", which must be
+/// reported.
+///
+/// This can't just test for `NotFound`: Windows rejects a path containing
+/// characters it doesn't allow (`{`, `"`, `:` — precisely what inline JSON
+/// looks like) with `InvalidFilename` *before* ever looking for the file, so
+/// matching only `NotFound` would turn every inline-JSON `--data-part` into
+/// a read error there while working fine on Unix, where those are all legal
+/// filename characters.
+fn means_not_a_readable_path(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::InvalidFilename
+            | std::io::ErrorKind::InvalidInput
+    )
+}
+
+fn build_data_part(value: &str) -> Result<Part, CliError> {
+    if value == "-" {
+        use std::io::Read;
+        let mut buffer = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buffer)
+            .map_err(|source| CliError::ReadFile {
+                path: "<stdin>".to_string(),
+                source,
+            })?;
+        return Ok(Part::data(serde_json::from_str(&buffer)?));
+    }
+
+    match std::fs::read_to_string(value) {
+        Ok(text) => return Ok(Part::data(serde_json::from_str(&text)?)),
+        Err(source) if !means_not_a_readable_path(source.kind()) => {
+            // A real file that couldn't be read (permission denied, a
+            // directory, invalid UTF-8, ...) — that's a failure to
+            // surface, not a signal to fall back to inline-JSON parsing.
+            return Err(CliError::ReadFile {
+                path: value.to_string(),
+                source,
+            });
+        }
+        Err(_) => {} // doesn't name a readable file — try `value` as JSON below
+    }
+
+    serde_json::from_str(value).map(Part::data).map_err(|_| {
+        CliError::InvalidInput(format!(
+            "--data-part must be a file path, \"-\" for stdin, or inline JSON: {value}"
+        ))
+    })
+}
+
+/// Parse a duration like "2s", "500ms", "1m", or a bare number of seconds.
+fn parse_duration(input: &str) -> Result<Duration, String> {
+    let trimmed = input.trim();
+    let (magnitude, unit) = if let Some(value) = trimmed.strip_suffix("ms") {
+        (value, "ms")
+    } else if let Some(value) = trimmed.strip_suffix('s') {
+        (value, "s")
+    } else if let Some(value) = trimmed.strip_suffix('m') {
+        (value, "m")
+    } else {
+        (trimmed, "s")
+    };
+
+    let magnitude: f64 = magnitude
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid duration: {input}"))?;
+    if magnitude < 0.0 || !magnitude.is_finite() {
+        return Err(format!("duration must be a non-negative number: {input}"));
+    }
+
+    let seconds = match unit {
+        "ms" => magnitude / 1000.0,
+        "m" => magnitude * 60.0,
+        _ => magnitude,
+    };
+    Ok(Duration::from_secs_f64(seconds))
+}
+
 fn build_send_message_request(
     command: &MessageCommand,
+    parts: Vec<Part>,
     tenant: Option<String>,
 ) -> SendMessageRequest {
-    let mut message = Message::new(Role::User, vec![Part::text(command.text.clone())]);
+    let mut message = Message::new(Role::User, parts);
     message.context_id = command.context_id.clone();
     message.task_id = command.task_id.clone();
 
@@ -1139,14 +1578,21 @@ mod tests {
         }
     }
 
-    fn parse_cli_with_base_url(base_url: &str, args: &[&str]) -> Cli {
+    fn build_args(base_url: &str, args: &[&str]) -> Vec<String> {
         let mut argv = vec![
             "a2acli".to_string(),
             "--base-url".to_string(),
             base_url.to_string(),
         ];
         argv.extend(args.iter().map(|arg| (*arg).to_string()));
-        Cli::try_parse_from(argv).unwrap()
+        argv
+    }
+
+    /// Parse and run `a2acli` exactly as the real binary does, so the
+    /// `ArgMatches`-derived part ordering (`resolve_message_parts`) is
+    /// exercised the same way in tests as in production.
+    async fn run_test_cli(base_url: &str, args: &[&str]) -> Result<(), CliError> {
+        run_args(build_args(base_url, args)).await
     }
 
     async fn unused_base_url() -> String {
@@ -1186,7 +1632,11 @@ mod tests {
     fn test_build_send_message_request_populates_optional_fields() {
         let request = build_send_message_request(
             &MessageCommand {
-                text: "hello".to_string(),
+                text: Some("hello".to_string()),
+                text_parts: Vec::new(),
+                file_parts: Vec::new(),
+                data_parts: Vec::new(),
+                media_types: Vec::new(),
                 context_id: Some("ctx-1".to_string()),
                 task_id: Some("task-1".to_string()),
                 history_length: Some(4),
@@ -1194,6 +1644,7 @@ mod tests {
                 return_immediately: true,
                 stream: false,
             },
+            vec![Part::text("hello")],
             Some("tenant-1".to_string()),
         );
 
@@ -1221,7 +1672,11 @@ mod tests {
     fn test_build_send_message_request_without_optional_fields() {
         let request = build_send_message_request(
             &MessageCommand {
-                text: "hello".to_string(),
+                text: Some("hello".to_string()),
+                text_parts: Vec::new(),
+                file_parts: Vec::new(),
+                data_parts: Vec::new(),
+                media_types: Vec::new(),
                 context_id: None,
                 task_id: None,
                 history_length: None,
@@ -1229,6 +1684,7 @@ mod tests {
                 return_immediately: false,
                 stream: false,
             },
+            vec![Part::text("hello")],
             None,
         );
 
@@ -1570,16 +2026,16 @@ mod tests {
     async fn test_run_executes_all_commands_in_lib_tests() {
         let server = RunTestServer::spawn().await;
 
-        run(parse_cli_with_base_url(&server.base_url, &["card", "get"]))
+        run_test_cli(&server.base_url, &["card", "get"])
             .await
             .unwrap();
-        run(parse_cli_with_base_url(
+        run_test_cli(
             &server.base_url,
             &["--compact", "card", "get", "--extended"],
-        ))
+        )
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
+        run_test_cli(
             &server.base_url,
             &[
                 "--binding",
@@ -1595,10 +2051,10 @@ mod tests {
                 "--context-id",
                 "ctx-send",
             ],
-        ))
+        )
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
+        run_test_cli(
             &server.base_url,
             &[
                 "--compact",
@@ -1610,16 +2066,13 @@ mod tests {
                 "--context-id",
                 "ctx-stream",
             ],
-        ))
+        )
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &["task", "get", "task-send"],
-        ))
-        .await
-        .unwrap();
-        run(parse_cli_with_base_url(
+        run_test_cli(&server.base_url, &["task", "get", "task-send"])
+            .await
+            .unwrap();
+        run_test_cli(
             &server.base_url,
             &[
                 "--compact",
@@ -1630,22 +2083,19 @@ mod tests {
                 "--status",
                 "completed",
             ],
-        ))
+        )
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
-            &server.base_url,
-            &["task", "cancel", "task-send"],
-        ))
-        .await
-        .unwrap();
-        run(parse_cli_with_base_url(
+        run_test_cli(&server.base_url, &["task", "cancel", "task-send"])
+            .await
+            .unwrap();
+        run_test_cli(
             &server.base_url,
             &["--compact", "task", "subscribe", "task-stream"],
-        ))
+        )
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
+        run_test_cli(
             &server.base_url,
             &[
                 "task",
@@ -1656,25 +2106,25 @@ mod tests {
                 "--config-id",
                 "cfg-1",
             ],
-        ))
+        )
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
+        run_test_cli(
             &server.base_url,
             &["--compact", "task", "push-config", "get", "task-1", "cfg-1"],
-        ))
+        )
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
+        run_test_cli(
             &server.base_url,
             &["--compact", "task", "push-config", "list", "task-1"],
-        ))
+        )
         .await
         .unwrap();
-        run(parse_cli_with_base_url(
+        run_test_cli(
             &server.base_url,
             &["task", "push-config", "delete", "task-1", "cfg-1"],
-        ))
+        )
         .await
         .unwrap();
     }
@@ -1683,10 +2133,10 @@ mod tests {
     async fn test_run_surfaces_errors_in_lib_tests() {
         let server = RunTestServer::spawn().await;
 
-        let err = run(parse_cli_with_base_url(
+        let err = run_test_cli(
             &server.base_url,
             &["card", "get", "--extended", "--tenant", "error"],
-        ))
+        )
         .await
         .unwrap_err();
         assert!(matches!(
@@ -1694,32 +2144,26 @@ mod tests {
             CliError::A2A(error) if error.code == a2a::error_code::UNSUPPORTED_OPERATION
         ));
 
-        let err = run(parse_cli_with_base_url(
-            &server.base_url,
-            &["send", "send-error"],
-        ))
-        .await
-        .unwrap_err();
+        let err = run_test_cli(&server.base_url, &["send", "send-error"])
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             CliError::A2A(error) if error.code == a2a::error_code::INVALID_REQUEST
         ));
 
-        let err = run(parse_cli_with_base_url(
-            &server.base_url,
-            &["task", "list", "--context-id", "error"],
-        ))
-        .await
-        .unwrap_err();
+        let err = run_test_cli(&server.base_url, &["task", "list", "--context-id", "error"])
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             CliError::A2A(error) if error.code == a2a::error_code::INVALID_PARAMS
         ));
 
-        let err = run(parse_cli_with_base_url(
+        let err = run_test_cli(
             &server.base_url,
             &["--compact", "send", "stream-error", "--stream"],
-        ))
+        )
         .await
         .unwrap_err();
         assert!(matches!(
@@ -1727,10 +2171,10 @@ mod tests {
             CliError::A2A(error) if error.code == a2a::error_code::INTERNAL_ERROR
         ));
 
-        let err = run(parse_cli_with_base_url(
+        let err = run_test_cli(
             &server.base_url,
             &["--compact", "task", "subscribe", "stream-error"],
-        ))
+        )
         .await
         .unwrap_err();
         assert!(matches!(
@@ -1738,7 +2182,7 @@ mod tests {
             CliError::A2A(error) if error.code == a2a::error_code::INTERNAL_ERROR
         ));
 
-        let err = run(parse_cli_with_base_url(
+        let err = run_test_cli(
             &server.base_url,
             &[
                 "task",
@@ -1749,7 +2193,7 @@ mod tests {
                 "--config-id",
                 "cfg-missing",
             ],
-        ))
+        )
         .await
         .unwrap_err();
         assert!(matches!(
@@ -1757,10 +2201,10 @@ mod tests {
             CliError::A2A(error) if error.code == a2a::error_code::TASK_NOT_FOUND
         ));
 
-        let err = run(parse_cli_with_base_url(
+        let err = run_test_cli(
             &server.base_url,
             &["task", "push-config", "list", "missing"],
-        ))
+        )
         .await
         .unwrap_err();
         assert!(matches!(
@@ -1769,9 +2213,7 @@ mod tests {
         ));
 
         let base_url = unused_base_url().await;
-        let err = run(parse_cli_with_base_url(&base_url, &["card", "get"]))
-            .await
-            .unwrap_err();
+        let err = run_test_cli(&base_url, &["card", "get"]).await.unwrap_err();
         assert!(matches!(err, CliError::Http(_)));
     }
 
@@ -1792,5 +2234,146 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(TaskState::from(input), expected);
         }
+    }
+
+    #[test]
+    fn test_means_not_a_readable_path_classification() {
+        use std::io::ErrorKind;
+
+        // "Doesn't name a readable file here" — --data-part goes on to try
+        // the value as inline JSON. InvalidFilename is the Windows answer
+        // for a path containing `{`, `"` or `:`, i.e. inline JSON itself,
+        // and is why this can't just test for NotFound.
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::InvalidFilename,
+            ErrorKind::InvalidInput,
+        ] {
+            assert!(
+                means_not_a_readable_path(kind),
+                "{kind:?} should fall through to inline-JSON parsing"
+            );
+        }
+
+        // A real file that failed to read — must be reported, not masked.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::IsADirectory,
+            ErrorKind::InvalidData,
+        ] {
+            assert!(
+                !means_not_a_readable_path(kind),
+                "{kind:?} should be surfaced as a read error"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_duration_variants() {
+        assert_eq!(parse_duration("2s").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("1m").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("1.5s").unwrap(), Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn test_parse_duration_rejects_invalid_input() {
+        assert!(parse_duration("banana").is_err());
+        assert!(parse_duration("-1s").is_err());
+    }
+
+    #[test]
+    fn test_is_settled_classifies_task_states() {
+        let settled = [
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Canceled,
+            TaskState::Rejected,
+            TaskState::InputRequired,
+            TaskState::AuthRequired,
+        ];
+        for state in settled {
+            assert!(is_settled(&state), "{state:?} should be settled");
+        }
+
+        let unsettled = [
+            TaskState::Unspecified,
+            TaskState::Submitted,
+            TaskState::Working,
+        ];
+        for state in unsettled {
+            assert!(!is_settled(&state), "{state:?} should not be settled");
+        }
+    }
+
+    fn parse_with_matches(args: &[&str]) -> (Cli, ArgMatches) {
+        let mut argv = vec!["a2acli".to_string()];
+        argv.extend(args.iter().map(|arg| (*arg).to_string()));
+        let matches = Cli::command().try_get_matches_from(argv).unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        (cli, matches)
+    }
+
+    fn send_command(cli: &Cli) -> &MessageCommand {
+        match &cli.command {
+            Command::Send(command) => command,
+            other => panic!("expected Command::Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_message_parts_preserves_interleaved_order_and_media_type() {
+        let (cli, matches) = parse_with_matches(&[
+            "send",
+            "--text-part",
+            "hello",
+            "--file-part",
+            "https://example.com/doc.pdf",
+            "--media-type",
+            "application/pdf",
+            "--data-part",
+            r#"{"k":1}"#,
+        ]);
+        let send_matches = matches.subcommand_matches("send").unwrap();
+        let parts = resolve_message_parts(send_matches, send_command(&cli)).unwrap();
+
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].as_text(), Some("hello"));
+        assert!(parts[0].media_type.is_none());
+        assert!(matches!(
+            &parts[1].content,
+            PartContent::Url(url) if url == "https://example.com/doc.pdf"
+        ));
+        assert_eq!(parts[1].media_type.as_deref(), Some("application/pdf"));
+        assert!(matches!(&parts[2].content, PartContent::Data(_)));
+        assert!(parts[2].media_type.is_none());
+    }
+
+    #[test]
+    fn test_resolve_message_parts_positional_text_is_shorthand() {
+        let (cli, matches) = parse_with_matches(&["send", "hello"]);
+        let send_matches = matches.subcommand_matches("send").unwrap();
+        let parts = resolve_message_parts(send_matches, send_command(&cli)).unwrap();
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].as_text(), Some("hello"));
+    }
+
+    #[test]
+    fn test_resolve_message_parts_rejects_media_type_without_preceding_part() {
+        let (cli, matches) =
+            parse_with_matches(&["send", "--media-type", "text/plain", "--text-part", "hi"]);
+        let send_matches = matches.subcommand_matches("send").unwrap();
+        let err = resolve_message_parts(send_matches, send_command(&cli)).unwrap_err();
+        assert!(matches!(err, CliError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn test_resolve_message_parts_rejects_positional_text_with_part_flags() {
+        let (cli, matches) = parse_with_matches(&["send", "hello", "--text-part", "world"]);
+        let send_matches = matches.subcommand_matches("send").unwrap();
+        let err = resolve_message_parts(send_matches, send_command(&cli)).unwrap_err();
+        assert!(matches!(err, CliError::InvalidInput(_)));
     }
 }
