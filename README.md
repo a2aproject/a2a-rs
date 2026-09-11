@@ -142,11 +142,11 @@ HTTP+JSON, prints responses as JSON, and manages task push notification
 configs.
 
 ```sh
-cargo run --bin a2acli -- card
+cargo run --bin a2acli -- card get
 cargo run --bin a2acli -- send "hello from rust"
-cargo run --bin a2acli -- stream "hello from rust"
-cargo run --bin a2acli -- list-tasks
-cargo run --bin a2acli -- push-config list task-123
+cargo run --bin a2acli -- send "hello from rust" --stream
+cargo run --bin a2acli -- task list
+cargo run --bin a2acli -- task push-config list task-123
 ```
 
 By default the CLI targets `http://localhost:3000`, which matches the bundled
