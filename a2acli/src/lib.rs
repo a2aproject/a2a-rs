@@ -1814,7 +1814,28 @@ fn looks_like_file_path(reference: &str) -> bool {
     reference.starts_with('/')
         || reference.starts_with("./")
         || reference.starts_with("../")
+        // Windows shapes. Without these a path that doesn't exist *yet*
+        // (a typo, a file not written) matches no prefix, falls through to
+        // the host forms, and is fetched as `https://C:\…` — so the error
+        // reported is "unreachable" rather than "no such card file".
+        || reference.starts_with('\\')
+        || reference.starts_with(".\\")
+        || reference.starts_with("..\\")
+        || has_windows_drive_prefix(reference)
         || std::fs::metadata(reference).is_ok()
+}
+
+/// Whether `reference` starts with a Windows drive-letter root (`C:\`,
+/// `C:/`). The drive letter must be exactly one character before the colon,
+/// so a `host:port` is never mistaken for a path — not `localhost:3000`,
+/// and not even a single-letter host like `a:3000`, whose third byte is a
+/// digit rather than a separator.
+fn has_windows_drive_prefix(reference: &str) -> bool {
+    let bytes = reference.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
 }
 
 /// Whether `host` (with or without a port) is loopback, which decides the
@@ -1847,7 +1868,15 @@ fn is_loopback_host(host: &str) -> bool {
 /// card URL is used as-is, and a local path (`file://…` or plain) resolves
 /// to a file on disk.
 fn normalize_card_reference(reference: &str) -> CardReference {
-    if let Some(path) = reference.strip_prefix("file://") {
+    if let Some(rest) = reference.strip_prefix("file://") {
+        let path = match rest.strip_prefix('/') {
+            // `file:///C:/card.json` is the canonical Windows form: the
+            // slash before the drive letter belongs to the URL, not to the
+            // path. On Unix there is no drive letter and the leading slash
+            // is kept, since it is the root.
+            Some(without_slash) if has_windows_drive_prefix(without_slash) => without_slash,
+            _ => rest,
+        };
         return CardReference::File(PathBuf::from(path));
     }
 
@@ -4443,6 +4472,48 @@ mod tests {
                 "reference {reference}"
             );
         }
+    }
+
+    /// Windows path shapes, asserted as plain strings so they are checked on
+    /// every platform. macOS and Linux cannot reproduce the divergence — a
+    /// Unix path starts with `/` and is caught by the first prefix — so only
+    /// the Windows CI job would otherwise notice a regression here, which is
+    /// exactly how this was found (a2aproject/a2a-rs#190).
+    #[test]
+    fn test_windows_path_shapes_are_recognized_as_files() {
+        for reference in [
+            r"C:\Users\me\card.json",
+            r"c:/Users/me/card.json",
+            r"\\server\share\card.json",
+            r".\card.json",
+            r"..\card.json",
+        ] {
+            assert!(looks_like_file_path(reference), "{reference}");
+            assert_eq!(
+                normalize_card_reference(reference),
+                CardReference::File(PathBuf::from(reference)),
+                "{reference}"
+            );
+        }
+
+        // A `host:port` is not a drive root, however short the host: the
+        // byte after the colon is a digit, not a path separator.
+        for reference in ["localhost:3000", "a:3000", "example.com:443"] {
+            assert!(!has_windows_drive_prefix(reference), "{reference}");
+            assert!(!looks_like_file_path(reference), "{reference}");
+        }
+
+        // `file:///C:/…`: the slash before the drive letter is URL syntax,
+        // not part of the path.
+        assert_eq!(
+            normalize_card_reference("file:///C:/Users/me/card.json"),
+            CardReference::File(PathBuf::from("C:/Users/me/card.json"))
+        );
+        // On Unix the same leading slash *is* the root, and is kept.
+        assert_eq!(
+            normalize_card_reference("file:///tmp/card.json"),
+            CardReference::File(PathBuf::from("/tmp/card.json"))
+        );
     }
 
     /// A bare name that happens to exist on disk is treated as a file, the
