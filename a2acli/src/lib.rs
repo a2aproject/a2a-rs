@@ -3002,4 +3002,457 @@ mod tests {
         assert!(text.contains("\"k\": 1"));
         assert!(text.contains("File: report.bin (application/octet-stream, 3 bytes)"));
     }
+
+    /// §10.3: a part whose media type the agent didn't declare still has to
+    /// render — by name and size for inline bytes, by URL for a referenced
+    /// file — rather than being dropped because the media type is missing.
+    #[test]
+    fn test_render_part_without_media_type_falls_back_to_name_and_url() {
+        let message = Message::new(
+            Role::Agent,
+            vec![
+                Part::raw(vec![7; 12]),
+                Part::raw(vec![1, 2]).with_filename("notes.txt"),
+                Part::url("https://example.com/spec.pdf"),
+                Part::url("https://example.com/report.csv").with_media_type("text/csv"),
+            ],
+        );
+
+        let text = message.render_text();
+        // No filename and no media type: neither is invented, and the part
+        // is still accounted for.
+        assert!(text.contains("File: (unnamed) (12 bytes)"), "{text}");
+        assert!(text.contains("File: notes.txt (2 bytes)"), "{text}");
+        assert!(
+            text.contains("File: https://example.com/spec.pdf"),
+            "{text}"
+        );
+        assert!(
+            text.contains("File: https://example.com/report.csv (text/csv)"),
+            "{text}"
+        );
+    }
+
+    /// A message with no parts renders an explicit `(none)` rather than
+    /// nothing at all, so `text` output never leaves the reader unsure
+    /// whether content was omitted or absent.
+    #[test]
+    fn test_message_render_text_marks_an_empty_part_list() {
+        let message = Message {
+            message_id: "msg-1".to_string(),
+            context_id: Some("ctx-1".to_string()),
+            task_id: Some("task-1".to_string()),
+            role: Role::Agent,
+            parts: vec![],
+            metadata: None,
+            extensions: None,
+            reference_task_ids: None,
+        };
+
+        let text = message.render_text();
+        assert!(text.contains("Context ID: ctx-1"), "{text}");
+        assert!(text.contains("Task ID: task-1"), "{text}");
+        assert!(text.contains("Parts: (none)"), "{text}");
+    }
+
+    /// A `send` that answers with a bare `Message` instead of a `Task`
+    /// renders through the message form (§10.2) — the response enum must not
+    /// have a task-shaped rendering as its only arm.
+    #[test]
+    fn test_send_message_response_renders_the_message_arm() {
+        let message = Message::new(Role::Agent, vec![Part::text("no task needed")]);
+        let response = SendMessageResponse::Message(message.clone());
+
+        assert_eq!(response.render_text(), message.render_text());
+        assert!(response.render_text().contains("no task needed"));
+    }
+
+    /// A card that declares no compatible interface renders `(none)` under
+    /// `Interfaces:` — `card get` is exactly the command you reach for to
+    /// find out *why* a transport couldn't be selected, so an empty list is
+    /// the case it most needs to state plainly.
+    #[test]
+    fn test_agent_card_render_text_marks_an_empty_interface_list() {
+        let card = AgentCard {
+            name: "Bare".to_string(),
+            description: "no interfaces".to_string(),
+            version: VERSION.to_string(),
+            supported_interfaces: vec![],
+            capabilities: AgentCapabilities {
+                streaming: None,
+                push_notifications: None,
+                extensions: None,
+                extended_agent_card: None,
+            },
+            default_input_modes: vec![],
+            default_output_modes: vec![],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        };
+
+        let text = card.render_text();
+        assert!(text.contains("Interfaces:\n  (none)"), "{text}");
+        // Absent capabilities read as `false`, never as a missing line.
+        assert!(text.contains("Streaming: false"), "{text}");
+    }
+
+    /// §10.3: artifacts are rendered per artifact, labeled by name when the
+    /// agent gave one and by artifact id when it didn't, with their parts
+    /// rendered underneath — never summarized as a count.
+    #[test]
+    fn test_task_render_text_lists_artifacts_and_resume_hint() {
+        let mut task = make_fixture_task(
+            "task-art",
+            "ctx-art",
+            TaskState::InputRequired,
+            "which region?",
+        );
+        task.artifacts = Some(vec![
+            Artifact {
+                artifact_id: "art-1".to_string(),
+                name: Some("summary".to_string()),
+                description: None,
+                parts: vec![Part::text("all clear")],
+                metadata: None,
+                extensions: None,
+            },
+            Artifact {
+                artifact_id: "art-2".to_string(),
+                name: None,
+                description: None,
+                parts: vec![Part::data(serde_json::json!({"rows": 3}))],
+                metadata: None,
+                extensions: None,
+            },
+        ]);
+
+        let text = task.render_text();
+        assert!(text.contains("Artifact: summary"), "{text}");
+        assert!(text.contains("all clear"), "{text}");
+        // Unnamed artifact falls back to its id rather than rendering blank.
+        assert!(text.contains("Artifact: art-2"), "{text}");
+        assert!(text.contains("\"rows\": 3"), "{text}");
+        // §9.2: an interrupted task always carries the resume command.
+        assert!(
+            text.contains("Resume with: a2acli send --task-id task-art \"<reply>\""),
+            "{text}"
+        );
+    }
+
+    /// §9.1: every task state has a distinct short label, and none of them
+    /// renders as the protocol's wire spelling — that form belongs to
+    /// `-o json` only.
+    #[test]
+    fn test_task_state_label_covers_every_state() {
+        let cases = [
+            (TaskState::Unspecified, "UNSPECIFIED"),
+            (TaskState::Submitted, "SUBMITTED"),
+            (TaskState::Working, "WORKING"),
+            (TaskState::Completed, "COMPLETED"),
+            (TaskState::Failed, "FAILED"),
+            (TaskState::Canceled, "CANCELED"),
+            (TaskState::InputRequired, "INPUT_REQUIRED"),
+            (TaskState::Rejected, "REJECTED"),
+            (TaskState::AuthRequired, "AUTH_REQUIRED"),
+        ];
+
+        for (state, expected) in cases {
+            assert_eq!(task_state_label(&state), expected);
+            assert!(!expected.starts_with("TASK_STATE_"));
+        }
+    }
+
+    #[test]
+    fn test_list_tasks_render_text_empty_and_paged() {
+        let empty = ListTasksResponse {
+            tasks: vec![],
+            next_page_token: "next-token".to_string(),
+            page_size: 10,
+            total_size: 0,
+        };
+
+        let text = empty.render_text();
+        assert!(text.contains("Total: 0"), "{text}");
+        assert!(text.contains("Page Size: 10"), "{text}");
+        assert!(text.contains("Next Page Token: next-token"), "{text}");
+        assert!(text.contains("Tasks: (none)"), "{text}");
+
+        let populated = ListTasksResponse {
+            tasks: vec![make_fixture_task(
+                "task-1",
+                "ctx-1",
+                TaskState::Completed,
+                "done",
+            )],
+            next_page_token: String::new(),
+            page_size: 10,
+            total_size: 1,
+        };
+
+        let text = populated.render_text();
+        // An empty page token is omitted rather than rendered as a blank
+        // field, so `text` output never suggests there is a next page.
+        assert!(!text.contains("Next Page Token"), "{text}");
+        assert!(text.contains("Task:"), "{text}");
+        assert!(text.contains("Task ID: task-1"), "{text}");
+    }
+
+    #[test]
+    fn test_push_config_render_text_includes_token_and_auth_scheme() {
+        let config = TaskPushNotificationConfig {
+            url: "https://example.com/hook".to_string(),
+            id: Some("cfg-1".to_string()),
+            task_id: "task-1".to_string(),
+            token: Some("tok-1".to_string()),
+            authentication: Some(AuthenticationInfo {
+                scheme: "Bearer".to_string(),
+                credentials: Some("super-secret".to_string()),
+            }),
+            tenant: None,
+        };
+
+        let text = config.render_text();
+        assert!(text.contains("Config ID: cfg-1"), "{text}");
+        assert!(text.contains("Task ID: task-1"), "{text}");
+        assert!(text.contains("URL: https://example.com/hook"), "{text}");
+        assert!(text.contains("Token: tok-1"), "{text}");
+        assert!(text.contains("Auth Scheme: Bearer"), "{text}");
+        // The scheme is useful; the credential behind it is never echoed.
+        assert!(!text.contains("super-secret"), "{text}");
+    }
+
+    #[test]
+    fn test_list_push_configs_render_text_empty_and_paged() {
+        let empty = ListTaskPushNotificationConfigsResponse {
+            configs: vec![],
+            next_page_token: Some("next-token".to_string()),
+        };
+
+        let text = empty.render_text();
+        assert!(text.contains("Next Page Token: next-token"), "{text}");
+        assert!(text.contains("Configs: (none)"), "{text}");
+
+        let populated = ListTaskPushNotificationConfigsResponse {
+            configs: vec![TaskPushNotificationConfig {
+                url: "https://example.com/hook".to_string(),
+                id: Some("cfg-1".to_string()),
+                task_id: "task-1".to_string(),
+                token: None,
+                authentication: None,
+                tenant: None,
+            }],
+            next_page_token: None,
+        };
+
+        let text = populated.render_text();
+        assert!(!text.contains("Next Page Token"), "{text}");
+        assert!(text.contains("Push Config:"), "{text}");
+        assert!(text.contains("Config ID: cfg-1"), "{text}");
+    }
+
+    #[test]
+    fn test_push_config_deleted_render_text() {
+        let deleted = PushConfigDeleted {
+            deleted: true,
+            task_id: "task-1".to_string(),
+            id: "cfg-1".to_string(),
+        };
+
+        let text = deleted.render_text();
+        assert!(text.contains("Deleted: true"), "{text}");
+        assert!(text.contains("Task ID: task-1"), "{text}");
+        assert!(text.contains("Config ID: cfg-1"), "{text}");
+    }
+
+    /// Under `--stream` each event is rendered on its own, so the update
+    /// events need renderings of their own — a status update that pauses the
+    /// task still has to carry the resume command (§9.2), and an artifact
+    /// update still has to show the artifact's parts (§10.3).
+    #[test]
+    fn test_stream_response_render_text_covers_update_events() {
+        let status = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "task-s".to_string(),
+            context_id: "ctx-s".to_string(),
+            status: TaskStatus {
+                state: TaskState::AuthRequired,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+
+        let text = status.render_text();
+        assert!(text.contains("Task ID: task-s"), "{text}");
+        assert!(text.contains("Context ID: ctx-s"), "{text}");
+        assert!(text.contains("State: AUTH_REQUIRED"), "{text}");
+        assert!(
+            text.contains("Resume with: a2acli send --task-id task-s \"<reply>\""),
+            "{text}"
+        );
+
+        // A state that isn't interrupted gets no resume line to act on.
+        let working = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "task-s".to_string(),
+            context_id: "ctx-s".to_string(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        assert!(!working.render_text().contains("Resume with"));
+
+        let artifact = StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            task_id: "task-s".to_string(),
+            context_id: "ctx-s".to_string(),
+            artifact: Artifact {
+                artifact_id: "art-9".to_string(),
+                name: None,
+                description: None,
+                parts: vec![Part::text("chunk one")],
+                metadata: None,
+                extensions: None,
+            },
+            append: None,
+            last_chunk: None,
+            metadata: None,
+        });
+
+        let text = artifact.render_text();
+        assert!(text.contains("Task ID: task-s"), "{text}");
+        assert!(text.contains("Artifact: art-9"), "{text}");
+        assert!(text.contains("chunk one"), "{text}");
+
+        // A stream may also carry whole tasks and messages, which render
+        // through their own forms rather than a stream-specific one.
+        let task = make_fixture_task("task-s", "ctx-s", TaskState::Completed, "done");
+        assert_eq!(
+            StreamResponse::Task(task.clone()).render_text(),
+            task.render_text()
+        );
+        let message = Message::new(Role::Agent, vec![Part::text("interim")]);
+        assert_eq!(
+            StreamResponse::Message(message.clone()).render_text(),
+            message.render_text()
+        );
+    }
+
+    fn text_cli() -> Cli {
+        parse_with_matches(&["task", "get", "unused"]).0
+    }
+
+    /// `text` mode renders through [`TextRender`] and never through
+    /// `Serialize`, so a value that cannot be serialized still streams — the
+    /// mirror of `test_consume_stream_reports_json_error`.
+    #[tokio::test]
+    async fn test_consume_stream_text_mode_does_not_serialize() {
+        let stream = Box::pin(stream::once(async { Ok(FailingSerialize) }));
+        consume_stream(make_test_client(None), stream, &text_cli())
+            .await
+            .unwrap();
+    }
+
+    /// Malformed JSON in a `--data-part` file is the caller's input to fix,
+    /// so it surfaces as a usage error naming the source — not as the
+    /// generic internal `CliError::Json`.
+    #[test]
+    fn test_parse_data_part_json_rejects_malformed_content() {
+        let error = parse_data_part_json("{not json", "payload.json").unwrap_err();
+
+        assert_eq!(error.exit_code(), 2);
+        let message = error.to_string();
+        assert!(message.contains("payload.json"), "{message}");
+        assert!(matches!(error, CliError::InvalidInput(_)));
+    }
+
+    /// A server that answers the well-known Agent Card path with exactly one
+    /// canned response and serves nothing else — enough to drive Appendix
+    /// D's classification of a card fetch, which needs a real
+    /// `reqwest::Error` (the type has no public constructor, so the
+    /// classification can't be asserted on a synthetic one).
+    struct CardOnlyServer {
+        base_url: String,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for CardOnlyServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    impl CardOnlyServer {
+        async fn spawn(status: axum::http::StatusCode, body: &'static str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new().route(
+                WELL_KNOWN_AGENT_CARD_PATH,
+                get(move || async move {
+                    (
+                        status,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        body.to_string(),
+                    )
+                }),
+            );
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            CardOnlyServer { base_url, handle }
+        }
+    }
+
+    /// Appendix D: a card fetch distinguishes "the agent isn't there" from
+    /// "the agent refused you" from "that isn't an agent card", because the
+    /// three need different fixes — and each maps to its own exit status
+    /// (§11.6) so a script can branch on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_card_fetch_failures_are_classified_per_appendix_d() {
+        let not_found = CardOnlyServer::spawn(axum::http::StatusCode::NOT_FOUND, "{}").await;
+        let error = run_test_cli(&not_found.base_url, &["card", "get"])
+            .await
+            .unwrap_err();
+        assert_eq!(error.envelope().error.code, "A2ACLI_ERR_CARD_NOT_FOUND");
+        assert_eq!(error.exit_code(), 3);
+        assert!(error.envelope().error.hint.is_some());
+
+        for status in [
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::http::StatusCode::FORBIDDEN,
+        ] {
+            let denied = CardOnlyServer::spawn(status, "{}").await;
+            let error = run_test_cli(&denied.base_url, &["card", "get"])
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.envelope().error.code,
+                "A2ACLI_ERR_AUTH_FAILED",
+                "status {status}"
+            );
+            assert_eq!(error.exit_code(), 4, "status {status}");
+        }
+
+        // 200, but the body isn't an Agent Card: the agent answered, so this
+        // is neither unreachable nor a missing card.
+        let invalid =
+            CardOnlyServer::spawn(axum::http::StatusCode::OK, r#"{"not":"a card"}"#).await;
+        let error = run_test_cli(&invalid.base_url, &["card", "get"])
+            .await
+            .unwrap_err();
+        assert_eq!(error.envelope().error.code, "A2ACLI_ERR_CARD_INVALID");
+        assert_eq!(error.exit_code(), 1);
+
+        // An unreachable agent stays distinct from all of the above.
+        let base_url = unused_base_url().await;
+        let error = run_test_cli(&base_url, &["card", "get"]).await.unwrap_err();
+        assert_eq!(error.envelope().error.code, "A2ACLI_ERR_UNREACHABLE");
+        assert_eq!(error.exit_code(), 3);
+    }
 }
