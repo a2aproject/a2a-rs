@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
+use super::apply_history_length;
 use super::store::{TaskStore, TaskVersion};
 
 struct StoredEntry {
@@ -107,21 +108,10 @@ impl TaskStore for InMemoryTaskStore {
             None
         };
 
-        // Apply history length truncation
         let page = page
             .into_iter()
             .map(|mut task| {
-                if let Some(ref hl) = req.history_length {
-                    let hl = *hl as usize;
-                    if let Some(ref mut history) = task.history {
-                        if hl == 0 {
-                            *history = Vec::new();
-                        } else if history.len() > hl {
-                            let start = history.len() - hl;
-                            *history = history[start..].to_vec();
-                        }
-                    }
-                }
+                apply_history_length(&mut task, req.history_length);
                 task
             })
             .collect();
@@ -346,6 +336,15 @@ mod tests {
         };
         let resp = store.list(&req).await.unwrap();
         assert_eq!(resp.tasks[0].history.as_ref().unwrap().len(), 1);
+
+        let empty = store
+            .list(&ListTasksRequest {
+                history_length: Some(-1),
+                ..req
+            })
+            .await
+            .unwrap();
+        assert!(empty.tasks[0].history.as_ref().unwrap().is_empty());
     }
 
     #[tokio::test]
