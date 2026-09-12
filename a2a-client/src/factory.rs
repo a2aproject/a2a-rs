@@ -121,8 +121,15 @@ impl A2AClientFactory {
         for (_prio, iface, factory) in &candidates {
             match factory.create(card, iface).await {
                 Ok(transport) => {
-                    let client =
+                    let mut client =
                         A2AClient::new(transport).with_interceptors(self.interceptors.clone());
+                    // A2A §8.3.2 rule 4: echo the tenant the selected
+                    // interface declares on every request. An empty string
+                    // is proto3's default for an unset field, so it means
+                    // "not declared" rather than a tenant named "".
+                    if let Some(tenant) = iface.tenant.as_deref().filter(|t| !t.is_empty()) {
+                        client = client.with_tenant(tenant);
+                    }
                     return Ok((client, (*iface).clone()));
                 }
                 Err(e) => {
@@ -316,5 +323,62 @@ mod tests {
             .unwrap();
         assert_eq!(selected.protocol_binding, TRANSPORT_PROTOCOL_JSONRPC);
         assert_eq!(selected.tenant.as_deref(), Some("tenant-42"));
+    }
+
+    fn card_with_tenant(tenant: Option<&str>) -> AgentCard {
+        let mut iface = AgentInterface::new("http://localhost/jsonrpc", TRANSPORT_PROTOCOL_JSONRPC);
+        iface.tenant = tenant.map(str::to_string);
+        AgentCard {
+            name: "test".into(),
+            description: "test agent".into(),
+            version: "1.0".into(),
+            supported_interfaces: vec![iface],
+            capabilities: AgentCapabilities::default(),
+            default_input_modes: vec!["text".into()],
+            default_output_modes: vec!["text".into()],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        }
+    }
+
+    /// A2A §8.3.2 rule 4: the factory carries the declared tenant onto the
+    /// client, so every request echoes it without the caller doing anything.
+    #[tokio::test]
+    async fn test_create_from_card_applies_the_declared_tenant() {
+        let factory = A2AClientFactory::builder().build();
+        let client = factory
+            .create_from_card(&card_with_tenant(Some("tenant-42")))
+            .await
+            .unwrap();
+        assert_eq!(client.tenant(), Some("tenant-42"));
+    }
+
+    /// An entry that declares no tenant leaves the client with none, so the
+    /// field stays omitted rather than being defaulted.
+    #[tokio::test]
+    async fn test_create_from_card_without_a_declared_tenant() {
+        let factory = A2AClientFactory::builder().build();
+        let client = factory
+            .create_from_card(&card_with_tenant(None))
+            .await
+            .unwrap();
+        assert_eq!(client.tenant(), None);
+    }
+
+    /// The empty string is proto3's default for an unset field, so it means
+    /// "not declared" — not a tenant named "".
+    #[tokio::test]
+    async fn test_create_from_card_treats_an_empty_tenant_as_undeclared() {
+        let factory = A2AClientFactory::builder().build();
+        let client = factory
+            .create_from_card(&card_with_tenant(Some("")))
+            .await
+            .unwrap();
+        assert_eq!(client.tenant(), None);
     }
 }

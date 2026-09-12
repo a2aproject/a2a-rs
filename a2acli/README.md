@@ -126,9 +126,10 @@ other than the tool's own is named on stderr rather than applied silently.
 never itself a credential flag. `--insecure` disables TLS certificate
 verification and always prints a warning naming the risk when a credential is
 also configured — it never disables verification silently. `--debug` never
-prints credential values, regardless of verbosity. `--tenant` overrides the
-routing tenant the selected Agent Card interface may itself declare; omit it
-to use the interface's own value, if it has one.
+prints credential values, regardless of verbosity. `--tenant` supplies a routing tenant when the
+selected Agent Card interface declares none; when the interface does declare
+one, A2A §8.3.2 requires that declared value to be sent exactly, so it is
+used and `--tenant` has no effect.
 
 ### Blocking and polling
 
