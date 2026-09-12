@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - apply `historyLength` on `get_task` and clamp `<= 0` on both get and list
-- treat `cancel_task` on a terminal task as idempotent
+- treat `cancel_task` on an already-`CANCELED` task as idempotent; other terminal states stay `TASK_NOT_CANCELABLE`
 
 ### Added
 

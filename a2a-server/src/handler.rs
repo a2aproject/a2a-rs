@@ -712,8 +712,14 @@ impl RequestHandler for DefaultRequestHandler {
         self.authorize(params, Some(&req.id))?;
         let task = self.load_task(&req.id).await?;
 
-        if task.status.state.is_terminal() {
+        // Idempotent: re-cancelling an already-canceled task is a no-op that
+        // returns the current task (matching a2a-go). Other terminal states
+        // are still not cancelable, per A2A and a2a-cli SPEC.md §10.4.
+        if task.status.state == TaskState::Canceled {
             return Ok(task);
+        }
+        if task.status.state.is_terminal() {
+            return Err(A2AError::task_not_cancelable(&req.id));
         }
 
         let active_execution = self.execution_manager.get(&req.id).await;
@@ -1509,8 +1515,78 @@ mod tests {
             metadata: None,
             tenant: None,
         };
+        let result = handler.cancel_task(&params, req).await;
+        match result {
+            Ok(_) => panic!("expected cancel of COMPLETED to fail"),
+            Err(error) => assert_eq!(error.code, error_code::TASK_NOT_CANCELABLE),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_already_canceled_is_idempotent() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        let task = Task {
+            id: "t-canceled".into(),
+            context_id: "c-canceled".into(),
+            status: TaskStatus {
+                state: TaskState::Canceled,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        handler.task_store.create(task).await.unwrap();
+        let req = CancelTaskRequest {
+            id: "t-canceled".into(),
+            metadata: None,
+            tenant: None,
+        };
         let result = handler.cancel_task(&params, req).await.unwrap();
-        assert_eq!(result.status.state, TaskState::Completed);
+        assert_eq!(result.status.state, TaskState::Canceled);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_failed_and_rejected_are_not_cancelable() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        for (id, state) in [
+            ("t-failed", TaskState::Failed),
+            ("t-rejected", TaskState::Rejected),
+        ] {
+            handler
+                .task_store
+                .create(Task {
+                    id: id.into(),
+                    context_id: format!("c-{id}"),
+                    status: TaskStatus {
+                        state,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: None,
+                    metadata: None,
+                })
+                .await
+                .unwrap();
+            let result = handler
+                .cancel_task(
+                    &params,
+                    CancelTaskRequest {
+                        id: id.into(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await;
+            match result {
+                Ok(_) => panic!("expected cancel of {id} to fail"),
+                Err(error) => assert_eq!(error.code, error_code::TASK_NOT_CANCELABLE),
+            }
+        }
     }
 
     fn task_with_history(id: &str, context_id: &str, n: usize) -> Task {
