@@ -5,8 +5,9 @@ on:
     - cron: '0 2 * * *'  # 2:00 AM UTC daily, 2 hours before dashboard redeploy
   workflow_dispatch:     # Allow manual trigger
 
+# Least privilege by default; the job that publishes results raises it itself.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: itk-nightly
@@ -16,6 +17,10 @@ jobs:
   nightly:
     name: Nightly ITK Run
     runs-on: ubuntu-latest
+    permissions:
+      # Needed only by "Upload Results to Rolling Release", which pushes
+      # itk_rust.json onto the nightly-metrics prerelease.
+      contents: write
 
     steps:
       - name: Checkout code
