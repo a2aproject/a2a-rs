@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `A2AError::extended_card_not_configured()`
+
+### Fixed
+
+- map `EXTENDED_CARD_NOT_CONFIGURED` and `EXTENSION_SUPPORT_REQUIRED` to
+  HTTP 400; both previously fell through to 500, contradicting the
+  FAILED_PRECONDITION gRPC status a2a-server already assigned them
+
 ## [0.3.0](https://github.com/a2aproject/a2a-rs/compare/a2a-lf-v0.2.4...a2a-lf-v0.3.0) - 2026-05-11
 
 ### Fixed
