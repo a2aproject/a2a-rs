@@ -2434,4 +2434,83 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, error_code::PUSH_NOTIFICATION_NOT_SUPPORTED);
     }
+
+    /// Reported in #161 against a different crate (`a2a-protocol-server`),
+    /// but worth pinning here: two tasks sharing a `contextId` must each
+    /// carry only their own artifacts. The task store is keyed by task id,
+    /// so there is no path by which a context could aggregate them — this
+    /// test exists so that stays true.
+    #[tokio::test]
+    async fn test_artifacts_do_not_aggregate_across_tasks_in_one_context() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        let context_id = "ctx-shared";
+
+        for (task_id, artifact_id) in [("t-first", "a-1"), ("t-second", "a-2")] {
+            handler
+                .task_store
+                .create(Task {
+                    id: task_id.into(),
+                    context_id: context_id.into(),
+                    status: TaskStatus {
+                        state: TaskState::Working,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: None,
+                    metadata: None,
+                })
+                .await
+                .unwrap();
+
+            apply_event_to_task(
+                handler.task_store.as_ref(),
+                None,
+                &StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    task_id: task_id.into(),
+                    context_id: context_id.into(),
+                    artifact: Artifact {
+                        artifact_id: artifact_id.into(),
+                        name: None,
+                        description: None,
+                        parts: vec![Part::text("payload")],
+                        metadata: None,
+                        extensions: None,
+                    },
+                    append: None,
+                    last_chunk: None,
+                    metadata: None,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        for (task_id, expected) in [("t-first", "a-1"), ("t-second", "a-2")] {
+            let task = handler
+                .get_task(
+                    &params,
+                    GetTaskRequest {
+                        id: task_id.into(),
+                        history_length: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let ids: Vec<&str> = task
+                .artifacts
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|a| a.artifact_id.as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![expected],
+                "{task_id} must carry only its own artifact"
+            );
+        }
+    }
 }
