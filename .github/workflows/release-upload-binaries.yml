@@ -11,6 +11,10 @@ on:
         required: true
         type: string
 
+# Least privilege by default; jobs that need more raise it themselves.
+permissions:
+  contents: read
+
 jobs:
   upload-a2acli-binaries:
     name: Upload a2acli binaries (${{ matrix.name }})

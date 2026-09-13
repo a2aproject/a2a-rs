@@ -14,6 +14,10 @@ on:
         required: true
         type: string
 
+# Least privilege by default; jobs that need more raise it themselves.
+permissions:
+  contents: read
+
 jobs:
   refresh-homebrew-formula:
     if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'a2a-cli-v') }}
