@@ -31,6 +31,17 @@ jobs:
         with:
           tool: just
 
+      - name: Check lockfile is up to date
+        # `--locked` fails if Cargo.lock would need changing. The release
+        # workflows already build with `--locked`, so a lockfile that drifts
+        # on main breaks every pull request's release-binary job.
+        #
+        # `shell: bash` because the windows runner defaults to pwsh, where
+        # `/dev/null` is an ordinary path and the redirect fails on the
+        # missing `C:\dev` directory.
+        shell: bash
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
       - name: Check compilation
         run: just check-compile
 
