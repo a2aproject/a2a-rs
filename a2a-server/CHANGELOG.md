@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are not dropped by intermediaries
 - bound request bodies on both bindings at 10 MB, rejecting oversized ones
   with `413` instead of reading them into memory
+- enforce the `AgentCapabilities` a server declares: `streaming: false` and
+  `push_notifications: false` now refuse the corresponding operations instead
+  of being stored and ignored. An undeclared (`None`) capability stays
+  permissive, and supplying a push store no longer overrides an explicit
+  `false`
 
 ### Added
 
