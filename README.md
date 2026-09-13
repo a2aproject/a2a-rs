@@ -151,7 +151,7 @@ cargo run --bin a2acli -- task push-config list task-123
 ```
 
 By default the CLI targets `http://localhost:3000`, which matches the bundled
-hello world server. Override the target with `--base-url https://host` for any
+hello world server. Override the target with `--agent-card https://host` for any
 compatible A2A server, use `--transport jsonrpc` or `--transport rest` to pin
 transport selection, and pass `--bearer`, `--api-key`, or repeated
 `--svc-param Name:Value` arguments when the server requires authentication.

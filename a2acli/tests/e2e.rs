@@ -120,6 +120,7 @@ impl TestServer {
 
         let card_state = state.clone();
         let card = public_card.clone();
+        let custom_path_card = public_card.clone();
 
         // Record the headers of every call that reaches the agent's own
         // endpoints, so a test can tell "the credential was attached to the
@@ -154,6 +155,19 @@ impl TestServer {
                             header_value(&headers, "x-api-key"),
                         ));
                         (StatusCode::OK, Json(card))
+                    }
+                }),
+            )
+            // The same card at a path that is *not* the well-known one, so a
+            // test can prove a full card URL is used as-is rather than
+            // having the well-known path appended to it.
+            .route(
+                "/custom/card.json",
+                get({
+                    let card = custom_path_card.clone();
+                    move || {
+                        let card = card.clone();
+                        async move { (StatusCode::OK, Json(card)) }
                     }
                 }),
             )
@@ -618,7 +632,7 @@ fn make_task_with_parts(
 /// instead of going through these.
 fn run_cli_success(server: &TestServer, args: &[&str]) -> String {
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
-    command.args(["--base-url", server.base_url.as_str(), "--output", "json"]);
+    command.args(["--agent-card", server.base_url.as_str(), "--output", "json"]);
     command.args(args);
     let output = command.assert().success().get_output().stdout.clone();
     String::from_utf8(output).unwrap()
@@ -626,7 +640,7 @@ fn run_cli_success(server: &TestServer, args: &[&str]) -> String {
 
 fn run_cli_failure(server: &TestServer, args: &[&str]) -> (String, String) {
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
-    command.args(["--base-url", server.base_url.as_str(), "--output", "json"]);
+    command.args(["--agent-card", server.base_url.as_str(), "--output", "json"]);
     command.args(args);
     let output = command.assert().failure().get_output().clone();
     (
@@ -639,7 +653,7 @@ fn run_cli_failure(server: &TestServer, args: &[&str]) -> (String, String) {
 /// handful of tests that check §11.6's exit-code contract explicitly.
 fn run_cli_failure_status(server: &TestServer, args: &[&str]) -> (String, String, i32) {
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
-    command.args(["--base-url", server.base_url.as_str(), "--output", "json"]);
+    command.args(["--agent-card", server.base_url.as_str(), "--output", "json"]);
     command.args(args);
     let output = command.assert().failure().get_output().clone();
     (
@@ -873,7 +887,7 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
     let output = command
         .args([
-            "--base-url",
+            "--agent-card",
             base_url.as_str(),
             "--output",
             "json",
@@ -1155,7 +1169,7 @@ async fn send_reads_local_file_part_and_stdin_data_part() {
     let output = AssertCommand::cargo_bin("a2acli")
         .unwrap()
         .args([
-            "--base-url",
+            "--agent-card",
             server.base_url.as_str(),
             "--output",
             "json",
@@ -1299,7 +1313,7 @@ async fn data_part_reports_a_usage_error_when_stdin_is_not_utf8() {
     let output = AssertCommand::cargo_bin("a2acli")
         .unwrap()
         .args([
-            "--base-url",
+            "--agent-card",
             server.base_url.as_str(),
             "send",
             "--data-part",
@@ -1377,7 +1391,7 @@ async fn text_is_the_default_output_format() {
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
     let output = command
         .args([
-            "--base-url",
+            "--agent-card",
             server.base_url.as_str(),
             "task",
             "get",
@@ -1410,7 +1424,7 @@ async fn text_output_prints_resume_hint_on_input_required() {
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
     let output = command
         .args([
-            "--base-url",
+            "--agent-card",
             server.base_url.as_str(),
             "task",
             "get",
@@ -1613,7 +1627,7 @@ async fn insecure_flag_still_builds_a_working_authenticated_client() {
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
     let output = command
         .args([
-            "--base-url",
+            "--agent-card",
             server.base_url.as_str(),
             "--output",
             "json",
@@ -1651,7 +1665,7 @@ async fn insecure_flag_prints_a_warning_and_names_the_credential_risk() {
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
     let output = command
         .args([
-            "--base-url",
+            "--agent-card",
             server.base_url.as_str(),
             "--insecure",
             "--bearer",
@@ -1672,7 +1686,7 @@ async fn insecure_flag_prints_a_warning_and_names_the_credential_risk() {
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
     let output = command
         .args([
-            "--base-url",
+            "--agent-card",
             server.base_url.as_str(),
             "--insecure",
             "card",
@@ -1693,7 +1707,7 @@ async fn no_insecure_flag_means_no_warning() {
 
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
     let output = command
-        .args(["--base-url", server.base_url.as_str(), "card", "get"])
+        .args(["--agent-card", server.base_url.as_str(), "card", "get"])
         .assert()
         .success()
         .get_output()
@@ -1737,7 +1751,7 @@ async fn debug_flag_emits_diagnostics_without_leaking_the_bearer_token() {
     let mut command = StdCommand::cargo_bin("a2acli").unwrap();
     let output = command
         .args([
-            "--base-url",
+            "--agent-card",
             server.base_url.as_str(),
             "--debug",
             "--bearer",
@@ -1799,7 +1813,9 @@ impl ConfigScratchDir {
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("A2ACLI_TENANT")
             .env_remove("A2ACLI_BASE_URL")
-            .args(["--base-url", server.base_url.as_str()]);
+            .env_remove("A2ACLI_AGENT_CARD")
+            .env_remove("A2ACLI_ENDPOINT")
+            .args(["--agent-card", server.base_url.as_str()]);
         command
     }
 }
@@ -1996,4 +2012,404 @@ async fn config_show_reports_an_explicit_transport_preference_in_order() {
         stdout.contains("transport: (agent card's own order)"),
         "{stdout}"
     );
+}
+
+// CARD_GET_001 / §10.1 (a2aproject/a2a-rs#178): the Agent Card reference.
+
+/// A bare host or origin gets the well-known path appended — the form every
+/// other test in this file relies on, asserted here explicitly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_card_accepts_a_bare_origin() {
+    let server = TestServer::spawn().await;
+
+    let stdout = run_cli_success(&server, &["card", "get"]);
+    let card: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(card["name"], "Fixture Agent");
+    // The card fetch did reach the well-known handler.
+    assert_eq!(server.state.card_headers.lock().unwrap().len(), 1);
+}
+
+/// A reference that already carries a path is a full card URL and is used
+/// as-is — the well-known path must not be appended to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_card_accepts_a_full_card_url_without_appending_the_well_known_path() {
+    let server = TestServer::spawn().await;
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let stdout = command
+        .args([
+            "--agent-card",
+            &format!("{}/custom/card.json", server.base_url),
+            "--output",
+            "json",
+            "card",
+            "get",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let card: Value = serde_json::from_str(String::from_utf8(stdout).unwrap().trim()).unwrap();
+    assert_eq!(card["name"], "Fixture Agent");
+    // Served from /custom/card.json, so the well-known handler was never hit.
+    assert!(server.state.card_headers.lock().unwrap().is_empty());
+}
+
+fn write_card_file(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
+fn scratch_dir(name: &str) -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("a2acli-card-{name}-{}", std::process::id()));
+    path
+}
+
+const FILE_CARD_JSON: &str = r#"{
+  "name": "File Agent",
+  "description": "resolved from a local file",
+  "version": "1.0",
+  "supportedInterfaces": [],
+  "capabilities": {},
+  "defaultInputModes": [],
+  "defaultOutputModes": [],
+  "skills": []
+}"#;
+
+/// A plain filesystem path resolves to a card on disk — how the tool is
+/// driven in tests and air-gapped environments, with no agent running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_card_reads_a_plain_local_path() {
+    let dir = scratch_dir("plain-path");
+    let path = write_card_file(&dir, "card.json", FILE_CARD_JSON);
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--agent-card",
+            path.to_str().unwrap(),
+            "--output",
+            "json",
+            "card",
+            "get",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let card: Value =
+        serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+    assert_eq!(card["name"], "File Agent");
+    assert!(String::from_utf8(output.stderr).unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `file://` form resolves the same way as a plain path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_card_reads_a_file_url() {
+    let dir = scratch_dir("file-url");
+    let path = write_card_file(&dir, "card.json", FILE_CARD_JSON);
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let stdout = command
+        .args([
+            "--agent-card",
+            &format!("file://{}", path.display()),
+            "--output",
+            "json",
+            "card",
+            "get",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let card: Value = serde_json::from_str(String::from_utf8(stdout).unwrap().trim()).unwrap();
+    assert_eq!(card["name"], "File Agent");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Appendix D: a card file that isn't there is `CARD_NOT_FOUND`/3, the same
+/// class and status as a card URL that answers non-2xx — a caller branching
+/// on the exit code needn't know which form was used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_card_file_reports_card_not_found() {
+    let dir = scratch_dir("missing");
+    let path = dir.join("absent.json");
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args(["--agent-card", path.to_str().unwrap(), "card", "get"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let envelope = parse_error_envelope(&String::from_utf8(output.stderr).unwrap());
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_CARD_NOT_FOUND");
+    assert!(envelope["error"]["hint"].is_string());
+    assert_eq!(output.status.code().unwrap(), 3);
+}
+
+/// A file that is there but isn't a card is `CARD_INVALID`/1 — the same
+/// split the HTTP path makes between a bad response and a bad body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_file_that_is_not_a_card_reports_card_invalid() {
+    let dir = scratch_dir("invalid");
+    let path = write_card_file(&dir, "bad.json", r#"{"not":"a card"}"#);
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args(["--agent-card", path.to_str().unwrap(), "card", "get"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let envelope = parse_error_envelope(&String::from_utf8(output.stderr).unwrap());
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_CARD_INVALID");
+    assert_eq!(output.status.code().unwrap(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--base-url` keeps working so pre-#178 invocations don't break, but says
+/// it is deprecated. The warning goes to stderr and leaves stdout intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn base_url_still_resolves_a_card_but_warns_it_is_deprecated() {
+    let server = TestServer::spawn().await;
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--base-url",
+            server.base_url.as_str(),
+            "--output",
+            "json",
+            "card",
+            "get",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let card: Value =
+        serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+    assert_eq!(card["name"], "Fixture Agent");
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--base-url is deprecated"), "{stderr}");
+    assert!(stderr.contains("--agent-card"), "{stderr}");
+}
+
+/// The warning names a flag the caller actually passed: leaving `--base-url`
+/// at its built-in default is not a deprecated invocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_base_url_does_not_warn_about_deprecation() {
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    assert!(
+        !String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("deprecated")
+    );
+}
+
+/// §7.2: `--endpoint` connects straight to an interface, so no card is
+/// fetched at all — asserted against the fixture's card handler never being
+/// reached, not merely against the command succeeding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn endpoint_connects_without_resolving_a_card() {
+    let server = TestServer::spawn().await;
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let stdout = command
+        .args([
+            "--endpoint",
+            &format!("{}/jsonrpc", server.base_url),
+            "--transport",
+            "jsonrpc",
+            "--output",
+            "json",
+            "task",
+            "get",
+            "task-1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let task: Value = serde_json::from_str(String::from_utf8(stdout).unwrap().trim()).unwrap();
+    assert_eq!(task["id"], "task-1");
+    assert!(
+        server.state.card_headers.lock().unwrap().is_empty(),
+        "--endpoint must not resolve an agent card"
+    );
+}
+
+/// With no card to declare the binding, the caller must name exactly one
+/// transport: zero leaves the protocol ambiguous, more than one asks for a
+/// preference order over a single interface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn endpoint_requires_exactly_one_transport() {
+    let server = TestServer::spawn().await;
+    let endpoint = format!("{}/jsonrpc", server.base_url);
+
+    for transports in [vec![], vec!["jsonrpc", "rest"]] {
+        let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+        command.args(["--endpoint", endpoint.as_str()]);
+        for transport in &transports {
+            command.args(["--transport", transport]);
+        }
+        let output = command
+            .args(["task", "get", "task-1"])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+
+        let envelope = parse_error_envelope(&String::from_utf8(output.stderr).unwrap());
+        assert_eq!(
+            envelope["error"]["code"],
+            "A2ACLI_ERR_USAGE",
+            "with {} transport(s)",
+            transports.len()
+        );
+        assert_eq!(output.status.code().unwrap(), 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn endpoint_and_agent_card_are_mutually_exclusive() {
+    let server = TestServer::spawn().await;
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--agent-card",
+            server.base_url.as_str(),
+            "--endpoint",
+            &format!("{}/jsonrpc", server.base_url),
+            "--transport",
+            "jsonrpc",
+            "task",
+            "get",
+            "task-1",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let envelope = parse_error_envelope(&stderr);
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_USAGE");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("mutually exclusive"),
+        "{stderr}"
+    );
+    assert_eq!(output.status.code().unwrap(), 2);
+}
+
+/// `config show` answers "which agent am I talking to?" in one line, so the
+/// reader doesn't have to apply the reference rules themselves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_show_reports_the_resolved_card_reference() {
+    let server = TestServer::spawn().await;
+    let scratch = ConfigScratchDir::new("resolved-card");
+
+    let stdout = String::from_utf8(
+        scratch
+            .command(&server)
+            .args(["config", "show"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stdout.contains(&format!(
+            "resolved-card: {}/.well-known/agent-card.json",
+            server.base_url
+        )),
+        "{stdout}"
+    );
+
+    // Under --endpoint there is no card to resolve, and the line says so
+    // rather than reporting a URL that is never fetched.
+    let stdout = String::from_utf8(
+        scratch
+            .command(&server)
+            .args([
+                "--endpoint",
+                &format!("{}/jsonrpc", server.base_url),
+                "--transport",
+                "jsonrpc",
+                "config",
+                "show",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stdout.contains("resolved-card: (none; --endpoint"),
+        "{stdout}"
+    );
+}
+
+/// A local card file is reported as the file it will be read from, not as a
+/// URL that would never be fetched. Built without `ConfigScratchDir`, whose
+/// base command already supplies `--agent-card`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_show_reports_a_local_card_file_as_the_resolved_card() {
+    let dir = scratch_dir("resolved-card-file");
+    let path = write_card_file(&dir, "card.json", FILE_CARD_JSON);
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let stdout = command
+        .env_remove("A2ACLI_AGENT_CARD")
+        .env_remove("A2ACLI_BASE_URL")
+        .env_remove("A2ACLI_ENDPOINT")
+        .args(["--agent-card", path.to_str().unwrap(), "config", "show"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(stdout).unwrap();
+    assert!(
+        stdout.contains(&format!("resolved-card: file://{}", path.display())),
+        "{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

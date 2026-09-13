@@ -36,10 +36,38 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<String>,
 
-    /// Base URL used to resolve /.well-known/agent-card.json.
+    /// The agent to talk to, as an Agent Card reference (§7.2): a bare host
+    /// or origin (the well-known path is appended), a full card URL (used
+    /// as-is), or a local file path (`file://…` or a plain path).
+    #[arg(
+        short = 'a',
+        long = "agent-card",
+        global = true,
+        value_name = "REF",
+        env = "A2ACLI_AGENT_CARD"
+    )]
+    pub agent_card: Option<String>,
+
+    /// Connect straight to an agent interface URL, skipping Agent Card
+    /// resolution (§7.2). MUST be used with exactly one --transport, since
+    /// there is no card to name the binding. Mutually exclusive with
+    /// --agent-card.
+    #[arg(
+        short = 'e',
+        long,
+        global = true,
+        value_name = "REF",
+        env = "A2ACLI_ENDPOINT"
+    )]
+    pub endpoint: Option<String>,
+
+    /// Deprecated alias for the bare-origin form of --agent-card, kept so
+    /// pre-#178 invocations keep working. Hidden: `--agent-card` is the
+    /// flag the specification defines.
     #[arg(
         long,
         global = true,
+        hide = true,
         default_value = "http://localhost:3000",
         env = "A2ACLI_BASE_URL"
     )]
@@ -451,7 +479,23 @@ pub enum CliError {
     },
     #[error("timed out after {timeout:?} waiting for task {task_id} to settle")]
     Timeout { task_id: String, timeout: Duration },
+    /// A local Agent Card file that couldn't be read — the file-path
+    /// counterpart of a non-2xx card fetch.
+    #[error("failed to read agent card file {path}: {source}")]
+    CardFile {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A local Agent Card file that was read but isn't an Agent Card — the
+    /// counterpart of a response body that won't deserialize.
+    #[error("agent card file is not a valid agent card: {0}")]
+    CardInvalid(String),
 }
+
+/// A2A §5.3: where an agent publishes its card, appended to a reference
+/// that names only a host or origin.
+const WELL_KNOWN_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 
 /// The Appendix B error envelope: the one result shape this specification
 /// defines of its own, for a failure that never reached the protocol.
@@ -481,6 +525,11 @@ impl CliError {
             CliError::InvalidInput(_) => 2,
             CliError::ReadFile { .. } => 2,
             CliError::Timeout { .. } => 5,
+            // Appendix D: the same statuses the HTTP card path uses, so a
+            // caller branching on the exit code needn't know whether the
+            // card came from a URL or a file.
+            CliError::CardFile { .. } => 3,
+            CliError::CardInvalid(_) => 1,
         }
     }
 
@@ -503,6 +552,16 @@ impl CliError {
                     "check that the --file-part/--data-part path exists and is readable"
                         .to_string(),
                 ),
+                None,
+            ),
+            CliError::CardFile { .. } => (
+                "A2ACLI_ERR_CARD_NOT_FOUND".to_string(),
+                Some("check that the --agent-card path exists and is readable".to_string()),
+                None,
+            ),
+            CliError::CardInvalid(_) => (
+                "A2ACLI_ERR_CARD_INVALID".to_string(),
+                Some("the agent card did not match the expected schema".to_string()),
                 None,
             ),
             CliError::Timeout { .. } => (
@@ -570,7 +629,7 @@ fn http_error_code_and_hint(error: &reqwest::Error) -> (String, Option<String>, 
 
     (
         "A2ACLI_ERR_UNREACHABLE".to_string(),
-        Some("check --base-url and network connectivity".to_string()),
+        Some("check --agent-card/--endpoint and network connectivity".to_string()),
         None,
     )
 }
@@ -625,7 +684,7 @@ pub async fn run(
     }
 
     match &cli.command {
-        Command::Card { command } => run_card_command(&cli, command).await?,
+        Command::Card { command } => run_card_command(&cli, matches, command).await?,
         Command::Config { command } => {
             run_config_command(&cli, matches, dotenv_provenance, command)?
         }
@@ -634,7 +693,7 @@ pub async fn run(
                 .subcommand_matches("send")
                 .expect("send subcommand matches present when cli.command is Command::Send");
             let parts = resolve_message_parts(send_matches, command)?;
-            let ResolvedClient { client, tenant } = resolve_client(&cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(&cli, matches).await?;
             let request = build_send_message_request(command, parts, tenant.clone());
 
             if command.stream {
@@ -678,7 +737,7 @@ pub async fn run(
                 print_output(&response, &cli)?;
             }
         }
-        Command::Task { command } => run_task_command(&cli, command).await?,
+        Command::Task { command } => run_task_command(&cli, matches, command).await?,
     }
 
     Ok(())
@@ -790,18 +849,22 @@ fn is_settled(state: &TaskState) -> bool {
     state.is_terminal() || matches!(state, TaskState::InputRequired | TaskState::AuthRequired)
 }
 
-async fn run_card_command(cli: &Cli, command: &CardCommand) -> Result<(), CliError> {
+async fn run_card_command(
+    cli: &Cli,
+    matches: &ArgMatches,
+    command: &CardCommand,
+) -> Result<(), CliError> {
     match command {
         CardCommand::Get(command) => {
             if command.extended {
-                let ResolvedClient { client, tenant } = resolve_client(cli).await?;
+                let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
                 let result = client
                     .get_extended_agent_card(&GetExtendedAgentCardRequest { tenant })
                     .await;
                 let card = finish_client_call(client, result).await?;
                 print_output(&card, cli)?;
             } else {
-                let card = resolve_agent_card(cli).await?;
+                let card = resolve_agent_card(cli, matches).await?;
                 print_output(&card, cli)?;
             }
         }
@@ -810,10 +873,14 @@ async fn run_card_command(cli: &Cli, command: &CardCommand) -> Result<(), CliErr
     Ok(())
 }
 
-async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliError> {
+async fn run_task_command(
+    cli: &Cli,
+    matches: &ArgMatches,
+    command: &TaskCommand,
+) -> Result<(), CliError> {
     match command {
         TaskCommand::Get(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
             let result = client
                 .get_task(&GetTaskRequest {
                     id: command.id.clone(),
@@ -840,7 +907,7 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
             print_output(&task, cli)?;
         }
         TaskCommand::List(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
             let result = client
                 .list_tasks(&ListTasksRequest {
                     context_id: command.context_id.clone(),
@@ -857,7 +924,7 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
             print_output(&response, cli)?;
         }
         TaskCommand::Cancel(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
             let result = client
                 .cancel_task(&CancelTaskRequest {
                     id: command.id.clone(),
@@ -869,7 +936,7 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
             print_output(&task, cli)?;
         }
         TaskCommand::Subscribe(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
             let stream = client
                 .subscribe_to_task(&SubscribeToTaskRequest {
                     id: command.id.clone(),
@@ -879,7 +946,7 @@ async fn run_task_command(cli: &Cli, command: &TaskCommand) -> Result<(), CliErr
             consume_stream(client, stream, cli).await?;
         }
         TaskCommand::PushConfig { command } => {
-            run_push_config_command(cli, command).await?;
+            run_push_config_command(cli, matches, command).await?;
         }
     }
 
@@ -1171,10 +1238,14 @@ fn build_push_notification_config(
     })
 }
 
-async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Result<(), CliError> {
+async fn run_push_config_command(
+    cli: &Cli,
+    matches: &ArgMatches,
+    command: &PushConfigCommand,
+) -> Result<(), CliError> {
     match command {
         PushConfigCommand::Create(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
             let mut config = build_push_notification_config(command)?;
             config.task_id = command.task_id.clone();
             config.tenant = tenant;
@@ -1183,7 +1254,7 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
             print_output(&response, cli)?;
         }
         PushConfigCommand::Get(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
             let result = client
                 .get_push_config(&GetTaskPushNotificationConfigRequest {
                     task_id: command.task_id.clone(),
@@ -1195,7 +1266,7 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
             print_output(&response, cli)?;
         }
         PushConfigCommand::List(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
             let result = client
                 .list_push_configs(&ListTaskPushNotificationConfigsRequest {
                     task_id: command.task_id.clone(),
@@ -1208,7 +1279,7 @@ async fn run_push_config_command(cli: &Cli, command: &PushConfigCommand) -> Resu
             print_output(&response, cli)?;
         }
         PushConfigCommand::Delete(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli).await?;
+            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
             let result = client
                 .delete_push_config(&DeleteTaskPushNotificationConfigRequest {
                     task_id: command.task_id.clone(),
@@ -1498,6 +1569,22 @@ fn effective_config_settings(
     };
 
     add(
+        "agent_card",
+        "agent-card",
+        cli.agent_card
+            .clone()
+            .unwrap_or_else(|| "(not set)".to_string()),
+        "A2ACLI_AGENT_CARD",
+    );
+    add(
+        "endpoint",
+        "endpoint",
+        cli.endpoint
+            .clone()
+            .unwrap_or_else(|| "(not set)".to_string()),
+        "A2ACLI_ENDPOINT",
+    );
+    add(
         "base_url",
         "base-url",
         cli.base_url.clone(),
@@ -1576,6 +1663,23 @@ fn effective_config_settings(
         "A2ACLI_TIMEOUT",
     );
 
+    // Where the card is actually fetched from, given the above: the one
+    // line that answers "which agent am I talking to?" without the reader
+    // having to apply the precedence rules themselves.
+    settings.push(ConfigSetting {
+        name: "resolved-card".to_string(),
+        value: match &cli.endpoint {
+            Some(endpoint) => format!("(none; --endpoint {endpoint})"),
+            None => {
+                match normalize_card_reference(cli.agent_card.as_deref().unwrap_or(&cli.base_url)) {
+                    CardReference::File(path) => format!("file://{}", path.display()),
+                    CardReference::Url(url) => url,
+                }
+            }
+        },
+        source: "derived".to_string(),
+    });
+
     ConfigSettings { settings }
 }
 
@@ -1588,8 +1692,65 @@ struct ResolvedClient {
     tenant: Option<String>,
 }
 
-async fn resolve_client(cli: &Cli) -> Result<ResolvedClient, CliError> {
-    let card = resolve_agent_card(cli).await?;
+/// How the caller named the agent (§7.2), validated once so the two forms
+/// can't disagree further down: an Agent Card reference to resolve, or a
+/// single interface to connect to directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentSelection {
+    Card(String),
+    Endpoint { url: String, binding: Binding },
+}
+
+fn resolve_agent_selection(cli: &Cli, matches: &ArgMatches) -> Result<AgentSelection, CliError> {
+    match (&cli.agent_card, &cli.endpoint) {
+        (Some(_), Some(_)) => Err(CliError::InvalidInput(
+            "--endpoint and --agent-card are mutually exclusive: --endpoint names an interface \
+             directly, so there is no card to resolve"
+                .to_string(),
+        )),
+        // §7.2: with no card to declare the binding, the caller must name
+        // exactly one transport — zero leaves the protocol ambiguous, and
+        // more than one asks for a preference order over a single interface.
+        (None, Some(url)) => match cli.transport.as_slice() {
+            [binding] => Ok(AgentSelection::Endpoint {
+                url: url.clone(),
+                binding: *binding,
+            }),
+            transports => Err(CliError::InvalidInput(format!(
+                "--endpoint requires exactly one --transport (got {}): there is no agent card \
+                 to declare the interface's protocol binding",
+                transports.len()
+            ))),
+        },
+        (Some(reference), None) => Ok(AgentSelection::Card(reference.clone())),
+        (None, None) => Ok(AgentSelection::Card(base_url_card_reference(cli, matches))),
+    }
+}
+
+/// A one-interface card standing in for the interface `--endpoint` named.
+/// Synthesizing keeps transport selection, tenant handling and credential
+/// attachment on a single path rather than growing a second card-less one.
+fn synthesized_endpoint_card(url: &str, binding: Binding) -> AgentCard {
+    AgentCard {
+        name: url.to_string(),
+        description: "synthesized from --endpoint; no agent card was resolved".to_string(),
+        version: VERSION.to_string(),
+        supported_interfaces: vec![AgentInterface::new(url, binding.protocol())],
+        capabilities: AgentCapabilities::default(),
+        default_input_modes: vec![],
+        default_output_modes: vec![],
+        skills: vec![],
+        provider: None,
+        documentation_url: None,
+        icon_url: None,
+        security_schemes: None,
+        security_requirements: None,
+        signatures: None,
+    }
+}
+
+async fn resolve_client(cli: &Cli, matches: &ArgMatches) -> Result<ResolvedClient, CliError> {
+    let card = resolve_agent_card(cli, matches).await?;
 
     let mut builder = A2AClientFactory::builder();
     if !cli.transport.is_empty() {
@@ -1635,21 +1796,174 @@ async fn resolve_client(cli: &Cli) -> Result<ResolvedClient, CliError> {
     Ok(ResolvedClient { client, tenant })
 }
 
-async fn resolve_agent_card(cli: &Cli) -> Result<AgentCard, CliError> {
+/// An `--agent-card` reference resolved to where the card actually lives
+/// (§7.2, §10.1). The three surface forms collapse to two destinations: a
+/// local file, or an HTTP(S) URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CardReference {
+    File(PathBuf),
+    Url(String),
+}
+
+/// Whether `reference` names a local file rather than a host or URL, using
+/// the same rule as the reference implementation: an explicitly
+/// path-shaped prefix, or any string that happens to name something on
+/// disk. Checked before the host forms so a relative path never gets an
+/// `https://` prefix stapled to it.
+fn looks_like_file_path(reference: &str) -> bool {
+    reference.starts_with('/')
+        || reference.starts_with("./")
+        || reference.starts_with("../")
+        // Windows shapes. Without these a path that doesn't exist *yet*
+        // (a typo, a file not written) matches no prefix, falls through to
+        // the host forms, and is fetched as `https://C:\…` — so the error
+        // reported is "unreachable" rather than "no such card file".
+        || reference.starts_with('\\')
+        || reference.starts_with(".\\")
+        || reference.starts_with("..\\")
+        || has_windows_drive_prefix(reference)
+        || std::fs::metadata(reference).is_ok()
+}
+
+/// Whether `reference` starts with a Windows drive-letter root (`C:\`,
+/// `C:/`). The drive letter must be exactly one character before the colon,
+/// so a `host:port` is never mistaken for a path — not `localhost:3000`,
+/// and not even a single-letter host like `a:3000`, whose third byte is a
+/// digit rather than a separator.
+fn has_windows_drive_prefix(reference: &str) -> bool {
+    let bytes = reference.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+/// Whether `host` (with or without a port) is loopback, which decides the
+/// scheme a bare host gets: `http://` for loopback, `https://` otherwise —
+/// a local development agent is rarely served over TLS, and defaulting it
+/// to `https://` would make the common case fail.
+fn is_loopback_host(host: &str) -> bool {
+    // An unbracketed IPv6 literal's colons are not port separators, so try
+    // the whole reference as an address before splitting on `:` — otherwise
+    // `::1` would be truncated to `::` and read as non-loopback.
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        return address.is_loopback();
+    }
+
+    let host = match host.strip_prefix('[') {
+        // Bracketed IPv6, with or without a port: `[::1]`, `[::1]:9000`.
+        Some(rest) => rest.split_once(']').map_or(rest, |(inside, _)| inside),
+        // Anything else: a trailing `:…` is a port.
+        None => host.split_once(':').map_or(host, |(head, _)| head),
+    };
+
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// Normalize an Agent Card reference to the place the card is fetched from
+/// (§10.1): a bare host or origin gets the well-known path appended, a full
+/// card URL is used as-is, and a local path (`file://…` or plain) resolves
+/// to a file on disk.
+fn normalize_card_reference(reference: &str) -> CardReference {
+    if let Some(rest) = reference.strip_prefix("file://") {
+        let path = match rest.strip_prefix('/') {
+            // `file:///C:/card.json` is the canonical Windows form: the
+            // slash before the drive letter belongs to the URL, not to the
+            // path. On Unix there is no drive letter and the leading slash
+            // is kept, since it is the root.
+            Some(without_slash) if has_windows_drive_prefix(without_slash) => without_slash,
+            _ => rest,
+        };
+        return CardReference::File(PathBuf::from(path));
+    }
+
+    if !reference.contains("://") {
+        if looks_like_file_path(reference) {
+            return CardReference::File(PathBuf::from(reference));
+        }
+        let scheme = if is_loopback_host(reference) {
+            "http"
+        } else {
+            "https"
+        };
+        return CardReference::Url(append_well_known_path(&format!("{scheme}://{reference}")));
+    }
+
+    CardReference::Url(append_well_known_path(reference))
+}
+
+/// A reference that names only a host or origin gets the well-known path;
+/// one that already carries a path is a full card URL and is left alone.
+fn append_well_known_path(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    let has_path = trimmed
+        .split_once("://")
+        .is_some_and(|(_, rest)| rest.contains('/'));
+    if has_path {
+        url.to_string()
+    } else {
+        format!("{trimmed}{WELL_KNOWN_AGENT_CARD_PATH}")
+    }
+}
+
+/// The reference from the deprecated `--base-url`, used only when
+/// `--agent-card` was not given. Warns when `--base-url` was passed
+/// explicitly, so the alias is discoverable as deprecated without breaking
+/// anything; leaving it at its built-in default is not a deprecated
+/// invocation and says nothing.
+fn base_url_card_reference(cli: &Cli, matches: &ArgMatches) -> String {
+    if matches!(
+        matches.value_source("base_url"),
+        Some(ValueSource::CommandLine)
+    ) {
+        eprintln!(
+            "warning: --base-url is deprecated; use --agent-card, which also accepts a full \
+             card URL or a local file path"
+        );
+    }
+    cli.base_url.clone()
+}
+
+async fn resolve_agent_card(cli: &Cli, matches: &ArgMatches) -> Result<AgentCard, CliError> {
     warn_if_insecure_with_credentials(cli);
 
-    let url = format!(
-        "{}/.well-known/agent-card.json",
-        cli.base_url.trim_end_matches('/')
-    );
-    let client = if cli.insecure {
-        build_insecure_reqwest_client()?
-    } else {
-        Client::new()
+    let reference = match resolve_agent_selection(cli, matches)? {
+        AgentSelection::Card(reference) => reference,
+        AgentSelection::Endpoint { url, binding } => {
+            return Ok(synthesized_endpoint_card(&url, binding));
+        }
     };
-    let request = apply_request_auth(client.get(url), cli);
-    let response = request.send().await?.error_for_status()?;
-    Ok(response.json::<AgentCard>().await?)
+
+    match normalize_card_reference(&reference) {
+        CardReference::File(path) => read_agent_card_file(&path),
+        CardReference::Url(url) => {
+            let client = if cli.insecure {
+                build_insecure_reqwest_client()?
+            } else {
+                Client::new()
+            };
+            let request = apply_request_auth(client.get(url), cli);
+            let response = request.send().await?.error_for_status()?;
+            Ok(response.json::<AgentCard>().await?)
+        }
+    }
+}
+
+/// Read an Agent Card from disk, classified per Appendix D: a file that
+/// isn't there or can't be read is `CARD_NOT_FOUND` (the card was not
+/// found where the caller pointed), while a file that is there but isn't a
+/// card is `CARD_INVALID` — the same split the HTTP path makes between a
+/// non-2xx response and a body that won't deserialize.
+fn read_agent_card_file(path: &Path) -> Result<AgentCard, CliError> {
+    let text = std::fs::read_to_string(path).map_err(|source| CliError::CardFile {
+        path: path.display().to_string(),
+        source,
+    })?;
+    serde_json::from_str(&text)
+        .map_err(|error| CliError::CardInvalid(format!("{}: {error}", path.display())))
 }
 
 fn apply_request_auth(mut request: RequestBuilder, cli: &Cli) -> RequestBuilder {
@@ -2641,7 +2955,7 @@ mod tests {
     fn build_args(base_url: &str, args: &[&str]) -> Vec<String> {
         let mut argv = vec![
             "a2acli".to_string(),
-            "--base-url".to_string(),
+            "--agent-card".to_string(),
             base_url.to_string(),
         ];
         argv.extend(args.iter().map(|arg| (*arg).to_string()));
@@ -4085,5 +4399,270 @@ mod tests {
             "(set, redacted)"
         );
         assert_eq!(redact_secret(&None), "(not set)");
+    }
+
+    /// §10.1's three reference forms, and the scheme a bare host gets. These
+    /// mirror the reference implementation's `normalize` in
+    /// `internal/flagparse/urlorpath.go`: loopback gets `http://` because a
+    /// local development agent is rarely served over TLS, everything else
+    /// gets `https://`, and a reference that already carries a path is a
+    /// full card URL rather than an origin.
+    #[test]
+    fn test_normalize_card_reference_host_forms() {
+        let cases = [
+            // Bare origin -> well-known path appended.
+            (
+                "example.com",
+                "https://example.com/.well-known/agent-card.json",
+            ),
+            (
+                "http://example.com",
+                "http://example.com/.well-known/agent-card.json",
+            ),
+            (
+                "https://example.com/",
+                "https://example.com/.well-known/agent-card.json",
+            ),
+            // Loopback -> http, since a dev agent is rarely behind TLS.
+            (
+                "localhost:3000",
+                "http://localhost:3000/.well-known/agent-card.json",
+            ),
+            (
+                "127.0.0.1:8080",
+                "http://127.0.0.1:8080/.well-known/agent-card.json",
+            ),
+            (
+                "[::1]:9000",
+                "http://[::1]:9000/.well-known/agent-card.json",
+            ),
+            // Already carries a path -> a full card URL, used as-is.
+            (
+                "https://example.com/custom/card.json",
+                "https://example.com/custom/card.json",
+            ),
+            (
+                "http://example.com/agents/a/card",
+                "http://example.com/agents/a/card",
+            ),
+        ];
+
+        for (reference, expected) in cases {
+            assert_eq!(
+                normalize_card_reference(reference),
+                CardReference::Url(expected.to_string()),
+                "reference {reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_card_reference_file_forms() {
+        // `file://` is explicit and needs no filesystem check.
+        assert_eq!(
+            normalize_card_reference("file:///tmp/card.json"),
+            CardReference::File(PathBuf::from("/tmp/card.json"))
+        );
+        // A path-shaped reference is a path even when nothing is there, so a
+        // typo reports a missing file rather than being fetched over HTTPS.
+        for reference in ["/no/such/card.json", "./card.json", "../card.json"] {
+            assert_eq!(
+                normalize_card_reference(reference),
+                CardReference::File(PathBuf::from(reference)),
+                "reference {reference}"
+            );
+        }
+    }
+
+    /// Windows path shapes, asserted as plain strings so they are checked on
+    /// every platform. macOS and Linux cannot reproduce the divergence — a
+    /// Unix path starts with `/` and is caught by the first prefix — so only
+    /// the Windows CI job would otherwise notice a regression here, which is
+    /// exactly how this was found (a2aproject/a2a-rs#190).
+    #[test]
+    fn test_windows_path_shapes_are_recognized_as_files() {
+        for reference in [
+            r"C:\Users\me\card.json",
+            r"c:/Users/me/card.json",
+            r"\\server\share\card.json",
+            r".\card.json",
+            r"..\card.json",
+        ] {
+            assert!(looks_like_file_path(reference), "{reference}");
+            assert_eq!(
+                normalize_card_reference(reference),
+                CardReference::File(PathBuf::from(reference)),
+                "{reference}"
+            );
+        }
+
+        // A `host:port` is not a drive root, however short the host: the
+        // byte after the colon is a digit, not a path separator.
+        for reference in ["localhost:3000", "a:3000", "example.com:443"] {
+            assert!(!has_windows_drive_prefix(reference), "{reference}");
+            assert!(!looks_like_file_path(reference), "{reference}");
+        }
+
+        // `file:///C:/…`: the slash before the drive letter is URL syntax,
+        // not part of the path.
+        assert_eq!(
+            normalize_card_reference("file:///C:/Users/me/card.json"),
+            CardReference::File(PathBuf::from("C:/Users/me/card.json"))
+        );
+        // On Unix the same leading slash *is* the root, and is kept.
+        assert_eq!(
+            normalize_card_reference("file:///tmp/card.json"),
+            CardReference::File(PathBuf::from("/tmp/card.json"))
+        );
+    }
+
+    /// A bare name that happens to exist on disk is treated as a file, the
+    /// same way the reference implementation stats the reference before
+    /// falling back to the host forms.
+    #[test]
+    fn test_normalize_card_reference_prefers_an_existing_file_over_a_host() {
+        let dir = std::env::temp_dir().join(format!("a2acli-norm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("example.com");
+        std::fs::write(&path, "{}").unwrap();
+
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let resolved = normalize_card_reference("example.com");
+        std::env::set_current_dir(previous).unwrap();
+
+        assert_eq!(resolved, CardReference::File(PathBuf::from("example.com")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_is_loopback_host() {
+        for host in [
+            "localhost",
+            "localhost:3000",
+            "127.0.0.1",
+            "127.0.0.1:80",
+            "::1",
+            "[::1]:9000",
+        ] {
+            assert!(is_loopback_host(host), "expected loopback: {host}");
+        }
+        for host in [
+            "example.com",
+            "example.com:443",
+            "8.8.8.8",
+            "2606:4700::1111",
+        ] {
+            assert!(!is_loopback_host(host), "expected non-loopback: {host}");
+        }
+    }
+
+    #[test]
+    fn test_card_file_errors_map_to_appendix_d_codes() {
+        let missing = CliError::CardFile {
+            path: "/no/such/card.json".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+        };
+        assert_eq!(missing.envelope().error.code, "A2ACLI_ERR_CARD_NOT_FOUND");
+        assert_eq!(missing.exit_code(), 3);
+
+        let invalid = CliError::CardInvalid("card.json: missing field `name`".to_string());
+        assert_eq!(invalid.envelope().error.code, "A2ACLI_ERR_CARD_INVALID");
+        assert_eq!(invalid.exit_code(), 1);
+    }
+
+    /// The §7.2 selection matrix, in one place: the two flags are exclusive,
+    /// `--endpoint` needs exactly one transport, and absent both the
+    /// deprecated `--base-url` still supplies the reference.
+    #[test]
+    fn test_resolve_agent_selection_matrix() {
+        let (cli, matches) = parse_with_matches(&["--agent-card", "example.com", "card", "get"]);
+        assert_eq!(
+            resolve_agent_selection(&cli, &matches).unwrap(),
+            AgentSelection::Card("example.com".to_string())
+        );
+
+        // Neither flag: falls back to --base-url at its built-in default,
+        // and does not warn, because nothing deprecated was passed.
+        let (cli, matches) = parse_with_matches(&["card", "get"]);
+        assert_eq!(
+            resolve_agent_selection(&cli, &matches).unwrap(),
+            AgentSelection::Card("http://localhost:3000".to_string())
+        );
+
+        // --base-url explicitly: still honored (the alias keeps working).
+        let (cli, matches) = parse_with_matches(&["--base-url", "http://host:1", "card", "get"]);
+        assert_eq!(
+            resolve_agent_selection(&cli, &matches).unwrap(),
+            AgentSelection::Card("http://host:1".to_string())
+        );
+
+        let (cli, matches) = parse_with_matches(&[
+            "--endpoint",
+            "http://host/jsonrpc",
+            "--transport",
+            "jsonrpc",
+            "card",
+            "get",
+        ]);
+        assert_eq!(
+            resolve_agent_selection(&cli, &matches).unwrap(),
+            AgentSelection::Endpoint {
+                url: "http://host/jsonrpc".to_string(),
+                binding: Binding::Jsonrpc,
+            }
+        );
+
+        // --endpoint with zero and with two transports: both usage errors.
+        for transports in [vec![], vec!["jsonrpc", "rest"]] {
+            let mut args = vec!["--endpoint", "http://host/jsonrpc"];
+            for transport in &transports {
+                args.push("--transport");
+                args.push(transport);
+            }
+            args.extend(["card", "get"]);
+            let (cli, matches) = parse_with_matches(&args);
+            let error = resolve_agent_selection(&cli, &matches).unwrap_err();
+            assert_eq!(
+                error.exit_code(),
+                2,
+                "with {} transport(s)",
+                transports.len()
+            );
+            assert!(error.to_string().contains("exactly one --transport"));
+        }
+
+        let (cli, matches) = parse_with_matches(&[
+            "--agent-card",
+            "example.com",
+            "--endpoint",
+            "http://host/jsonrpc",
+            "--transport",
+            "jsonrpc",
+            "card",
+            "get",
+        ]);
+        let error = resolve_agent_selection(&cli, &matches).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    /// `--endpoint` stands in a one-interface card so the rest of the client
+    /// path is unchanged; it must carry exactly the named interface and
+    /// declare no capabilities it cannot vouch for.
+    #[test]
+    fn test_synthesized_endpoint_card_carries_only_the_named_interface() {
+        let card = synthesized_endpoint_card("http://host/rest", Binding::Rest);
+
+        assert_eq!(card.supported_interfaces.len(), 1);
+        assert_eq!(card.supported_interfaces[0].url, "http://host/rest");
+        assert_eq!(
+            card.supported_interfaces[0].protocol_binding,
+            Binding::Rest.protocol()
+        );
+        assert!(card.description.contains("no agent card was resolved"));
+        // No card was read, so nothing is advertised.
+        assert_eq!(card.capabilities.streaming, None);
+        assert!(card.skills.is_empty());
     }
 }
