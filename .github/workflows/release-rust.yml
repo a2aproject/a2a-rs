@@ -8,6 +8,10 @@ on:
       - 'itk/**'
   workflow_dispatch:
 
+# Least privilege by default; jobs that need more raise it themselves.
+permissions:
+  contents: read
+
 jobs:
   release-crates:
     name: Release crates

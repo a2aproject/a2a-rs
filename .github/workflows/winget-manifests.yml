@@ -22,6 +22,10 @@ on:
         required: true
         type: string
 
+# Least privilege by default; jobs that need more raise it themselves.
+permissions:
+  contents: read
+
 jobs:
   render-winget-manifests:
     runs-on: ubuntu-latest

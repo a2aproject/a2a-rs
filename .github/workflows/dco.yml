@@ -1,0 +1,74 @@
+name: DCO
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Signed-off-by on every commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Need the full range between base and head, not just the tip.
+          fetch-depth: 0
+
+      # Implemented here rather than with a third-party action: the check is
+      # a dozen lines of git, and a security workflow should not add a
+      # supply-chain dependency to assert a trailer is present.
+      - name: Verify Developer Certificate of Origin
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          commits=$(git rev-list --no-merges "$BASE_SHA".."$HEAD_SHA")
+          if [ -z "$commits" ]; then
+            echo "No non-merge commits to check."
+            exit 0
+          fi
+
+          failed=0
+          while read -r sha; do
+            subject=$(git log -1 --format=%s "$sha")
+            author=$(git log -1 --format='%an <%ae>' "$sha")
+
+            # Any Signed-off-by matching the author, compared case-insensitively:
+            # git does not normalise case, and a mismatched capitalisation is not
+            # a missing sign-off.
+            if git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$sha" \
+                 | grep -qiFx "$author"; then
+              echo "ok    ${sha:0:8}  $subject"
+            else
+              failed=1
+              echo "FAIL  ${sha:0:8}  $subject"
+              echo "        author:      $author"
+              echo "        signed-off:  $(git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$sha" | paste -sd'; ' - || echo '(none)')"
+            fi
+          done <<< "$commits"
+
+          if [ "$failed" -ne 0 ]; then
+            cat <<'MSG'
+
+          Every commit must carry a Signed-off-by trailer matching its author,
+          certifying the Developer Certificate of Origin (https://developercertificate.org/).
+
+          Add it to new commits with:
+              git commit -s
+
+          To fix commits already pushed:
+              git rebase --signoff <base>   # e.g. origin/main
+              git push --force-with-lease
+          MSG
+            exit 1
+          fi
+
+          echo
+          echo "All commits carry a matching Signed-off-by."
