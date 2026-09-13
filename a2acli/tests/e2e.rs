@@ -2706,3 +2706,115 @@ async fn streamed_status_updates_name_a_paused_outcome() {
         "{stderr}"
     );
 }
+
+// OUT_004 / §11.4 (a2aproject/a2a-rs#193): a malformed invocation is a
+// CLI-local failure and must still be machine-readable.
+
+/// Run `a2acli` with no agent configured at all — a parse failure must be
+/// reported without contacting anything.
+fn run_raw(args: &[&str]) -> (String, String, i32) {
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .env_remove("A2ACLI_AGENT_CARD")
+        .env_remove("A2ACLI_BASE_URL")
+        .env_remove("A2ACLI_ENDPOINT")
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+        output.status.code().unwrap(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_invocation_reports_the_error_envelope() {
+    // An unknown flag, a missing required argument, and an invalid enum
+    // value are all parse failures, and all three are CLI-local (§11.4).
+    let cases: [(&[&str], &str); 3] = [
+        (&["--bogus-flag", "card", "get"], "--bogus-flag"),
+        (&["task", "get"], "required"),
+        (&["--transport", "smoke", "card", "get"], "smoke"),
+    ];
+
+    for (args, expected_fragment) in cases {
+        let (stdout, stderr, code) = run_raw(args);
+
+        let envelope = parse_error_envelope(&stderr);
+        assert_eq!(
+            envelope["error"]["code"], "A2ACLI_ERR_USAGE",
+            "args {args:?}"
+        );
+        // clap's message is kept, since it names the offending argument.
+        let message = envelope["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(expected_fragment),
+            "args {args:?}: {message}"
+        );
+        // One line, one object (§11.4) — no usage block trailing it.
+        assert_eq!(stderr.trim().lines().count(), 1, "args {args:?}: {stderr}");
+        assert!(envelope["error"]["hint"].is_string(), "args {args:?}");
+        assert_eq!(code, 2, "args {args:?}");
+        // §11.1: nothing on stdout when the command failed.
+        assert!(stdout.is_empty(), "args {args:?}: {stdout}");
+    }
+}
+
+/// `--help` and `--version` travel the same clap `Err` channel as a parse
+/// failure but are not failures: they keep writing to stdout and exiting 0
+/// (`A2ACLI_CLI_001`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn help_and_version_are_not_treated_as_usage_errors() {
+    for args in [
+        vec!["--help"],
+        vec!["-h"],
+        vec!["help"],
+        vec!["card", "--help"],
+    ] {
+        let (stdout, stderr, code) = run_raw(&args);
+        assert_eq!(code, 0, "args {args:?}");
+        assert!(!stdout.is_empty(), "args {args:?} should print to stdout");
+        assert!(stderr.is_empty(), "args {args:?}: {stderr}");
+        // Not an error envelope.
+        assert!(!stdout.contains("A2ACLI_ERR"), "args {args:?}");
+    }
+
+    for args in [vec!["--version"], vec!["-V"]] {
+        let (stdout, stderr, code) = run_raw(&args);
+        assert_eq!(code, 0, "args {args:?}");
+        assert!(stdout.contains("a2acli"), "args {args:?}: {stdout}");
+        assert!(stderr.is_empty(), "args {args:?}: {stderr}");
+    }
+}
+
+/// A bare invocation, and a command group with no subcommand, are usage
+/// failures — clap already exits 2 for them — so they carry the envelope
+/// like every other usage error rather than printing prose, with the hint
+/// pointing at `--help` for the usage text it replaces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_subcommand_reports_the_error_envelope() {
+    for args in [
+        vec![],
+        vec!["task"],
+        vec!["card"],
+        vec!["task", "push-config"],
+    ] {
+        let (stdout, stderr, code) = run_raw(&args);
+
+        let envelope = parse_error_envelope(&stderr);
+        assert_eq!(
+            envelope["error"]["code"], "A2ACLI_ERR_USAGE",
+            "args {args:?}"
+        );
+        assert!(
+            envelope["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("--help"),
+            "args {args:?}"
+        );
+        assert_eq!(code, 2, "args {args:?}");
+        assert!(stdout.is_empty(), "args {args:?}: {stdout}");
+    }
+}
