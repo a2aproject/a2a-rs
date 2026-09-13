@@ -1766,8 +1766,26 @@ async fn selected_interface_tenant_is_used_absent_an_explicit_tenant_flag() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_tenant_flag_overrides_the_interface_tenant() {
+async fn a_declared_interface_tenant_is_not_displaced_by_the_tenant_flag() {
     let server = TestServer::spawn_with_card_tenant(Some("card-declared-tenant")).await;
+
+    run_cli_success(
+        &server,
+        &["--compact", "--tenant", "explicit-tenant", "send", "hello"],
+    );
+
+    // A2A §8.3.2 rule 4 / SPEC.md §13.1: the tenant sent MUST be exactly
+    // the value the selected interface declares. --tenant does not get to
+    // substitute another one (#199).
+    let received = server.state.received_send_tenants.lock().unwrap().clone();
+    assert_eq!(received, vec![Some("card-declared-tenant".to_string())]);
+}
+
+/// Where the card declares no tenant there is nothing to preserve, so an
+/// explicit --tenant is used as given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tenant_flag_applies_when_the_interface_declares_none() {
+    let server = TestServer::spawn().await;
 
     run_cli_success(
         &server,

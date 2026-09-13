@@ -2104,7 +2104,16 @@ async fn resolve_client(cli: &Cli, matches: &ArgMatches) -> Result<ResolvedClien
         version: negotiated.version,
     }));
 
-    let tenant = cli.tenant.clone().or(interface.tenant);
+    // Not `cli.tenant.or(interface.tenant)`: A2A §8.3.2 rule 4 and SPEC.md
+    // §13.1 require the tenant to be "exactly the value declared in the
+    // selected AgentInterface entry", so an explicit --tenant must not
+    // displace a declared one. a2a-client applies the declared value itself,
+    // overriding what is passed here, so --tenant reaches the wire only
+    // where the card declares none (#199).
+    //
+    // `create_from_card_with_interface` stays: #191's version negotiation
+    // needs the selected interface's protocol_version.
+    let tenant = cli.tenant.clone();
     Ok(ResolvedClient {
         client: client.with_interceptors(interceptors),
         tenant,
