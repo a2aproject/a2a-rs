@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- apply `historyLength` on `get_task` and clamp `<= 0` on both get and list
+- treat `cancel_task` on an already-`CANCELED` task as idempotent; other terminal states stay `TASK_NOT_CANCELABLE`
+
+### Added
+
+- `RequestAuthorizer` callback on `DefaultRequestHandler` (`with_authorizer`)
+
 ## [0.4.3](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.4.2...a2a-server-lf-v0.4.3) - 2026-08-27
 
 ### Fixed

@@ -7,6 +7,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{RwLock, broadcast};
 
 use crate::middleware::ServiceParams;
+use crate::task_store::apply_history_length;
 
 const EXECUTION_BUFFER_CAPACITY: usize = 32;
 
@@ -427,6 +428,25 @@ pub trait RequestHandler: Send + Sync + 'static {
     ) -> Result<AgentCard, A2AError>;
 }
 
+/// Decides whether a request may proceed.
+///
+/// The handler never treats a non-empty header as a principal. An
+/// implementation must validate whatever credential it accepts (token, DID,
+/// session) and return [`A2AError`] when that check fails. `task_id` is set
+/// when the method addresses one task and is reserved for owner checks.
+pub trait RequestAuthorizer: Send + Sync {
+    fn authorize(&self, params: &ServiceParams, task_id: Option<&str>) -> Result<(), A2AError>;
+}
+
+impl<F> RequestAuthorizer for F
+where
+    F: Fn(&ServiceParams, Option<&str>) -> Result<(), A2AError> + Send + Sync,
+{
+    fn authorize(&self, params: &ServiceParams, task_id: Option<&str>) -> Result<(), A2AError> {
+        self(params, task_id)
+    }
+}
+
 /// Default implementation of [`RequestHandler`] that orchestrates
 /// task lifecycle management, storage, and executor dispatch.
 pub struct DefaultRequestHandler {
@@ -436,6 +456,7 @@ pub struct DefaultRequestHandler {
     push_config_store: Option<Arc<dyn crate::PushConfigStore>>,
     push_sender: Option<Arc<crate::HttpPushSender>>,
     capabilities: AgentCapabilities,
+    authorizer: Option<Arc<dyn RequestAuthorizer>>,
 }
 
 impl DefaultRequestHandler {
@@ -447,6 +468,20 @@ impl DefaultRequestHandler {
             push_config_store: None,
             push_sender: None,
             capabilities: AgentCapabilities::default(),
+            authorizer: None,
+        }
+    }
+
+    /// Install an authorizer. The default handler does not enforce one.
+    pub fn with_authorizer(mut self, authorizer: impl RequestAuthorizer + 'static) -> Self {
+        self.authorizer = Some(Arc::new(authorizer));
+        self
+    }
+
+    fn authorize(&self, params: &ServiceParams, task_id: Option<&str>) -> Result<(), A2AError> {
+        match &self.authorizer {
+            Some(authorizer) => authorizer.authorize(params, task_id),
+            None => Ok(()),
         }
     }
 
@@ -597,6 +632,7 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
+        self.authorize(params, req.message.task_id.as_deref())?;
         let (task_id, mut stream) = self.start_execution(params, req.clone(), true).await?;
         let mut last_event = None;
 
@@ -635,27 +671,37 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        self.authorize(params, req.message.task_id.as_deref())?;
         let (_, stream) = self.start_execution(params, req, false).await?;
         Ok(stream)
     }
 
     async fn get_task(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
-        self.task_store
+        self.authorize(params, Some(&req.id))?;
+        let mut task = self
+            .task_store
             .get(&req.id)
             .await?
-            .ok_or_else(|| A2AError::task_not_found(&req.id))
+            .ok_or_else(|| A2AError::task_not_found(&req.id))?;
+        apply_history_length(&mut task, req.history_length);
+        Ok(task)
     }
 
     async fn list_tasks(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
-        self.task_store.list(&req).await
+        self.authorize(params, None)?;
+        let mut response = self.task_store.list(&req).await?;
+        for task in &mut response.tasks {
+            apply_history_length(task, req.history_length);
+        }
+        Ok(response)
     }
 
     async fn cancel_task(
@@ -663,8 +709,15 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: CancelTaskRequest,
     ) -> Result<Task, A2AError> {
+        self.authorize(params, Some(&req.id))?;
         let task = self.load_task(&req.id).await?;
 
+        // Idempotent: re-cancelling an already-canceled task is a no-op that
+        // returns the current task (matching a2a-go). Other terminal states
+        // are still not cancelable, per A2A and a2a-cli SPEC.md §10.4.
+        if task.status.state == TaskState::Canceled {
+            return Ok(task);
+        }
         if task.status.state.is_terminal() {
             return Err(A2AError::task_not_cancelable(&req.id));
         }
@@ -727,9 +780,10 @@ impl RequestHandler for DefaultRequestHandler {
 
     async fn subscribe_to_task(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        self.authorize(params, Some(&req.id))?;
         let (receiver, snapshot_task, sequence) = self
             .execution_manager
             .resubscribe(&req.id)
@@ -740,25 +794,28 @@ impl RequestHandler for DefaultRequestHandler {
 
     async fn create_push_config(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
+        self.authorize(params, Some(&req.task_id))?;
         self.push_config_store()?.save(req).await
     }
 
     async fn get_push_config(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
+        self.authorize(params, Some(&req.task_id))?;
         self.push_config_store()?.get(&req.task_id, &req.id).await
     }
 
     async fn list_push_configs(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
+        self.authorize(params, Some(&req.task_id))?;
         let mut configs = self.push_config_store()?.list(&req.task_id).await?;
         configs.sort_by(|left, right| left.id.cmp(&right.id));
 
@@ -783,9 +840,10 @@ impl RequestHandler for DefaultRequestHandler {
 
     async fn delete_push_config(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
+        self.authorize(params, Some(&req.task_id))?;
         self.push_config_store()?
             .delete(&req.task_id, &req.id)
             .await
@@ -793,9 +851,10 @@ impl RequestHandler for DefaultRequestHandler {
 
     async fn get_extended_agent_card(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         _req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
+        self.authorize(params, None)?;
         Err(A2AError::unsupported_operation(
             "extended agent card not configured",
         ))
@@ -1457,7 +1516,299 @@ mod tests {
             tenant: None,
         };
         let result = handler.cancel_task(&params, req).await;
-        assert!(result.is_err());
+        match result {
+            Ok(_) => panic!("expected cancel of COMPLETED to fail"),
+            Err(error) => assert_eq!(error.code, error_code::TASK_NOT_CANCELABLE),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_already_canceled_is_idempotent() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        let task = Task {
+            id: "t-canceled".into(),
+            context_id: "c-canceled".into(),
+            status: TaskStatus {
+                state: TaskState::Canceled,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        handler.task_store.create(task).await.unwrap();
+        let req = CancelTaskRequest {
+            id: "t-canceled".into(),
+            metadata: None,
+            tenant: None,
+        };
+        let result = handler.cancel_task(&params, req).await.unwrap();
+        assert_eq!(result.status.state, TaskState::Canceled);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_failed_and_rejected_are_not_cancelable() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        for (id, state) in [
+            ("t-failed", TaskState::Failed),
+            ("t-rejected", TaskState::Rejected),
+        ] {
+            handler
+                .task_store
+                .create(Task {
+                    id: id.into(),
+                    context_id: format!("c-{id}"),
+                    status: TaskStatus {
+                        state,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: None,
+                    metadata: None,
+                })
+                .await
+                .unwrap();
+            let result = handler
+                .cancel_task(
+                    &params,
+                    CancelTaskRequest {
+                        id: id.into(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await;
+            match result {
+                Ok(_) => panic!("expected cancel of {id} to fail"),
+                Err(error) => assert_eq!(error.code, error_code::TASK_NOT_CANCELABLE),
+            }
+        }
+    }
+
+    fn task_with_history(id: &str, context_id: &str, n: usize) -> Task {
+        Task {
+            id: id.into(),
+            context_id: context_id.into(),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: Some(
+                (0..n)
+                    .map(|i| Message::new(Role::User, vec![Part::text(format!("m{i}"))]))
+                    .collect(),
+            ),
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_task_applies_history_length() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        handler
+            .task_store
+            .create(task_with_history("hist", "c", 3))
+            .await
+            .unwrap();
+
+        let full = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: "hist".into(),
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(full.history.as_ref().unwrap().len(), 3);
+
+        let last = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: "hist".into(),
+                    history_length: Some(1),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(last.history.as_ref().unwrap().len(), 1);
+
+        for hl in [0, -1] {
+            let empty = handler
+                .get_task(
+                    &params,
+                    GetTaskRequest {
+                        id: "hist".into(),
+                        history_length: Some(hl),
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                empty.history.as_ref().unwrap().is_empty(),
+                "history_length={hl} must clear history"
+            );
+        }
+    }
+
+    fn reject_unauthenticated(
+        _params: &ServiceParams,
+        _task_id: Option<&str>,
+    ) -> Result<(), A2AError> {
+        Err(A2AError::invalid_request("authentication required"))
+    }
+
+    #[tokio::test]
+    async fn test_authorizer_rejects_handler_methods() {
+        let handler = DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+            .with_authorizer(reject_unauthenticated)
+            .with_push_config_store(InMemoryPushConfigStore::new());
+        let params = ServiceParams::new();
+
+        assert!(
+            handler
+                .send_message(
+                    &params,
+                    SendMessageRequest {
+                        message: make_message(),
+                        configuration: None,
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .get_task(
+                    &params,
+                    GetTaskRequest {
+                        id: "t".into(),
+                        history_length: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .list_tasks(
+                    &params,
+                    ListTasksRequest {
+                        context_id: None,
+                        status: None,
+                        page_size: None,
+                        page_token: None,
+                        history_length: None,
+                        status_timestamp_after: None,
+                        include_artifacts: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .cancel_task(
+                    &params,
+                    CancelTaskRequest {
+                        id: "t".into(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .subscribe_to_task(
+                    &params,
+                    SubscribeToTaskRequest {
+                        id: "t".into(),
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .create_push_config(
+                    &params,
+                    TaskPushNotificationConfig {
+                        url: "https://example.com/push".into(),
+                        id: None,
+                        task_id: "t".into(),
+                        token: None,
+                        authentication: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .get_push_config(
+                    &params,
+                    GetTaskPushNotificationConfigRequest {
+                        task_id: "t".into(),
+                        id: "cfg".into(),
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .list_push_configs(
+                    &params,
+                    ListTaskPushNotificationConfigsRequest {
+                        task_id: "t".into(),
+                        page_size: None,
+                        page_token: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .delete_push_config(
+                    &params,
+                    DeleteTaskPushNotificationConfigRequest {
+                        task_id: "t".into(),
+                        id: "cfg".into(),
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .get_extended_agent_card(&params, GetExtendedAgentCardRequest { tenant: None })
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
