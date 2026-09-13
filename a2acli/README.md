@@ -109,9 +109,17 @@ cargo run --bin a2acli -- --bearer "$TOKEN" card get
 cargo run --bin a2acli -- --api-key "$KEY" card get
 cargo run --bin a2acli -- --svc-param "X-Trace-Id:abc123" send "hello"
 cargo run --bin a2acli -- --transport jsonrpc --transport rest card get
+cargo run --bin a2acli -- --a2a-version 1.0 card get
 cargo run --bin a2acli -- --insecure --bearer "$TOKEN" card get  # dev only; always warns
 cargo run --bin a2acli -- --debug send "hello"                  # request/response diagnostics to stderr
 ```
+
+`--a2a-version` pins the protocol version signaled on every request. Absent
+it, the version is negotiated down to the highest one both `a2acli` and the
+agent's selected card interface declare, bounded to 1.x and never below 1.0 —
+A2A reads an empty or pre-1.0 value as 0.3, so a version outside 1.x is
+refused as a usage error rather than downgraded, and any effective version
+other than the tool's own is named on stderr rather than applied silently.
 
 `--bearer`/`--api-key` (env `A2ACLI_BEARER`/`A2ACLI_API_KEY`) supply credentials;
 `--svc-param` is a separate, general-purpose transport-level key-value pair,
@@ -208,6 +216,7 @@ one `KEY=value` per line; blank lines and `#` comments are ignored, a leading
 A2ACLI_AGENT_CARD=https://agent.example.com
 A2ACLI_TRANSPORT=rest,jsonrpc
 A2ACLI_TIMEOUT=60s
+A2ACLI_A2A_VERSION=1.0
 # credentials
 A2ACLI_BEARER="Bearer <token>"
 ```

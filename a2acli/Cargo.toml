@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 a2a = { workspace = true }
 a2a-client = { workspace = true }
+async-trait = { workspace = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 futures = { workspace = true }
 reqwest = { workspace = true }
@@ -36,6 +37,5 @@ rustls-tls = ["a2a-client/rustls-tls", "reqwest/rustls"]
 [dev-dependencies]
 a2a-server = { workspace = true }
 assert_cmd = "2"
-async-trait = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
