@@ -159,8 +159,15 @@ fn validate_push_url(url: &str) -> Result<(), A2AError> {
             return Err(A2AError::invalid_params("push URL targets blocked host"));
         }
         // Block IP literals in restricted ranges (loopback, RFC 1918
-        // private, link-local, ULA, unspecified, multicast).
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        // private, link-local, ULA, unspecified, multicast). For IPv6 URLs
+        // the host serializes WITH brackets ("[fc00::1]"), which never
+        // parses as an IpAddr — strip them first or every range check
+        // below is silently skipped.
+        let host_unbracketed = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = host_unbracketed.parse::<std::net::IpAddr>() {
             let blocked = match ip {
                 std::net::IpAddr::V4(v4) => {
                     v4.is_loopback()
@@ -172,8 +179,19 @@ fn validate_push_url(url: &str) -> Result<(), A2AError> {
                 std::net::IpAddr::V6(v6) => {
                     // fc00::/7 unique local addresses (IPv6 "private").
                     let is_ula = (v6.segments()[0] & 0xfe00) == 0xfc00;
+                    // IPv4-mapped IPv6 literals (::ffff:a.b.c.d) must be
+                    // checked against the IPv4 restrictions too, or they
+                    // bypass the loopback/private/link-local checks above.
+                    let mapped_v4_blocked = v6.to_ipv4_mapped().is_some_and(|v4| {
+                        v4.is_loopback()
+                            || v4.is_private()
+                            || v4.is_link_local()
+                            || v4.is_unspecified()
+                            || v4.is_multicast()
+                    });
                     v6.is_loopback()
                         || is_ula
+                        || mapped_v4_blocked
                         || v6.is_unicast_link_local()
                         || v6.is_unspecified()
                         || v6.is_multicast()
@@ -455,5 +473,53 @@ mod tests {
         let result = sender.send_push(&config, sample_status_update()).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, error_code::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn test_validate_push_url_rejects_invalid_url() {
+        assert!(validate_push_url("not a url").is_err());
+        assert!(validate_push_url("").is_err());
+        // Empty authority fails URL parsing outright (EmptyHost).
+        assert!(validate_push_url("http://").is_err());
+    }
+
+    #[test]
+    fn test_validate_push_url_rejects_ipv6_restricted_ranges() {
+        for url in [
+            "http://[fc00::1]/cb",
+            "http://[fd12:3456:789a::1]/cb",
+            "http://[fe80::1]/cb",
+            "http://[ff02::1]/cb",
+            "http://[::]/cb",
+        ] {
+            let result = validate_push_url(url);
+            assert!(result.is_err(), "expected {url} to be rejected");
+            assert_eq!(result.unwrap_err().code, error_code::INVALID_PARAMS);
+        }
+    }
+
+    #[test]
+    fn test_validate_push_url_rejects_ipv4_mapped_ipv6() {
+        // ::ffff:a.b.c.d literals must inherit the IPv4 restrictions.
+        for url in [
+            "http://[::ffff:127.0.0.1]/cb",
+            "http://[::ffff:10.0.0.1]/cb",
+        ] {
+            let result = validate_push_url(url);
+            assert!(result.is_err(), "expected {url} to be rejected");
+            assert_eq!(result.unwrap_err().code, error_code::INVALID_PARAMS);
+        }
+    }
+
+    #[test]
+    fn test_validate_push_url_rejects_ipv4_multicast() {
+        let result = validate_push_url("http://224.0.0.1/cb");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, error_code::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn test_validate_push_url_accepts_global_ipv6() {
+        assert!(validate_push_url("http://[2606:4700::1111]/cb").is_ok());
     }
 }
