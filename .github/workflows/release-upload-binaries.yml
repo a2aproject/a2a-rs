@@ -98,12 +98,14 @@ jobs:
         run: |
           # Keyless: the certificate binds the signature to this workflow's
           # OIDC identity, so there is no private key to hold or rotate.
+          #
+          # One Sigstore bundle, not the older --output-signature plus
+          # --output-certificate pair: cosign v3 defaults --new-bundle-format
+          # to true, which ignores both of those and writes to --bundle.
           cosign sign-blob --yes \
-            --output-signature "${ARCHIVE}.sig" \
-            --output-certificate "${ARCHIVE}.pem" \
+            --bundle "${ARCHIVE}.sigstore.json" \
             "$ARCHIVE"
-          echo "signature_path=${ARCHIVE}.sig" >> "$GITHUB_OUTPUT"
-          echo "certificate_path=${ARCHIVE}.pem" >> "$GITHUB_OUTPUT"
+          echo "bundle_path=${ARCHIVE}.sigstore.json" >> "$GITHUB_OUTPUT"
 
       - name: Attest build provenance
         id: provenance
@@ -129,8 +131,7 @@ jobs:
           gh release upload "${{ inputs.release_tag }}" \
             "${{ steps.package.outputs.archive_path }}" \
             "${{ steps.package.outputs.checksum_path }}" \
-            "${{ steps.sign.outputs.signature_path }}" \
-            "${{ steps.sign.outputs.certificate_path }}" \
+            "${{ steps.sign.outputs.bundle_path }}" \
             "${{ steps.provenance_asset.outputs.path }}" \
             --repo "${{ github.repository }}" \
             --clobber

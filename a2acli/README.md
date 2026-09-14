@@ -25,12 +25,12 @@ with [Sigstore](https://www.sigstore.dev/) and carry SLSA build provenance.
 Both are keyless: there is no long-lived key, and the certificate binds the
 artifact to the workflow that produced it.
 
-Check the signature (`<archive>.sig` plus `<archive>.pem`):
+Check the signature (`<archive>.sigstore.json`, a Sigstore bundle carrying
+both the signature and the signing certificate):
 
 ```sh
 cosign verify-blob \
-  --signature a2acli-v0.1.11-x86_64-unknown-linux-gnu.tar.gz.sig \
-  --certificate a2acli-v0.1.11-x86_64-unknown-linux-gnu.tar.gz.pem \
+  --bundle a2acli-v0.1.11-x86_64-unknown-linux-gnu.tar.gz.sigstore.json \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github\.com/a2aproject/a2a-rs/\.github/workflows/' \
   a2acli-v0.1.11-x86_64-unknown-linux-gnu.tar.gz
