@@ -5,7 +5,10 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
-/// Maximum number of push notification configs allowed per task (BUG-42).
+/// Maximum number of push notification configs allowed per task.
+///
+/// Each config costs memory and triggers an outbound request on every
+/// event, so an unbounded count is a resource-exhaustion vector.
 const MAX_PUSH_CONFIGS_PER_TASK: usize = 50;
 
 /// Interface for persisting push notification configurations.

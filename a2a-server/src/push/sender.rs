@@ -143,6 +143,13 @@ fn validate_push_url(url: &str) -> Result<(), A2AError> {
     }
 
     if let Some(host) = parsed.host_str() {
+        // A trailing dot is an equivalent fully-qualified form: "localhost."
+        // resolves exactly as "localhost" does. Normalise it away, or every
+        // hostname below is bypassed by appending one character. IP literals
+        // are unaffected either way -- Url::parse already strips the dot for
+        // those, which is why "127.0.0.1." was blocked and "localhost." was
+        // not.
+        let host = host.strip_suffix('.').unwrap_or(host);
         // Block well-known loopback, metadata, and unspecified hosts.
         let blocked = [
             "127.0.0.1",
@@ -409,6 +416,43 @@ mod tests {
             assert!(
                 validate_push_url(url).is_err(),
                 "expected {url} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_push_url_rejects_trailing_dot_hosts() {
+        // "localhost." is the fully-qualified spelling of "localhost" and
+        // resolves identically, so it must not slip past the host blocklist.
+        for url in [
+            "http://localhost./hook",
+            "http://LocalHost./hook",
+            "https://localhost./hook",
+            "http://metadata.google.internal./hook",
+            "http://metadata.azure.com./hook",
+        ] {
+            assert!(
+                validate_push_url(url).is_err(),
+                "{url} must be blocked, but was allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_push_url_rejects_alternate_ipv4_spellings() {
+        // These are blocked only because Url::parse normalises them to
+        // 127.0.0.1 before the range check sees them. Pin that, so the
+        // normalisation cannot be regressed away unnoticed.
+        for url in [
+            "http://2130706433/hook",         // decimal
+            "http://0x7f.0.0.1/hook",         // hex octet
+            "http://127.1/hook",              // short form
+            "http://127.0.0.1./hook",         // trailing dot on a literal
+            "http://[::ffff:127.0.0.1]/hook", // IPv4-mapped IPv6
+        ] {
+            assert!(
+                validate_push_url(url).is_err(),
+                "{url} must be blocked, but was allowed"
             );
         }
     }
