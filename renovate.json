@@ -72,6 +72,25 @@
         "github-actions"
       ],
       "groupName": "github actions"
+    },
+    {
+      "description": "Security fixes override every restriction above, including the rustls cap. That cap is not temporary -- mls-rs-crypto-awslc pins aws-lc-rs exactly at every release (=1.16.2 at 0.23, =1.16.3 at 0.25), so it is policy upstream rather than a lapse -- and a long-lived allowedVersions must not be able to silently swallow a CVE fix. Mirrors the pattern in agntcy/slim's renovate.json.",
+      "matchJsonata": [
+        "$exists(vulnerabilityFixVersion) or isVulnerabilityAlert = true"
+      ],
+      "enabled": true,
+      "allowedVersions": "*"
     }
-  ]
+  ],
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": [
+      "security"
+    ],
+    "minimumReleaseAge": null,
+    "schedule": [
+      "at any time"
+    ]
+  }
 }
