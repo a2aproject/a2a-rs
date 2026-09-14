@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `with_extended_agent_card` / `with_extended_agent_card_resolver` on
+  `DefaultRequestHandler`, so a server can actually serve an extended Agent
+  Card; configuring one also declares the capability
+
+### Fixed
+
+- report `EXTENDED_CARD_NOT_CONFIGURED` (-32007) when no extended card is
+  configured, instead of `UNSUPPORTED_OPERATION` (-32004)
+
 ### Fixed
 
 - apply `historyLength` on `get_task` and clamp `<= 0` on both get and list

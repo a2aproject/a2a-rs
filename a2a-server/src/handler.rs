@@ -458,6 +458,28 @@ pub struct DefaultRequestHandler {
     push_sender: Option<Arc<crate::HttpPushSender>>,
     capabilities: AgentCapabilities,
     authorizer: Option<Arc<dyn RequestAuthorizer>>,
+    extended_agent_card: Option<Arc<dyn ExtendedAgentCardResolver>>,
+}
+
+/// Supplies the authenticated extended Agent Card (§12.4, §10.1).
+///
+/// A resolver rather than a stored card because §12.4 has the extended card
+/// fetched *under a security scheme*: which skills an agent reveals can
+/// legitimately differ by caller, and `ServiceParams` is where the caller's
+/// credentials arrive. An agent serving one card to everyone can ignore the
+/// argument — [`DefaultRequestHandler::with_extended_agent_card`] wraps a
+/// plain card for exactly that case.
+pub trait ExtendedAgentCardResolver: Send + Sync {
+    fn resolve(&self, params: &ServiceParams) -> Result<AgentCard, A2AError>;
+}
+
+impl<F> ExtendedAgentCardResolver for F
+where
+    F: Fn(&ServiceParams) -> Result<AgentCard, A2AError> + Send + Sync,
+{
+    fn resolve(&self, params: &ServiceParams) -> Result<AgentCard, A2AError> {
+        self(params)
+    }
 }
 
 impl DefaultRequestHandler {
@@ -470,7 +492,29 @@ impl DefaultRequestHandler {
             push_sender: None,
             capabilities: AgentCapabilities::default(),
             authorizer: None,
+            extended_agent_card: None,
         }
+    }
+
+    /// Serve `card` as the extended Agent Card, identically for every caller.
+    ///
+    /// Also declares the `extendedAgentCard` capability, since serving one
+    /// and advertising it should not be two separate things to remember —
+    /// an explicit `with_capabilities(..)` still overrides it either way.
+    pub fn with_extended_agent_card(mut self, card: AgentCard) -> Self {
+        self.capabilities.extended_agent_card.get_or_insert(true);
+        self.with_extended_agent_card_resolver(move |_: &ServiceParams| Ok(card.clone()))
+    }
+
+    /// Serve an extended Agent Card computed per caller, so an agent can
+    /// reveal different skills to different principals (§12.4).
+    pub fn with_extended_agent_card_resolver(
+        mut self,
+        resolver: impl ExtendedAgentCardResolver + 'static,
+    ) -> Self {
+        self.capabilities.extended_agent_card.get_or_insert(true);
+        self.extended_agent_card = Some(Arc::new(resolver));
+        self
     }
 
     /// Install an authorizer. The default handler does not enforce one.
@@ -922,9 +966,19 @@ impl RequestHandler for DefaultRequestHandler {
         _req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
         self.authorize(params, None)?;
-        Err(A2AError::unsupported_operation(
-            "extended agent card not configured",
-        ))
+        Self::require_capability(self.capabilities.extended_agent_card, || {
+            A2AError::unsupported_operation(
+                "the agent card does not declare an extended agent card",
+            )
+        })?;
+        match &self.extended_agent_card {
+            Some(resolver) => resolver.resolve(params),
+            // A2A defines a code for exactly this condition.
+            // UNSUPPORTED_OPERATION would say the agent does not do extended
+            // cards at all, when the truth is that this deployment has not
+            // configured one — the client can act on that difference.
+            None => Err(A2AError::extended_card_not_configured()),
+        }
     }
 }
 
@@ -2984,5 +3038,110 @@ mod tests {
                 "{task_id} must carry only its own artifact"
             );
         }
+    }
+    // §12.4 / §10.1 (#204): the extended Agent Card.
+
+    fn extended_card(name: &str) -> AgentCard {
+        AgentCard {
+            name: name.into(),
+            description: "extended".into(),
+            version: "1.0".into(),
+            supported_interfaces: vec![],
+            capabilities: AgentCapabilities::default(),
+            default_input_modes: vec![],
+            default_output_modes: vec![],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        }
+    }
+
+    fn extended_request() -> GetExtendedAgentCardRequest {
+        GetExtendedAgentCardRequest { tenant: None }
+    }
+
+    #[tokio::test]
+    async fn test_extended_agent_card_is_served_when_configured() {
+        let handler = make_handler().with_extended_agent_card(extended_card("secret skills"));
+        let card = handler
+            .get_extended_agent_card(&ServiceParams::new(), extended_request())
+            .await
+            .unwrap();
+        assert_eq!(card.name, "secret skills");
+    }
+
+    /// Configuring a card also declares the capability, so serving one and
+    /// advertising it are not two things to remember.
+    #[tokio::test]
+    async fn test_configuring_an_extended_card_declares_the_capability() {
+        let handler = make_handler().with_extended_agent_card(extended_card("x"));
+        assert_eq!(handler.capabilities.extended_agent_card, Some(true));
+    }
+
+    /// A2A gives this condition its own code. Before #204 it reported
+    /// `UNSUPPORTED_OPERATION`, which says the agent does not do extended
+    /// cards at all rather than that this deployment has not configured one.
+    #[tokio::test]
+    async fn test_unconfigured_extended_card_reports_its_own_code() {
+        let handler = make_handler().with_capabilities(AgentCapabilities {
+            streaming: None,
+            push_notifications: None,
+            extensions: None,
+            extended_agent_card: Some(true),
+        });
+        let error = handler
+            .get_extended_agent_card(&ServiceParams::new(), extended_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::EXTENDED_CARD_NOT_CONFIGURED);
+        assert_ne!(error.code, error_code::UNSUPPORTED_OPERATION);
+    }
+
+    /// The capability gate from #203 runs first: a card declaring
+    /// `extendedAgentCard: false` refuses before the configured/unconfigured
+    /// distinction is even reached.
+    #[tokio::test]
+    async fn test_capability_gate_precedes_the_not_configured_check() {
+        let handler = make_handler()
+            .with_extended_agent_card(extended_card("x"))
+            .with_capabilities(AgentCapabilities {
+                streaming: None,
+                push_notifications: None,
+                extensions: None,
+                extended_agent_card: Some(false),
+            });
+        let error = handler
+            .get_extended_agent_card(&ServiceParams::new(), extended_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+    }
+
+    /// §12.4 fetches the extended card under a security scheme, so a
+    /// resolver can vary what it reveals by caller.
+    #[tokio::test]
+    async fn test_resolver_sees_the_caller_params() {
+        let handler = make_handler().with_extended_agent_card_resolver(|params: &ServiceParams| {
+            let privileged = params.contains_key("x-privileged");
+            Ok(extended_card(if privileged { "full" } else { "limited" }))
+        });
+
+        let card = handler
+            .get_extended_agent_card(&ServiceParams::new(), extended_request())
+            .await
+            .unwrap();
+        assert_eq!(card.name, "limited");
+
+        let mut params = ServiceParams::new();
+        params.insert("x-privileged".into(), vec!["yes".into()]);
+        let card = handler
+            .get_extended_agent_card(&params, extended_request())
+            .await
+            .unwrap();
+        assert_eq!(card.name, "full");
     }
 }
