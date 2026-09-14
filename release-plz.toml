@@ -1,16 +1,10 @@
 [workspace]
-release_always = false
+# Default. `false` makes a failed release unretryable — see #234.
+release_always = true
 publish_no_verify = true
 
-# A GitHub Release exists to carry downloadable artifacts. The libraries in
-# this workspace are consumed from crates.io and ship no artifacts, so the
-# releases created for them were empty pages that only added noise — and they
-# each count as an unsigned release against supply-chain tooling. Only the CLI,
-# which attaches per-target archives and checksums, gets one.
-#
-# Tagging stays on for every crate: release-plz reads those tags to work out
-# what changed since the last release, and they are how a published crates.io
-# version is located in this history.
+# Only the CLI ships downloadable artifacts; libraries go to crates.io.
+# Tags stay enabled for every crate — see #215.
 git_release_enable = false
 
 [[package]]
