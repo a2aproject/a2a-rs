@@ -115,6 +115,9 @@ pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
             REST_EXTENDED_AGENT_CARD_LEGACY_PATH,
             axum::routing::get(handle_get_extended_agent_card::<H>),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::jsonrpc::MAX_REQUEST_BODY_BYTES,
+        ))
         .with_state(state)
 }
 
@@ -1272,5 +1275,23 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // Each make_app() creates a new store, so this will be not found
         assert!(resp.status() == StatusCode::OK || resp.status() == StatusCode::NOT_FOUND);
+    }
+
+    /// The REST binding is bounded by the same limit as JSON-RPC: an
+    /// oversized body is rejected at the framework boundary, before any
+    /// handler runs.
+    #[tokio::test]
+    async fn test_request_body_over_the_limit_is_rejected() {
+        let app = make_app();
+        let oversized = Body::from("x".repeat(crate::jsonrpc::MAX_REQUEST_BODY_BYTES + 1));
+        let req = Request::builder()
+            .uri(REST_SEND_MESSAGE_PATH)
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(oversized)
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

@@ -15,7 +15,7 @@ pub mod tls;
 
 pub use agent_card::{AgentCardProducer, StaticAgentCard, WELL_KNOWN_AGENT_CARD_PATH};
 pub use executor::{AgentExecutor, ExecutorContext};
-pub use handler::{DefaultRequestHandler, RequestHandler};
+pub use handler::{DefaultRequestHandler, RequestAuthorizer, RequestHandler};
 pub use middleware::{CallContext, CallInterceptor, InterceptedHandler, ServiceParams, User};
 pub use push::{HttpPushSender, InMemoryPushConfigStore, PushConfigStore};
 pub use task_store::{InMemoryTaskStore, TaskStore};

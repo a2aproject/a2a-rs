@@ -3,6 +3,7 @@
 examples/.certs/
 itk/target/
 itk/a2a-itk/
+itk/a2a-itk
 itk/raw_results.json
 itk/itk_rust.json
 itk/logs/

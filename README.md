@@ -5,6 +5,7 @@
 [![crates.io](https://img.shields.io/crates/v/a2a-lf.svg)](https://crates.io/crates/a2a-lf)
 [![docs.rs](https://docs.rs/a2a-lf/badge.svg)](https://docs.rs/a2a-lf)
 [![License](https://img.shields.io/crates/l/a2a-lf.svg)](https://github.com/a2aproject/a2a-rs/blob/main/LICENSE.md)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/a2aproject/a2a-rs/badge)](https://scorecard.dev/viewer/?uri=github.com/a2aproject/a2a-rs)
 
 `a2a-rs` is a Rust workspace for the A2A v1 protocol. It includes core protocol
 types, async client and server libraries, protobuf definitions, and gRPC
@@ -138,22 +139,22 @@ cargo install a2a-cli
 
 The workspace includes a standalone CLI client built on `a2a-client`. It
 resolves the public agent card from a base URL, negotiates JSON-RPC or
-HTTP+JSON, prints responses as JSON, and manages task push notification
-configs.
+HTTP+JSON, prints human-readable text by default (`-o json` for the
+protocol's own JSON types), and manages task push notification configs.
 
 ```sh
-cargo run --bin a2acli -- card
+cargo run --bin a2acli -- card get
 cargo run --bin a2acli -- send "hello from rust"
-cargo run --bin a2acli -- stream "hello from rust"
-cargo run --bin a2acli -- list-tasks
-cargo run --bin a2acli -- push-config list task-123
+cargo run --bin a2acli -- send "hello from rust" --stream
+cargo run --bin a2acli -- task list
+cargo run --bin a2acli -- task push-config list task-123
 ```
 
 By default the CLI targets `http://localhost:3000`, which matches the bundled
-hello world server. Override the target with `--base-url https://host` for any
-compatible A2A server, use `--binding jsonrpc` or `--binding http-json` to pin
-transport selection, and pass `--bearer-token` or repeated `--header Name:Value`
-arguments when the server requires authentication.
+hello world server. Override the target with `--agent-card https://host` for any
+compatible A2A server, use `--transport jsonrpc` or `--transport rest` to pin
+transport selection, and pass `--bearer`, `--api-key`, or repeated
+`--svc-param Name:Value` arguments when the server requires authentication.
 
 ## Depending On The Workspace
 

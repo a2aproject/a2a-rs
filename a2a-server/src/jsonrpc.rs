@@ -30,6 +30,13 @@ impl<H: RequestHandler> Clone for JsonRpcState<H> {
     }
 }
 
+/// Largest request body either binding accepts.
+///
+/// Without an explicit bound a single large POST is read into memory. The
+/// limit matches a2a-go's `MaxSSETokenSize` (`internal/sse/sse.go`), so a
+/// payload one SDK accepts is not rejected by the other.
+pub const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 /// Create an axum router for the JSON-RPC protocol binding.
 ///
 /// All requests are dispatched to a single POST endpoint that routes
@@ -38,6 +45,7 @@ pub fn jsonrpc_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
     let state = JsonRpcState { handler };
     axum::Router::new()
         .route("/", axum::routing::post(handle_jsonrpc::<H>))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
@@ -329,6 +337,23 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    /// An unbounded body is read into memory; the limit rejects it at the
+    /// framework boundary instead, before any handler runs.
+    #[tokio::test]
+    async fn test_request_body_over_the_limit_is_rejected() {
+        let app = make_app();
+        let oversized = Body::from("x".repeat(MAX_REQUEST_BODY_BYTES + 1));
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(oversized)
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     #[tokio::test]
     async fn test_send_message() {
         let app = make_app();
@@ -410,10 +435,35 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_params() {
         let app = make_app();
-        let params = serde_json::json!({"bogus": true});
+        // Type mismatch: `message` must be an object. A merely-unknown field
+        // is not invalid params; it is ignored per spec §5.7.
+        let params = serde_json::json!({"message": "not-an-object"});
         let resp = post_jsonrpc(app, methods::SEND_MESSAGE, params).await;
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, error_code::PARSE_ERROR);
+    }
+
+    /// Spec §5.7: unrecognized fields in request params are ignored for
+    /// forward compatibility instead of being rejected.
+    #[tokio::test]
+    async fn test_unknown_params_fields_are_ignored() {
+        let app = make_app();
+        let params = serde_json::json!({
+            "message": {
+                "messageId": "m1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hi"}],
+                "futureField": true
+            },
+            "anotherFutureField": {"nested": 1}
+        });
+        let resp = post_jsonrpc(app, methods::SEND_MESSAGE, params).await;
+        assert!(
+            resp.error.is_none(),
+            "unknown fields must be ignored: {:?}",
+            resp.error
+        );
+        assert!(resp.result.is_some());
     }
 
     #[tokio::test]
