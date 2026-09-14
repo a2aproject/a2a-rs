@@ -1371,19 +1371,22 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
     let envelope = parse_error_envelope(&stderr);
     assert_eq!(envelope["error"]["code"], "TASK_NOT_FOUND");
 
-    // The server sanitizes internal (-32603) error details before they
-    // reach the wire, so the CLI reports the generic message.
+    // Errors on the executor's own event stream are the agent's failure
+    // reports: the boundary no longer rewrites them, so the CLI surfaces
+    // the message the executor raised ("stream failed"). Server-side
+    // faults are sanitized at the raise site via `sanitized_internal_error`
+    // instead.
     let (_stdout, stderr) = run_cli_failure(&server, &["task", "subscribe", "stream-error"]);
     let envelope = parse_error_envelope(&stderr);
     assert_eq!(envelope["error"]["code"], "INTERNAL_ERROR");
     assert_eq!(envelope["error"]["a2aCode"], -32603);
-    assert_eq!(envelope["error"]["message"], "Internal error");
+    assert_eq!(envelope["error"]["message"], "stream failed");
 
     let (_stdout, stderr) =
         run_cli_failure(&server, &["--compact", "send", "stream-error", "--stream"]);
     let envelope = parse_error_envelope(&stderr);
     assert_eq!(envelope["error"]["code"], "INTERNAL_ERROR");
-    assert_eq!(envelope["error"]["message"], "Internal error");
+    assert_eq!(envelope["error"]["message"], "stream failed");
 
     let (_stdout, stderr) = run_cli_failure(
         &server,

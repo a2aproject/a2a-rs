@@ -398,7 +398,7 @@ async fn handle_get_extended_agent_card<H: RequestHandler>(
 fn protojson_json_response<T: ProtoJsonPayload>(value: &T) -> axum::response::Response {
     match protojson_conv::to_value(value) {
         Ok(payload) => Json(payload).into_response(),
-        Err(e) => rest_error_response(A2AError::internal(format!(
+        Err(e) => rest_error_response(crate::sanitized_internal_error(format!(
             "failed to serialize ProtoJSON payload: {e}"
         ))),
     }
@@ -410,7 +410,9 @@ fn protojson_stream(
     Box::pin(stream.map(|item| {
         item.and_then(|value| {
             protojson_conv::to_value(&value).map_err(|e| {
-                A2AError::internal(format!("failed to serialize ProtoJSON stream payload: {e}"))
+                crate::sanitized_internal_error(format!(
+                    "failed to serialize ProtoJSON stream payload: {e}"
+                ))
             })
         })
     }))
@@ -447,7 +449,6 @@ fn rest_payload_error_response(error: impl std::fmt::Display) -> axum::response:
 }
 
 fn rest_error_response(err: A2AError) -> axum::response::Response {
-    let err = crate::sanitize_client_error(err);
     let status =
         StatusCode::from_u16(err.http_status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let reason = error_reason(err.code);
@@ -778,25 +779,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rest_error_response_sanitizes_internal_message() {
-        let resp = rest_error_response(A2AError::internal("boom with internal details"));
+    async fn test_rest_error_response_boundary_does_not_rewrite_internal_errors() {
+        // The boundary no longer sanitizes: an INTERNAL_ERROR raised by the
+        // executor (or any handler-layer fault) keeps its message, because
+        // the boundary cannot tell an agent's own failure report from a
+        // server fault. Sanitization now happens at the raise site via
+        // `sanitized_internal_error`.
+        let resp = rest_error_response(A2AError::internal("agent-reported failure detail"));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["error"]["message"], "Internal error");
-        assert!(
-            !payload["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("internal details")
-        );
+        assert_eq!(payload["error"]["message"], "agent-reported failure detail");
+    }
+
+    #[test]
+    fn test_sanitized_internal_error_hides_server_side_detail() {
+        let err = crate::sanitized_internal_error("serde fault at /etc/server/keys.pem");
+        assert_eq!(err.code, a2a::error_code::INTERNAL_ERROR);
+        assert_eq!(err.message, "Internal error");
+        assert!(!err.message.contains("/etc/server/keys.pem"));
 
         // Non-internal errors keep their message (client-validation feedback).
         let resp = rest_error_response(A2AError::task_not_found("t1"));
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["error"]["message"], "task not found: t1");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
