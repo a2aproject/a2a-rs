@@ -28,6 +28,16 @@
   },
   "packageRules": [
     {
+      "description": "rustls 0.23.44 requires aws-lc-rs ^1.18, but mls-rs-crypto-awslc pins aws-lc-rs = \"=1.16.2\" and we reach it through a2a-slimrpc -> agntcy-slim-auth. Cargo cannot satisfy both, so the precise lockfile bump Renovate runs for this group aborts and every Cargo dependency PR fails renovate/artifacts. Capped until the upstream pin is relaxed; see https://github.com/a2aproject/a2a-rs/issues/227. Not expressed in Cargo.toml on purpose: the conflict is a property of this workspace, and an upper bound there would constrain downstream crates that do not depend on slimrpc.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "rustls"
+      ],
+      "allowedVersions": "<0.23.44"
+    },
+    {
       "description": "The SLIM crates must move together: slim_auth 0.14 caps below 0.15 while slim_rpc 2.3 requires it, which puts two versions in the tree and breaks the TokenProvider bounds.",
       "matchManagers": [
         "cargo"
@@ -62,6 +72,25 @@
         "github-actions"
       ],
       "groupName": "github actions"
+    },
+    {
+      "description": "Security fixes override every restriction above, including the rustls cap. That cap is not temporary -- mls-rs-crypto-awslc pins aws-lc-rs exactly at every release (=1.16.2 at 0.23, =1.16.3 at 0.25), so it is policy upstream rather than a lapse -- and a long-lived allowedVersions must not be able to silently swallow a CVE fix. Mirrors the pattern in agntcy/slim's renovate.json.",
+      "matchJsonata": [
+        "$exists(vulnerabilityFixVersion) or isVulnerabilityAlert = true"
+      ],
+      "enabled": true,
+      "allowedVersions": "*"
     }
-  ]
+  ],
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": [
+      "security"
+    ],
+    "minimumReleaseAge": null,
+    "schedule": [
+      "at any time"
+    ]
+  }
 }
