@@ -73,7 +73,7 @@ pub struct JsonRpcError {
 // ---------------------------------------------------------------------------
 
 /// A JSON-RPC ID that can be a string, integer, or null.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum JsonRpcId {
     String(String),
     Number(i64),
