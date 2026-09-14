@@ -90,7 +90,7 @@ impl HttpPushSender {
 
     fn handle_error(&self, msg: String) -> Result<(), A2AError> {
         if self.fail_on_error {
-            Err(A2AError::internal(&msg))
+            Err(crate::sanitized_internal_error(&msg))
         } else {
             tracing::error!("{}", msg);
             Ok(())

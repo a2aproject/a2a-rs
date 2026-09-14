@@ -274,7 +274,7 @@ fn subscription_stream(
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         state.done = true;
                         return Some((
-                            Err(A2AError::internal(
+                            Err(crate::sanitized_internal_error(
                                 "subscription fell behind active execution",
                             )),
                             state,

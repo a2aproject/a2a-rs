@@ -20,20 +20,20 @@ pub use middleware::{CallContext, CallInterceptor, InterceptedHandler, ServicePa
 pub use push::{HttpPushSender, InMemoryPushConfigStore, PushConfigStore};
 pub use task_store::{InMemoryTaskStore, TaskStore};
 
-/// Replace the message of internal errors with a generic one before it is
-/// exposed to clients, logging the original details (BUG-12 / CWE-209).
+/// Build an `INTERNAL_ERROR` whose client-visible message is generic, while
+/// the real cause is logged server-side (BUG-12 / CWE-209).
 ///
-/// Internal errors (`INTERNAL_ERROR` code) may embed server-side details such
-/// as serialization internals, library names, or paths; clients should only
-/// ever see a generic message. Client-input errors (parse errors, invalid
-/// params, task-not-found, ...) pass through unchanged so callers still get
-/// actionable validation feedback.
-pub(crate) fn sanitize_client_error(mut err: a2a::A2AError) -> a2a::A2AError {
-    if err.code == a2a::error_code::INTERNAL_ERROR {
-        tracing::error!(code = err.code, error = %err.message, "returning sanitized internal error to client");
-        err.message = "Internal error".to_string();
-    }
-    err
+/// Call this where the **server itself** failed — a serialization fault, a
+/// broken invariant — and never at a response boundary. A2A gives an
+/// `AgentExecutor` no code other than `INTERNAL_ERROR` to report its own
+/// failure with (`error_code` has nothing between `INVALID_AGENT_RESPONSE`
+/// and the JSON-RPC generics), and `A2AError` carries no marker for where an
+/// error came from. Sanitizing by code at the boundary therefore cannot tell
+/// a serialization fault from an agent saying why it failed, and would
+/// replace both with "Internal error".
+pub(crate) fn sanitized_internal_error(detail: impl std::fmt::Display) -> a2a::A2AError {
+    tracing::error!(error = %detail, "internal error; returning a generic message to the client");
+    a2a::A2AError::internal("Internal error")
 }
 
 #[cfg(test)]

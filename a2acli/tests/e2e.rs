@@ -663,13 +663,16 @@ async fn binary_reports_a2a_and_non_a2a_errors() {
     let (_stdout, stderr) = run_cli_failure(&server, &["cancel-task", "missing"]);
     assert!(stderr.contains("a2a error -32001: task not found: missing"));
 
-    // The server sanitizes internal (-32603) error details before they
-    // reach the wire, so the CLI reports the generic message.
+    // Errors on the executor's own event stream are the agent's failure
+    // reports: the boundary no longer rewrites them, so the CLI surfaces
+    // the message the executor raised ("stream failed"). Server-side
+    // faults are sanitized at the raise site via `sanitized_internal_error`
+    // instead.
     let (_stdout, stderr) = run_cli_failure(&server, &["subscribe", "stream-error"]);
-    assert!(stderr.contains("a2a error -32603: Internal error"));
+    assert!(stderr.contains("a2a error -32603: stream failed"));
 
     let (_stdout, stderr) = run_cli_failure(&server, &["--compact", "stream", "stream-error"]);
-    assert!(stderr.contains("a2a error -32603: Internal error"));
+    assert!(stderr.contains("a2a error -32603: stream failed"));
 
     let (_stdout, stderr) = run_cli_failure(
         &server,
