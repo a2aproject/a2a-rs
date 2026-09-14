@@ -7,6 +7,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{RwLock, broadcast};
 
 use crate::middleware::ServiceParams;
+use crate::pagination::resolve_page_size;
 use crate::task_store::apply_history_length;
 
 const EXECUTION_BUFFER_CAPACITY: usize = 32;
@@ -739,7 +740,25 @@ impl RequestHandler for DefaultRequestHandler {
         req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
         self.authorize(params, None)?;
+        // TaskStore is a public trait, so neither half of this is redundant.
+        // Clamping the request bounds a store that honours page_size, which
+        // is the ordinary case and the one that turns pageSize=999999999
+        // into a real query. Truncating the response bounds a store that
+        // ignores it, which the handler cannot otherwise detect.
+        let page_size = resolve_page_size(req.page_size);
+        let req = ListTasksRequest {
+            page_size: Some(page_size as i32),
+            ..req
+        };
         let mut response = self.task_store.list(&req).await?;
+        if response.tasks.len() > page_size {
+            // The store returned more than it was asked for. Its own
+            // next_page_token is kept as-is: paging is the store's scheme
+            // (the in-tree stores use offsets, another may use an opaque
+            // cursor) and the handler cannot invent a correct one. See the
+            // TaskStore contract.
+            response.tasks.truncate(page_size);
+        }
         for task in &mut response.tasks {
             apply_history_length(task, req.history_length);
         }
@@ -864,11 +883,11 @@ impl RequestHandler for DefaultRequestHandler {
         let mut configs = self.push_config_store_checked()?.list(&req.task_id).await?;
         configs.sort_by(|left, right| left.id.cmp(&right.id));
 
-        // Cap the page size (max 100, default 50) like the task list path.
-        let page_size = match req.page_size {
-            Some(size) if size > 0 => (size as usize).min(100),
-            _ => 50,
-        };
+        // Paging for push configs is done here, not in the store: the store
+        // is asked for every config for the task and the page is cut from
+        // that. PushConfigStore is public, so this clamp is what bounds the
+        // response for an implementation with no per-task limit of its own.
+        let page_size = resolve_page_size(req.page_size);
         let start = if let Some(ref token) = req.page_token {
             token
                 .parse::<usize>()
@@ -913,8 +932,9 @@ impl RequestHandler for DefaultRequestHandler {
 mod tests {
     use super::*;
     use crate::executor::ExecutorContext;
+    use crate::pagination::MAX_PAGE_SIZE;
     use crate::push::InMemoryPushConfigStore;
-    use crate::task_store::InMemoryTaskStore;
+    use crate::task_store::{InMemoryTaskStore, TaskStore, TaskVersion};
 
     use crate::test_util::install_crypto_provider;
     use axum::{
@@ -926,6 +946,7 @@ mod tests {
     };
     use futures::stream;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicI32, Ordering};
     use tokio::{
         net::TcpListener,
         sync::{Notify, mpsc, oneshot},
@@ -1103,6 +1124,117 @@ mod tests {
                 metadata: None,
             };
             Box::pin(stream::once(async move { Ok(StreamResponse::Task(task)) }))
+        }
+    }
+
+    /// A store that ignores paging entirely and answers with everything it
+    /// holds. Stands in for a third-party `TaskStore`: the trait is public,
+    /// so nothing obliges an implementation to bound its own response, and
+    /// the handler's clamp is the only protection left.
+    struct UnboundedTaskStore {
+        count: usize,
+        /// `true` models a well-behaved store, which is bounded by the
+        /// handler clamping the request; `false` models one that ignores
+        /// `page_size`, which is bounded only by the handler truncating the
+        /// response.
+        honour_page_size: bool,
+        /// The `page_size` the handler actually asked for. Recorded because
+        /// the response bound alone cannot distinguish a clamped request
+        /// from an unclamped one -- both end up 100 items wide.
+        seen_page_size: Arc<AtomicI32>,
+    }
+
+    #[async_trait]
+    impl TaskStore for UnboundedTaskStore {
+        async fn create(&self, _task: Task) -> Result<TaskVersion, A2AError> {
+            Ok(1)
+        }
+
+        async fn update(&self, _task: Task) -> Result<TaskVersion, A2AError> {
+            Ok(1)
+        }
+
+        async fn get(&self, _task_id: &str) -> Result<Option<Task>, A2AError> {
+            Ok(None)
+        }
+
+        async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+            self.seen_page_size
+                .store(req.page_size.unwrap_or(-1), Ordering::SeqCst);
+            let served = if self.honour_page_size {
+                req.page_size.unwrap_or(i32::MAX).max(0) as usize
+            } else {
+                self.count
+            }
+            .min(self.count);
+            let tasks = (0..served)
+                .map(|i| Task {
+                    id: format!("t-{i:04}"),
+                    context_id: "c1".into(),
+                    status: TaskStatus {
+                        state: TaskState::Completed,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: None,
+                    metadata: None,
+                })
+                .collect::<Vec<_>>();
+            let total = tasks.len() as i32;
+            Ok(ListTasksResponse {
+                tasks,
+                next_page_token: String::new(),
+                page_size: total,
+                total_size: total,
+            })
+        }
+    }
+
+    /// The push-config equivalent: a store with no per-task limit, which is
+    /// the only way to reach the handler's page cap. `InMemoryPushConfigStore`
+    /// caps a task at `MAX_PUSH_CONFIGS_PER_TASK` (50), below the page cap of
+    /// 100, so going through it can never exercise the clamp.
+    struct UnboundedPushConfigStore {
+        count: usize,
+    }
+
+    #[async_trait]
+    impl crate::PushConfigStore for UnboundedPushConfigStore {
+        async fn save(
+            &self,
+            config: TaskPushNotificationConfig,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            Ok(config)
+        }
+
+        async fn get(
+            &self,
+            _task_id: &str,
+            _config_id: &str,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            Err(A2AError::task_not_found("unused"))
+        }
+
+        async fn list(&self, task_id: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
+            Ok((0..self.count)
+                .map(|i| TaskPushNotificationConfig {
+                    task_id: task_id.to_string(),
+                    url: format!("https://example.com/hook/{i}"),
+                    id: Some(format!("cfg-{i:04}")),
+                    token: None,
+                    authentication: None,
+                    tenant: None,
+                })
+                .collect())
+        }
+
+        async fn delete(&self, _task_id: &str, _config_id: &str) -> Result<(), A2AError> {
+            Ok(())
+        }
+
+        async fn delete_all(&self, _task_id: &str) -> Result<(), A2AError> {
+            Ok(())
         }
     }
 
@@ -2015,12 +2147,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_tasks_page_size_cap_bounds_a_store_that_ignores_it() {
+        install_crypto_provider();
+        // A store that pays no attention to page_size. Clamping the request
+        // does nothing here; only truncating the response bounds it.
+        let handler = DefaultRequestHandler::new(
+            EchoExecutor,
+            UnboundedTaskStore {
+                count: MAX_PAGE_SIZE * 3,
+                honour_page_size: false,
+                seen_page_size: Arc::new(AtomicI32::new(-1)),
+            },
+        );
+
+        let resp = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: Some(1_000_000),
+                    page_token: None,
+                    history_length: None,
+                    include_artifacts: None,
+                    status_timestamp_after: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.tasks.len(), MAX_PAGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_page_size_cap_bounds_a_store_that_honours_it() {
+        install_crypto_provider();
+        // The ordinary case: the store does what it is asked, so what it is
+        // asked for has to be bounded. Without the clamp this store would
+        // build a million tasks.
+        let seen = Arc::new(AtomicI32::new(-1));
+        let handler = DefaultRequestHandler::new(
+            EchoExecutor,
+            UnboundedTaskStore {
+                count: MAX_PAGE_SIZE * 3,
+                honour_page_size: true,
+                seen_page_size: Arc::clone(&seen),
+            },
+        );
+
+        let resp = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: Some(1_000_000),
+                    page_token: None,
+                    history_length: None,
+                    include_artifacts: None,
+                    status_timestamp_after: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.tasks.len(), MAX_PAGE_SIZE);
+        // The point of the clamp: the store is never asked for the million.
+        // Asserting only on the response would pass with no clamp at all,
+        // because the response bound would hide it.
+        assert_eq!(seen.load(Ordering::SeqCst), MAX_PAGE_SIZE as i32);
+    }
+
+    #[tokio::test]
+    async fn test_list_push_configs_page_size_cap_bounds_a_custom_store() {
+        install_crypto_provider();
+        // InMemoryPushConfigStore caps a task at 50 configs, below the page
+        // cap of 100, so it can never reach the clamp. A store without that
+        // limit can, and is what the clamp exists for.
+        let handler = DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+            .with_push_config_store(UnboundedPushConfigStore {
+                count: MAX_PAGE_SIZE * 3,
+            });
+
+        let resp = handler
+            .list_push_configs(
+                &ServiceParams::new(),
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: Some(1_000_000),
+                    page_token: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.configs.len(), MAX_PAGE_SIZE);
+        // The remainder must stay reachable, or the cap silently truncates.
+        assert_eq!(resp.next_page_token.as_deref(), Some("100"));
+    }
+
+    #[tokio::test]
     async fn test_list_push_configs_page_size_is_capped() {
         install_crypto_provider();
         let handler = make_handler_with_push_configs();
         let params = ServiceParams::new();
-        // Keep the count below the per-task push config cap (50) so this test
-        // stays valid once push config limits are enforced.
+        // Keep the count below InMemoryPushConfigStore's per-task cap
+        // (MAX_PUSH_CONFIGS_PER_TASK), which rejects the 51st config.
         for i in 0..40 {
             handler
                 .create_push_config(
@@ -2039,7 +2274,10 @@ mod tests {
         }
 
         // Requesting a huge page size must not error and returns everything
-        // available (the hard page-size cap of 100 is enforced in the store).
+        // available. This does NOT exercise the cap -- 40 < MAX_PAGE_SIZE, so
+        // a capped and an uncapped implementation agree here. The cap itself
+        // is pinned by test_list_push_configs_page_size_cap_bounds_a_custom_store,
+        // which is the only route that can reach it.
         let resp = handler
             .list_push_configs(
                 &params,

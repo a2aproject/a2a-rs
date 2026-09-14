@@ -7,11 +7,7 @@ use tokio::sync::RwLock;
 
 use super::apply_history_length;
 use super::store::{TaskStore, TaskVersion};
-
-/// Default page size when the client does not request one (or requests <= 0).
-const DEFAULT_PAGE_SIZE: usize = 50;
-/// Upper bound on the page size to prevent unbounded responses.
-const MAX_PAGE_SIZE: usize = 100;
+use crate::pagination::resolve_page_size;
 
 struct StoredEntry {
     task: Task,
@@ -90,10 +86,10 @@ impl TaskStore for InMemoryTaskStore {
         tasks.sort_by(|a, b| a.id.cmp(&b.id));
 
         // Apply pagination
-        let page_size = match req.page_size {
-            Some(size) if size > 0 => (size as usize).min(MAX_PAGE_SIZE),
-            _ => DEFAULT_PAGE_SIZE,
-        };
+        // Defence in depth: DefaultRequestHandler clamps before calling a
+        // store, but a store reached by another route must still bound its
+        // own page.
+        let page_size = resolve_page_size(req.page_size);
         let start = if let Some(ref token) = req.page_token {
             // Simple offset-based pagination
             token
