@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.1.11...a2a-cli-v0.2.0) - 2026-09-14
+
+### Added
+
+- *(release)* sign the published CLI archives ([#216](https://github.com/a2aproject/a2a-rs/pull/216))
+- *(a2acli)* report a malformed invocation as an error envelope ([#194](https://github.com/a2aproject/a2a-rs/pull/194))
+- *(a2acli)* name a non-success or paused task outcome on stderr ([#192](https://github.com/a2aproject/a2a-rs/pull/192))
+- *(a2acli)* --a2a-version flag and 1.x-bounded version negotiation ([#191](https://github.com/a2aproject/a2a-rs/pull/191))
+- *(a2acli)* Agent Card reference resolution and direct --endpoint ([#190](https://github.com/a2aproject/a2a-rs/pull/190))
+- *(a2acli)* overridable defaults, config precedence, and config show ([#177](https://github.com/a2aproject/a2a-rs/pull/177))
+- *(a2acli)* auth, transport selection, and version-negotiation flags ([#176](https://github.com/a2aproject/a2a-rs/pull/176))
+- *(a2acli)* text output mode, error envelope, and exit-code contract ([#173](https://github.com/a2aproject/a2a-rs/pull/173))
+- *(a2acli)* blocking-by-default send, task polling, and message parts ([#172](https://github.com/a2aproject/a2a-rs/pull/172))
+- *(a2acli)* [**breaking**] align command surface with the a2a-cli taxonomy ([#171](https://github.com/a2aproject/a2a-rs/pull/171))
+
+### Fixed
+
+- *(release)* use the cosign v3 bundle format when signing archives ([#230](https://github.com/a2aproject/a2a-rs/pull/230))
+- *(a2a-client)* echo the selected interface's tenant on every request ([#200](https://github.com/a2aproject/a2a-rs/pull/200))
+
+### Other
+
+- *(a2acli)* verify stateless interaction-id handling (INTERACT_001-005) ([#174](https://github.com/a2aproject/a2a-rs/pull/174))
+
 ## [0.1.11](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.1.10...a2a-cli-v0.1.11) - 2026-08-27
 
 ### Other
