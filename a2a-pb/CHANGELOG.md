@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/a2aproject/a2a-rs/compare/a2a-pb-v0.2.0...a2a-pb-v0.2.1) - 2026-09-14
+
+### Fixed
+
+- *(a2a-pb)* ignore unknown fields in ProtoJSON decode (spec §5.7) ([#81](https://github.com/a2aproject/a2a-rs/pull/81))
+
 ## [0.2.0](https://github.com/a2aproject/a2a-rs/compare/a2a-pb-v0.1.8...a2a-pb-v0.2.0) - 2026-07-16
 
 ### Added

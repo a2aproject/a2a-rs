@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/a2aproject/a2a-rs/compare/a2a-lf-v0.3.0...a2a-lf-v0.3.1) - 2026-09-14
+
+### Added
+
+- *(a2a-server)* serve the extended Agent Card, with its own error code ([#212](https://github.com/a2aproject/a2a-rs/pull/212))
+
 ### Added
 
 - `A2AError::extended_card_not_configured()`

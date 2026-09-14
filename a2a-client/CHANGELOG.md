@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.2.3...a2a-client-lf-v0.2.4) - 2026-09-14
+
+### Added
+
+- *(a2acli)* auth, transport selection, and version-negotiation flags ([#176](https://github.com/a2aproject/a2a-rs/pull/176))
+
+### Fixed
+
+- *(a2a-client)* echo the selected interface's tenant on every request ([#200](https://github.com/a2aproject/a2a-rs/pull/200))
+- *(a2a-client)* interpret residual bytes at end of a stream ([#198](https://github.com/a2aproject/a2a-rs/pull/198))
+
 ## [0.2.3](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.2.2...a2a-client-lf-v0.2.3) - 2026-08-27
 
 ### Fixed
