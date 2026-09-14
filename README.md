@@ -126,7 +126,7 @@ Installs to `/usr/local/bin` as root or `~/.local/bin` otherwise. Override with 
 **Windows** — [WinGet](https://learn.microsoft.com/en-us/windows/package-manager/winget/):
 
 ```sh
-winget install a2aproject.a2acli
+winget install a2aproject.a2acli-rs
 ```
 
 **From source** — via [crates.io](https://crates.io/crates/a2a-cli):
