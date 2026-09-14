@@ -26,6 +26,7 @@ jobs:
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
         run: |
           set -euo pipefail
 
@@ -48,6 +49,26 @@ jobs:
           while read -r sha; do
             subject=$(git log -1 --format=%s "$sha")
             author=$(git log -1 --format='%an <%ae>' "$sha")
+
+            # A release PR carries version bumps and changelog text derived
+            # mechanically from commits that were already signed off. There is
+            # no new human contribution for anyone to certify, and release-plz
+            # offers no way to add the trailer -- it has no commit-message or
+            # signoff option.
+            #
+            # Both conditions below are set by GitHub, not by commit content,
+            # so neither can be forged by a contributor: the PR author type
+            # comes from the token that opened the pull request, and a bot
+            # noreply address cannot be claimed by a push that GitHub did not
+            # create. A human pushing a commit that merely names a bot as
+            # author is still checked, because their pull request is not
+            # authored by a bot.
+            if [ "$PR_AUTHOR_TYPE" = "Bot" ] \
+               && printf '%s' "$author" | grep -qE '\[bot\]@users\.noreply\.github\.com>$'; then
+              echo "skip  ${sha:0:8}  $subject"
+              echo "        bot-authored commit in a bot-authored pull request"
+              continue
+            fi
 
             # Any Signed-off-by matching the author, compared case-insensitively:
             # git does not normalise case, and a mismatched capitalisation is not
