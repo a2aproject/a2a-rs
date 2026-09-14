@@ -734,31 +734,31 @@ impl RequestHandler for DefaultRequestHandler {
         Ok(task)
     }
 
+    /// Bounds the page twice, and neither is redundant: `TaskStore` is a
+    /// public trait.
+    ///
+    /// Clamping `page_size` before the call bounds a store that honours it
+    /// -- the ordinary case, and the one that turns `pageSize=999999999`
+    /// into a real query. Truncating the response bounds a store that
+    /// ignores it, which cannot be detected from here.
+    ///
+    /// On truncation the store's `next_page_token` is left alone: paging is
+    /// the store's own scheme (the in-tree stores use offsets, another may
+    /// use an opaque cursor) so no correct token can be synthesised. See
+    /// [`TaskStore::list`].
     async fn list_tasks(
         &self,
         params: &ServiceParams,
         req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
         self.authorize(params, None)?;
-        // TaskStore is a public trait, so neither half of this is redundant.
-        // Clamping the request bounds a store that honours page_size, which
-        // is the ordinary case and the one that turns pageSize=999999999
-        // into a real query. Truncating the response bounds a store that
-        // ignores it, which the handler cannot otherwise detect.
         let page_size = resolve_page_size(req.page_size);
         let req = ListTasksRequest {
             page_size: Some(page_size as i32),
             ..req
         };
         let mut response = self.task_store.list(&req).await?;
-        if response.tasks.len() > page_size {
-            // The store returned more than it was asked for. Its own
-            // next_page_token is kept as-is: paging is the store's scheme
-            // (the in-tree stores use offsets, another may use an opaque
-            // cursor) and the handler cannot invent a correct one. See the
-            // TaskStore contract.
-            response.tasks.truncate(page_size);
-        }
+        response.tasks.truncate(page_size);
         for task in &mut response.tasks {
             apply_history_length(task, req.history_length);
         }
@@ -932,8 +932,8 @@ impl RequestHandler for DefaultRequestHandler {
 mod tests {
     use super::*;
     use crate::executor::ExecutorContext;
-    use crate::pagination::MAX_PAGE_SIZE;
-    use crate::push::InMemoryPushConfigStore;
+    use crate::pagination::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
+    use crate::push::{InMemoryPushConfigStore, PushConfigStore};
     use crate::task_store::{InMemoryTaskStore, TaskStore, TaskVersion};
 
     use crate::test_util::install_crypto_provider;
@@ -1127,35 +1127,58 @@ mod tests {
         }
     }
 
-    /// A store that ignores paging entirely and answers with everything it
-    /// holds. Stands in for a third-party `TaskStore`: the trait is public,
-    /// so nothing obliges an implementation to bound its own response, and
-    /// the handler's clamp is the only protection left.
-    struct UnboundedTaskStore {
+    /// A `TaskStore` that behaves exactly like `InMemoryTaskStore` except
+    /// for `list`, which it drives from the fields below.
+    ///
+    /// `TaskStore` is public, so nothing obliges a third-party
+    /// implementation to bound its own response. Only a decorator can model
+    /// that; everything else delegates, so a cap test cannot accidentally
+    /// depend on stub behaviour.
+    struct PagingTaskStore {
+        inner: InMemoryTaskStore,
         count: usize,
-        /// `true` models a well-behaved store, which is bounded by the
-        /// handler clamping the request; `false` models one that ignores
-        /// `page_size`, which is bounded only by the handler truncating the
-        /// response.
+        /// `true` models a well-behaved store, bounded by the handler
+        /// clamping the request; `false` models one that ignores
+        /// `page_size`, bounded only by the handler truncating the response.
         honour_page_size: bool,
         /// The `page_size` the handler actually asked for. Recorded because
         /// the response bound alone cannot distinguish a clamped request
         /// from an unclamped one -- both end up 100 items wide.
         seen_page_size: Arc<AtomicI32>,
+        /// Continuation token the store reports, so truncation's handling of
+        /// it can be observed.
+        next_page_token: String,
+    }
+
+    impl PagingTaskStore {
+        fn new(count: usize, honour_page_size: bool) -> Self {
+            Self {
+                inner: InMemoryTaskStore::new(),
+                count,
+                honour_page_size,
+                seen_page_size: Arc::new(AtomicI32::new(-1)),
+                next_page_token: String::new(),
+            }
+        }
+
+        fn with_next_page_token(mut self, token: &str) -> Self {
+            self.next_page_token = token.to_string();
+            self
+        }
     }
 
     #[async_trait]
-    impl TaskStore for UnboundedTaskStore {
-        async fn create(&self, _task: Task) -> Result<TaskVersion, A2AError> {
-            Ok(1)
+    impl TaskStore for PagingTaskStore {
+        async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.create(task).await
         }
 
-        async fn update(&self, _task: Task) -> Result<TaskVersion, A2AError> {
-            Ok(1)
+        async fn update(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.update(task).await
         }
 
-        async fn get(&self, _task_id: &str) -> Result<Option<Task>, A2AError> {
-            Ok(None)
+        async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
+            self.inner.get(task_id).await
         }
 
         async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
@@ -1184,36 +1207,47 @@ mod tests {
             let total = tasks.len() as i32;
             Ok(ListTasksResponse {
                 tasks,
-                next_page_token: String::new(),
+                next_page_token: self.next_page_token.clone(),
                 page_size: total,
                 total_size: total,
             })
         }
     }
 
-    /// The push-config equivalent: a store with no per-task limit, which is
-    /// the only way to reach the handler's page cap. `InMemoryPushConfigStore`
-    /// caps a task at `MAX_PUSH_CONFIGS_PER_TASK` (50), below the page cap of
-    /// 100, so going through it can never exercise the clamp.
-    struct UnboundedPushConfigStore {
+    /// The push-config equivalent, and the only way to reach the handler's
+    /// page cap on that path: `InMemoryPushConfigStore` caps a task at
+    /// `MAX_PUSH_CONFIGS_PER_TASK` (50), below the page cap of 100, so
+    /// nothing routed through it can make the clamp bind. Everything but
+    /// `list` delegates.
+    struct PagingPushConfigStore {
+        inner: InMemoryPushConfigStore,
         count: usize,
     }
 
+    impl PagingPushConfigStore {
+        fn new(count: usize) -> Self {
+            Self {
+                inner: InMemoryPushConfigStore::new(),
+                count,
+            }
+        }
+    }
+
     #[async_trait]
-    impl crate::PushConfigStore for UnboundedPushConfigStore {
+    impl crate::PushConfigStore for PagingPushConfigStore {
         async fn save(
             &self,
             config: TaskPushNotificationConfig,
         ) -> Result<TaskPushNotificationConfig, A2AError> {
-            Ok(config)
+            self.inner.save(config).await
         }
 
         async fn get(
             &self,
-            _task_id: &str,
-            _config_id: &str,
+            task_id: &str,
+            config_id: &str,
         ) -> Result<TaskPushNotificationConfig, A2AError> {
-            Err(A2AError::task_not_found("unused"))
+            self.inner.get(task_id, config_id).await
         }
 
         async fn list(&self, task_id: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
@@ -1229,12 +1263,12 @@ mod tests {
                 .collect())
         }
 
-        async fn delete(&self, _task_id: &str, _config_id: &str) -> Result<(), A2AError> {
-            Ok(())
+        async fn delete(&self, task_id: &str, config_id: &str) -> Result<(), A2AError> {
+            self.inner.delete(task_id, config_id).await
         }
 
-        async fn delete_all(&self, _task_id: &str) -> Result<(), A2AError> {
-            Ok(())
+        async fn delete_all(&self, task_id: &str) -> Result<(), A2AError> {
+            self.inner.delete_all(task_id).await
         }
     }
 
@@ -2153,11 +2187,7 @@ mod tests {
         // does nothing here; only truncating the response bounds it.
         let handler = DefaultRequestHandler::new(
             EchoExecutor,
-            UnboundedTaskStore {
-                count: MAX_PAGE_SIZE * 3,
-                honour_page_size: false,
-                seen_page_size: Arc::new(AtomicI32::new(-1)),
-            },
+            PagingTaskStore::new(MAX_PAGE_SIZE * 3, false),
         );
 
         let resp = handler
@@ -2181,20 +2211,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_paging_stores_delegate_everything_except_list() {
+        install_crypto_provider();
+        // The cap tests above are only measuring the handler if these two
+        // doubles differ from the real stores in `list` and nowhere else.
+        // Pin that, so a later edit cannot quietly make them lie.
+        let tasks = PagingTaskStore::new(0, true);
+        let task = Task {
+            id: "t-delegated".into(),
+            context_id: "c1".into(),
+            status: TaskStatus {
+                state: TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        tasks.create(task.clone()).await.unwrap();
+        assert_eq!(
+            tasks
+                .get("t-delegated")
+                .await
+                .unwrap()
+                .map(|t| t.status.state),
+            Some(TaskState::Submitted)
+        );
+        let mut done = task.clone();
+        done.status.state = TaskState::Completed;
+        tasks.update(done).await.unwrap();
+        assert_eq!(
+            tasks
+                .get("t-delegated")
+                .await
+                .unwrap()
+                .map(|t| t.status.state),
+            Some(TaskState::Completed)
+        );
+
+        let configs = PagingPushConfigStore::new(0);
+        configs
+            .save(TaskPushNotificationConfig {
+                task_id: "t1".into(),
+                url: "https://example.com/callback".into(),
+                id: Some("cfg-1".into()),
+                token: None,
+                authentication: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            configs.get("t1", "cfg-1").await.unwrap().id.as_deref(),
+            Some("cfg-1")
+        );
+        configs.delete("t1", "cfg-1").await.unwrap();
+        assert!(configs.get("t1", "cfg-1").await.is_err());
+        configs.delete_all("t1").await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_list_tasks_page_size_cap_bounds_a_store_that_honours_it() {
         install_crypto_provider();
         // The ordinary case: the store does what it is asked, so what it is
         // asked for has to be bounded. Without the clamp this store would
         // build a million tasks.
-        let seen = Arc::new(AtomicI32::new(-1));
-        let handler = DefaultRequestHandler::new(
-            EchoExecutor,
-            UnboundedTaskStore {
-                count: MAX_PAGE_SIZE * 3,
-                honour_page_size: true,
-                seen_page_size: Arc::clone(&seen),
-            },
-        );
+        let store = PagingTaskStore::new(MAX_PAGE_SIZE * 3, true);
+        let seen = Arc::clone(&store.seen_page_size);
+        let handler = DefaultRequestHandler::new(EchoExecutor, store);
 
         let resp = handler
             .list_tasks(
@@ -2221,15 +2306,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_tasks_truncation_keeps_the_store_continuation_token() {
+        install_crypto_provider();
+        // Truncating must not strand the remainder. The handler cannot
+        // synthesise a token for a paging scheme it does not own, so the
+        // store's own token has to survive untouched -- otherwise a caller
+        // that lost 200 tasks has no way to ask for them.
+        let handler = DefaultRequestHandler::new(
+            EchoExecutor,
+            PagingTaskStore::new(MAX_PAGE_SIZE * 3, false)
+                .with_next_page_token("cursor-from-store"),
+        );
+
+        let resp = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    include_artifacts: None,
+                    status_timestamp_after: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.tasks.len(), DEFAULT_PAGE_SIZE);
+        assert_eq!(resp.next_page_token, "cursor-from-store");
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_honours_a_page_size_under_the_cap() {
+        install_crypto_provider();
+        // The clamp is an upper bound, not a floor: a modest request must
+        // reach the store unchanged.
+        let store = PagingTaskStore::new(MAX_PAGE_SIZE * 3, true);
+        let seen = Arc::clone(&store.seen_page_size);
+        let handler = DefaultRequestHandler::new(EchoExecutor, store);
+
+        let resp = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: Some(7),
+                    page_token: None,
+                    history_length: None,
+                    include_artifacts: None,
+                    status_timestamp_after: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(seen.load(Ordering::SeqCst), 7);
+        assert_eq!(resp.tasks.len(), 7);
+    }
+
+    #[tokio::test]
     async fn test_list_push_configs_page_size_cap_bounds_a_custom_store() {
         install_crypto_provider();
         // InMemoryPushConfigStore caps a task at 50 configs, below the page
         // cap of 100, so it can never reach the clamp. A store without that
         // limit can, and is what the clamp exists for.
         let handler = DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
-            .with_push_config_store(UnboundedPushConfigStore {
-                count: MAX_PAGE_SIZE * 3,
-            });
+            .with_push_config_store(PagingPushConfigStore::new(MAX_PAGE_SIZE * 3));
 
         let resp = handler
             .list_push_configs(
