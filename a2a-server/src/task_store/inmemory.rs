@@ -18,13 +18,6 @@ struct StoredEntry {
     version: TaskVersion,
 }
 
-    let hl = hl as usize;
-    if history.len() > hl {
-        let start = history.len() - hl;
-        *history = history[start..].to_vec();
-    }
-}
-
 /// In-memory task store. Contents do not survive restarts.
 pub struct InMemoryTaskStore {
     tasks: RwLock<HashMap<TaskId, StoredEntry>>,
