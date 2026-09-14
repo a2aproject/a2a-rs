@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
+use super::apply_history_length;
 use super::store::{TaskStore, TaskVersion};
 
 /// Default page size when the client does not request one (or requests <= 0).
@@ -17,21 +18,6 @@ struct StoredEntry {
     version: TaskVersion,
 }
 
-/// Apply `historyLength` truncation to a task's history.
-///
-/// Negative values (previously cast to `usize`, silently bypassing the
-/// truncation limit) are treated as an empty history.
-pub(crate) fn truncate_history(task: &mut Task, history_length: Option<i32>) {
-    let Some(hl) = history_length else {
-        return;
-    };
-    let Some(history) = task.history.as_mut() else {
-        return;
-    };
-    if hl <= 0 {
-        *history = Vec::new();
-        return;
-    }
     let hl = hl as usize;
     if history.len() > hl {
         let start = history.len() - hl;
@@ -136,11 +122,10 @@ impl TaskStore for InMemoryTaskStore {
             None
         };
 
-        // Apply history length truncation
         let page = page
             .into_iter()
             .map(|mut task| {
-                truncate_history(&mut task, req.history_length);
+                apply_history_length(&mut task, req.history_length);
                 task
             })
             .collect();
@@ -365,6 +350,15 @@ mod tests {
         };
         let resp = store.list(&req).await.unwrap();
         assert_eq!(resp.tasks[0].history.as_ref().unwrap().len(), 1);
+
+        let empty = store
+            .list(&ListTasksRequest {
+                history_length: Some(-1),
+                ..req
+            })
+            .await
+            .unwrap();
+        assert!(empty.tasks[0].history.as_ref().unwrap().is_empty());
     }
 
     fn make_task_with_history(id: &str, messages: Vec<&str>) -> Task {

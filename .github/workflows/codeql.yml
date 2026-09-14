@@ -1,0 +1,55 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Offset from the Scorecard run so the two do not contend for runners.
+    - cron: '30 3 * * 6'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      # Only this job needs to publish findings.
+      security-events: write
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Rust is a no-build extractor and rejects any other mode:
+          # "Rust does not support the manual build mode. Please try using
+          # one of the following build modes instead: none."
+          #
+          # That also sidesteps `itk`, which panics in its build script
+          # without the a2a-itk protos (#207) — nothing is compiled here.
+          - language: rust
+            build-mode: none
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          category: '/language:${{ matrix.language }}'

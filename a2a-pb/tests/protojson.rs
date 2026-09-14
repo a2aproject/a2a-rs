@@ -227,6 +227,46 @@ fn agent_card_protojson_deserializes_null_skills_as_empty() {
     assert_eq!(parsed, expected);
 }
 
+/// Spec §5.7: implementations SHOULD ignore unrecognized fields in messages,
+/// allowing for forward compatibility. Unknown fields must be tolerated both
+/// at the top level and inside nested messages.
+#[test]
+fn task_protojson_decode_ignores_unknown_fields() {
+    let json = json!({
+        "id": "task-1",
+        "contextId": "ctx-1",
+        "status": {
+            "state": "TASK_STATE_COMPLETED",
+            "futureStatusField": "ignored"
+        },
+        "futureTopLevelField": {"nested": ["values", 1, true]}
+    });
+
+    let task = a2a_pb::protojson_conv::from_value::<a2a::Task>(json)
+        .expect("unknown fields must be ignored");
+    assert_eq!(task.id, "task-1");
+    assert_eq!(task.context_id, "ctx-1");
+    assert_eq!(task.status.state, a2a::TaskState::Completed);
+}
+
+/// Unknown *enum string values* are still rejected: only unrecognized fields
+/// are tolerated (`ignore_unknown_enum_variants` is intentionally not
+/// enabled).
+#[test]
+fn task_protojson_decode_rejects_unknown_enum_values() {
+    let json = json!({
+        "id": "task-1",
+        "contextId": "ctx-1",
+        "status": {"state": "TASK_STATE_FROM_THE_FUTURE"}
+    });
+
+    let result = a2a_pb::protojson_conv::from_value::<a2a::Task>(json);
+    assert!(
+        result.is_err(),
+        "unknown enum values must still be rejected"
+    );
+}
+
 #[test]
 fn stream_response_protojson_roundtrip_serializes_oneof_payloads() {
     let response = StreamResponse {

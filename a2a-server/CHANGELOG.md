@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- apply `historyLength` on `get_task` and clamp `<= 0` on both get and list
+- treat `cancel_task` on an already-`CANCELED` task as idempotent; other terminal states stay `TASK_NOT_CANCELABLE`
+- assign a monotonic `id` to every SSE event, so a client can detect a gap
+  and has a value for `Last-Event-ID`
+- keep SSE responses alive with a 15s comment frame, so idle subscriptions
+  are not dropped by intermediaries
+- bound request bodies on both bindings at 10 MB, rejecting oversized ones
+  with `413` instead of reading them into memory
+- enforce the `AgentCapabilities` a server declares: `streaming: false` and
+  `push_notifications: false` now refuse the corresponding operations instead
+  of being stored and ignored. An undeclared (`None`) capability stays
+  permissive, and supplying a push store no longer overrides an explicit
+  `false`
+
+### Added
+
+- `RequestAuthorizer` callback on `DefaultRequestHandler` (`with_authorizer`)
+
 ## [0.4.3](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.4.2...a2a-server-lf-v0.4.3) - 2026-08-27
 
 ### Fixed
