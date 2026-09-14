@@ -24,12 +24,21 @@ jobs:
       - name: Verify Developer Certificate of Origin
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
-          commits=$(git rev-list --no-merges "$BASE_SHA".."$HEAD_SHA")
+          git fetch --no-tags --quiet origin "$BASE_REF"
+
+          # Range against the base branch as it stands now, not against
+          # github.event.pull_request.base.sha. --no-merges drops a merge
+          # commit but not the commits it brought in, so a contributor who
+          # merges the base branch into their branch would otherwise have
+          # every upstream commit in that merge attributed to them. Excluding
+          # everything reachable from the base branch cannot do that,
+          # whatever the event's base snapshot happens to say.
+          commits=$(git rev-list --no-merges "origin/$BASE_REF".."$HEAD_SHA")
           if [ -z "$commits" ]; then
             echo "No non-merge commits to check."
             exit 0
@@ -64,7 +73,7 @@ jobs:
               git commit -s
 
           To fix commits already pushed:
-              git rebase --signoff <base>   # e.g. origin/main
+              git rebase --signoff origin/<base branch>
               git push --force-with-lease
           MSG
             exit 1
