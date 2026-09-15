@@ -2,8 +2,6 @@ name: CI
 
 on:
   pull_request:
-    paths-ignore:
-      - 'itk/**'
   # Also on main: the badge reports the newest run on the default branch, a
   # squash merge can produce a tree no pull request ever built (#208), and a
   # cache is scoped to the ref that created it — so without this, every
