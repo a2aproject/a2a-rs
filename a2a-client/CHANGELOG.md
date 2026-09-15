@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.2.4...a2a-client-lf-v0.2.5) - 2026-09-15
+
+### Added
+
+- *(fuzz)* fuzz the SSE framing path ([#239](https://github.com/a2aproject/a2a-rs/pull/239))
+
 ## [0.2.4](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.2.3...a2a-client-lf-v0.2.4) - 2026-09-14
 
 ### Added

@@ -14,6 +14,16 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.2.0...a2a-cli-v0.2.1) - 2026-09-15
+
+### Added
+
+- *(fuzz)* fuzz the SSE framing path ([#239](https://github.com/a2aproject/a2a-rs/pull/239))
+
+### Other
+
+- generate the workspace CHANGELOG at the repo root ([#243](https://github.com/a2aproject/a2a-rs/pull/243))
+
 ## [0.2.0](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.1.11...a2a-cli-v0.2.0) - 2026-09-14
 
 ### Added
