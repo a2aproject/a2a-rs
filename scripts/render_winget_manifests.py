@@ -32,6 +32,9 @@ PACKAGE_LOCALE = "en-US"
 PUBLISHER = "a2aproject"
 PACKAGE_NAME = "a2acli-rs"
 MONIKER = "a2acli-rs"
+# The command users type. This is the binary's own name and must not follow
+# the package rename: every other install path gives them `a2acli`.
+COMMAND_NAME = "a2acli"
 # WinGet lists both A2A CLIs side by side, and the crate description does not
 # say which implementation it is. Name it, so a search for "a2a" is decidable.
 DESCRIPTION_SUFFIX = " (Rust implementation)"
@@ -256,7 +259,7 @@ def render_default_locale_manifest(
 
 def render_installer_manifest(release_assets: ReleaseAssets) -> str:
     relative_file_path = (
-        f"a2acli-v{release_assets.version}-{WINDOWS_TARGET}\\a2acli.exe"
+        f"a2acli-v{release_assets.version}-{WINDOWS_TARGET}\\{COMMAND_NAME}.exe"
     )
     return (
         f"# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.{MANIFEST_VERSION}.schema.json\n"
@@ -266,7 +269,7 @@ def render_installer_manifest(release_assets: ReleaseAssets) -> str:
         f"InstallerType: zip\n"
         f"NestedInstallerType: portable\n"
         f"Commands:\n"
-        f"- {MONIKER}\n"
+        f"- {COMMAND_NAME}\n"
         f"ReleaseDate: {release_assets.release_date}\n"
         f"Dependencies:\n"
         f"  PackageDependencies:\n"
@@ -277,7 +280,7 @@ def render_installer_manifest(release_assets: ReleaseAssets) -> str:
         f"  InstallerSha256: {release_assets.installer_sha256}\n"
         f"  NestedInstallerFiles:\n"
         f"  - RelativeFilePath: {relative_file_path}\n"
-        f"    PortableCommandAlias: {MONIKER}\n"
+        f"    PortableCommandAlias: {COMMAND_NAME}\n"
         f"ManifestType: installer\n"
         f"ManifestVersion: {MANIFEST_VERSION}\n"
     )
