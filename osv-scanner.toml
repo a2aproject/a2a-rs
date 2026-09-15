@@ -1,27 +1,73 @@
-# Advisories that do not apply to this repository. Cargo.lock is
-# feature-agnostic, so OSV sees packages that are never built — see #227.
+# Advisories accepted rather than fixed, for osv-scanner and anything built on
+# it (OpenSSF Scorecard's Vulnerabilities check runs osv-scanner over the
+# lockfiles in this repo).
+#
+# Cargo.lock is feature-agnostic: it records every optionally-reachable package
+# so that enabling a feature later needs no re-resolution. OSV reads the
+# lockfile and cannot tell whether a package is actually built, so advisories
+# for code this workspace never compiles count against the score as though they
+# were reachable. Hence this file.
+#
+# Every entry expires, so the debt resurfaces instead of being buried. Convention
+# follows agntcy/shadi's osv-scanner.toml.
+#
+# Not listed here, deliberately: RUSTSEC-2026-0285 (rustls). That one is
+# reachable — rustls is compiled — and is left visible as the single true
+# finding. It is unfixable today because rustls >= 0.23.45 needs aws-lc-rs ^1.18
+# while mls-rs-crypto-awslc pins it exactly via agntcy-slim-auth. Tracked in
+# #236 and upstream at agntcy/slim#2057. shadi ignores it because it gates CI on
+# cargo-audit and would otherwise fail every build; this repo has no such gate,
+# so suppressing it here would buy a score and cost the signal.
+
+# --- rust-openssl: not in the resolve graph ----------------------------------
+# openssl, openssl-sys, native-tls, hyper-tls and tokio-native-tls are all
+# absent from the feature-resolved graph under default features on
+# x86_64-unknown-linux-gnu. Both reqwest versions in the tree (0.12.28 via
+# oauth2 <- agntcy-slim-auth, and 0.13.4 direct) resolve with __rustls and no
+# default-tls, so no TLS backend pulls openssl in.
+#
+# Verify with:
+#   cargo metadata --filter-platform x86_64-unknown-linux-gnu \
+#     | jq '.resolve.nodes[].id' | grep openssl   # expect no output
+#
+# Revisit if anything ever enables reqwest's default-tls feature.
 
 [[IgnoredVulns]]
 id = "GHSA-8c75-8mhr-p7r9"
-reason = "rust-openssl: not in the resolve graph under default features; reqwest uses rustls"
+ignoreUntil = 2027-03-15
+reason = "rust-openssl incorrect bounds assertion in AES key wrap; openssl is not built by this workspace"
+
 [[IgnoredVulns]]
 id = "GHSA-ghm9-cr32-g9qj"
-reason = "rust-openssl: not in the resolve graph under default features; reqwest uses rustls"
+ignoreUntil = 2027-03-15
+reason = "rust-openssl MdCtxRef::digest_final writes past the calculated length; openssl is not built by this workspace"
+
 [[IgnoredVulns]]
 id = "GHSA-hppc-g8h3-xhp3"
-reason = "rust-openssl: not in the resolve graph under default features; reqwest uses rustls"
+ignoreUntil = 2027-03-15
+reason = "rust-openssl unchecked callback length in the PSK/cookie trampolines; openssl is not built by this workspace"
+
 [[IgnoredVulns]]
 id = "GHSA-phqj-4mhp-q6mq"
-reason = "rust-openssl: not in the resolve graph under default features; reqwest uses rustls"
+ignoreUntil = 2027-03-15
+reason = "rust-openssl potential out-of-bounds write in CipherCtxRef; openssl is not built by this workspace"
+
 [[IgnoredVulns]]
 id = "GHSA-pqf5-4pqq-29f5"
-reason = "rust-openssl: not in the resolve graph under default features; reqwest uses rustls"
+ignoreUntil = 2027-03-15
+reason = "rust-openssl Deriver::derive and PkeyCtxRef::derive can overflow; openssl is not built by this workspace"
+
 [[IgnoredVulns]]
 id = "GHSA-xmgf-hq76-4vx2"
-reason = "rust-openssl: not in the resolve graph under default features; reqwest uses rustls"
+ignoreUntil = 2027-03-15
+reason = "rust-openssl out-of-bounds read in the PEM password callback; openssl is not built by this workspace"
+
 [[IgnoredVulns]]
 id = "GHSA-xp3w-r5p5-63rr"
-reason = "rust-openssl: not in the resolve graph under default features; reqwest uses rustls"
+ignoreUntil = 2027-03-15
+reason = "rust-openssl undefined behaviour in X509Ref::ocsp_resp; openssl is not built by this workspace"
+
 [[IgnoredVulns]]
 id = "GHSA-xv59-967r-8726"
-reason = "rust-openssl: not in the resolve graph under default features; reqwest uses rustls"
+ignoreUntil = 2027-03-15
+reason = "rust-openssl heap buffer overflow when encrypting; openssl is not built by this workspace"
