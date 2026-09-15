@@ -11,3 +11,9 @@ itk/logs/
 # Python bytecode from running scripts/ helpers locally
 __pycache__/
 *.py[cod]
+
+# libFuzzer output; only fuzz/seeds/ is tracked.
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/target/

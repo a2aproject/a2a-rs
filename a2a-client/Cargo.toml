@@ -39,6 +39,9 @@ rcgen = { workspace = true }
 # By default we will use aws-lc-rs as crypto provider.
 default = ["rustls-tls"]
 
+# Exposes framing internals to fuzz/. Never enable in a dependent.
+fuzzing = []
+
 rustls-tls = [
     "reqwest/rustls",
     "dep:rustls",
