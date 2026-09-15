@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+This is the workspace changelog. Versions are `a2a-cli`'s, which sits at the top
+of the dependency graph, and the entries include changes from every crate. Each
+library also keeps its own: [a2a](a2a/CHANGELOG.md),
+[a2a-client](a2a-client/CHANGELOG.md), [a2a-server](a2a-server/CHANGELOG.md),
+[a2a-pb](a2a-pb/CHANGELOG.md), [a2a-grpc](a2a-grpc/CHANGELOG.md),
+[a2a-slimrpc](a2a-slimrpc/CHANGELOG.md).
+
 ## [Unreleased]
 
 ## [0.2.0](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.1.11...a2a-cli-v0.2.0) - 2026-09-14
