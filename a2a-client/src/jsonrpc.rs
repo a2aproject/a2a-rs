@@ -183,7 +183,7 @@ impl JsonRpcTransport {
 ///
 /// SSE line terminators per https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation:
 /// `\n\n`, `\r\r`, and `\r\n\r\n` are all valid event separators.
-fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     for i in 0..buf.len().saturating_sub(1) {
         if buf[i] == b'\n' && buf[i + 1] == b'\n' {
             return Some((i, i + 2));
@@ -218,7 +218,7 @@ fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
 /// Anything else is reported rather than swallowed: a non-empty tail that
 /// parses as neither means the stream was cut mid-message, and ending
 /// silently is the one answer that is always wrong.
-fn parse_stream_tail(
+pub(crate) fn parse_stream_tail(
     buf: &[u8],
     parse_event: &dyn Fn(&str) -> Option<Result<StreamResponse, A2AError>>,
 ) -> Option<Result<StreamResponse, A2AError>> {

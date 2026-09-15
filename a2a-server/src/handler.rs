@@ -7,6 +7,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{RwLock, broadcast};
 
 use crate::middleware::ServiceParams;
+use crate::pagination::resolve_page_size;
 use crate::task_store::apply_history_length;
 
 const EXECUTION_BUFFER_CAPACITY: usize = 32;
@@ -457,6 +458,28 @@ pub struct DefaultRequestHandler {
     push_sender: Option<Arc<crate::HttpPushSender>>,
     capabilities: AgentCapabilities,
     authorizer: Option<Arc<dyn RequestAuthorizer>>,
+    extended_agent_card: Option<Arc<dyn ExtendedAgentCardResolver>>,
+}
+
+/// Supplies the authenticated extended Agent Card (§12.4, §10.1).
+///
+/// A resolver rather than a stored card because §12.4 has the extended card
+/// fetched *under a security scheme*: which skills an agent reveals can
+/// legitimately differ by caller, and `ServiceParams` is where the caller's
+/// credentials arrive. An agent serving one card to everyone can ignore the
+/// argument — [`DefaultRequestHandler::with_extended_agent_card`] wraps a
+/// plain card for exactly that case.
+pub trait ExtendedAgentCardResolver: Send + Sync {
+    fn resolve(&self, params: &ServiceParams) -> Result<AgentCard, A2AError>;
+}
+
+impl<F> ExtendedAgentCardResolver for F
+where
+    F: Fn(&ServiceParams) -> Result<AgentCard, A2AError> + Send + Sync,
+{
+    fn resolve(&self, params: &ServiceParams) -> Result<AgentCard, A2AError> {
+        self(params)
+    }
 }
 
 impl DefaultRequestHandler {
@@ -469,7 +492,29 @@ impl DefaultRequestHandler {
             push_sender: None,
             capabilities: AgentCapabilities::default(),
             authorizer: None,
+            extended_agent_card: None,
         }
+    }
+
+    /// Serve `card` as the extended Agent Card, identically for every caller.
+    ///
+    /// Also declares the `extendedAgentCard` capability, since serving one
+    /// and advertising it should not be two separate things to remember —
+    /// an explicit `with_capabilities(..)` still overrides it either way.
+    pub fn with_extended_agent_card(mut self, card: AgentCard) -> Self {
+        self.capabilities.extended_agent_card.get_or_insert(true);
+        self.with_extended_agent_card_resolver(move |_: &ServiceParams| Ok(card.clone()))
+    }
+
+    /// Serve an extended Agent Card computed per caller, so an agent can
+    /// reveal different skills to different principals (§12.4).
+    pub fn with_extended_agent_card_resolver(
+        mut self,
+        resolver: impl ExtendedAgentCardResolver + 'static,
+    ) -> Self {
+        self.capabilities.extended_agent_card.get_or_insert(true);
+        self.extended_agent_card = Some(Arc::new(resolver));
+        self
     }
 
     /// Install an authorizer. The default handler does not enforce one.
@@ -733,13 +778,31 @@ impl RequestHandler for DefaultRequestHandler {
         Ok(task)
     }
 
+    /// Bounds the page twice, and neither is redundant: `TaskStore` is a
+    /// public trait.
+    ///
+    /// Clamping `page_size` before the call bounds a store that honours it
+    /// -- the ordinary case, and the one that turns `pageSize=999999999`
+    /// into a real query. Truncating the response bounds a store that
+    /// ignores it, which cannot be detected from here.
+    ///
+    /// On truncation the store's `next_page_token` is left alone: paging is
+    /// the store's own scheme (the in-tree stores use offsets, another may
+    /// use an opaque cursor) so no correct token can be synthesised. See
+    /// [`TaskStore::list`].
     async fn list_tasks(
         &self,
         params: &ServiceParams,
         req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
         self.authorize(params, None)?;
+        let page_size = resolve_page_size(req.page_size);
+        let req = ListTasksRequest {
+            page_size: Some(page_size as i32),
+            ..req
+        };
         let mut response = self.task_store.list(&req).await?;
+        response.tasks.truncate(page_size);
         for task in &mut response.tasks {
             apply_history_length(task, req.history_length);
         }
@@ -882,16 +945,19 @@ impl RequestHandler for DefaultRequestHandler {
         let mut configs = self.push_config_store_checked()?.list(&req.task_id).await?;
         configs.sort_by(|left, right| left.id.cmp(&right.id));
 
-        let page_size = match req.page_size {
-            Some(size) if size > 0 => size as usize,
-            _ => 50,
+        // Paging for push configs is done here, not in the store: the store
+        // is asked for every config for the task and the page is cut from
+        // that. PushConfigStore is public, so this clamp is what bounds the
+        // response for an implementation with no per-task limit of its own.
+        let page_size = resolve_page_size(req.page_size);
+        let start = if let Some(ref token) = req.page_token {
+            token
+                .parse::<usize>()
+                .map_err(|_| A2AError::invalid_params("invalid page token"))?
+        } else {
+            0
         };
-        let start = req
-            .page_token
-            .as_deref()
-            .and_then(|token| token.parse::<usize>().ok())
-            .unwrap_or(0)
-            .min(configs.len());
+        let start = start.min(configs.len());
         let end = (start + page_size).min(configs.len());
         let next_page_token = (end < configs.len()).then(|| end.to_string());
 
@@ -918,9 +984,19 @@ impl RequestHandler for DefaultRequestHandler {
         _req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
         self.authorize(params, None)?;
-        Err(A2AError::unsupported_operation(
-            "extended agent card not configured",
-        ))
+        Self::require_capability(self.capabilities.extended_agent_card, || {
+            A2AError::unsupported_operation(
+                "the agent card does not declare an extended agent card",
+            )
+        })?;
+        match &self.extended_agent_card {
+            Some(resolver) => resolver.resolve(params),
+            // A2A defines a code for exactly this condition.
+            // UNSUPPORTED_OPERATION would say the agent does not do extended
+            // cards at all, when the truth is that this deployment has not
+            // configured one — the client can act on that difference.
+            None => Err(A2AError::extended_card_not_configured()),
+        }
     }
 }
 
@@ -928,8 +1004,9 @@ impl RequestHandler for DefaultRequestHandler {
 mod tests {
     use super::*;
     use crate::executor::ExecutorContext;
-    use crate::push::InMemoryPushConfigStore;
-    use crate::task_store::InMemoryTaskStore;
+    use crate::pagination::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
+    use crate::push::{InMemoryPushConfigStore, PushConfigStore};
+    use crate::task_store::{InMemoryTaskStore, TaskStore, TaskVersion};
 
     use crate::test_util::install_crypto_provider;
     use axum::{
@@ -941,6 +1018,7 @@ mod tests {
     };
     use futures::stream;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicI32, Ordering};
     use tokio::{
         net::TcpListener,
         sync::{Notify, mpsc, oneshot},
@@ -1121,6 +1199,151 @@ mod tests {
         }
     }
 
+    /// A `TaskStore` that behaves exactly like `InMemoryTaskStore` except
+    /// for `list`, which it drives from the fields below.
+    ///
+    /// `TaskStore` is public, so nothing obliges a third-party
+    /// implementation to bound its own response. Only a decorator can model
+    /// that; everything else delegates, so a cap test cannot accidentally
+    /// depend on stub behaviour.
+    struct PagingTaskStore {
+        inner: InMemoryTaskStore,
+        count: usize,
+        /// `true` models a well-behaved store, bounded by the handler
+        /// clamping the request; `false` models one that ignores
+        /// `page_size`, bounded only by the handler truncating the response.
+        honour_page_size: bool,
+        /// The `page_size` the handler actually asked for. Recorded because
+        /// the response bound alone cannot distinguish a clamped request
+        /// from an unclamped one -- both end up 100 items wide.
+        seen_page_size: Arc<AtomicI32>,
+        /// Continuation token the store reports, so truncation's handling of
+        /// it can be observed.
+        next_page_token: String,
+    }
+
+    impl PagingTaskStore {
+        fn new(count: usize, honour_page_size: bool) -> Self {
+            Self {
+                inner: InMemoryTaskStore::new(),
+                count,
+                honour_page_size,
+                seen_page_size: Arc::new(AtomicI32::new(-1)),
+                next_page_token: String::new(),
+            }
+        }
+
+        fn with_next_page_token(mut self, token: &str) -> Self {
+            self.next_page_token = token.to_string();
+            self
+        }
+    }
+
+    #[async_trait]
+    impl TaskStore for PagingTaskStore {
+        async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.create(task).await
+        }
+
+        async fn update(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.update(task).await
+        }
+
+        async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
+            self.inner.get(task_id).await
+        }
+
+        async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+            self.seen_page_size
+                .store(req.page_size.unwrap_or(-1), Ordering::SeqCst);
+            let served = if self.honour_page_size {
+                req.page_size.unwrap_or(i32::MAX).max(0) as usize
+            } else {
+                self.count
+            }
+            .min(self.count);
+            let tasks = (0..served)
+                .map(|i| Task {
+                    id: format!("t-{i:04}"),
+                    context_id: "c1".into(),
+                    status: TaskStatus {
+                        state: TaskState::Completed,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: None,
+                    metadata: None,
+                })
+                .collect::<Vec<_>>();
+            let total = tasks.len() as i32;
+            Ok(ListTasksResponse {
+                tasks,
+                next_page_token: self.next_page_token.clone(),
+                page_size: total,
+                total_size: total,
+            })
+        }
+    }
+
+    /// The push-config equivalent, and the only way to reach the handler's
+    /// page cap on that path: `InMemoryPushConfigStore` caps a task at
+    /// `MAX_PUSH_CONFIGS_PER_TASK` (50), below the page cap of 100, so
+    /// nothing routed through it can make the clamp bind. Everything but
+    /// `list` delegates.
+    struct PagingPushConfigStore {
+        inner: InMemoryPushConfigStore,
+        count: usize,
+    }
+
+    impl PagingPushConfigStore {
+        fn new(count: usize) -> Self {
+            Self {
+                inner: InMemoryPushConfigStore::new(),
+                count,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::PushConfigStore for PagingPushConfigStore {
+        async fn save(
+            &self,
+            config: TaskPushNotificationConfig,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.inner.save(config).await
+        }
+
+        async fn get(
+            &self,
+            task_id: &str,
+            config_id: &str,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.inner.get(task_id, config_id).await
+        }
+
+        async fn list(&self, task_id: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
+            Ok((0..self.count)
+                .map(|i| TaskPushNotificationConfig {
+                    task_id: task_id.to_string(),
+                    url: format!("https://example.com/hook/{i}"),
+                    id: Some(format!("cfg-{i:04}")),
+                    token: None,
+                    authentication: None,
+                    tenant: None,
+                })
+                .collect())
+        }
+
+        async fn delete(&self, task_id: &str, config_id: &str) -> Result<(), A2AError> {
+            self.inner.delete(task_id, config_id).await
+        }
+
+        async fn delete_all(&self, task_id: &str) -> Result<(), A2AError> {
+            self.inner.delete_all(task_id).await
+        }
+    }
+
     fn make_handler() -> DefaultRequestHandler {
         DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
     }
@@ -1131,8 +1354,16 @@ mod tests {
     }
 
     fn make_push_delivery_handler() -> DefaultRequestHandler {
+        // URL validation is disabled because the test webhook runs on
+        // 127.0.0.1; the default HttpPushSender rejects loopback targets.
         DefaultRequestHandler::new(PushEventExecutor, InMemoryTaskStore::new())
-            .with_push_config_store(InMemoryPushConfigStore::new())
+            .with_push_notifications(
+                InMemoryPushConfigStore::new(),
+                crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                    validate_urls: false,
+                    ..Default::default()
+                })),
+            )
     }
 
     fn make_resumable_handler() -> (DefaultRequestHandler, Arc<Notify>) {
@@ -2024,6 +2255,301 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_push_configs_invalid_page_token_errors() {
+        install_crypto_provider();
+        let handler = make_handler_with_push_configs();
+        let params = ServiceParams::new();
+        handler
+            .create_push_config(
+                &params,
+                TaskPushNotificationConfig {
+                    task_id: "t1".into(),
+                    url: "https://example.com/callback".into(),
+                    id: Some("cfg-1".into()),
+                    token: None,
+                    authentication: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = handler
+            .list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: None,
+                    page_token: Some("not-a-number".into()),
+                    tenant: None,
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, error_code::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_page_size_cap_bounds_a_store_that_ignores_it() {
+        install_crypto_provider();
+        // A store that pays no attention to page_size. Clamping the request
+        // does nothing here; only truncating the response bounds it.
+        let handler = DefaultRequestHandler::new(
+            EchoExecutor,
+            PagingTaskStore::new(MAX_PAGE_SIZE * 3, false),
+        );
+
+        let resp = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: Some(1_000_000),
+                    page_token: None,
+                    history_length: None,
+                    include_artifacts: None,
+                    status_timestamp_after: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.tasks.len(), MAX_PAGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_paging_stores_delegate_everything_except_list() {
+        install_crypto_provider();
+        // The cap tests above are only measuring the handler if these two
+        // doubles differ from the real stores in `list` and nowhere else.
+        // Pin that, so a later edit cannot quietly make them lie.
+        let tasks = PagingTaskStore::new(0, true);
+        let task = Task {
+            id: "t-delegated".into(),
+            context_id: "c1".into(),
+            status: TaskStatus {
+                state: TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        tasks.create(task.clone()).await.unwrap();
+        assert_eq!(
+            tasks
+                .get("t-delegated")
+                .await
+                .unwrap()
+                .map(|t| t.status.state),
+            Some(TaskState::Submitted)
+        );
+        let mut done = task.clone();
+        done.status.state = TaskState::Completed;
+        tasks.update(done).await.unwrap();
+        assert_eq!(
+            tasks
+                .get("t-delegated")
+                .await
+                .unwrap()
+                .map(|t| t.status.state),
+            Some(TaskState::Completed)
+        );
+
+        let configs = PagingPushConfigStore::new(0);
+        configs
+            .save(TaskPushNotificationConfig {
+                task_id: "t1".into(),
+                url: "https://example.com/callback".into(),
+                id: Some("cfg-1".into()),
+                token: None,
+                authentication: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            configs.get("t1", "cfg-1").await.unwrap().id.as_deref(),
+            Some("cfg-1")
+        );
+        configs.delete("t1", "cfg-1").await.unwrap();
+        assert!(configs.get("t1", "cfg-1").await.is_err());
+        configs.delete_all("t1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_page_size_cap_bounds_a_store_that_honours_it() {
+        install_crypto_provider();
+        // The ordinary case: the store does what it is asked, so what it is
+        // asked for has to be bounded. Without the clamp this store would
+        // build a million tasks.
+        let store = PagingTaskStore::new(MAX_PAGE_SIZE * 3, true);
+        let seen = Arc::clone(&store.seen_page_size);
+        let handler = DefaultRequestHandler::new(EchoExecutor, store);
+
+        let resp = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: Some(1_000_000),
+                    page_token: None,
+                    history_length: None,
+                    include_artifacts: None,
+                    status_timestamp_after: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.tasks.len(), MAX_PAGE_SIZE);
+        // The point of the clamp: the store is never asked for the million.
+        // Asserting only on the response would pass with no clamp at all,
+        // because the response bound would hide it.
+        assert_eq!(seen.load(Ordering::SeqCst), MAX_PAGE_SIZE as i32);
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_truncation_keeps_the_store_continuation_token() {
+        install_crypto_provider();
+        // Truncating must not strand the remainder. The handler cannot
+        // synthesise a token for a paging scheme it does not own, so the
+        // store's own token has to survive untouched -- otherwise a caller
+        // that lost 200 tasks has no way to ask for them.
+        let handler = DefaultRequestHandler::new(
+            EchoExecutor,
+            PagingTaskStore::new(MAX_PAGE_SIZE * 3, false)
+                .with_next_page_token("cursor-from-store"),
+        );
+
+        let resp = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    include_artifacts: None,
+                    status_timestamp_after: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.tasks.len(), DEFAULT_PAGE_SIZE);
+        assert_eq!(resp.next_page_token, "cursor-from-store");
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_honours_a_page_size_under_the_cap() {
+        install_crypto_provider();
+        // The clamp is an upper bound, not a floor: a modest request must
+        // reach the store unchanged.
+        let store = PagingTaskStore::new(MAX_PAGE_SIZE * 3, true);
+        let seen = Arc::clone(&store.seen_page_size);
+        let handler = DefaultRequestHandler::new(EchoExecutor, store);
+
+        let resp = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: Some(7),
+                    page_token: None,
+                    history_length: None,
+                    include_artifacts: None,
+                    status_timestamp_after: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(seen.load(Ordering::SeqCst), 7);
+        assert_eq!(resp.tasks.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_list_push_configs_page_size_cap_bounds_a_custom_store() {
+        install_crypto_provider();
+        // InMemoryPushConfigStore caps a task at 50 configs, below the page
+        // cap of 100, so it can never reach the clamp. A store without that
+        // limit can, and is what the clamp exists for.
+        let handler = DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+            .with_push_config_store(PagingPushConfigStore::new(MAX_PAGE_SIZE * 3));
+
+        let resp = handler
+            .list_push_configs(
+                &ServiceParams::new(),
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: Some(1_000_000),
+                    page_token: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.configs.len(), MAX_PAGE_SIZE);
+        // The remainder must stay reachable, or the cap silently truncates.
+        assert_eq!(resp.next_page_token.as_deref(), Some("100"));
+    }
+
+    #[tokio::test]
+    async fn test_list_push_configs_page_size_is_capped() {
+        install_crypto_provider();
+        let handler = make_handler_with_push_configs();
+        let params = ServiceParams::new();
+        // Keep the count below InMemoryPushConfigStore's per-task cap
+        // (MAX_PUSH_CONFIGS_PER_TASK), which rejects the 51st config.
+        for i in 0..40 {
+            handler
+                .create_push_config(
+                    &params,
+                    TaskPushNotificationConfig {
+                        task_id: "t1".into(),
+                        url: format!("https://example.com/callback/{i}"),
+                        id: Some(format!("cfg-{i:03}")),
+                        token: None,
+                        authentication: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // Requesting a huge page size must not error and returns everything
+        // available. This does NOT exercise the cap -- 40 < MAX_PAGE_SIZE, so
+        // a capped and an uncapped implementation agree here. The cap itself
+        // is pinned by test_list_push_configs_page_size_cap_bounds_a_custom_store,
+        // which is the only route that can reach it.
+        let resp = handler
+            .list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: Some(1000),
+                    page_token: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.configs.len(), 40);
+    }
+
+    #[tokio::test]
     async fn test_push_config_crud_with_store() {
         install_crypto_provider();
         let handler = make_handler_with_push_configs();
@@ -2488,5 +3014,189 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, error_code::PUSH_NOTIFICATION_NOT_SUPPORTED);
+    }
+
+    /// Reported in #161 against a different crate (`a2a-protocol-server`),
+    /// but worth pinning here: two tasks sharing a `contextId` must each
+    /// carry only their own artifacts. The task store is keyed by task id,
+    /// so there is no path by which a context could aggregate them — this
+    /// test exists so that stays true.
+    #[tokio::test]
+    async fn test_artifacts_do_not_aggregate_across_tasks_in_one_context() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        let context_id = "ctx-shared";
+
+        for (task_id, artifact_id) in [("t-first", "a-1"), ("t-second", "a-2")] {
+            handler
+                .task_store
+                .create(Task {
+                    id: task_id.into(),
+                    context_id: context_id.into(),
+                    status: TaskStatus {
+                        state: TaskState::Working,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: None,
+                    metadata: None,
+                })
+                .await
+                .unwrap();
+
+            apply_event_to_task(
+                handler.task_store.as_ref(),
+                None,
+                &StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    task_id: task_id.into(),
+                    context_id: context_id.into(),
+                    artifact: Artifact {
+                        artifact_id: artifact_id.into(),
+                        name: None,
+                        description: None,
+                        parts: vec![Part::text("payload")],
+                        metadata: None,
+                        extensions: None,
+                    },
+                    append: None,
+                    last_chunk: None,
+                    metadata: None,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        for (task_id, expected) in [("t-first", "a-1"), ("t-second", "a-2")] {
+            let task = handler
+                .get_task(
+                    &params,
+                    GetTaskRequest {
+                        id: task_id.into(),
+                        history_length: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let ids: Vec<&str> = task
+                .artifacts
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|a| a.artifact_id.as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![expected],
+                "{task_id} must carry only its own artifact"
+            );
+        }
+    }
+    // §12.4 / §10.1 (#204): the extended Agent Card.
+
+    fn extended_card(name: &str) -> AgentCard {
+        AgentCard {
+            name: name.into(),
+            description: "extended".into(),
+            version: "1.0".into(),
+            supported_interfaces: vec![],
+            capabilities: AgentCapabilities::default(),
+            default_input_modes: vec![],
+            default_output_modes: vec![],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        }
+    }
+
+    fn extended_request() -> GetExtendedAgentCardRequest {
+        GetExtendedAgentCardRequest { tenant: None }
+    }
+
+    #[tokio::test]
+    async fn test_extended_agent_card_is_served_when_configured() {
+        let handler = make_handler().with_extended_agent_card(extended_card("secret skills"));
+        let card = handler
+            .get_extended_agent_card(&ServiceParams::new(), extended_request())
+            .await
+            .unwrap();
+        assert_eq!(card.name, "secret skills");
+    }
+
+    /// Configuring a card also declares the capability, so serving one and
+    /// advertising it are not two things to remember.
+    #[tokio::test]
+    async fn test_configuring_an_extended_card_declares_the_capability() {
+        let handler = make_handler().with_extended_agent_card(extended_card("x"));
+        assert_eq!(handler.capabilities.extended_agent_card, Some(true));
+    }
+
+    /// A2A gives this condition its own code. Before #204 it reported
+    /// `UNSUPPORTED_OPERATION`, which says the agent does not do extended
+    /// cards at all rather than that this deployment has not configured one.
+    #[tokio::test]
+    async fn test_unconfigured_extended_card_reports_its_own_code() {
+        let handler = make_handler().with_capabilities(AgentCapabilities {
+            streaming: None,
+            push_notifications: None,
+            extensions: None,
+            extended_agent_card: Some(true),
+        });
+        let error = handler
+            .get_extended_agent_card(&ServiceParams::new(), extended_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::EXTENDED_CARD_NOT_CONFIGURED);
+        assert_ne!(error.code, error_code::UNSUPPORTED_OPERATION);
+    }
+
+    /// The capability gate from #203 runs first: a card declaring
+    /// `extendedAgentCard: false` refuses before the configured/unconfigured
+    /// distinction is even reached.
+    #[tokio::test]
+    async fn test_capability_gate_precedes_the_not_configured_check() {
+        let handler = make_handler()
+            .with_extended_agent_card(extended_card("x"))
+            .with_capabilities(AgentCapabilities {
+                streaming: None,
+                push_notifications: None,
+                extensions: None,
+                extended_agent_card: Some(false),
+            });
+        let error = handler
+            .get_extended_agent_card(&ServiceParams::new(), extended_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+    }
+
+    /// §12.4 fetches the extended card under a security scheme, so a
+    /// resolver can vary what it reveals by caller.
+    #[tokio::test]
+    async fn test_resolver_sees_the_caller_params() {
+        let handler = make_handler().with_extended_agent_card_resolver(|params: &ServiceParams| {
+            let privileged = params.contains_key("x-privileged");
+            Ok(extended_card(if privileged { "full" } else { "limited" }))
+        });
+
+        let card = handler
+            .get_extended_agent_card(&ServiceParams::new(), extended_request())
+            .await
+            .unwrap();
+        assert_eq!(card.name, "limited");
+
+        let mut params = ServiceParams::new();
+        params.insert("x-privileged".into(), vec!["yes".into()]);
+        let card = handler
+            .get_extended_agent_card(&params, extended_request())
+            .await
+            .unwrap();
+        assert_eq!(card.name, "full");
     }
 }

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.2.8...a2a-slimrpc-v0.2.9) - 2026-09-15
+
+### Other
+
+- updated the following local packages: a2a-client-lf
+
+## [0.2.8](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.2.7...a2a-slimrpc-v0.2.8) - 2026-09-14
+
+### Other
+
+- updated the following local packages: a2a-lf, a2a-pb, a2a-client-lf, a2a-server-lf
+
 ## [0.2.7](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.2.6...a2a-slimrpc-v0.2.7) - 2026-08-27
 
 ### Other

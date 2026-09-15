@@ -3,7 +3,7 @@
 
 [package]
 name = "a2a-client-lf"
-version = "0.2.3"
+version = "0.2.5"
 description = "A2A v1 async client with protocol binding factory"
 readme = "README.md"
 edition.workspace = true
@@ -38,6 +38,9 @@ rcgen = { workspace = true }
 [features]
 # By default we will use aws-lc-rs as crypto provider.
 default = ["rustls-tls"]
+
+# Exposes framing internals to fuzz/. Never enable in a dependent.
+fuzzing = []
 
 rustls-tls = [
     "reqwest/rustls",

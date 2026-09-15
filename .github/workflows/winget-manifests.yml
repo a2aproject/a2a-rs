@@ -177,7 +177,9 @@ jobs:
           rm -rf /tmp/winget-pkgs
           GH_TOKEN="$WINGET_PKGS_TOKEN" gh repo clone "$fork_owner/winget-pkgs" /tmp/winget-pkgs -- --depth 1
 
-          branch="automation/winget-a2acli-$PACKAGE_VERSION"
+          # Derived from the identifier so a future rename lands in one place.
+          package_slug="${PACKAGE_IDENTIFIER#*.}"
+          branch="automation/winget-$package_slug-$PACKAGE_VERSION"
 
           cd /tmp/winget-pkgs
           if git remote get-url upstream >/dev/null 2>&1; then
@@ -206,7 +208,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "release: add WinGet manifest for a2acli v$PACKAGE_VERSION"
+          git commit -m "release: add WinGet manifest for $PACKAGE_IDENTIFIER v$PACKAGE_VERSION"
           git push --force --set-upstream origin "$branch"
 
           pr_number=$(GH_TOKEN="$WINGET_PKGS_TOKEN" gh pr list --repo microsoft/winget-pkgs --head "$fork_owner:$branch" --base master --state open --json number --jq 'first(.[].number) // ""' 2>/dev/null || true)

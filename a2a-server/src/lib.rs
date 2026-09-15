@@ -5,6 +5,7 @@ pub mod executor;
 pub mod handler;
 pub mod jsonrpc;
 pub mod middleware;
+pub mod pagination;
 pub mod push;
 pub mod rest;
 pub mod sse;
@@ -15,9 +16,11 @@ pub mod tls;
 
 pub use agent_card::{AgentCardProducer, StaticAgentCard, WELL_KNOWN_AGENT_CARD_PATH};
 pub use executor::{AgentExecutor, ExecutorContext};
-pub use handler::{DefaultRequestHandler, RequestAuthorizer, RequestHandler};
+pub use handler::{
+    DefaultRequestHandler, ExtendedAgentCardResolver, RequestAuthorizer, RequestHandler,
+};
 pub use middleware::{CallContext, CallInterceptor, InterceptedHandler, ServiceParams, User};
-pub use push::{HttpPushSender, InMemoryPushConfigStore, PushConfigStore};
+pub use push::{HttpPushSender, HttpPushSenderConfig, InMemoryPushConfigStore, PushConfigStore};
 pub use task_store::{InMemoryTaskStore, TaskStore};
 
 #[cfg(test)]

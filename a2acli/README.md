@@ -18,6 +18,35 @@ From crates.io after release:
 cargo install a2a-cli
 ```
 
+### Verifying a download
+
+The prebuilt archives attached to an `a2a-cli-v*` GitHub Release are signed
+with [Sigstore](https://www.sigstore.dev/) and carry SLSA build provenance.
+Both are keyless: there is no long-lived key, and the certificate binds the
+artifact to the workflow that produced it.
+
+Check the signature (`<archive>.sigstore.json`, a Sigstore bundle carrying
+both the signature and the signing certificate):
+
+```sh
+cosign verify-blob \
+  --bundle a2acli-v0.1.11-x86_64-unknown-linux-gnu.tar.gz.sigstore.json \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/a2aproject/a2a-rs/\.github/workflows/' \
+  a2acli-v0.1.11-x86_64-unknown-linux-gnu.tar.gz
+```
+
+Check the provenance — what built the archive, from which commit:
+
+```sh
+gh attestation verify a2acli-v0.1.11-x86_64-unknown-linux-gnu.tar.gz \
+  --repo a2aproject/a2a-rs
+```
+
+The `<archive>.sha256` file alongside them is a plain integrity checksum. It
+tells you the download is intact, not who produced it — only the signature and
+the provenance do that.
+
 ## What It Provides
 
 - Fetch and print the public agent card for an A2A deployment, named by

@@ -26,6 +26,15 @@ pub trait TaskStore: Send + Sync + 'static {
     async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError>;
 
     /// List tasks matching the request criteria.
+    ///
+    /// An implementation must honour `req.page_size` and set
+    /// `next_page_token` when more tasks remain. `DefaultRequestHandler`
+    /// clamps `page_size` to
+    /// [`MAX_PAGE_SIZE`](crate::pagination::MAX_PAGE_SIZE) before calling
+    /// this, and truncates the response to that bound if more comes back --
+    /// so a store that ignores `page_size` will have its extra tasks
+    /// dropped, and the caller loses them, because the handler cannot
+    /// synthesise a continuation token for a paging scheme it does not own.
     async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError>;
 
     /// Atomically check that a task is not in a terminal state and transition
