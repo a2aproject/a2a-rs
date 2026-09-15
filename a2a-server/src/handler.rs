@@ -614,13 +614,39 @@ impl DefaultRequestHandler {
         &self,
         req: &SendMessageRequest,
     ) -> Result<(Task, Option<Task>, String), A2AError> {
-        let task_id = req.message.task_id.clone().unwrap_or_else(new_task_id);
+        // A2A §3.4.2: a client-provided taskId MUST reference an existing task,
+        // and client-provided ids for *creating* tasks are not supported. Only
+        // an absent taskId may mint a new one.
+        let task_id = match req.message.task_id.clone() {
+            Some(id) => id,
+            None => new_task_id(),
+        };
         let stored = self.task_store.get(&task_id).await?;
-        let context_id = stored
-            .as_ref()
-            .map(|task| task.context_id.clone())
-            .or_else(|| req.message.context_id.clone())
-            .unwrap_or_else(new_context_id);
+        if stored.is_none() && req.message.task_id.is_some() {
+            return Err(A2AError::task_not_found(&task_id));
+        }
+
+        // A2A §3.4.3: reject a mismatching contextId/taskId pair, and infer
+        // contextId from the task when only taskId is given.
+        let context_id = match stored.as_ref() {
+            Some(task) => {
+                if let Some(requested) = req.message.context_id.as_deref() {
+                    if requested != task.context_id {
+                        return Err(A2AError::invalid_params(format!(
+                            "contextId {requested} does not match task {task_id}, \
+                             which belongs to context {}",
+                            task.context_id
+                        )));
+                    }
+                }
+                task.context_id.clone()
+            }
+            None => req
+                .message
+                .context_id
+                .clone()
+                .unwrap_or_else(new_context_id),
+        };
 
         let task = if let Some(existing) = stored.clone() {
             existing
@@ -1344,6 +1370,27 @@ mod tests {
         }
     }
 
+    /// Pre-create a task so a message may legitimately reference it: A2A
+    /// §3.4.2 forbids client-provided taskIds for *creating* tasks.
+    async fn seed_task(handler: &DefaultRequestHandler, task_id: &str, context_id: &str) {
+        handler
+            .task_store
+            .create(Task {
+                id: task_id.into(),
+                context_id: context_id.into(),
+                status: TaskStatus {
+                    state: TaskState::Submitted,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+    }
+
     fn make_handler() -> DefaultRequestHandler {
         DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
     }
@@ -1479,6 +1526,7 @@ mod tests {
         let mut message = make_message();
         message.task_id = Some("t-disconnect".into());
         message.context_id = Some("c-disconnect".into());
+        seed_task(&handler, "t-disconnect", "c-disconnect").await;
 
         let mut stream = handler
             .send_streaming_message(
@@ -1701,6 +1749,114 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // A2A §3.4.2 / §3.4.3: taskId and contextId rules on send_message (#248).
+
+    fn send_req(task_id: Option<&str>, context_id: Option<&str>) -> SendMessageRequest {
+        let mut msg = make_message();
+        msg.task_id = task_id.map(Into::into);
+        msg.context_id = context_id.map(Into::into);
+        SendMessageRequest {
+            message: msg,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_message_unknown_task_id_is_not_found() {
+        install_crypto_provider();
+        let handler = make_handler();
+        // §3.4.2: a client-provided taskId MUST reference an existing task, and
+        // MUST NOT create one. Silently minting a task here is what let a
+        // mistyped or replayed id start a fresh conversation.
+        let err = handler
+            .send_message(&ServiceParams::new(), send_req(Some("t-absent"), None))
+            .await
+            .expect_err("an unknown taskId must not create a task");
+        assert_eq!(err.code, error_code::TASK_NOT_FOUND);
+        assert!(
+            handler.task_store.get("t-absent").await.unwrap().is_none(),
+            "the rejected id must not have been created"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_message_mismatched_context_id_is_rejected() {
+        install_crypto_provider();
+        let handler = make_handler();
+        seed_task(&handler, "t-ctx", "c-real").await;
+        // §3.4.3: previously the stored contextId silently won, so a client
+        // addressing the wrong conversation was never told.
+        let err = handler
+            .send_message(
+                &ServiceParams::new(),
+                send_req(Some("t-ctx"), Some("c-wrong")),
+            )
+            .await
+            .expect_err("a mismatching contextId must be rejected");
+        assert_eq!(err.code, error_code::INVALID_PARAMS);
+        assert!(
+            err.message.contains("c-wrong"),
+            "error names the bad id: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_message_matching_context_id_is_accepted() {
+        install_crypto_provider();
+        let handler = make_handler();
+        seed_task(&handler, "t-ok", "c-ok").await;
+        handler
+            .send_message(&ServiceParams::new(), send_req(Some("t-ok"), Some("c-ok")))
+            .await
+            .expect("a matching pair must be accepted");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_infers_context_id_from_the_task() {
+        install_crypto_provider();
+        let handler = make_handler();
+        seed_task(&handler, "t-infer", "c-infer").await;
+        // §3.4.3: contextId MUST be inferred when only taskId is given.
+        handler
+            .send_message(&ServiceParams::new(), send_req(Some("t-infer"), None))
+            .await
+            .unwrap();
+        let task = handler.task_store.get("t-infer").await.unwrap().unwrap();
+        assert_eq!(task.context_id, "c-infer");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_without_task_id_still_creates_one() {
+        install_crypto_provider();
+        let handler = make_handler();
+        // The server generates the id. A contextId alone is allowed and starts
+        // a new task within that conversation.
+        let resp = handler
+            .send_message(&ServiceParams::new(), send_req(None, Some("c-new")))
+            .await
+            .expect("a message with no taskId must still create a task");
+        let _ = resp;
+        let listed = handler
+            .task_store
+            .list(&ListTasksRequest {
+                context_id: Some("c-new".into()),
+                status: None,
+                page_size: None,
+                page_token: None,
+                history_length: None,
+                include_artifacts: None,
+                status_timestamp_after: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed.tasks.len(), 1);
+        assert_eq!(listed.tasks[0].context_id, "c-new");
+    }
+
     #[tokio::test]
     async fn test_get_task_after_send() {
         let handler = make_handler();
@@ -1708,6 +1864,7 @@ mod tests {
         let mut msg = make_message();
         msg.task_id = Some("t1".into());
         msg.context_id = Some("c1".into());
+        seed_task(&handler, "t1", "c1").await;
         let req = SendMessageRequest {
             message: msg,
             configuration: None,
@@ -2166,6 +2323,7 @@ mod tests {
         let mut message = make_message();
         message.task_id = Some("t-resume".into());
         message.context_id = Some("c-resume".into());
+        seed_task(&handler, "t-resume", "c-resume").await;
 
         let response = handler
             .send_message(
@@ -2667,6 +2825,7 @@ mod tests {
         let mut message = make_message();
         message.task_id = Some("t-push-request".into());
         message.context_id = Some("c-push-request".into());
+        seed_task(&handler, "t-push-request", "c-push-request").await;
 
         let response = handler
             .send_message(
@@ -2765,6 +2924,7 @@ mod tests {
         let mut message = make_message();
         message.task_id = Some("t-push-stored".into());
         message.context_id = Some("c-push-stored".into());
+        seed_task(&handler, "t-push-stored", "c-push-stored").await;
         let response = handler
             .send_message(
                 &params,
