@@ -40,25 +40,13 @@ pub trait TaskStore: Send + Sync + 'static {
     /// Atomically check that a task is not in a terminal state and transition
     /// it to `CANCELED`, returning the updated task.
     ///
-    /// Used to eliminate the check-then-act TOCTOU race between concurrent
-    /// cancel requests (BUG-44). Fails with `TASK_NOT_CANCELABLE` if the task
-    /// is already terminal, and `TASK_NOT_FOUND` if it does not exist.
+    /// `TASK_NOT_CANCELABLE` if the task is already terminal,
+    /// `TASK_NOT_FOUND` if it does not exist.
     ///
-    /// The default implementation performs a non-atomic read + update; stores
-    /// with locking should override it so the check and the transition are
-    /// serialized.
-    async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError> {
-        let task = self
-            .get(task_id)
-            .await?
-            .ok_or_else(|| A2AError::task_not_found(task_id))?;
-        if task.status.state.is_terminal() {
-            return Err(A2AError::task_not_cancelable(task_id));
-        }
-        let mut task = task;
-        task.status.state = TaskState::Canceled;
-        task.status.timestamp = Some(chrono::Utc::now());
-        self.update(task.clone()).await?;
-        Ok(task)
-    }
+    /// Deliberately has no default implementation. A default could only read
+    /// and then write, which is the check-then-act race this method exists to
+    /// close, and an implementor who did not notice would inherit it silently.
+    /// Serialise the check and the transition -- see `InMemoryTaskStore`, which
+    /// holds its write lock across both.
+    async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError>;
 }
