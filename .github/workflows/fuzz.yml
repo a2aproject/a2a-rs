@@ -33,6 +33,10 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: nightly
+          # This action defaults RUSTFLAGS to "-D warnings"; cargo-fuzz appends
+          # its own instrumentation flags and an instrumented build of every
+          # dependency should not fail on someone else's warning.
+          rustflags: ''
           # The repo sits near GitHub's 10 GiB cache cap and evicts hourly, so
           # only main writes a cache; pull requests still restore from it.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -45,7 +49,17 @@ jobs:
 
       - name: Fuzz ${{ matrix.target }}
         working-directory: fuzz
-        run: cargo fuzz run ${{ matrix.target }} corpus/${{ matrix.target }} seeds/${{ matrix.target }} -- -max_total_time=60 -print_final_stats=1
+        run: |
+          mkdir -p corpus/${{ matrix.target }}
+          # --target is explicit: install-action ships the musl prebuilt of
+          # cargo-fuzz, which otherwise defaults --target to musl, and ASan
+          # cannot link against a statically linked libc.
+          cargo fuzz run \
+            --target x86_64-unknown-linux-gnu \
+            ${{ matrix.target }} \
+            corpus/${{ matrix.target }} \
+            seeds/${{ matrix.target }} \
+            -- -max_total_time=60 -print_final_stats=1
 
       - name: Upload crash inputs
         if: failure()
