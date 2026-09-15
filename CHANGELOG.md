@@ -14,6 +14,12 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.2.1...a2a-cli-v0.2.2) - 2026-09-15
+
+### Fixed
+
+- *(server)* protect terminal task states and make cancel transition atomic ([#126](https://github.com/a2aproject/a2a-rs/pull/126))
+
 ## [0.2.1](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.2.0...a2a-cli-v0.2.1) - 2026-09-15
 
 ### Added

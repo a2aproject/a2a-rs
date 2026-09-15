@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.4.4...a2a-server-lf-v0.4.5) - 2026-09-15
+
+### Fixed
+
+- *(server)* protect terminal task states and make cancel transition atomic ([#126](https://github.com/a2aproject/a2a-rs/pull/126))
+
 ## [0.4.4](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.4.3...a2a-server-lf-v0.4.4) - 2026-09-14
 
 ### Added
