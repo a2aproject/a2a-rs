@@ -827,6 +827,24 @@ impl RequestHandler for DefaultRequestHandler {
             return Err(A2AError::task_not_cancelable(&req.id));
         }
 
+        // Atomically transition the task to CANCELED so two concurrent cancel
+        // requests cannot both pass the check-then-act window (BUG-44).
+        let task = match self.task_store.begin_cancel(&req.id).await {
+            Ok(task) => task,
+            Err(error) if error.code == error_code::TASK_NOT_CANCELABLE => {
+                // Raced with another cancel or with task completion. Keep the
+                // same semantics as the upfront check: a task another cancel
+                // already moved to CANCELED is returned (idempotent); any
+                // other terminal state is still not cancelable.
+                let raced = self.load_task(&req.id).await?;
+                if raced.status.state == TaskState::Canceled {
+                    return Ok(raced);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+
         let active_execution = self.execution_manager.get(&req.id).await;
 
         let exec_ctx = crate::ExecutorContext {
@@ -1767,6 +1785,43 @@ mod tests {
         };
         let result = handler.cancel_task(&params, req).await.unwrap();
         assert_eq!(result.status.state, TaskState::Canceled);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_concurrent_both_succeed_idempotently() {
+        let handler = Arc::new(make_handler());
+        let params = ServiceParams::new();
+        let task = Task {
+            id: "t-race".into(),
+            context_id: "c-race".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        handler.task_store.create(task).await.unwrap();
+
+        let handlers = vec![Arc::clone(&handler), Arc::clone(&handler)];
+        let mut results = Vec::new();
+        for handler in handlers {
+            let params = params.clone();
+            let req = CancelTaskRequest {
+                id: "t-race".into(),
+                metadata: None,
+                tenant: None,
+            };
+            results.push(tokio::spawn(async move {
+                handler.cancel_task(&params, req).await
+            }));
+        }
+        for result in results {
+            let task = result.await.unwrap().unwrap();
+            assert_eq!(task.status.state, TaskState::Canceled);
+        }
     }
 
     #[tokio::test]
