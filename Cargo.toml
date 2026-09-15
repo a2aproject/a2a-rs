@@ -7,6 +7,7 @@ members = [
     "a2a-grpc",
     "a2a-slimrpc",
     "a2acli",
+    "a2acli-transport-slimrpc",
     "examples",
     "itk",
 ]
@@ -19,6 +20,7 @@ default-members = [
     "a2a-grpc",
     "a2a-slimrpc",
     "a2acli",
+    "a2acli-transport-slimrpc",
     "examples",
 ]
 

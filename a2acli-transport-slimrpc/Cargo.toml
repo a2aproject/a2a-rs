@@ -1,0 +1,47 @@
+[package]
+name = "a2acli-transport-slimrpc"
+version = "0.1.0"
+description = "SLIMRPC transport plugin for a2a-cli — implements the pluggable transport contract"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "a2a-transport-slimrpc"
+path = "src/main.rs"
+
+[dependencies]
+a2a = { workspace = true }
+a2a-client = { workspace = true }
+a2a-server = { workspace = true }
+a2a-pb = { workspace = true }
+a2a-grpc = { workspace = true }
+a2a-slimrpc = { workspace = true }
+slim_config = { workspace = true }
+slim_service = { workspace = true }
+slim_auth = { workspace = true }
+slim_datapath = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-tls = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+serde_yaml = "0.9"
+
+[features]
+default = ["rustls-tls"]
+rustls-tls = [
+    "a2a-grpc/rustls-tls",
+    "tonic-tls/rustls",
+]
