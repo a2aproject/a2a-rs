@@ -6,6 +6,7 @@
 [![docs.rs](https://docs.rs/a2a-lf/badge.svg)](https://docs.rs/a2a-lf)
 [![License](https://img.shields.io/crates/l/a2a-lf.svg)](https://github.com/a2aproject/a2a-rs/blob/main/LICENSE.md)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/a2aproject/a2a-rs/badge)](https://scorecard.dev/viewer/?uri=github.com/a2aproject/a2a-rs)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14617/badge)](https://www.bestpractices.dev/projects/14617)
 
 `a2a-rs` is a Rust workspace for the A2A v1 protocol. It includes core protocol
 types, async client and server libraries, protobuf definitions, and gRPC
