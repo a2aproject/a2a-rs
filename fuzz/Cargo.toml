@@ -1,0 +1,20 @@
+[package]
+name = "a2a-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+a2a-client-lf = { path = "../a2a-client", features = ["fuzzing"] }
+a2a-lf = { path = "../a2a" }
+
+[[bin]]
+name = "sse_framing"
+path = "fuzz_targets/sse_framing.rs"
+test = false
+doc = false
+bench = false

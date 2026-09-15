@@ -1,0 +1,5 @@
+# libFuzzer writes new units and crash inputs here; only fuzz/seeds/ is tracked.
+corpus/
+artifacts/
+coverage/
+target/

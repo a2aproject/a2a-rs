@@ -1,4 +1,6 @@
 [workspace]
+# fuzz/ needs nightly; keep it out of the stable build — see #238.
+exclude = ["fuzz"]
 members = [
     "a2a",
     "a2a-client",
