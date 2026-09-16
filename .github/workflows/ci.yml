@@ -79,7 +79,8 @@ jobs:
         run: |
           missing=0
           for f in $(find . -name '*.rs' -not -path '*/gen/*' -not -path '*/target/*'); do
-            if ! head -1 "$f" | grep -q '^// Copyright AGNTCY'; then
+            if ! head -1 "$f" | grep -q '^// Copyright AGNTCY' \
+               || ! sed -n 2p "$f" | grep -q '^// Copyright A2A Contributors'; then
               echo "Missing header: $f"
               missing=$((missing + 1))
             fi

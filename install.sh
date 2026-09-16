@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Copyright AGNTCY Contributors (https://github.com/agntcy)
+# Copyright A2A Contributors (https://github.com/a2aproject)
 # SPDX-License-Identifier: Apache-2.0
 #
 # Install a2acli — the A2A CLI tool (Linux only; macOS users: brew install a2aproject/a2acli)
