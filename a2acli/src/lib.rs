@@ -794,10 +794,28 @@ pub async fn run(
                 .subcommand_matches("send")
                 .expect("send subcommand matches present when cli.command is Command::Send");
             let parts = resolve_message_parts(send_matches, command)?;
-            let ResolvedClient { client, tenant } = resolve_client(&cli, matches).await?;
+            let ResolvedClient {
+                client,
+                tenant,
+                capabilities,
+            } = resolve_client(&cli, matches).await?;
             let request = build_send_message_request(command, parts, tenant.clone());
 
-            if command.stream {
+            // §13.3 pre-flight: the card is the contract, so a card that
+            // does not declare streaming settles the question without a
+            // round trip. The caller asked for a result rather than
+            // specifically for a stream, so this takes the same fallback
+            // #173 gave an UNSUPPORTED_OPERATION from the agent
+            // (TASK_POLL_004) instead of failing.
+            let streaming = capabilities.declares(Capability::Streaming);
+            if command.stream && !streaming {
+                eprintln!(
+                    "warning: the agent card does not declare streaming; \
+                     sending without it and polling for the result instead"
+                );
+            }
+
+            if command.stream && streaming {
                 match client.send_streaming_message(&request).await {
                     Ok(stream) => {
                         consume_stream(client, stream, &cli).await?;
@@ -1025,7 +1043,14 @@ async fn run_card_command(
     match command {
         CardCommand::Get(command) => {
             if command.extended {
-                let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
+                let ResolvedClient {
+                    client,
+                    tenant,
+                    capabilities,
+                } = resolve_client(cli, matches).await?;
+                // No equivalent path exists for an extended card, so this
+                // fails with the reason instead of asking anyway.
+                capabilities.require(Capability::ExtendedCard)?;
                 let result = client
                     .get_extended_agent_card(&GetExtendedAgentCardRequest { tenant })
                     .await;
@@ -1048,7 +1073,7 @@ async fn run_task_command(
 ) -> Result<(), CliError> {
     match command {
         TaskCommand::Get(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
+            let ResolvedClient { client, tenant, .. } = resolve_client(cli, matches).await?;
             let result = client
                 .get_task(&GetTaskRequest {
                     id: command.id.clone(),
@@ -1076,7 +1101,7 @@ async fn run_task_command(
             print_output(&task, cli)?;
         }
         TaskCommand::List(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
+            let ResolvedClient { client, tenant, .. } = resolve_client(cli, matches).await?;
             let result = client
                 .list_tasks(&ListTasksRequest {
                     context_id: command.context_id.clone(),
@@ -1093,7 +1118,7 @@ async fn run_task_command(
             print_output(&response, cli)?;
         }
         TaskCommand::Cancel(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
+            let ResolvedClient { client, tenant, .. } = resolve_client(cli, matches).await?;
             let result = client
                 .cancel_task(&CancelTaskRequest {
                     id: command.id.clone(),
@@ -1106,7 +1131,15 @@ async fn run_task_command(
             print_output(&task, cli)?;
         }
         TaskCommand::Subscribe(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
+            let ResolvedClient {
+                client,
+                tenant,
+                capabilities,
+            } = resolve_client(cli, matches).await?;
+            // Unlike `send --stream`, subscribing *is* the request: there is
+            // no non-streaming way to satisfy it, so an undeclared
+            // capability is a failure rather than a fallback.
+            capabilities.require(Capability::Streaming)?;
             let stream = client
                 .subscribe_to_task(&SubscribeToTaskRequest {
                     id: command.id.clone(),
@@ -1408,6 +1441,10 @@ fn build_push_notification_config(
     })
 }
 
+/// Every push-notification subcommand is gated on the card declaring
+/// `pushNotifications` (§13.3). None of them has a non-push equivalent, so
+/// an undeclared capability fails with the reason rather than spending a
+/// round trip to be told the same thing less clearly.
 async fn run_push_config_command(
     cli: &Cli,
     matches: &ArgMatches,
@@ -1415,7 +1452,12 @@ async fn run_push_config_command(
 ) -> Result<(), CliError> {
     match command {
         PushConfigCommand::Create(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
+            let ResolvedClient {
+                client,
+                tenant,
+                capabilities,
+            } = resolve_client(cli, matches).await?;
+            capabilities.require(Capability::PushNotifications)?;
             let mut config = build_push_notification_config(command)?;
             config.task_id = command.task_id.clone();
             config.tenant = tenant;
@@ -1424,7 +1466,12 @@ async fn run_push_config_command(
             print_output(&response, cli)?;
         }
         PushConfigCommand::Get(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
+            let ResolvedClient {
+                client,
+                tenant,
+                capabilities,
+            } = resolve_client(cli, matches).await?;
+            capabilities.require(Capability::PushNotifications)?;
             let result = client
                 .get_push_config(&GetTaskPushNotificationConfigRequest {
                     task_id: command.task_id.clone(),
@@ -1436,7 +1483,12 @@ async fn run_push_config_command(
             print_output(&response, cli)?;
         }
         PushConfigCommand::List(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
+            let ResolvedClient {
+                client,
+                tenant,
+                capabilities,
+            } = resolve_client(cli, matches).await?;
+            capabilities.require(Capability::PushNotifications)?;
             let result = client
                 .list_push_configs(&ListTaskPushNotificationConfigsRequest {
                     task_id: command.task_id.clone(),
@@ -1449,7 +1501,12 @@ async fn run_push_config_command(
             print_output(&response, cli)?;
         }
         PushConfigCommand::Delete(command) => {
-            let ResolvedClient { client, tenant } = resolve_client(cli, matches).await?;
+            let ResolvedClient {
+                client,
+                tenant,
+                capabilities,
+            } = resolve_client(cli, matches).await?;
+            capabilities.require(Capability::PushNotifications)?;
             let result = client
                 .delete_push_config(&DeleteTaskPushNotificationConfigRequest {
                     task_id: command.task_id.clone(),
@@ -1868,6 +1925,88 @@ fn effective_config_settings(
 struct ResolvedClient {
     client: A2AClient<Box<dyn a2a_client::Transport>>,
     tenant: Option<String>,
+    capabilities: DeclaredCapabilities,
+}
+
+/// A capability the specification gates an operation on (§13.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capability {
+    Streaming,
+    PushNotifications,
+    ExtendedCard,
+}
+
+impl Capability {
+    /// Read the way the card renderer reads it: an absent field is not a
+    /// declaration, so `None` and `Some(false)` are the same answer.
+    fn declared_in(self, capabilities: &AgentCapabilities) -> bool {
+        match self {
+            Capability::Streaming => capabilities.streaming.unwrap_or(false),
+            Capability::PushNotifications => capabilities.push_notifications.unwrap_or(false),
+            Capability::ExtendedCard => capabilities.extended_agent_card.unwrap_or(false),
+        }
+    }
+
+    /// The card field's name, as it is spelled in the card.
+    fn field(self) -> &'static str {
+        match self {
+            Capability::Streaming => "streaming",
+            Capability::PushNotifications => "pushNotifications",
+            Capability::ExtendedCard => "extendedAgentCard",
+        }
+    }
+
+    /// The protocol error the agent itself would have returned, so that
+    /// answering locally changes only the round trip and the message, never
+    /// the code a caller branches on.
+    fn undeclared_error(self) -> A2AError {
+        let message = format!("the agent card does not declare {}", self.field());
+        match self {
+            // A2A gives this case its own code, so use it rather than the
+            // generic one.
+            Capability::PushNotifications => {
+                A2AError::new(a2a::error_code::PUSH_NOTIFICATION_NOT_SUPPORTED, message)
+            }
+            // Deliberately not EXTENDED_CARD_NOT_CONFIGURED: that means the
+            // agent offers extended cards and this deployment has none. A
+            // card that does not declare the capability is saying the agent
+            // does not offer them at all, which is UNSUPPORTED_OPERATION.
+            Capability::Streaming | Capability::ExtendedCard => {
+                A2AError::unsupported_operation(message)
+            }
+        }
+    }
+}
+
+/// What the resolved card is able to say about capabilities.
+#[derive(Debug, Clone, PartialEq)]
+enum DeclaredCapabilities {
+    /// Read from an Agent Card, so its declarations are the contract.
+    Card(AgentCapabilities),
+    /// `--endpoint` was used, so no card was read. The synthesized card
+    /// declares nothing precisely because nothing was read, and gating on
+    /// that would refuse operations the agent may well support — so the
+    /// pre-flight stands down and the agent answers for itself.
+    NoCard,
+}
+
+impl DeclaredCapabilities {
+    fn declares(&self, capability: Capability) -> bool {
+        match self {
+            DeclaredCapabilities::Card(capabilities) => capability.declared_in(capabilities),
+            DeclaredCapabilities::NoCard => true,
+        }
+    }
+
+    /// §13.3: refuse a capability-gated call the card says will not work,
+    /// rather than spending a round trip to be told so.
+    fn require(&self, capability: Capability) -> Result<(), CliError> {
+        if self.declares(capability) {
+            Ok(())
+        } else {
+            Err(CliError::A2A(capability.undeclared_error()))
+        }
+    }
 }
 
 /// §13.2: the A2A protocol version, as a `(major, minor)` pair. A2A
@@ -2060,6 +2199,13 @@ fn synthesized_endpoint_card(url: &str, binding: Binding) -> AgentCard {
 
 async fn resolve_client(cli: &Cli, matches: &ArgMatches) -> Result<ResolvedClient, CliError> {
     let card = resolve_agent_card(cli, matches).await?;
+    // Re-reading the selection is cheap (it only inspects flags) and avoids
+    // a second card fetch: what matters is whether a card was read at all,
+    // which `resolve_agent_card` does not report.
+    let capabilities = match resolve_agent_selection(cli, matches)? {
+        AgentSelection::Endpoint { .. } => DeclaredCapabilities::NoCard,
+        AgentSelection::Card(_) => DeclaredCapabilities::Card(card.capabilities.clone()),
+    };
 
     let mut builder = A2AClientFactory::builder();
     if !cli.transport.is_empty() {
@@ -2134,6 +2280,7 @@ async fn resolve_client(cli: &Cli, matches: &ArgMatches) -> Result<ResolvedClien
     Ok(ResolvedClient {
         client: client.with_interceptors(interceptors),
         tenant,
+        capabilities,
     })
 }
 

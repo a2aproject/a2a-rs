@@ -70,6 +70,10 @@ struct ServerState {
     /// order — for TX_003's "selected interface's own tenant, absent an
     /// explicit --tenant" fallback.
     received_send_tenants: Mutex<Vec<Option<String>>>,
+    /// Every RPC that actually reached the agent, in order. A capability
+    /// pre-flight (§13.3) is only doing its job if the gated call is absent
+    /// from here — the CLI's own output cannot show that.
+    received_calls: Mutex<Vec<&'static str>>,
 }
 
 /// Fixture task ids that settle to `COMPLETED` only after this many
@@ -105,7 +109,20 @@ impl TestServer {
     /// declares the given routing `tenant` (A2A §8.3.2), for exercising
     /// TX_003's "use the selected interface's own tenant absent an explicit
     /// --tenant" fallback.
+    /// Spawn with a public card declaring exactly `capabilities`, for the
+    /// §13.3 pre-flight tests.
+    async fn spawn_with_capabilities(capabilities: AgentCapabilities) -> Self {
+        Self::spawn_configured(None, Some(capabilities)).await
+    }
+
     async fn spawn_with_card_tenant(tenant: Option<&str>) -> Self {
+        Self::spawn_configured(tenant, None).await
+    }
+
+    async fn spawn_configured(
+        tenant: Option<&str>,
+        capabilities: Option<AgentCapabilities>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(ServerState::default());
@@ -141,6 +158,9 @@ impl TestServer {
         }
 
         let mut public_card = make_agent_card(&base_url, "Fixture Agent");
+        if let Some(capabilities) = capabilities {
+            public_card.capabilities = capabilities;
+        }
         if let Some(tenant) = tenant {
             public_card.supported_interfaces[0].tenant = Some(tenant.to_string());
         }
@@ -229,6 +249,11 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
+        self.state
+            .received_calls
+            .lock()
+            .unwrap()
+            .push("send_message");
         self.state
             .received_send_tenants
             .lock()
@@ -335,6 +360,11 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        self.state
+            .received_calls
+            .lock()
+            .unwrap()
+            .push("send_streaming_message");
         let task_id = req
             .message
             .task_id
@@ -484,6 +514,11 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        self.state
+            .received_calls
+            .lock()
+            .unwrap()
+            .push("subscribe_to_task");
         if req.id == "stream-error" {
             return Ok(Box::pin(stream::once(async {
                 Err(A2AError::internal("stream failed"))
@@ -519,6 +554,11 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
+        self.state
+            .received_calls
+            .lock()
+            .unwrap()
+            .push("create_push_config");
         if !self.state.tasks.lock().unwrap().contains_key(&req.task_id) {
             return Err(A2AError::task_not_found(&req.task_id));
         }
@@ -543,6 +583,11 @@ impl RequestHandler for TestHandler {
         req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         self.state
+            .received_calls
+            .lock()
+            .unwrap()
+            .push("get_push_config");
+        self.state
             .push_configs
             .lock()
             .unwrap()
@@ -556,6 +601,11 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
+        self.state
+            .received_calls
+            .lock()
+            .unwrap()
+            .push("list_push_configs");
         if req.task_id == "missing" {
             return Err(A2AError::task_not_found(&req.task_id));
         }
@@ -580,6 +630,11 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
+        self.state
+            .received_calls
+            .lock()
+            .unwrap()
+            .push("delete_push_config");
         let deleted = self
             .state
             .push_configs
@@ -597,6 +652,11 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
+        self.state
+            .received_calls
+            .lock()
+            .unwrap()
+            .push("get_extended_agent_card");
         if req.tenant.as_deref() == Some("error") {
             return Err(A2AError::unsupported_operation("extended card denied"));
         }
@@ -2932,4 +2992,198 @@ fn completion_rejects_an_unknown_shell_as_a_usage_error() {
     for shell in ["bash", "zsh", "fish", "powershell"] {
         assert!(message.contains(shell), "message omits {shell}: {message}");
     }
+}
+
+/// A card declaring nothing at all, so each pre-flight test can switch on
+/// exactly the one capability it is about.
+fn declares(
+    streaming: bool,
+    push_notifications: bool,
+    extended_agent_card: bool,
+) -> AgentCapabilities {
+    AgentCapabilities {
+        streaming: Some(streaming),
+        push_notifications: Some(push_notifications),
+        extensions: None,
+        extended_agent_card: Some(extended_agent_card),
+    }
+}
+
+fn calls(server: &TestServer) -> Vec<&'static str> {
+    server.state.received_calls.lock().unwrap().clone()
+}
+
+/// §13.3 / `A2ACLI_VER_003`. `send --stream` against a card that does not
+/// declare streaming keeps #173's behaviour — the caller asked for a result,
+/// not specifically for a stream — but reaches it without opening a stream
+/// first. The proof is server-side: `send_streaming_message` never arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_falls_back_when_the_card_does_not_declare_streaming() {
+    let server = TestServer::spawn_with_capabilities(declares(false, true, true)).await;
+
+    let output = StdCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args(["--agent-card", server.base_url.as_str()])
+        .args(["--output", "json", "send", "hello", "--stream"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let received = calls(&server);
+    assert!(
+        !received.contains(&"send_streaming_message"),
+        "the stream was opened anyway: {received:?}"
+    );
+    assert!(
+        received.contains(&"send_message"),
+        "the fallback did not send: {received:?}"
+    );
+
+    // The reason is on stderr, and the payload still on stdout.
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("does not declare streaming"),
+        "no reason given: {stderr}"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed["task"]["id"], "task-send");
+}
+
+/// `task subscribe` has no non-streaming equivalent, so an undeclared
+/// capability is a failure — carrying the same code the agent would have
+/// returned, so a caller branching on it sees no difference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_fails_when_the_card_does_not_declare_streaming() {
+    let server = TestServer::spawn_with_capabilities(declares(false, true, true)).await;
+
+    let output = StdCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args(["--agent-card", server.base_url.as_str()])
+        .args(["--output", "json", "task", "subscribe", "task-1"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert_eq!(output.status.code(), Some(1));
+    let received = calls(&server);
+    assert!(
+        !received.contains(&"subscribe_to_task"),
+        "the agent was asked anyway: {received:?}"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stderr).unwrap()).unwrap();
+    assert_eq!(envelope["error"]["a2aCode"], -32004);
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not declare streaming"),
+    );
+}
+
+/// `card get --extended` likewise. The code is `UNSUPPORTED_OPERATION`, not
+/// `EXTENDED_CARD_NOT_CONFIGURED`: the latter means the agent offers
+/// extended cards and this deployment has none, while a card that does not
+/// declare the capability is saying it offers none at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_get_extended_fails_when_the_card_does_not_declare_it() {
+    let server = TestServer::spawn_with_capabilities(declares(true, true, false)).await;
+
+    let output = StdCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args(["--agent-card", server.base_url.as_str()])
+        .args(["--output", "json", "card", "get", "--extended"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert_eq!(output.status.code(), Some(1));
+    let received = calls(&server);
+    assert!(
+        !received.contains(&"get_extended_agent_card"),
+        "the agent was asked anyway: {received:?}"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stderr).unwrap()).unwrap();
+    assert_eq!(envelope["error"]["a2aCode"], -32004);
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not declare extendedAgentCard"),
+    );
+}
+
+/// Push configs have their own protocol error, so the pre-flight uses it
+/// rather than the generic one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_config_fails_when_the_card_does_not_declare_push_notifications() {
+    let server = TestServer::spawn_with_capabilities(declares(true, false, true)).await;
+
+    let output = StdCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args(["--agent-card", server.base_url.as_str()])
+        .args(["--output", "json", "task", "push-config", "list", "task-1"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert_eq!(output.status.code(), Some(1));
+    let received = calls(&server);
+    assert!(
+        !received.contains(&"list_push_configs"),
+        "the agent was asked anyway: {received:?}"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stderr).unwrap()).unwrap();
+    assert_eq!(envelope["error"]["a2aCode"], -32003);
+}
+
+/// An absent capability field reads as not declared, matching how the card
+/// renderer prints it — `None` and `Some(false)` must not diverge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_absent_capability_field_counts_as_undeclared() {
+    let server = TestServer::spawn_with_capabilities(AgentCapabilities::default()).await;
+
+    StdCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args(["--agent-card", server.base_url.as_str()])
+        .args(["--output", "json", "task", "subscribe", "task-1"])
+        .assert()
+        .failure();
+
+    assert!(
+        !calls(&server).contains(&"subscribe_to_task"),
+        "an absent field was treated as a declaration"
+    );
+}
+
+/// `--endpoint` resolves no card, and the card synthesized to stand in for
+/// it declares nothing *because* nothing was read. Gating on that would
+/// refuse operations the agent may well support, so the pre-flight stands
+/// down and the agent answers for itself: the stream is attempted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_preflight_stands_down_when_no_card_was_resolved() {
+    let server = TestServer::spawn_with_capabilities(declares(false, false, false)).await;
+
+    StdCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args(["--endpoint", &format!("{}/jsonrpc", server.base_url)])
+        .args(["--transport", "jsonrpc"])
+        .args(["--output", "json", "send", "hello", "--stream"])
+        .assert()
+        .success();
+
+    assert!(
+        calls(&server).contains(&"send_streaming_message"),
+        "the pre-flight blocked a call it could not verify"
+    );
 }
