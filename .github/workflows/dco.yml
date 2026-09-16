@@ -80,17 +80,26 @@ jobs:
               continue
             fi
 
-            # Any Signed-off-by matching the author, compared case-insensitively:
-            # git does not normalise case, and a mismatched capitalisation is not
-            # a missing sign-off.
-            if git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$sha" \
-                 | grep -qiFx "$author"; then
+            trailers=$(git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$sha")
+
+            # Case-insensitive: a capitalisation difference is not a
+            # missing sign-off. merge_group tests GitHub's squash commit,
+            # whose author name comes from the PR author's profile and need
+            # not match the trailer, so match on the address there.
+            if [ "$EVENT_NAME" = "merge_group" ]; then
+              author_email=$(git log -1 --format='%ae' "$sha")
+              matched=$(printf '%s\n' "$trailers" | grep -qiF "<$author_email>" && echo yes || echo no)
+            else
+              matched=$(printf '%s\n' "$trailers" | grep -qiFx "$author" && echo yes || echo no)
+            fi
+
+            if [ "$matched" = "yes" ]; then
               echo "ok    ${sha:0:8}  $subject"
             else
               failed=1
               echo "FAIL  ${sha:0:8}  $subject"
               echo "        author:      $author"
-              echo "        signed-off:  $(git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$sha" | paste -sd'; ' - || echo '(none)')"
+              echo "        signed-off:  $(printf '%s\n' "$trailers" | paste -sd'; ' - || echo '(none)')"
             fi
           done <<< "$commits"
 
