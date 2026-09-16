@@ -160,7 +160,7 @@ cargo run --bin a2acli -- --svc-param "X-Trace-Id:abc123" send "hello"
 cargo run --bin a2acli -- --transport jsonrpc --transport rest card get
 cargo run --bin a2acli -- --a2a-version 1.0 card get
 cargo run --bin a2acli -- --insecure --bearer "$TOKEN" card get  # dev only; always warns
-cargo run --bin a2acli -- --debug send "hello"                  # request/response diagnostics to stderr
+cargo run --bin a2acli -- --debug send "hello"                  # raw wire messages + diagnostics to stderr
 ```
 
 `--a2a-version` pins the protocol version signaled on every request. Absent
@@ -174,8 +174,17 @@ other than the tool's own is named on stderr rather than applied silently.
 `--svc-param` is a separate, general-purpose transport-level key-value pair,
 never itself a credential flag. `--insecure` disables TLS certificate
 verification and always prints a warning naming the risk when a credential is
-also configured — it never disables verification silently. `--debug` never
-prints credential values, regardless of verbosity. `--tenant` supplies a routing tenant when the
+also configured — it never disables verification silently.
+
+`--debug` writes developer diagnostics to stderr, including the raw protocol
+messages exchanged on the wire: the request and response body of every call
+and each streamed event. Credential values never appear there, regardless of
+verbosity — a credential header is shown as `authorization: (redacted)`, so
+the log confirms it was attached without disclosing it. Redaction is applied
+where the log line is built rather than filtered afterwards, so no flag or
+environment variable can turn it off. Protocol metadata such as
+`a2a-version` stays visible, since version negotiation is one of the things
+`--debug` exists to explain. `--tenant` supplies a routing tenant when the
 selected Agent Card interface declares none; when the interface does declare
 one, A2A §8.3.2 requires that declared value to be sent exactly, so it is
 used and `--tenant` has no effect.

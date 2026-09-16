@@ -28,6 +28,7 @@ pub mod middleware;
 mod push_config_compat;
 pub mod rest;
 pub mod transport;
+mod wire;
 
 pub use client::A2AClient;
 pub use factory::A2AClientFactory;
