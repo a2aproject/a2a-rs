@@ -76,16 +76,8 @@ jobs:
       - name: Check copyright headers
         if: matrix.os != 'windows-latest'
         shell: bash
-        run: |
-          missing=0
-          for f in $(find . -name '*.rs' -not -path '*/gen/*' -not -path '*/target/*'); do
-            if ! head -1 "$f" | grep -q '^// Copyright AGNTCY' \
-               || ! sed -n 2p "$f" | grep -q '^// Copyright A2A Contributors'; then
-              echo "Missing header: $f"
-              missing=$((missing + 1))
-            fi
-          done
-          if [ "$missing" -gt 0 ]; then
-            echo "ERROR: $missing file(s) missing copyright header"
-            exit 1
-          fi
+        # Calls the justfile recipe rather than a second copy of its logic --
+        # the previous inline duplicate drifted from it (the recipe alone was
+        # updated for a new copyright line, and this step went on enforcing
+        # the old one until a queued PR was rejected by it).
+        run: just check-headers

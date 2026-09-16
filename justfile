@@ -71,16 +71,26 @@ clean:
 check-headers:
     #!/usr/bin/env bash
     set -euo pipefail
+    # Each required line just needs to appear somewhere in the file's first 5
+    # lines -- not on a fixed line number, and independent of the others' order
+    # or presence -- so adding, reordering or dropping a copyright holder here
+    # is the only edit a future change needs.
+    required=(
+        "Copyright AGNTCY Contributors (https://github.com/agntcy)"
+        "Copyright A2A Contributors (https://github.com/a2aproject)"
+    )
     missing=0
     for f in $(find . -name '*.rs' -not -path '*/gen/*' -not -path '*/target/*'); do
-        if ! head -1 "$f" | grep -q '^// Copyright AGNTCY' \
-           || ! sed -n 2p "$f" | grep -q '^// Copyright A2A Contributors'; then
-            echo "Missing header: $f"
-            missing=$((missing + 1))
-        fi
+        header=$(head -5 "$f")
+        for line in "${required[@]}"; do
+            if ! grep -qF "// $line" <<< "$header"; then
+                echo "Missing '$line': $f"
+                missing=$((missing + 1))
+            fi
+        done
     done
     if [ "$missing" -gt 0 ]; then
-        echo "ERROR: $missing file(s) missing copyright header"
+        echo "ERROR: $missing missing copyright line(s)"
         exit 1
     fi
     echo "All source files have copyright headers"
