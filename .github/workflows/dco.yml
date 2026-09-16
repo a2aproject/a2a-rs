@@ -1,6 +1,8 @@
 name: DCO
 
 on:
+  # Required checks must report on queue entries too, or every entry stalls.
+  merge_group:
   pull_request:
     branches: [main]
 
@@ -24,12 +26,16 @@ jobs:
       - name: Verify Developer Certificate of Origin
         shell: bash
         env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # A merge_group event has no pull_request context; its base_ref is
+          # a full ref, normalised below.
+          BASE_REF: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
+          BASE_REF="${BASE_REF#refs/heads/}"
           git fetch --no-tags --quiet origin "$BASE_REF"
 
           # Range against the base branch as it stands now, not against
@@ -63,10 +69,14 @@ jobs:
             # create. A human pushing a commit that merely names a bot as
             # author is still checked, because their pull request is not
             # authored by a bot.
-            if [ "$PR_AUTHOR_TYPE" = "Bot" ] \
+            # On merge_group the pull request author is not in the payload, but
+            # entering the queue required this check to pass on the pull
+            # request itself, where the author type is known and enforced. So a
+            # bot commit reaching the queue was already validated strictly.
+            if { [ "$PR_AUTHOR_TYPE" = "Bot" ] || [ "$EVENT_NAME" = "merge_group" ]; } \
                && printf '%s' "$author" | grep -qE '\[bot\]@users\.noreply\.github\.com>$'; then
               echo "skip  ${sha:0:8}  $subject"
-              echo "        bot-authored commit in a bot-authored pull request"
+              echo "        bot-authored commit, certified on the pull request"
               continue
             fi
 

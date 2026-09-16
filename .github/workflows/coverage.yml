@@ -1,6 +1,8 @@
 name: Publish Project Coverage to Codecov
 
 on:
+  # Required checks must report on queue entries too, or every entry stalls.
+  merge_group:
   push:
     branches: [main]
     paths-ignore:

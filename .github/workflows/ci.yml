@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  # Required checks must report on queue entries too, or every entry stalls.
+  merge_group:
   pull_request:
     paths-ignore:
       - 'itk/**'
