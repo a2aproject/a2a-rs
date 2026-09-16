@@ -100,6 +100,23 @@ the transport when the agent card exposes more than one compatible interface.
 The global `--tenant`, `--bearer`, `--api-key`, and repeated
 `--svc-param Name:Value` options also apply to `task push-config` commands.
 
+### Capability pre-flight
+
+The Agent Card is the contract, so a capability-gated operation is checked
+against it before the call goes out (§13.3): streaming for `send --stream`
+and `task subscribe`, `extendedAgentCard` for `card get --extended`, and
+`pushNotifications` for every `task push-config` subcommand. An absent field
+counts as undeclared, the same way `card get` prints it.
+
+`send --stream` against a card that does not declare streaming still returns
+a result — it sends without streaming and polls, with the reason on stderr —
+because the request was for a result, not specifically for a stream. The
+others have no equivalent path, so they fail with the reason instead, using
+the same protocol error code the agent itself would have returned.
+
+`--endpoint` resolves no card at all, so there is nothing to verify and the
+pre-flight stands down: the agent answers for itself, as before.
+
 ### Naming the agent
 
 `-a/--agent-card <ref>` names the agent as an **Agent Card reference**, in any
