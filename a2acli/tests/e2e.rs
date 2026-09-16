@@ -1864,6 +1864,15 @@ impl ConfigScratchDir {
     }
 
     fn command(&self, server: &TestServer) -> StdCommand {
+        let mut command = self.command_without_agent();
+        command.args(["--agent-card", server.base_url.as_str()]);
+        command
+    }
+
+    /// Like [`Self::command`] but with no agent configured at all — no
+    /// `--agent-card`, no `A2ACLI_*` in the environment and no discoverable
+    /// `.env` — for the commands that must work without one.
+    fn command_without_agent(&self) -> StdCommand {
         let mut command = StdCommand::cargo_bin("a2acli").unwrap();
         command
             .current_dir(&self.path)
@@ -1872,8 +1881,7 @@ impl ConfigScratchDir {
             .env_remove("A2ACLI_TENANT")
             .env_remove("A2ACLI_BASE_URL")
             .env_remove("A2ACLI_AGENT_CARD")
-            .env_remove("A2ACLI_ENDPOINT")
-            .args(["--agent-card", server.base_url.as_str()]);
+            .env_remove("A2ACLI_ENDPOINT");
         command
     }
 }
@@ -2834,5 +2842,94 @@ async fn a_missing_subcommand_reports_the_error_envelope() {
         );
         assert_eq!(code, 2, "args {args:?}");
         assert!(stdout.is_empty(), "args {args:?}: {stdout}");
+    }
+}
+
+/// §7.1 / `A2ACLI_CLI_002`. The script goes to stdout on its own: the output
+/// is meant to be redirected to a file or `eval`'d, so a diagnostic sharing
+/// stdout would corrupt it (§11.1). Run with no agent configured anywhere,
+/// because `completion` must not resolve an Agent Card.
+#[test]
+fn completion_emits_a_script_on_stdout_for_every_supported_shell() {
+    let scratch = ConfigScratchDir::new("completion-shells");
+
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let output = scratch
+            .command_without_agent()
+            .args(["completion", shell])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+
+        let script = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            script.contains("a2acli"),
+            "{shell} script does not name the binary"
+        );
+        // A deep surface is the reason this requirement exists, so assert the
+        // script reaches the nested commands rather than merely being
+        // non-empty.
+        assert!(
+            script.contains("push-config"),
+            "{shell} script is missing nested subcommands"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "{shell} wrote to stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// `-o json` has no meaning for a shell script, so the script is emitted as
+/// itself rather than wrapped in an envelope that would not be `eval`-able.
+#[test]
+fn completion_ignores_the_json_output_mode() {
+    let scratch = ConfigScratchDir::new("completion-json");
+
+    let output = scratch
+        .command_without_agent()
+        .args(["--output", "json", "completion", "bash"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let script = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        script.starts_with("_a2acli()"),
+        "script was wrapped: {script:.60}"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+/// An unrecognised shell is a CLI-local usage failure: exit 2 carrying the
+/// Appendix B envelope with the accepted values named, and nothing on stdout
+/// to corrupt a redirect.
+#[test]
+fn completion_rejects_an_unknown_shell_as_a_usage_error() {
+    let scratch = ConfigScratchDir::new("completion-unknown");
+
+    let output = scratch
+        .command_without_agent()
+        .args(["completion", "tcsh"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "a usage error must not put bytes on stdout"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stderr).unwrap()).unwrap();
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_USAGE");
+    let message = envelope["error"]["message"].as_str().unwrap();
+    for shell in ["bash", "zsh", "fish", "powershell"] {
+        assert!(message.contains(shell), "message omits {shell}: {message}");
     }
 }

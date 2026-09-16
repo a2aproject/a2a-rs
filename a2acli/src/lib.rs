@@ -210,6 +210,13 @@ pub enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// Emit a shell completion script for the named shell on stdout (§7.1).
+    Completion {
+        /// Shell to emit the script for. An unrecognised name is a usage
+        /// error naming the accepted values.
+        #[arg(value_name = "SHELL")]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
@@ -771,6 +778,16 @@ pub async fn run(
         Command::Card { command } => run_card_command(&cli, matches, command).await?,
         Command::Config { command } => {
             run_config_command(&cli, matches, dotenv_provenance, command)?
+        }
+        Command::Completion { shell } => {
+            // Deliberately resolves no Agent Card and builds no client: the
+            // command has to work with no agent configured at all. The script
+            // is meant to be redirected to a file or eval'd, so stdout
+            // carries it and nothing else, and -o json does not wrap it
+            // (§11.1).
+            let mut command = Cli::command();
+            let binary = command.get_name().to_string();
+            clap_complete::generate(*shell, &mut command, binary, &mut std::io::stdout());
         }
         Command::Send(command) => {
             let send_matches = matches

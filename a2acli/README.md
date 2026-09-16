@@ -69,6 +69,8 @@ the provenance do that.
 - Full configuration precedence (flag > environment variable > local `.env`
   > global `.env` > built-in default) with a read-only `config show` to
   inspect it
+- Shell completion scripts for bash, zsh, fish, PowerShell, and elvish via
+  `completion <shell>`
 
 ## Run
 
@@ -89,6 +91,7 @@ cargo run --bin a2acli -- task cancel task-123
 cargo run --bin a2acli -- task subscribe task-123
 cargo run --bin a2acli -- task push-config list task-123
 cargo run --bin a2acli -- task push-config create task-123 https://example.com/callback --auth-scheme Bearer --auth-credentials secret
+cargo run --bin a2acli -- completion zsh
 ```
 
 By default the CLI targets `http://localhost:3000`. Use `--transport jsonrpc`
@@ -275,6 +278,34 @@ editing a `.env` file directly — the command never mutates anything. `a2acli`
 never writes a `.env` file itself, but warns if one it reads is readable by
 users other than its owner (mode should be `0600`).
 
+### Shell completion
+
+`completion <shell>` writes a completion script to stdout and nothing else, so
+it can be redirected to a file or `eval`'d directly. It needs no agent and
+makes no network call, so it works before anything is configured.
+
+```sh
+# bash — user-level; use /etc/bash_completion.d/a2acli to install system-wide
+a2acli completion bash > ~/.local/share/bash-completion/completions/a2acli
+
+# zsh — any directory on $fpath
+a2acli completion zsh > "${fpath[1]}/_a2acli"
+
+# fish
+a2acli completion fish > ~/.config/fish/completions/a2acli.fish
+
+# elvish
+a2acli completion elvish > ~/.config/elvish/lib/a2acli.elv
+```
+
+```powershell
+# PowerShell — add to $PROFILE to persist
+a2acli completion powershell | Out-String | Invoke-Expression
+```
+
+Naming an unsupported shell is a usage error (exit 2) listing the accepted
+values.
+
 ## Conformance
 
 This CLI is tracked against the
@@ -282,4 +313,7 @@ This CLI is tracked against the
 Tier 1 ("Core") requirements; see
 [a2aproject/a2a-rs#164](https://github.com/a2aproject/a2a-rs/issues/164) for the
 current gap list and in-progress work (blocking-by-default `send`/polling,
-human-readable `text` output, message parts, and more).
+human-readable `text` output, message parts, and more). Tier 2 ("Extended")
+requirements are tracked in
+[a2aproject/a2a-rs#181](https://github.com/a2aproject/a2a-rs/issues/181);
+`completion <shell>` above is the first of them.
