@@ -9,6 +9,7 @@ use a2a_client::Transport;
 use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::jsonrpc::JsonRpcTransport;
 use a2a_client::rest::RestTransport;
+use a2a_server::TaskStore;
 use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::rest::rest_router;
 use a2a_server::{
@@ -342,15 +343,29 @@ async fn spawn_push_http_server() -> (String, tokio::task::JoinHandle<()>) {
     // URL validation is disabled here because the e2e webhook runs on
     // 127.0.0.1; the default HttpPushSender rejects loopback targets (SSRF
     // guard, see push/sender.rs validate_push_url).
+    // A2A §3.4.2 forbids a client-provided taskId from creating a task, so
+    // the ids these tests address have to exist first.
+    let store = InMemoryTaskStore::new();
+    // The contexts must match what each test sends: §3.4.3 rejects a
+    // mismatching pair, which these tests were previously relying on being
+    // ignored.
+    for (id, context) in [
+        ("task-1", "ctx-1"),
+        ("task-rest-push", "ctx-rest-push"),
+        ("task-rpc-push", "ctx-rpc-push"),
+    ] {
+        let mut task = sample_task(id, TaskState::Submitted);
+        task.context_id = context.to_string();
+        store.create(task).await.unwrap();
+    }
     let handler = Arc::new(
-        DefaultRequestHandler::new(PushTransportExecutor, InMemoryTaskStore::new())
-            .with_push_notifications(
-                InMemoryPushConfigStore::new(),
-                HttpPushSender::new(Some(HttpPushSenderConfig {
-                    validate_urls: false,
-                    ..Default::default()
-                })),
-            ),
+        DefaultRequestHandler::new(PushTransportExecutor, store).with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            HttpPushSender::new(Some(HttpPushSenderConfig {
+                validate_urls: false,
+                ..Default::default()
+            })),
+        ),
     );
     let app = Router::new()
         .nest("/rest", rest_router(handler.clone()))
