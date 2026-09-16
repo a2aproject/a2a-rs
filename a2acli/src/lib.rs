@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -116,10 +117,13 @@ pub struct Cli {
     #[arg(long, global = true, env = "A2ACLI_INSECURE")]
     pub insecure: bool,
 
-    /// Verbose diagnostics to stderr: request/response timing and outcome
-    /// for each call. Never includes credential material (bearer token,
-    /// API key, or any --svc-param value), and that redaction cannot be
-    /// defeated by this or any other verbosity flag.
+    /// Verbose diagnostics to stderr: the outcome of each call plus the raw
+    /// protocol messages exchanged on the wire — request and response
+    /// bodies, and each streamed event (§7.2). Never includes credential
+    /// material (bearer token, API key, or any --svc-param value): header
+    /// names stay visible so their attachment can be confirmed, but values
+    /// are replaced, and that redaction cannot be defeated by this or any
+    /// other verbosity flag.
     #[arg(long, global = true, env = "A2ACLI_DEBUG")]
     pub debug: bool,
 
@@ -766,6 +770,18 @@ pub async fn run(
         // on a second global-subscriber install.
         let _ = tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
+            // DEBUG for this project's crates, because the raw wire
+            // messages §7.2 asks for at Tier 2 are emitted at that level —
+            // but not for dependencies, whose connection-pool chatter is
+            // also DEBUG and would bury the protocol exchange it is meant
+            // to show.
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "warn,a2a_client=debug,a2a_cli=debug",
+            ))
+            // Colour only when a person is watching: these diagnostics are
+            // routinely redirected to a file or piped into a grep, and
+            // escape codes there are noise rather than emphasis.
+            .with_ansi(std::io::stderr().is_terminal())
             .with_target(false)
             .try_init();
     }

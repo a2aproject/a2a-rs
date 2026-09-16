@@ -13,6 +13,7 @@ use crate::push_config_compat::{
     deserialize_task_push_notification_config,
 };
 use crate::transport::{ServiceParams, Transport, TransportFactory};
+use crate::wire;
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
 const REST_STREAM_MESSAGE_PATH: &str = "/message:stream";
@@ -78,15 +79,17 @@ impl RestTransport {
     }
 
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response, A2AError> {
-        builder
-            .send()
-            .await
-            .map_err(|e| A2AError::internal(format!("HTTP request failed: {e}")))
+        // Every REST request goes through here, so wire logging for this
+        // binding needs exactly one call site.
+        wire::send(&self.client, builder).await
     }
 
     async fn into_rest_error(resp: reqwest::Response) -> A2AError {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // A failing response is the one a person reaches for --debug to see,
+        // so log it on the way to being turned into an error.
+        wire::log_response(status, &body);
         parse_rest_error(status, &body)
     }
 
@@ -112,9 +115,10 @@ impl RestTransport {
         if !resp.status().is_success() {
             return Err(Self::into_rest_error(resp).await);
         }
-        let payload = resp
-            .json::<Value>()
+        let body = wire::response_text(resp)
             .await
+            .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+        let payload = serde_json::from_str::<Value>(&body)
             .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
 
         Ok(payload)
@@ -150,9 +154,10 @@ impl RestTransport {
         if !resp.status().is_success() {
             return Err(Self::into_rest_error(resp).await);
         }
-        let payload = resp
-            .json::<Value>()
+        let body = wire::response_text(resp)
             .await
+            .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+        let payload = serde_json::from_str::<Value>(&body)
             .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
 
         Ok(payload)

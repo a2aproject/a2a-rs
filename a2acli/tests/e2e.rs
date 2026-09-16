@@ -3187,3 +3187,119 @@ async fn the_preflight_stands_down_when_no_card_was_resolved() {
         "the pre-flight blocked a call it could not verify"
     );
 }
+
+/// §7.2 / `A2ACLI_OUT_007`. At Tier 2 `--debug` must show the raw protocol
+/// messages, not just that a call happened — the difference between "it
+/// failed" and "here is what we sent and what came back".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_logs_the_raw_request_and_response_bodies() {
+    let server = TestServer::spawn().await;
+
+    let output = StdCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args(["--agent-card", server.base_url.as_str()])
+        .args(["--output", "json", "--debug", "send", "hello-on-the-wire"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("A2A wire request"),
+        "no request logged: {stderr}"
+    );
+    assert!(
+        stderr.contains("A2A wire response"),
+        "no response logged: {stderr}"
+    );
+    // The request body, not merely the method name.
+    assert!(
+        stderr.contains("hello-on-the-wire"),
+        "request body missing: {stderr}"
+    );
+    // The response body.
+    assert!(
+        stderr.contains("task-send"),
+        "response body missing: {stderr}"
+    );
+    assert!(stderr.contains("method=POST"), "method missing: {stderr}");
+
+    // §11.1: the diagnostics are on stderr and stdout is still only the
+    // payload, so `-o json | jq` keeps working under --debug.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed["task"]["id"], "task-send");
+}
+
+/// `A2ACLI_AUTH_004`: redaction covers `--debug` raw-wire logging and is not
+/// defeasible by a verbosity flag. Wire logging is the thing that row was
+/// written for, so this asserts the secrets appear *nowhere* in stderr while
+/// the header names still do — presence stays confirmable, values do not
+/// leak.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_logs_credential_header_names_but_never_their_values() {
+    let server = TestServer::spawn().await;
+
+    let output = StdCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args(["--agent-card", server.base_url.as_str()])
+        .args(["--bearer", "bearer-must-not-appear"])
+        .args(["--api-key", "apikey-must-not-appear"])
+        .args(["--svc-param", "X-Trace-Id:svcparam-must-not-appear"])
+        .args(["--output", "json", "--debug", "send", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Attachment is still visible. No failure message below interpolates a
+    // credential, or a stream that would contain one if redaction were
+    // broken: this test failing must not itself be what writes the
+    // credential into a public CI log (rust/cleartext-logging).
+    for name in ["authorization:", "x-api-key:", "x-trace-id:"] {
+        assert!(stderr.contains(name), "header name {name} was not shown");
+    }
+    assert!(stderr.contains("(redacted)"), "nothing was redacted");
+
+    // The values are not — in either stream.
+    for (flag, credential) in [
+        ("--bearer", "bearer-must-not-appear"),
+        ("--api-key", "apikey-must-not-appear"),
+        ("--svc-param", "svcparam-must-not-appear"),
+    ] {
+        assert!(
+            !stderr.contains(credential),
+            "the {flag} credential appeared in stderr"
+        );
+        assert!(
+            !stdout.contains(credential),
+            "the {flag} credential appeared in stdout"
+        );
+    }
+}
+
+/// Without `--debug` there is no subscriber, so the wire events are not
+/// emitted at all: the default run stays quiet on stderr.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wire_logging_is_silent_without_debug() {
+    let server = TestServer::spawn().await;
+
+    let output = StdCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args(["--agent-card", server.base_url.as_str()])
+        .args(["--output", "json", "send", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("A2A wire"),
+        "wire logging leaked without --debug: {stderr}"
+    );
+}

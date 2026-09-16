@@ -33,7 +33,10 @@ pin-project-lite = { workspace = true }
 rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 rcgen = { workspace = true }
+reqwest = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 # By default we will use aws-lc-rs as crypto provider.
