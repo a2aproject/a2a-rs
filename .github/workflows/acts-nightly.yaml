@@ -1,0 +1,97 @@
+name: Nightly ACTS
+
+# Conformance counterpart of `itk-nightly.yaml`, on the same schedule. Separate
+# workflows so neither shows up red for the other's failure and each can be
+# re-run on its own.
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 2:00 AM UTC daily, 2 hours before dashboard redeploy
+  workflow_dispatch:     # Allow manual trigger
+
+# Least privilege by default; the job that publishes results raises it itself.
+permissions:
+  contents: read
+
+concurrency:
+  group: acts-nightly
+  cancel-in-progress: true
+
+jobs:
+  acts:
+    name: Nightly ACTS Run
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed only by "Upload ACTS Results to Rolling Release", which pushes
+      # acts_rust.json onto the nightly-metrics prerelease.
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Clone a2a-itk
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: a2aproject/a2a-itk
+          ref: main
+          path: itk/a2a-itk
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build itk_service image (GHA layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: itk/a2a-itk
+          tags: itk_service:latest
+          load: true
+          cache-from: type=gha,scope=itk_service
+          cache-to: type=gha,mode=max,scope=itk_service
+
+      - name: Cache launcher peer-SDK checkouts + build outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/a2a-itk-launcher
+          key: itk-launcher-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            itk-launcher-${{ runner.os }}-
+
+      - name: Run Nightly ACTS Conformance
+        run: bash run_itk.sh
+        working-directory: itk
+        env:
+          A2A_ITK_REVISION: main
+          ITK_ACTS_RUN: "1"
+          ITK_ACTS_TRANSPORTS: jsonrpc,grpc,rest
+          # Does not gate on conformance, unlike the PR tier: a `must` failure
+          # is the metric being recorded. The step fails only if the service
+          # errored or the report came back malformed — exactly when
+          # publishing should be skipped.
+          ITK_NIGHTLY_RUN: "True"
+          ITK_SKIP_BUILD: "1"
+
+      - name: Upload ACTS reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acts-reports-rust-nightly
+          path: itk/acts-report-*.json
+          if-no-files-found: warn
+          # Outlives the rolling asset's 7-run window, so every entry it
+          # carries still has its full report to link to.
+          retention-days: 30
+
+      - name: Upload ACTS Results to Rolling Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          # The conformance counterpart of itk_rust.json, on the same
+          # permanent tag: process_acts_results.py fetches the existing
+          # acts_rust.json, appends one entry covering all three bindings, and
+          # this puts it back.
+          tag_name: "nightly-metrics"
+          prerelease: true
+          files: |
+            itk/acts_rust.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
