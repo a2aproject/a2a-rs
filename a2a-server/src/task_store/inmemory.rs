@@ -50,7 +50,7 @@ impl TaskStore for InMemoryTaskStore {
         let entry = store
             .get_mut(&task.id)
             .ok_or_else(|| A2AError::task_not_found(&task.id))?;
-        // BUG-43: a terminal task's state is immutable. Re-applying the same
+        // A terminal task's state is immutable. Re-applying the same
         // terminal state is allowed so idempotent re-emission (e.g. cancel
         // flows) keeps working, but a terminal state can never be overwritten
         // by a different state.
@@ -68,7 +68,7 @@ impl TaskStore for InMemoryTaskStore {
     async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError> {
         // Hold the write lock across the check and the state transition so two
         // concurrent cancel requests cannot both pass the check-then-act window
-        // (BUG-44).
+        // window.
         let mut store = self.tasks.write().await;
         let entry = store
             .get_mut(task_id)
