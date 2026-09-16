@@ -828,7 +828,7 @@ impl RequestHandler for DefaultRequestHandler {
         }
 
         // Atomically transition the task to CANCELED so two concurrent cancel
-        // requests cannot both pass the check-then-act window (BUG-44).
+        // requests cannot both pass the check-then-act window.
         let task = match self.task_store.begin_cancel(&req.id).await {
             Ok(task) => task,
             Err(error) if error.code == error_code::TASK_NOT_CANCELABLE => {
@@ -1251,6 +1251,10 @@ mod tests {
 
         async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
             self.inner.get(task_id).await
+        }
+
+        async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError> {
+            self.inner.begin_cancel(task_id).await
         }
 
         async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
@@ -2357,6 +2361,27 @@ mod tests {
                 .unwrap()
                 .map(|t| t.status.state),
             Some(TaskState::Completed)
+        );
+
+        // begin_cancel has no default (#250), so this must reach
+        // InMemoryTaskStore's atomic implementation -- and refuse a task that
+        // is already terminal, as the trait documents.
+        let mut cancelable = task.clone();
+        cancelable.id = "t-cancelable".into();
+        cancelable.status.state = TaskState::Working;
+        tasks.create(cancelable).await.unwrap();
+        assert_eq!(
+            tasks
+                .begin_cancel("t-cancelable")
+                .await
+                .unwrap()
+                .status
+                .state,
+            TaskState::Canceled
+        );
+        assert_eq!(
+            tasks.begin_cancel("t-delegated").await.unwrap_err().code,
+            error_code::TASK_NOT_CANCELABLE
         );
 
         let configs = PagingPushConfigStore::new(0);
