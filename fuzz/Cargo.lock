@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "a2a-client-lf"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "a2a-lf",
  "a2a-pb",
@@ -30,13 +30,17 @@ version = "0.0.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
+ "a2a-pb",
+ "arbitrary",
  "libfuzzer-sys",
+ "serde_json",
 ]
 
 [[package]]
 name = "a2a-lf"
 version = "0.3.1"
 dependencies = [
+ "arbitrary",
  "base64 0.23.1",
  "chrono",
  "serde",
@@ -93,6 +97,9 @@ name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+dependencies = [
+ "derive_arbitrary",
+]
 
 [[package]]
 name = "async-trait"
@@ -265,6 +272,7 @@ version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
+ "arbitrary",
  "iana-time-zone",
  "js-sys",
  "num-traits",
@@ -331,6 +339,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "derive_arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

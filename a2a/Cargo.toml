@@ -18,3 +18,11 @@ chrono = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+
+[dependencies.arbitrary]
+version = "1"
+features = ["derive"]
+optional = true
+
+[features]
+fuzzing = ["arbitrary", "chrono/arbitrary"]
