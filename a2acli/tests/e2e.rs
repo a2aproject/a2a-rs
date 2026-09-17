@@ -75,6 +75,10 @@ struct ServerState {
     /// pre-flight (§13.3) is only doing its job if the gated call is absent
     /// from here — the CLI's own output cannot show that.
     received_calls: Mutex<Vec<&'static str>>,
+    /// Number of times `subscribe_to_task` has been called for each of the
+    /// resumption fixture task ids below, so each reconnect gets the next
+    /// canned event sequence in that id's list.
+    subscribe_attempts: Mutex<BTreeMap<String, u32>>,
 }
 
 /// Fixture task ids that settle to `COMPLETED` only after this many
@@ -83,6 +87,139 @@ struct ServerState {
 const POLLS_UNTIL_SETTLED: u32 = 3;
 /// Fixture task id that never settles, for exercising `--timeout`.
 const STUCK_TASK_ID: &str = "task-stuck";
+
+/// `task subscribe` resumption fixture ids (§9.4, `A2ACLI_TASK_SUBSCRIBE_002`).
+/// Each first `subscribe_to_task` call ends the stream before the task
+/// settles -- a cut, not a finish -- and a later call (the reconnect)
+/// completes it, so tests can drive the reconnect path deterministically
+/// rather than by actually dropping a connection.
+///
+/// Ends unsettled once, then reconciles to a *different* state on
+/// reconnect -- the ordinary case, and confirms a changed state is
+/// printed, not suppressed.
+const SUBSCRIBE_CUT_THEN_SETTLE_ID: &str = "task-subscribe-cut-then-settle";
+/// Ends unsettled at `Working`, then on reconnect re-delivers that same
+/// `Working` state as its first event before moving on to `Completed` --
+/// the reconciling echo a real server would send, which must be
+/// suppressed rather than printed as a second, spurious event.
+const SUBSCRIBE_CUT_UNCHANGED_ID: &str = "task-subscribe-cut-unchanged";
+/// Every attempt ends unsettled; never reconciles. Exercises `--timeout`
+/// on the reconnect path the way `STUCK_TASK_ID` does for polling.
+const SUBSCRIBE_STUCK_ID: &str = "task-subscribe-stuck";
+/// The first reconnect *attempt* fails outright (the call to re-subscribe,
+/// not a cut within an established stream); the next succeeds and
+/// settles. Exercises that a failure re-establishing the subscription is
+/// retried under the same budget, not surfaced as a distinct error.
+const SUBSCRIBE_RESUBSCRIBE_FAILS_ONCE_ID: &str = "task-subscribe-resubscribe-fails-once";
+
+fn artifact_update(task_id: &str) -> Result<StreamResponse, A2AError> {
+    Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+        task_id: task_id.to_string(),
+        context_id: format!("{task_id}-ctx"),
+        artifact: Artifact {
+            artifact_id: "artifact-1".to_string(),
+            name: None,
+            description: None,
+            parts: vec![Part::text("partial output")],
+            metadata: None,
+            extensions: None,
+        },
+        append: None,
+        last_chunk: None,
+        metadata: None,
+    }))
+}
+
+fn working_status_update(task_id: &str) -> Result<StreamResponse, A2AError> {
+    Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+        task_id: task_id.to_string(),
+        context_id: format!("{task_id}-ctx"),
+        status: TaskStatus {
+            state: TaskState::Working,
+            message: None,
+            timestamp: None,
+        },
+        metadata: None,
+    }))
+}
+
+fn task_event(task_id: &str, state: TaskState) -> Result<StreamResponse, A2AError> {
+    Ok(StreamResponse::Task(make_task(
+        task_id,
+        &format!("{task_id}-ctx"),
+        state,
+        "resumption fixture",
+    )))
+}
+
+/// The canned event sequence for one `subscribe_to_task` call against a
+/// resumption fixture id, or `None` if `task_id` names an ordinary task.
+/// `attempt` is 1 on the first call, 2 on the first reconnect, and so on.
+/// The outer `Result` is the call to `subscribe_to_task` itself succeeding
+/// or failing to open a stream at all; the inner ones are the stream's own
+/// items once open.
+fn subscribe_resumption_events(
+    state: &ServerState,
+    task_id: &str,
+) -> Option<Result<Vec<Result<StreamResponse, A2AError>>, A2AError>> {
+    if ![
+        SUBSCRIBE_CUT_THEN_SETTLE_ID,
+        SUBSCRIBE_CUT_UNCHANGED_ID,
+        SUBSCRIBE_STUCK_ID,
+        SUBSCRIBE_RESUBSCRIBE_FAILS_ONCE_ID,
+    ]
+    .contains(&task_id)
+    {
+        return None;
+    }
+
+    let attempt = {
+        let mut attempts = state.subscribe_attempts.lock().unwrap();
+        let counter = attempts.entry(task_id.to_string()).or_insert(0);
+        *counter += 1;
+        *counter
+    };
+
+    if task_id == SUBSCRIBE_RESUBSCRIBE_FAILS_ONCE_ID {
+        return Some(match attempt {
+            1 => Ok(vec![working_status_update(task_id)]),
+            2 => Err(A2AError::internal("transient failure re-subscribing")),
+            _ => Ok(vec![task_event(task_id, TaskState::Completed)]),
+        });
+    }
+
+    Some(Ok(match task_id {
+        SUBSCRIBE_CUT_THEN_SETTLE_ID if attempt == 1 => {
+            // Ends unsettled: a cut, not a finish.
+            vec![working_status_update(task_id)]
+        }
+        SUBSCRIBE_CUT_THEN_SETTLE_ID => {
+            // The reconnect settles it at a *different* state than the cut
+            // left off at -- must be printed, not suppressed. The artifact
+            // update ahead of it carries no task state at all, exercising
+            // that an event with nothing to reconcile still passes through.
+            vec![
+                artifact_update(task_id),
+                task_event(task_id, TaskState::Completed),
+            ]
+        }
+        SUBSCRIBE_CUT_UNCHANGED_ID if attempt == 1 => {
+            vec![task_event(task_id, TaskState::Working)]
+        }
+        SUBSCRIBE_CUT_UNCHANGED_ID => {
+            // First event reconciles the *same* Working state the cut left
+            // off at -- must be suppressed. Second event is new progress.
+            vec![
+                task_event(task_id, TaskState::Working),
+                task_event(task_id, TaskState::Completed),
+            ]
+        }
+        _ => {
+            // SUBSCRIBE_STUCK_ID: every attempt ends unsettled.
+            vec![working_status_update(task_id)]
+        }
+    }))
+}
 
 struct TestHandler {
     state: Arc<ServerState>,
@@ -525,6 +662,9 @@ impl RequestHandler for TestHandler {
                 Err(A2AError::internal("stream failed"))
             })));
         }
+        if let Some(result) = subscribe_resumption_events(&self.state, &req.id) {
+            return result.map(|events| Box::pin(stream::iter(events)) as _);
+        }
 
         let task = self
             .state
@@ -922,6 +1062,190 @@ async fn stream_and_subscribe_commands_work() {
     let subscribe_events = parse_json_lines(&subscribe_output);
     assert_eq!(subscribe_events.len(), 2);
     assert_eq!(subscribe_events[1]["task"]["id"], "task-stream");
+}
+
+/// §9.4 / `A2ACLI_TASK_SUBSCRIBE_002`: a stream that ends *after* the task
+/// has settled is a finish, not a cut, and must not reconnect at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_does_not_reconnect_once_the_task_has_settled() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(&server, &["--compact", "task", "subscribe", "task-1"]);
+    let events = parse_json_lines(&output);
+    assert_eq!(
+        events.last().unwrap()["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+
+    let calls: Vec<&str> = server
+        .state
+        .received_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| **c == "subscribe_to_task")
+        .copied()
+        .collect();
+    assert_eq!(
+        calls,
+        vec!["subscribe_to_task"],
+        "subscribed more than once"
+    );
+}
+
+/// A stream cut before the task settles reconnects, and reaches the
+/// terminal state the reconnect delivers -- not the unsettled one the cut
+/// left off at. `task get` is never called: reconciliation comes from the
+/// stream's own first event after reconnecting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_reconnects_after_a_cut_and_reaches_the_terminal_state() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "--poll-interval",
+            "10ms",
+            "task",
+            "subscribe",
+            SUBSCRIBE_CUT_THEN_SETTLE_ID,
+        ],
+    );
+    let events = parse_json_lines(&output);
+    // The first attempt's own Working status update, then the reconnect's:
+    // an artifact update (which carries no task state at all, so it passes
+    // straight through with nothing to reconcile) followed by the settling
+    // Task.
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(
+        events[0]["statusUpdate"]["status"]["state"], "TASK_STATE_WORKING",
+        "{events:?}"
+    );
+    assert_eq!(
+        events[1]["artifactUpdate"]["artifact"]["artifactId"], "artifact-1",
+        "{events:?}"
+    );
+    assert_eq!(
+        events.last().unwrap()["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED",
+        "{events:?}"
+    );
+
+    let calls = server.state.received_calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.iter().filter(|c| **c == "subscribe_to_task").count(),
+        2,
+        "expected exactly one reconnect: {calls:?}"
+    );
+    assert!(
+        !server
+            .state
+            .received_calls
+            .lock()
+            .unwrap()
+            .contains(&"get_task"),
+        "reconnection must reconcile from the stream, not a task get"
+    );
+}
+
+/// The reconciling event a reconnect delivers is suppressed when it
+/// reports the same state the cut left off at -- printing it again would
+/// look like a second, spurious transition under `-o json --stream`'s
+/// incrementally-read JSONL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_suppresses_an_unchanged_reconciliation_event() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "--poll-interval",
+            "10ms",
+            "task",
+            "subscribe",
+            SUBSCRIBE_CUT_UNCHANGED_ID,
+        ],
+    );
+    let events = parse_json_lines(&output);
+
+    // Three events were sent across the two attempts (Working, then the
+    // reconciling Working echo, then Completed); the echo must not appear.
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0]["task"]["status"]["state"], "TASK_STATE_WORKING");
+    assert_eq!(events[1]["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+}
+
+/// A cut that never reconciles exhausts `--timeout` and reports
+/// `A2ACLI_ERR_TIMEOUT`, exit 5 -- the same class of failure `task get
+/// --wait` reports for a task that never settles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_reconnect_exhausts_timeout() {
+    let server = TestServer::spawn().await;
+
+    let (_, stderr, code) = run_cli_failure_status(
+        &server,
+        &[
+            "--timeout",
+            "150ms",
+            "--poll-interval",
+            "20ms",
+            "task",
+            "subscribe",
+            SUBSCRIBE_STUCK_ID,
+        ],
+    );
+    assert_eq!(code, 5);
+    // stderr also carries a warning per reconnect attempt (checked below),
+    // so the envelope -- always the last line (§11.4) -- is parsed on its
+    // own rather than assuming stderr is only the envelope.
+    let envelope = parse_error_envelope(stderr.lines().next_back().unwrap());
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_TIMEOUT");
+    assert!(
+        stderr.contains("reconnecting"),
+        "expected a reconnect warning on stderr: {stderr}"
+    );
+
+    let calls = server.state.received_calls.lock().unwrap().clone();
+    assert!(
+        calls.iter().filter(|c| **c == "subscribe_to_task").count() > 1,
+        "expected more than one reconnect attempt before timing out: {calls:?}"
+    );
+}
+
+/// A failure to re-establish the subscription itself -- not a cut within an
+/// already-open one -- is retried under the same budget rather than
+/// surfaced as a distinct error: both are "the network misbehaved" from
+/// the caller's point of view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_retries_a_failed_resubscribe_attempt() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "--poll-interval",
+            "10ms",
+            "task",
+            "subscribe",
+            SUBSCRIBE_RESUBSCRIBE_FAILS_ONCE_ID,
+        ],
+    );
+    let events = parse_json_lines(&output);
+    assert_eq!(
+        events.last().unwrap()["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED",
+        "{events:?}"
+    );
+
+    let calls = server.state.received_calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.iter().filter(|c| **c == "subscribe_to_task").count(),
+        3,
+        "expected the failed attempt plus two that opened a stream: {calls:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
