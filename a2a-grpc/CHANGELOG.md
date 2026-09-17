@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8](https://github.com/a2aproject/a2a-rs/compare/a2a-grpc-v0.3.7...a2a-grpc-v0.3.8) - 2026-09-17
+
+### Other
+
+- add the A2A Contributors copyright line to every header ([#260](https://github.com/a2aproject/a2a-rs/pull/260))
+
 ## [0.3.7](https://github.com/a2aproject/a2a-rs/compare/a2a-grpc-v0.3.6...a2a-grpc-v0.3.7) - 2026-09-15
 
 ### Other

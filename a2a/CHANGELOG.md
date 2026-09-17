@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/a2aproject/a2a-rs/compare/a2a-lf-v0.3.1...a2a-lf-v0.3.2) - 2026-09-17
+
+### Added
+
+- *(fuzz)* protojson round trip and Agent Card fuzzing (#238 Phase 2) ([#262](https://github.com/a2aproject/a2a-rs/pull/262))
+
+### Other
+
+- add the A2A Contributors copyright line to every header ([#260](https://github.com/a2aproject/a2a-rs/pull/260))
+
 ## [0.3.1](https://github.com/a2aproject/a2a-rs/compare/a2a-lf-v0.3.0...a2a-lf-v0.3.1) - 2026-09-14
 
 ### Added

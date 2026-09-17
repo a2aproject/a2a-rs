@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.4.4...a2a-server-lf-v0.5.0) - 2026-09-17
+
+### Added
+
+- *(fuzz)* Phase 3 validation targets + weekly run ([#238](https://github.com/a2aproject/a2a-rs/pull/238)) ([#264](https://github.com/a2aproject/a2a-rs/pull/264))
+
+### Fixed
+
+- *(a2a-server)* [**breaking**] enforce the spec's taskId and contextId rules ([#249](https://github.com/a2aproject/a2a-rs/pull/249))
+- *(a2a-server)* [**breaking**] require TaskStore::begin_cancel instead of defaulting it ([#252](https://github.com/a2aproject/a2a-rs/pull/252))
+- *(server)* protect terminal task states and make cancel transition atomic ([#126](https://github.com/a2aproject/a2a-rs/pull/126))
+
+### Other
+
+- add the A2A Contributors copyright line to every header ([#260](https://github.com/a2aproject/a2a-rs/pull/260))
+
 ## [0.4.4](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.4.3...a2a-server-lf-v0.4.4) - 2026-09-14
 
 ### Added

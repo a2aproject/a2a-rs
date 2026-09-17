@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.2.9...a2a-slimrpc-v0.2.10) - 2026-09-17
+
+### Added
+
+- *(fuzz)* Phase 3 validation targets + weekly run ([#238](https://github.com/a2aproject/a2a-rs/pull/238)) ([#264](https://github.com/a2aproject/a2a-rs/pull/264))
+
+### Other
+
+- add the A2A Contributors copyright line to every header ([#260](https://github.com/a2aproject/a2a-rs/pull/260))
+
 ## [0.2.9](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.2.8...a2a-slimrpc-v0.2.9) - 2026-09-15
 
 ### Other
