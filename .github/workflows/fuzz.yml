@@ -9,6 +9,19 @@ on:
       - main
     paths-ignore:
       - 'itk/**'
+  # A weekly, much longer run per #238 Phase 4. This is deliberately not
+  # OSS-Fuzz or ClusterFuzzLite: both give persistent, continuously-growing
+  # corpora, but OSS-Fuzz needs an upstream onboarding PR and a security
+  # contact, and ClusterFuzzLite's corpus persistence needs a cloud storage
+  # bucket -- both are commitments only a maintainer can make. A scheduled
+  # run on the infrastructure already proven here needs neither: no new
+  # credentials, no new service, and it still explores far more than a
+  # bounded 60s PR check can. It starts cold each time rather than growing a
+  # corpus, which is the real gap against the cloud options, left open below
+  # rather than worked around with something that resembles persistence but
+  # is not.
+  schedule:
+    - cron: '17 6 * * 0'
 
 # Least privilege; nothing here writes.
 permissions:
@@ -28,6 +41,9 @@ jobs:
           - protojson_roundtrip
           - agent_card_deserialize
           - agent_card_roundtrip
+          - rest_query_deserialize
+          - slimrpc_roundtrip
+          - push_url_validation
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -52,6 +68,10 @@ jobs:
 
       - name: Fuzz ${{ matrix.target }}
         working-directory: fuzz
+        env:
+          # 30 minutes on the weekly schedule, 60s on every PR and push to
+          # main -- long enough to matter without making every PR wait on it.
+          MAX_TOTAL_TIME: ${{ github.event_name == 'schedule' && '1800' || '60' }}
         run: |
           mkdir -p corpus/${{ matrix.target }}
           # --target is explicit: install-action ships the musl prebuilt of
@@ -62,7 +82,7 @@ jobs:
             ${{ matrix.target }} \
             corpus/${{ matrix.target }} \
             seeds/${{ matrix.target }} \
-            -- -max_total_time=60 -print_final_stats=1
+            -- -max_total_time="$MAX_TOTAL_TIME" -print_final_stats=1
 
       - name: Upload crash inputs
         if: failure()

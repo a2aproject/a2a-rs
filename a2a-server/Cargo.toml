@@ -50,6 +50,8 @@ rustls-no-provider = [
     "axum-server/tls-rustls-no-provider"
 ]
 
+fuzzing = []
+
 [dev-dependencies]
 http-body-util = "0.1"
 rustls = { workspace = true }
