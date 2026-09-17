@@ -71,6 +71,8 @@ the provenance do that.
   inspect it
 - Shell completion scripts for bash, zsh, fish, PowerShell, and elvish via
   `completion <shell>`
+- `card get --validate` against the A2A JSON schema, reporting every
+  violation with its JSON pointer path
 
 ## Run
 
@@ -303,6 +305,38 @@ precedence without guessing. Change settings by exporting the variable or
 editing a `.env` file directly — the command never mutates anything. `a2acli`
 never writes a `.env` file itself, but warns if one it reads is readable by
 users other than its owner (mode should be `0600`).
+
+### Schema validation
+
+`card get --validate` checks the fetched card against the A2A JSON schema
+(§10.1) — a stricter, complementary check to the type-checked deserialization
+`card get` always does. The two catch different things: the type check
+rejects a card that does not parse as an `AgentCard` at all, while the schema
+additionally rejects a card that parses fine but violates the schema in a way
+the Rust type is too permissive to notice — an unrecognised property, most
+commonly, since `AgentCard`'s fields accept any JSON object as long as the
+ones the type cares about are present and well-typed. `--validate` therefore
+needs the bytes the agent actually served, not a round trip through the typed
+value, which would have already dropped whatever the schema is being asked to
+catch.
+
+```sh
+cargo run --bin a2acli -- card get --validate
+```
+
+A card that passes is printed exactly as `card get` prints it. A card that
+fails exits with `A2ACLI_ERR_CARD_INVALID` and every violation under the error
+envelope's `details`, each with a JSON pointer `path` into the card and a
+`message` — never only the first one found. The schema is vendored at a
+pinned A2A version rather than fetched, and that version is reported in the
+envelope's `hint` alongside `A2ACLI_ERR_CARD_INVALID`, since "invalid" means
+nothing without saying invalid against what.
+
+`--validate` combined with `--extended` validates the extended card the same
+way, with one gap worth stating: that card arrives through the A2A client's
+typed protocol pipeline rather than as bytes this CLI reads itself, so it
+cannot see an unrecognised property the same pipeline already discarded. A
+wrong type or an unrecognised enum value are still caught on that path.
 
 ### Shell completion
 

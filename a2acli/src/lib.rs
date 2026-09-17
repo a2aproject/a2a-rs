@@ -1,6 +1,8 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+pub mod card_schema;
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -16,6 +18,7 @@ use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand,
 use futures::StreamExt;
 use reqwest::{Client, RequestBuilder};
 use serde::Serialize;
+use serde_json::Value;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
@@ -244,6 +247,12 @@ pub struct CardGetCommand {
     /// Fetch the authenticated extended agent card instead of the public one.
     #[arg(long)]
     pub extended: bool,
+
+    /// Validate the fetched card against the A2A JSON schema (§10.1) and
+    /// report every violation, rather than only the type check
+    /// deserialization already performs on every `card get`.
+    #[arg(long)]
+    pub validate: bool,
 }
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
@@ -510,6 +519,14 @@ pub enum CliError {
     /// counterpart of a response body that won't deserialize.
     #[error("agent card file is not a valid agent card: {0}")]
     CardInvalid(String),
+    /// `card get --validate`: the card deserialized fine (so `CardInvalid`
+    /// does not apply) but fails the A2A JSON schema (§10.1) — distinct
+    /// from a type-check failure, and carrying every violation rather than
+    /// only the first.
+    #[error("agent card failed schema validation ({} violation(s))", violations.len())]
+    CardSchemaInvalid {
+        violations: Vec<card_schema::Violation>,
+    },
     /// A malformed invocation, as clap describes it. §11.4 counts a
     /// malformed flag among the CLI-local failures that must still be
     /// machine-readable, so clap's prose becomes the envelope's message
@@ -537,6 +554,11 @@ struct ErrorDetail {
     hint: Option<String>,
     #[serde(rename = "a2aCode", skip_serializing_if = "Option::is_none")]
     a2a_code: Option<i64>,
+    /// Every schema violation on `CardSchemaInvalid`; absent otherwise. Its
+    /// own field rather than folded into `message`, so `-o json` can walk
+    /// each violation's path without parsing prose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Vec<card_schema::Violation>>,
 }
 
 impl CliError {
@@ -555,6 +577,7 @@ impl CliError {
             // card came from a URL or a file.
             CliError::CardFile { .. } => 3,
             CliError::CardInvalid(_) => 1,
+            CliError::CardSchemaInvalid { .. } => 1,
             CliError::Usage(_) => 2,
         }
     }
@@ -595,6 +618,14 @@ impl CliError {
                 Some("the agent card did not match the expected schema".to_string()),
                 None,
             ),
+            CliError::CardSchemaInvalid { .. } => (
+                "A2ACLI_ERR_CARD_INVALID".to_string(),
+                Some(format!(
+                    "against the A2A JSON schema, version {}; see `details`",
+                    card_schema::SCHEMA_A2A_VERSION
+                )),
+                None,
+            ),
             CliError::Timeout { .. } => (
                 "A2ACLI_ERR_TIMEOUT".to_string(),
                 Some(
@@ -605,12 +636,18 @@ impl CliError {
             ),
         };
 
+        let details = match self {
+            CliError::CardSchemaInvalid { violations } => Some(violations.clone()),
+            _ => None,
+        };
+
         ErrorEnvelope {
             error: ErrorDetail {
                 code,
                 message: self.to_string(),
                 hint,
                 a2a_code,
+                details,
             },
         }
     }
@@ -1072,15 +1109,41 @@ async fn run_card_command(
                     .get_extended_agent_card(&GetExtendedAgentCardRequest { tenant })
                     .await;
                 let card = finish_client_call(client, result).await?;
+                if command.validate {
+                    // Best effort: get_extended_agent_card comes back
+                    // through a2a-client's typed protojson pipeline, which
+                    // has already discarded anything the schema would flag
+                    // as an unrecognised property, the same way AgentCard's
+                    // own Deserialize would. Re-serializing the typed value
+                    // still catches a wrong type or a bad enum value; it
+                    // cannot catch that one shape of violation on this path.
+                    validate_card_or_fail(&serde_json::to_value(&card)?)?;
+                }
                 print_output(&card, cli)?;
             } else {
-                let card = resolve_agent_card(cli, matches).await?;
+                let (card, raw) = resolve_agent_card_with_raw(cli, matches).await?;
+                if command.validate {
+                    validate_card_or_fail(&raw)?;
+                }
                 print_output(&card, cli)?;
             }
         }
     }
 
     Ok(())
+}
+
+/// `card get --validate` (§10.1, `A2ACLI_CARD_GET_002`). Every violation is
+/// collected before failing, rather than stopping at the first — a card with
+/// three problems should take one run to diagnose.
+fn validate_card_or_fail(card: &Value) -> Result<(), CliError> {
+    let violations = card_schema::validate_agent_card(card)
+        .map_err(|error| CliError::CardInvalid(format!("schema could not be loaded: {error}")))?;
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::CardSchemaInvalid { violations })
+    }
 }
 
 async fn run_task_command(
@@ -2433,12 +2496,31 @@ fn base_url_card_reference(cli: &Cli, matches: &ArgMatches) -> String {
 }
 
 async fn resolve_agent_card(cli: &Cli, matches: &ArgMatches) -> Result<AgentCard, CliError> {
+    Ok(resolve_agent_card_with_raw(cli, matches).await?.0)
+}
+
+/// Like [`resolve_agent_card`], but also returns the raw JSON the card was
+/// parsed from.
+///
+/// `card get --validate` needs those actual bytes rather than the typed
+/// `AgentCard`: `AgentCard`'s `Deserialize` has no `deny_unknown_fields`, so
+/// an extra property serde tolerated is already gone by the time a typed
+/// value exists to re-serialize — exactly the shape of violation §10.1
+/// schema validation exists to catch that the type check does not.
+async fn resolve_agent_card_with_raw(
+    cli: &Cli,
+    matches: &ArgMatches,
+) -> Result<(AgentCard, Value), CliError> {
     warn_if_insecure_with_credentials(cli);
 
     let reference = match resolve_agent_selection(cli, matches)? {
         AgentSelection::Card(reference) => reference,
         AgentSelection::Endpoint { url, binding } => {
-            return Ok(synthesized_endpoint_card(&url, binding));
+            let card = synthesized_endpoint_card(&url, binding);
+            // Nothing was fetched, so there is nothing "extra" a typed
+            // round trip could have lost; the two forms coincide.
+            let raw = serde_json::to_value(&card)?;
+            return Ok((card, raw));
         }
     };
 
@@ -2450,9 +2532,16 @@ async fn resolve_agent_card(cli: &Cli, matches: &ArgMatches) -> Result<AgentCard
             } else {
                 Client::new()
             };
-            let request = apply_request_auth(client.get(url), cli);
+            let request = apply_request_auth(client.get(&url), cli);
             let response = request.send().await?.error_for_status()?;
-            Ok(response.json::<AgentCard>().await?)
+            let raw: Value = response.json().await?;
+            // Classified the same way the old single-step `response.json::
+            // <AgentCard>()` was: a body that parses as JSON but not as the
+            // expected shape is CARD_INVALID, not a bare serde_json::Error
+            // (-> INTERNAL) now that fetching and typing are two steps.
+            let card: AgentCard = serde_json::from_value(raw.clone())
+                .map_err(|error| CliError::CardInvalid(format!("{url}: {error}")))?;
+            Ok((card, raw))
         }
     }
 }
@@ -2462,13 +2551,16 @@ async fn resolve_agent_card(cli: &Cli, matches: &ArgMatches) -> Result<AgentCard
 /// found where the caller pointed), while a file that is there but isn't a
 /// card is `CARD_INVALID` — the same split the HTTP path makes between a
 /// non-2xx response and a body that won't deserialize.
-fn read_agent_card_file(path: &Path) -> Result<AgentCard, CliError> {
+fn read_agent_card_file(path: &Path) -> Result<(AgentCard, Value), CliError> {
     let text = std::fs::read_to_string(path).map_err(|source| CliError::CardFile {
         path: path.display().to_string(),
         source,
     })?;
-    serde_json::from_str(&text)
-        .map_err(|error| CliError::CardInvalid(format!("{}: {error}", path.display())))
+    let raw: Value = serde_json::from_str(&text)
+        .map_err(|error| CliError::CardInvalid(format!("{}: {error}", path.display())))?;
+    let card: AgentCard = serde_json::from_value(raw.clone())
+        .map_err(|error| CliError::CardInvalid(format!("{}: {error}", path.display())))?;
+    Ok((card, raw))
 }
 
 fn apply_request_auth(mut request: RequestBuilder, cli: &Cli) -> RequestBuilder {
