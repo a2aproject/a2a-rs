@@ -2982,9 +2982,7 @@ async fn finish_client_call<T: a2a_client::Transport, V>(
     }
 }
 
-/// Prints one streamed value per §11.1/§11.2's output-mode rules. Shared by
-/// [`consume_stream`] and [`subscribe_with_resumption`] so the two paths
-/// render an event identically.
+/// Prints one streamed value per §11.1/§11.2's output-mode rules.
 fn print_stream_value<V: Serialize + TextRender>(value: &V, cli: &Cli) -> Result<(), CliError> {
     match cli.output {
         OutputFormat::Text => {
@@ -2997,10 +2995,7 @@ fn print_stream_value<V: Serialize + TextRender>(value: &V, cli: &Cli) -> Result
     }
 }
 
-/// Warns about one stream value's outcome and prints it, destroying `client`
-/// first if printing fails. Shared by [`consume_stream`] and
-/// [`subscribe_with_resumption`], which otherwise each carried their own
-/// copy of this exact sequence.
+/// Warns, prints, and destroys `client` first if printing fails.
 async fn print_or_destroy<T: a2a_client::Transport, V: Serialize + TextRender + TaskOutcome>(
     client: &A2AClient<T>,
     value: &V,
@@ -3014,16 +3009,9 @@ async fn print_or_destroy<T: a2a_client::Transport, V: Serialize + TextRender + 
     Ok(())
 }
 
-/// Consume a streamed event sequence to completion, printing each event as
-/// it arrives. Under `-o json`, always emits JSONL — one complete, compact
-/// object per line, flushed as produced — regardless of `--compact`, which
-/// only affects the single-document form (§11.3). Under `-o text`, each
-/// event is rendered in the same field-and-block form as a one-shot result.
-///
-/// Used by `send --stream`, which does not reconnect: `send`'s own fallback
-/// for an agent that does not support streaming already covers a stream
-/// that cannot be used at all, and `task subscribe` is where §9.4 actually
-/// asks for resumption (see [`subscribe_with_resumption`]).
+/// Consumes a streamed event sequence to completion, printing each event.
+/// Used by `send --stream`, which does not reconnect -- see
+/// [`subscribe_with_resumption`] for `task subscribe`, which does.
 async fn consume_stream<T: a2a_client::Transport, V: Serialize + TextRender + TaskOutcome>(
     client: A2AClient<T>,
     mut stream: BoxStream<'static, Result<V, A2AError>>,
@@ -3046,9 +3034,7 @@ async fn consume_stream<T: a2a_client::Transport, V: Serialize + TextRender + Ta
     }
 }
 
-/// The task-lifecycle state a `StreamResponse` carries, if any --
-/// `Message`/`ArtifactUpdate` events don't represent a lifecycle
-/// transition, so there is nothing here to reconcile or settle on.
+/// The task state a `StreamResponse` carries, if any.
 fn stream_response_state(value: &StreamResponse) -> Option<TaskState> {
     match value {
         StreamResponse::Task(task) => Some(task.status.state.clone()),
@@ -3058,33 +3044,10 @@ fn stream_response_state(value: &StreamResponse) -> Option<TaskState> {
 }
 
 /// `task subscribe` (§9.4, `A2ACLI_TASK_SUBSCRIBE_002`): reconnects when the
-/// stream ends before the task has settled. A dropped connection and a
-/// finished task both end the stream with `None` -- indistinguishable by
-/// closure alone -- so this tracks the state last observed and consults
-/// that instead: settled means the task finished, anything else means the
-/// connection was cut.
-///
-/// On reconnect, the server's first event is the full `Task`, reconciling
-/// state (§9.4) -- deliberately not followed by a `task get`, which would
-/// add a round trip the protocol already covers. If that reconciling
-/// event's state matches what was already known before the cut, it is
-/// suppressed rather than printed again: under `-o json --stream` the
-/// output is JSONL a consumer reads incrementally, and a duplicate `Task`
-/// line there would look like a second, spurious transition. A state that
-/// *did* change while disconnected is not suppressed -- that is new
-/// information, not an echo.
-///
-/// `--timeout` bounds the reconnection budget cumulatively across
-/// attempts, not any single one, and does not apply to a stream that never
-/// disconnects at all: a healthy, actively-progressing subscription is not
-/// aborted just because the command has been running a while. Re-resolving
-/// the subscription itself uses the same budget and backoff as an
-/// in-stream cut, rather than being a separate failure mode, since both
-/// are the same "the network misbehaved" event to the caller. This SDK's
-/// `SubscribeToTaskRequest` has no field to resume from a named
-/// last-received event, so every reconnect is a plain re-subscribe -- the
-/// "otherwise" branch of §9.4's "where the server supports it"; a future
-/// resumption parameter belongs here if the protocol adds one.
+/// stream ends before the task settles, using the last state observed to
+/// tell a cut from a finish. The reconnect's first event reconciles state
+/// (no `task get` needed) and is suppressed if unchanged from before the
+/// cut. `--timeout` bounds reconnection cumulatively, not a healthy stream.
 async fn subscribe_with_resumption<T: a2a_client::Transport>(
     client: A2AClient<T>,
     mut stream: BoxStream<'static, Result<StreamResponse, A2AError>>,
@@ -3130,10 +3093,7 @@ async fn subscribe_with_resumption<T: a2a_client::Transport>(
             return Ok(());
         }
 
-        // Reconnect: retries both an in-stream cut (above) and a failure to
-        // re-establish the subscription itself (below) under the same
-        // deadline and delay, so a transient failure in either place is
-        // just another attempt rather than a distinct error path.
+        // Retries both a cut and a failed re-subscribe under one budget.
         loop {
             let now = tokio::time::Instant::now();
             if now >= deadline {
