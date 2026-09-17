@@ -135,7 +135,7 @@ impl HttpPushSender {
 /// The URL scheme must be http/https and the host must not resolve to a
 /// loopback, private, link-local, multicast, or unspecified address, nor to a
 /// well-known cloud metadata endpoint.
-fn validate_push_url(url: &str) -> Result<(), A2AError> {
+pub(crate) fn validate_push_url(url: &str) -> Result<(), A2AError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| A2AError::invalid_params("invalid push notification URL"))?;
 
@@ -176,36 +176,7 @@ fn validate_push_url(url: &str) -> Result<(), A2AError> {
             .and_then(|h| h.strip_suffix(']'))
             .unwrap_or(host);
         if let Ok(ip) = host_unbracketed.parse::<std::net::IpAddr>() {
-            let blocked = match ip {
-                std::net::IpAddr::V4(v4) => {
-                    v4.is_loopback()
-                        || v4.is_private()
-                        || v4.is_link_local()
-                        || v4.is_unspecified()
-                        || v4.is_multicast()
-                }
-                std::net::IpAddr::V6(v6) => {
-                    // fc00::/7 unique local addresses (IPv6 "private").
-                    let is_ula = (v6.segments()[0] & 0xfe00) == 0xfc00;
-                    // IPv4-mapped IPv6 literals (::ffff:a.b.c.d) must be
-                    // checked against the IPv4 restrictions too, or they
-                    // bypass the loopback/private/link-local checks above.
-                    let mapped_v4_blocked = v6.to_ipv4_mapped().is_some_and(|v4| {
-                        v4.is_loopback()
-                            || v4.is_private()
-                            || v4.is_link_local()
-                            || v4.is_unspecified()
-                            || v4.is_multicast()
-                    });
-                    v6.is_loopback()
-                        || is_ula
-                        || mapped_v4_blocked
-                        || v6.is_unicast_link_local()
-                        || v6.is_unspecified()
-                        || v6.is_multicast()
-                }
-            };
-            if blocked {
+            if is_blocked_ip(ip) {
                 return Err(A2AError::invalid_params(
                     "push URL targets private/loopback/link-local address",
                 ));
@@ -214,6 +185,49 @@ fn validate_push_url(url: &str) -> Result<(), A2AError> {
     }
 
     Ok(())
+}
+
+/// Whether `ip` is loopback, RFC 1918/ULA private, link-local, unspecified,
+/// or multicast -- the ranges a push URL must not target.
+///
+/// A standalone predicate rather than inline in `validate_push_url`, per
+/// #224's own scope: the connect-time guard it asks for needs to check the
+/// *resolved* address against these same ranges, and must reuse this rather
+/// than duplicate it. It is also what makes target 4 of #238's fuzz plan
+/// possible: fuzzing "does `validate_push_url` correctly extract an IP from
+/// an arbitrary URL and apply this predicate" needs the predicate itself to
+/// be callable as independent ground truth, not re-derived by the fuzz
+/// target and risking drifting out of sync with the real one.
+pub(crate) fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            // fc00::/7 unique local addresses (IPv6 "private").
+            let is_ula = (v6.segments()[0] & 0xfe00) == 0xfc00;
+            // IPv4-mapped IPv6 literals (::ffff:a.b.c.d) must be checked
+            // against the IPv4 restrictions too, or they bypass the
+            // loopback/private/link-local checks above.
+            let mapped_v4_blocked = v6.to_ipv4_mapped().is_some_and(|v4| {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_multicast()
+            });
+            v6.is_loopback()
+                || is_ula
+                || mapped_v4_blocked
+                || v6.is_unicast_link_local()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -450,6 +464,51 @@ mod tests {
             "http://127.1/hook",              // short form
             "http://127.0.0.1./hook",         // trailing dot on a literal
             "http://[::ffff:127.0.0.1]/hook", // IPv4-mapped IPv6
+        ] {
+            assert!(
+                validate_push_url(url).is_err(),
+                "{url} must be blocked, but was allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_blocked_ip_checks_every_range_through_an_ipv4_mapped_address() {
+        // is_blocked_ip's IPv4-mapped-IPv6 branch applies every IPv4
+        // predicate to the unwrapped address, not just is_loopback -- the
+        // existing ::ffff:127.0.0.1 test case above only exercises that
+        // first one, since a loopback address short-circuits the rest.
+        // Each of these is chosen to be false on every earlier predicate,
+        // so the run reaches its own line rather than returning early.
+        for (ip, why) in [
+            ("::ffff:169.254.1.1", "link-local"),
+            ("::ffff:0.0.0.0", "unspecified"),
+            ("::ffff:224.0.0.1", "multicast"),
+        ] {
+            let addr: std::net::IpAddr = ip.parse().unwrap();
+            assert!(is_blocked_ip(addr), "{ip} ({why}) should be blocked");
+        }
+
+        // And the mapped address is not blocked when the underlying IPv4
+        // address is none of these -- confirms the closure's result is
+        // actually load-bearing, not a predicate that always returns true.
+        let public: std::net::IpAddr = "::ffff:93.184.216.34".parse().unwrap();
+        assert!(
+            !is_blocked_ip(public),
+            "a public mapped address was blocked"
+        );
+    }
+
+    #[test]
+    fn test_validate_push_url_rejects_blocked_hosts_regardless_of_case() {
+        // Url::parse lowercases the host per the URL Standard before the
+        // blocklist ever sees it, so this holds independent of the
+        // trailing-dot case above -- pinned on its own rather than only as
+        // a side effect of that test.
+        for url in [
+            "http://LOCALHOST/hook",
+            "http://METADATA.GOOGLE.INTERNAL/hook",
+            "http://Metadata.Azure.Com/hook",
         ] {
             assert!(
                 validate_push_url(url).is_err(),

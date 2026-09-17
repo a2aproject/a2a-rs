@@ -12,6 +12,22 @@ pub mod rest;
 pub mod sse;
 pub mod task_store;
 
+// Push-URL validation internals reached by the fuzz target in fuzz/ — see
+// #238. Thin wrappers, not re-exports: the originals stay crate-private.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz_support {
+    use a2a::A2AError;
+
+    pub fn validate_push_url(url: &str) -> Result<(), A2AError> {
+        crate::push::sender::validate_push_url(url)
+    }
+
+    pub fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+        crate::push::sender::is_blocked_ip(ip)
+    }
+}
+
 #[cfg(any(feature = "rustls-tls", feature = "rustls-no-provider"))]
 pub mod tls;
 
