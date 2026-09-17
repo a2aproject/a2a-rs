@@ -823,6 +823,18 @@ async fn card_and_extended_card_commands_work() {
     assert_eq!(card["name"], "Fixture Agent (extended)");
 }
 
+/// `--validate` on the `--extended` path: best-effort (README states the
+/// limit), but a card that satisfies the schema still passes on it, the
+/// same as the public-card path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_get_extended_validate_accepts_a_schema_conformant_card() {
+    let server = TestServer::spawn().await;
+
+    let stdout = run_cli_success(&server, &["card", "get", "--extended", "--validate"]);
+    let card: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(card["name"], "Fixture Agent (extended)");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_task_list_and_cancel_commands_work() {
     let server = TestServer::spawn().await;
@@ -2308,6 +2320,170 @@ async fn card_file_that_is_not_a_card_reports_card_invalid() {
     assert_eq!(output.status.code().unwrap(), 1);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §10.1 / `A2ACLI_CARD_GET_002`. A card that satisfies the schema passes
+/// `--validate` and still prints normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_get_validate_accepts_a_schema_conformant_card() {
+    let dir = scratch_dir("validate-ok");
+    let path = write_card_file(&dir, "card.json", FILE_CARD_JSON);
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--agent-card",
+            path.to_str().unwrap(),
+            "--output",
+            "json",
+            "card",
+            "get",
+            "--validate",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let card: Value =
+        serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+    assert_eq!(card["name"], "File Agent");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The property this exists for: `AgentCard`'s `Deserialize` has no
+/// `deny_unknown_fields`, so an extra property is silently accepted by the
+/// type check and would be gone from a re-serialized typed value. Validating
+/// the raw bytes the card actually was must still catch it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_get_validate_reports_a_property_the_type_check_silently_accepts() {
+    let dir = scratch_dir("validate-extra-property");
+    let path = write_card_file(
+        &dir,
+        "card.json",
+        r#"{
+          "name": "File Agent", "description": "d", "version": "1.0",
+          "supportedInterfaces": [], "capabilities": {},
+          "defaultInputModes": [], "defaultOutputModes": [], "skills": [],
+          "speling": "mistake"
+        }"#,
+    );
+
+    // Without --validate, the type check alone accepts it -- the gap
+    // A2ACLI_CARD_GET_002 exists to close, pinned here so this test would
+    // fail if that gap ever closed by some other means and made the second
+    // half below no longer meaningful.
+    let mut plain = StdCommand::cargo_bin("a2acli").unwrap();
+    plain
+        .args(["--agent-card", path.to_str().unwrap(), "card", "get"])
+        .assert()
+        .success();
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--agent-card",
+            path.to_str().unwrap(),
+            "--output",
+            "json",
+            "card",
+            "get",
+            "--validate",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert_eq!(output.status.code().unwrap(), 1);
+    let envelope = parse_error_envelope(&String::from_utf8(output.stderr).unwrap());
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_CARD_INVALID");
+    let details = envelope["error"]["details"].as_array().unwrap();
+    assert_eq!(details.len(), 1, "{details:?}");
+    assert!(
+        details[0]["message"].as_str().unwrap().contains("speling"),
+        "{details:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A card with several problems is reported in one run, each with its own
+/// JSON pointer path -- not only the first violation found. All three here
+/// are schema-only (an unrecognised property at three different nesting
+/// depths), so none of them could instead be a typed-deserialization
+/// failure masking the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_get_validate_reports_every_violation_with_its_path() {
+    let dir = scratch_dir("validate-several");
+    let path = write_card_file(
+        &dir,
+        "card.json",
+        r#"{
+          "name": "Fixture", "description": "d", "version": "1.0",
+          "supportedInterfaces": [], "capabilities": {"unexpectedCapField": true},
+          "defaultInputModes": [], "defaultOutputModes": [],
+          "skills": [{"id":"s1","name":"n","description":"d","tags":[],
+                       "unexpectedSkillField":true}],
+          "nonsense": true
+        }"#,
+    );
+
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--agent-card",
+            path.to_str().unwrap(),
+            "--output",
+            "json",
+            "card",
+            "get",
+            "--validate",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let envelope = parse_error_envelope(&String::from_utf8(output.stderr).unwrap());
+    let details = envelope["error"]["details"].as_array().unwrap();
+    let paths: Vec<&str> = details
+        .iter()
+        .map(|v| v["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&""), "{details:?}");
+    assert!(paths.contains(&"/capabilities"), "{details:?}");
+    assert!(paths.contains(&"/skills/0"), "{details:?}");
+    assert_eq!(details.len(), 3, "{details:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §10.1's scope: validation is not reached at all when the agent itself
+/// could not be reached, and that stays `A2ACLI_ERR_UNREACHABLE` rather than
+/// being reported as a card problem.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_get_validate_against_an_unreachable_agent_reports_unreachable() {
+    let mut command = StdCommand::cargo_bin("a2acli").unwrap();
+    let output = command
+        .args([
+            "--agent-card",
+            "http://127.0.0.1:1/agent-card.json",
+            "--output",
+            "json",
+            "card",
+            "get",
+            "--validate",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert_eq!(output.status.code().unwrap(), 3);
+    let envelope = parse_error_envelope(&String::from_utf8(output.stderr).unwrap());
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_UNREACHABLE");
 }
 
 /// `--base-url` keeps working so pre-#178 invocations don't break, but says

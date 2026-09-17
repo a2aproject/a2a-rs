@@ -16,6 +16,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "futures",
+ "jsonschema",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
