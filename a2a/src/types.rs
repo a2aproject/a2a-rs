@@ -20,13 +20,11 @@ mod fuzz_support {
     /// documented valid range (0001-01-01T00:00:00Z to
     /// 9999-12-31T23:59:59.999999999Z) rather than `chrono`'s much wider one.
     ///
-    /// Outside that range, `a2a-pb`'s `to_proto_timestamp` still converts
-    /// the value, but the well-known-type JSON it produces cannot be parsed
-    /// back -- a genuine round-trip bug, filed as #261 rather
-    /// than fixed here, with this exact boundary as its regression case.
-    /// Generating only in-range values here keeps fuzz target 2 pointed at
-    /// timestamps a real `Task` could actually carry, rather than spending
-    /// its whole budget rediscovering an already-filed bug on every run.
+    /// Outside that range, `a2a-pb`'s `to_proto_timestamp` previously produced
+    /// well-known-type JSON that could not be parsed back (the #261 round-trip
+    /// bug, now fixed: it returns `None`). Generating only in-range values here
+    /// keeps fuzz target 2 pointed at timestamps a real `Task` could actually
+    /// carry, rather than at values whose behaviour #261 already pins.
     pub(crate) fn bounded_timestamp(u: &mut Unstructured) -> Result<Option<DateTime<Utc>>> {
         if !bool::arbitrary(u)? {
             return Ok(None);
