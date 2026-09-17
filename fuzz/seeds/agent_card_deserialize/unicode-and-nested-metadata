@@ -1,0 +1,1 @@
+{"name":"名前 🤖","description":"d","version":"1.0.0","supportedInterfaces":[],"capabilities":{},"defaultInputModes":[],"defaultOutputModes":[],"skills":[{"id":"s","name":"n","description":"d","tags":[],"security":[{"a":{"nested":{"deeply":{"value":[1,2,3]}}}}]}]}
