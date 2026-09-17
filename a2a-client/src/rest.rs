@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
