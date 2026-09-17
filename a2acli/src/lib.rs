@@ -2997,6 +2997,23 @@ fn print_stream_value<V: Serialize + TextRender>(value: &V, cli: &Cli) -> Result
     }
 }
 
+/// Warns about one stream value's outcome and prints it, destroying `client`
+/// first if printing fails. Shared by [`consume_stream`] and
+/// [`subscribe_with_resumption`], which otherwise each carried their own
+/// copy of this exact sequence.
+async fn print_or_destroy<T: a2a_client::Transport, V: Serialize + TextRender + TaskOutcome>(
+    client: &A2AClient<T>,
+    value: &V,
+    cli: &Cli,
+) -> Result<(), CliError> {
+    value.warn_outcome();
+    if let Err(error) = print_stream_value(value, cli) {
+        let _ = client.destroy().await;
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Consume a streamed event sequence to completion, printing each event as
 /// it arrives. Under `-o json`, always emits JSONL — one complete, compact
 /// object per line, flushed as produced — regardless of `--compact`, which
@@ -3015,11 +3032,7 @@ async fn consume_stream<T: a2a_client::Transport, V: Serialize + TextRender + Ta
     loop {
         match stream.next().await {
             Some(Ok(value)) => {
-                value.warn_outcome();
-                if let Err(error) = print_stream_value(&value, cli) {
-                    let _ = client.destroy().await;
-                    return Err(error);
-                }
+                print_or_destroy(&client, &value, cli).await?;
             }
             Some(Err(error)) => {
                 let _ = client.destroy().await;
@@ -3102,11 +3115,7 @@ async fn subscribe_with_resumption<T: a2a_client::Transport>(
                         continue;
                     }
 
-                    value.warn_outcome();
-                    if let Err(error) = print_stream_value(&value, cli) {
-                        let _ = client.destroy().await;
-                        return Err(error);
-                    }
+                    print_or_destroy(&client, &value, cli).await?;
                 }
                 Some(Err(error)) => {
                     let _ = client.destroy().await;
@@ -3985,6 +3994,29 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, CliError::Json(_)));
+    }
+
+    /// `print_or_destroy` is the print-failure path both `consume_stream`
+    /// and `subscribe_with_resumption` share; exercised directly since
+    /// `StreamResponse`'s own `Serialize` impl never fails for a real
+    /// value, so this path is otherwise unreachable through
+    /// `subscribe_with_resumption` specifically.
+    #[tokio::test]
+    async fn test_print_or_destroy_reports_json_error() {
+        let client = make_test_client(None);
+        let err = print_or_destroy(&client, &FailingSerialize, &json_cli())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CliError::Json(_)));
+    }
+
+    #[tokio::test]
+    async fn test_print_or_destroy_succeeds_in_text_mode() {
+        let client = make_test_client(None);
+        print_or_destroy(&client, &FailingSerialize, &text_cli())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
