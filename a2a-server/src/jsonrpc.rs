@@ -7,6 +7,7 @@ use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use axum::{
     Json,
+    body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -53,9 +54,18 @@ pub fn jsonrpc_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
 async fn handle_jsonrpc<H: RequestHandler>(
     State(state): State<JsonRpcState<H>>,
     headers: HeaderMap,
-    Json(request): Json<JsonRpcRequest>,
+    body: Bytes,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
+
+    // A `Json<JsonRpcRequest>` extractor would reject a malformed body with
+    // axum's own error response before this handler runs at all, which is
+    // the wrong shape for JSON-RPC over HTTP: the status stays 200 and the
+    // error belongs inside the envelope regardless of what failed.
+    let request: JsonRpcRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => return malformed_request_response(&body, error),
+    };
     let id = request.id.clone();
     let method = request.method.as_str();
 
@@ -68,6 +78,34 @@ async fn handle_jsonrpc<H: RequestHandler>(
     }
 
     handle_unary_request(&state, &params, &request).await
+}
+
+/// A body that failed to deserialize into [`JsonRpcRequest`]: invalid JSON
+/// syntax is `ParseError` (-32700); well-formed JSON with the wrong shape
+/// (e.g. a missing `method`) is `InvalidRequestError` (-32600). The id is
+/// recovered on a best-effort basis for the latter, since JSON-RPC 2.0 asks
+/// for it to be echoed back when it can be determined; a syntax error, by
+/// definition, cannot.
+fn malformed_request_response(body: &[u8], error: serde_json::Error) -> axum::response::Response {
+    if !error.is_data() {
+        return error_response(
+            JsonRpcId::Null,
+            A2AError {
+                code: error_code::PARSE_ERROR,
+                message: format!("parse error: {error}"),
+                details: None,
+            },
+        );
+    }
+    let id = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("id").cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or(JsonRpcId::Null);
+    error_response(
+        id,
+        A2AError::invalid_request(format!("invalid request: {error}")),
+    )
 }
 
 async fn handle_unary_request<H: RequestHandler>(
@@ -431,6 +469,50 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
         assert!(rpc_resp.error.is_some());
+    }
+
+    /// A `Json<T>` extractor would have axum reject this with a 422 before
+    /// the handler runs; JSON-RPC over HTTP always answers 200 with the
+    /// error inside the envelope, regardless of what about the body failed.
+    #[tokio::test]
+    async fn test_missing_method_field_is_invalid_request_not_a_422() {
+        let app = make_app();
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"params":{}}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let code = rpc_resp.error.expect("expected an error").code;
+        assert!(
+            code == error_code::INVALID_REQUEST || code == error_code::INVALID_PARAMS,
+            "got {code}"
+        );
+        assert_eq!(rpc_resp.id, JsonRpcId::Number(1), "id should be recovered");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_syntax_is_parse_error_not_a_400() {
+        let app = make_app();
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from("{this is not valid json"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            rpc_resp.error.expect("expected an error").code,
+            error_code::PARSE_ERROR
+        );
+        assert_eq!(rpc_resp.id, JsonRpcId::Null, "id cannot be recovered");
     }
 
     #[tokio::test]
