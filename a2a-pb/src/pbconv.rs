@@ -83,12 +83,28 @@ pub fn proto_value_to_json_value(v: &prost_types::Value) -> Value {
     }
 }
 
+/// Lowest `seconds` a `google.protobuf.Timestamp` may carry: `0001-01-01T00:00:00Z`.
+const PROTO_TIMESTAMP_MIN_SECONDS: i64 = -62_135_596_800;
+/// Highest `seconds` a `google.protobuf.Timestamp` may carry: `9999-12-31T23:59:59Z`.
+const PROTO_TIMESTAMP_MAX_SECONDS: i64 = 253_402_300_799;
+
 /// Convert `chrono::DateTime<Utc>` to `prost_types::Timestamp`.
-pub fn to_proto_timestamp(dt: &chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
-    prost_types::Timestamp {
-        seconds: dt.timestamp(),
-        nanos: dt.timestamp_subsec_nanos() as i32,
+///
+/// Returns `None` when `dt` falls outside the range `google.protobuf.Timestamp`
+/// is defined for (`0001-01-01T00:00:00Z` .. `9999-12-31T23:59:59.999999999Z`).
+/// `chrono::DateTime` represents a wider range; passing such a value through
+/// unconditionally produces protojson this crate's own deserializer then
+/// rejects, so it is rejected here rather than converted (mirrors
+/// [`from_proto_timestamp`], which is likewise fallible).
+pub fn to_proto_timestamp(dt: &chrono::DateTime<chrono::Utc>) -> Option<prost_types::Timestamp> {
+    let seconds = dt.timestamp();
+    if !(PROTO_TIMESTAMP_MIN_SECONDS..=PROTO_TIMESTAMP_MAX_SECONDS).contains(&seconds) {
+        return None;
     }
+    Some(prost_types::Timestamp {
+        seconds,
+        nanos: dt.timestamp_subsec_nanos() as i32,
+    })
 }
 
 /// Convert `prost_types::Timestamp` to `chrono::DateTime<Utc>`.
@@ -249,7 +265,7 @@ pub fn to_proto_task_status(s: &TaskStatus) -> proto::TaskStatus {
     proto::TaskStatus {
         state: to_proto_task_state(&s.state),
         message: s.message.as_ref().map(to_proto_message),
-        timestamp: s.timestamp.as_ref().map(to_proto_timestamp),
+        timestamp: s.timestamp.as_ref().and_then(to_proto_timestamp),
     }
 }
 
@@ -488,7 +504,10 @@ pub fn to_proto_list_tasks_request(r: &ListTasksRequest) -> proto::ListTasksRequ
         page_size: r.page_size,
         page_token: r.page_token.clone().unwrap_or_default(),
         history_length: r.history_length,
-        status_timestamp_after: r.status_timestamp_after.as_ref().map(to_proto_timestamp),
+        status_timestamp_after: r
+            .status_timestamp_after
+            .as_ref()
+            .and_then(to_proto_timestamp),
         include_artifacts: r.include_artifacts,
     }
 }
@@ -2042,10 +2061,43 @@ mod tests {
     fn test_timestamp_roundtrip() {
         use chrono::Utc;
         let now = Utc::now();
-        let proto = to_proto_timestamp(&now);
+        let proto = to_proto_timestamp(&now).expect("current time is within proto range");
         let back = from_proto_timestamp(&proto).unwrap();
         // Compare to microsecond level (proto loses sub-nanosecond)
         assert_eq!(now.timestamp(), back.timestamp());
+    }
+
+    #[test]
+    fn test_to_proto_timestamp_rejects_out_of_range() {
+        // Regression for #261: a chrono value beyond google.protobuf.Timestamp's
+        // range must not silently convert into unparseable protojson.
+        let too_late = chrono::DateTime::from_timestamp(300_000_000_000, 0).unwrap();
+        assert!(to_proto_timestamp(&too_late).is_none());
+        // Both inclusive boundaries still convert.
+        let max = chrono::DateTime::from_timestamp(PROTO_TIMESTAMP_MAX_SECONDS, 0).unwrap();
+        let min = chrono::DateTime::from_timestamp(PROTO_TIMESTAMP_MIN_SECONDS, 0).unwrap();
+        assert!(to_proto_timestamp(&max).is_some());
+        assert!(to_proto_timestamp(&min).is_some());
+    }
+
+    #[test]
+    fn test_task_status_out_of_range_timestamp_roundtrips() {
+        // The exact class of value fuzz target 2 (#238) surfaced: an out-of-range
+        // status timestamp must drop to None rather than yield a TaskStatus that
+        // this crate can serialize but not read back.
+        let ts = TaskStatus {
+            state: TaskState::Working,
+            message: None,
+            timestamp: chrono::DateTime::from_timestamp(4_650_000_000_000, 0),
+        };
+        assert!(ts.timestamp.is_some(), "chrono represents the wide value");
+        let proto = to_proto_task_status(&ts);
+        assert!(
+            proto.timestamp.is_none(),
+            "out-of-range timestamp is dropped, not emitted"
+        );
+        let back = from_proto_task_status(&proto);
+        assert!(back.timestamp.is_none());
     }
 
     #[test]
