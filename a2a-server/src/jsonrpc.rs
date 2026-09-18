@@ -63,6 +63,10 @@ async fn handle_jsonrpc<H: RequestHandler>(
         return error_response(id, A2AError::invalid_request("invalid jsonrpc version"));
     }
 
+    if let Err(error) = check_a2a_version(&params) {
+        return error_response(id, error);
+    }
+
     if methods::is_streaming(method) {
         return handle_streaming_request(&state, &params, &request).await;
     }
@@ -242,6 +246,30 @@ fn parse_error(e: impl std::fmt::Display) -> A2AError {
         code: error_code::PARSE_ERROR,
         message: format!("invalid params: {e}"),
         details: None,
+    }
+}
+
+/// The major version this build implements (§3.6.2). Minor is accepted
+/// unconditionally since nothing here branches on it.
+const SUPPORTED_MAJOR_VERSION: u32 = 1;
+
+/// Mirrors a2acli's own `parse_protocol_version`: tolerant of a bare major,
+/// extra trailing components, and surrounding whitespace.
+fn parse_major_version(value: &str) -> Option<u32> {
+    value.trim().split('.').next()?.parse().ok()
+}
+
+/// §3.6.2: reject a request whose `A2A-Version` header names an
+/// unsupported major version. An absent header is left alone -- §3.6.1
+/// only requires *sending* it, and this server has one version to speak
+/// regardless.
+fn check_a2a_version(params: &ServiceParams) -> Result<(), A2AError> {
+    let Some(requested) = params.get("a2a-version").and_then(|v| v.first()) else {
+        return Ok(());
+    };
+    match parse_major_version(requested) {
+        Some(SUPPORTED_MAJOR_VERSION) => Ok(()),
+        _ => Err(A2AError::version_not_supported(requested)),
     }
 }
 
@@ -672,6 +700,78 @@ mod tests {
             "Bearer jsonrpc-token",
         );
         assert_header_captured(&captured, "send_message", "x-tenant-id", "acme");
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_a2a_version_is_rejected() {
+        let app = make_app();
+        let rpc = JsonRpcRequest::new(
+            JsonRpcId::Number(1),
+            methods::SEND_MESSAGE,
+            Some(serde_json::json!({
+                "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+            })),
+        );
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("a2a-version", "99.0")
+            .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let parsed: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed.error.expect("expected an error").code,
+            error_code::VERSION_NOT_SUPPORTED
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_a2a_version_is_accepted() {
+        let resp = post_jsonrpc(
+            make_app(),
+            methods::SEND_MESSAGE,
+            serde_json::json!({
+                "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+            }),
+        )
+        .await;
+        assert!(
+            resp.error.is_none(),
+            "expected success, got {:?}",
+            resp.error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_supported_a2a_version_is_accepted() {
+        let app = make_app();
+        let rpc = JsonRpcRequest::new(
+            JsonRpcId::Number(1),
+            methods::SEND_MESSAGE,
+            Some(serde_json::json!({
+                "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+            })),
+        );
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("a2a-version", "1.0")
+            .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let parsed: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            parsed.error.is_none(),
+            "expected success, got {:?}",
+            parsed.error
+        );
     }
 
     #[tokio::test]
