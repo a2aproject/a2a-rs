@@ -17,7 +17,8 @@ use a2a_client::agent_card::AgentCardResolver;
 use a2a_grpc::{GrpcHandler, GrpcTransportFactory};
 use a2a_pb::proto::a2a_service_server::A2aServiceServer;
 use a2a_server::{
-    DefaultRequestHandler, InMemoryPushConfigStore, InMemoryTaskStore, StaticAgentCard,
+    DefaultRequestHandler, HttpPushSender, HttpPushSenderConfig, InMemoryPushConfigStore,
+    InMemoryTaskStore, StaticAgentCard,
 };
 use async_trait::async_trait;
 use axum::Router;
@@ -655,7 +656,17 @@ impl ItkHandler {
         // which is what the ACTS reduced pass is checking for.
         let mut inner = DefaultRequestHandler::new(ItkExecutor, InMemoryTaskStore::new());
         if advertises_push {
-            inner = inner.with_push_config_store(InMemoryPushConfigStore::new());
+            // The ITK/interop harness's own webhook receiver runs on
+            // 127.0.0.1, which HttpPushSender's default SSRF guard blocks --
+            // appropriate for a real deployment, not for this reference
+            // agent talking to a test harness on loopback.
+            inner = inner.with_push_notifications(
+                InMemoryPushConfigStore::new(),
+                HttpPushSender::new(Some(HttpPushSenderConfig {
+                    validate_urls: false,
+                    ..Default::default()
+                })),
+            );
         }
 
         Self {
