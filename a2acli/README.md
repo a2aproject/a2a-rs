@@ -201,6 +201,26 @@ get` is one-shot by default — add `--wait` to poll it the same way. Tune the
 loop with `--poll-interval` (default `2s`) and `--timeout` (default `30s`,
 after which the command exits with a timeout error).
 
+### Stream resumption
+
+`task subscribe` reconnects when its connection is cut before the task
+settles — an SSE stream held open for a long-running task will eventually be
+dropped by a proxy, a load balancer, or a laptop going to sleep, and a dropped
+connection looks identical to a finished task unless something distinguishes
+them. `--poll-interval` and `--timeout` apply here too: `--poll-interval` is
+the delay between reconnect attempts, and `--timeout` bounds the reconnection
+budget cumulatively across all of them — not any single attempt, and not a
+healthy stream that never disconnects at all. Each attempt is reported on
+stderr; stdout carries only the protocol events.
+
+Reconnecting never issues a `task get`: the server's first event after
+resuming is the full current `Task`, which is enough to reconcile state
+through the protocol itself. If that reconciling event reports the same
+state the connection had already reached before the cut, it is suppressed
+rather than printed a second time — under `-o json --stream` the output is
+JSONL a consumer reads incrementally, and a duplicate `Task` line there would
+look like a second, spurious transition.
+
 ### Message parts
 
 A message can carry more than one part, built from repeatable,

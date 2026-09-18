@@ -1223,10 +1223,10 @@ async fn run_task_command(
             let stream = client
                 .subscribe_to_task(&SubscribeToTaskRequest {
                     id: command.id.clone(),
-                    tenant,
+                    tenant: tenant.clone(),
                 })
                 .await?;
-            consume_stream(client, stream, cli).await?;
+            subscribe_with_resumption(client, stream, command.id.clone(), tenant, cli).await?;
         }
         TaskCommand::PushConfig { command } => {
             run_push_config_command(cli, matches, command).await?;
@@ -2982,11 +2982,36 @@ async fn finish_client_call<T: a2a_client::Transport, V>(
     }
 }
 
-/// Consume a streamed event sequence to completion, printing each event as
-/// it arrives. Under `-o json`, always emits JSONL — one complete, compact
-/// object per line, flushed as produced — regardless of `--compact`, which
-/// only affects the single-document form (§11.3). Under `-o text`, each
-/// event is rendered in the same field-and-block form as a one-shot result.
+/// Prints one streamed value per §11.1/§11.2's output-mode rules.
+fn print_stream_value<V: Serialize + TextRender>(value: &V, cli: &Cli) -> Result<(), CliError> {
+    match cli.output {
+        OutputFormat::Text => {
+            println!("{}", value.render_text());
+            Ok(())
+        }
+        OutputFormat::Json => serde_json::to_string(value)
+            .map(|line| println!("{line}"))
+            .map_err(CliError::from),
+    }
+}
+
+/// Warns, prints, and destroys `client` first if printing fails.
+async fn print_or_destroy<T: a2a_client::Transport, V: Serialize + TextRender + TaskOutcome>(
+    client: &A2AClient<T>,
+    value: &V,
+    cli: &Cli,
+) -> Result<(), CliError> {
+    value.warn_outcome();
+    if let Err(error) = print_stream_value(value, cli) {
+        let _ = client.destroy().await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Consumes a streamed event sequence to completion, printing each event.
+/// Used by `send --stream`, which does not reconnect -- see
+/// [`subscribe_with_resumption`] for `task subscribe`, which does.
 async fn consume_stream<T: a2a_client::Transport, V: Serialize + TextRender + TaskOutcome>(
     client: A2AClient<T>,
     mut stream: BoxStream<'static, Result<V, A2AError>>,
@@ -2995,20 +3020,7 @@ async fn consume_stream<T: a2a_client::Transport, V: Serialize + TextRender + Ta
     loop {
         match stream.next().await {
             Some(Ok(value)) => {
-                value.warn_outcome();
-                let printed = match cli.output {
-                    OutputFormat::Text => {
-                        println!("{}", value.render_text());
-                        Ok(())
-                    }
-                    OutputFormat::Json => serde_json::to_string(&value)
-                        .map(|line| println!("{line}"))
-                        .map_err(CliError::from),
-                };
-                if let Err(error) = printed {
-                    let _ = client.destroy().await;
-                    return Err(error);
-                }
+                print_or_destroy(&client, &value, cli).await?;
             }
             Some(Err(error)) => {
                 let _ = client.destroy().await;
@@ -3017,6 +3029,103 @@ async fn consume_stream<T: a2a_client::Transport, V: Serialize + TextRender + Ta
             None => {
                 client.destroy().await?;
                 return Ok(());
+            }
+        }
+    }
+}
+
+/// The task state a `StreamResponse` carries, if any.
+fn stream_response_state(value: &StreamResponse) -> Option<TaskState> {
+    match value {
+        StreamResponse::Task(task) => Some(task.status.state.clone()),
+        StreamResponse::StatusUpdate(event) => Some(event.status.state.clone()),
+        StreamResponse::Message(_) | StreamResponse::ArtifactUpdate(_) => None,
+    }
+}
+
+/// `task subscribe` (§9.4, `A2ACLI_TASK_SUBSCRIBE_002`): reconnects when the
+/// stream ends before the task settles, using the last state observed to
+/// tell a cut from a finish. The reconnect's first event reconciles state
+/// (no `task get` needed) and is suppressed if unchanged from before the
+/// cut. `--timeout` bounds reconnection cumulatively, not a healthy stream.
+async fn subscribe_with_resumption<T: a2a_client::Transport>(
+    client: A2AClient<T>,
+    mut stream: BoxStream<'static, Result<StreamResponse, A2AError>>,
+    task_id: String,
+    tenant: Option<String>,
+    cli: &Cli,
+) -> Result<(), CliError> {
+    let deadline = tokio::time::Instant::now() + cli.timeout;
+    let mut last_state: Option<TaskState> = None;
+    let mut attempt: u32 = 0;
+
+    loop {
+        let state_before_this_attempt = last_state.clone();
+        let mut first_event = attempt > 0;
+
+        loop {
+            match stream.next().await {
+                Some(Ok(value)) => {
+                    let state = stream_response_state(&value);
+                    if let Some(state) = &state {
+                        last_state = Some(state.clone());
+                    }
+
+                    let is_unchanged_reconciliation =
+                        first_event && state.is_some() && state == state_before_this_attempt;
+                    first_event = false;
+                    if is_unchanged_reconciliation {
+                        continue;
+                    }
+
+                    print_or_destroy(&client, &value, cli).await?;
+                }
+                Some(Err(error)) => {
+                    let _ = client.destroy().await;
+                    return Err(error.into());
+                }
+                None => break,
+            }
+        }
+
+        if last_state.as_ref().is_some_and(is_settled) {
+            client.destroy().await?;
+            return Ok(());
+        }
+
+        // Retries both a cut and a failed re-subscribe under one budget.
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                let _ = client.destroy().await;
+                return Err(CliError::Timeout {
+                    task_id: task_id.clone(),
+                    timeout: cli.timeout,
+                });
+            }
+            attempt += 1;
+            eprintln!(
+                "warning: subscription to task {task_id} was interrupted before it settled; \
+                 reconnecting (attempt {attempt})..."
+            );
+            tokio::time::sleep(
+                cli.poll_interval
+                    .min(deadline.saturating_duration_since(now)),
+            )
+            .await;
+
+            match client
+                .subscribe_to_task(&SubscribeToTaskRequest {
+                    id: task_id.clone(),
+                    tenant: tenant.clone(),
+                })
+                .await
+            {
+                Ok(new_stream) => {
+                    stream = new_stream;
+                    break;
+                }
+                Err(_) => continue,
             }
         }
     }
@@ -3845,6 +3954,29 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, CliError::Json(_)));
+    }
+
+    /// `print_or_destroy` is the print-failure path both `consume_stream`
+    /// and `subscribe_with_resumption` share; exercised directly since
+    /// `StreamResponse`'s own `Serialize` impl never fails for a real
+    /// value, so this path is otherwise unreachable through
+    /// `subscribe_with_resumption` specifically.
+    #[tokio::test]
+    async fn test_print_or_destroy_reports_json_error() {
+        let client = make_test_client(None);
+        let err = print_or_destroy(&client, &FailingSerialize, &json_cli())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CliError::Json(_)));
+    }
+
+    #[tokio::test]
+    async fn test_print_or_destroy_succeeds_in_text_mode() {
+        let client = make_test_client(None);
+        print_or_destroy(&client, &FailingSerialize, &text_cli())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
