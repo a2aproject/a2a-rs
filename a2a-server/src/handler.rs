@@ -626,6 +626,14 @@ impl DefaultRequestHandler {
         if stored.is_none() && req.message.task_id.is_some() {
             return Err(A2AError::task_not_found(&task_id));
         }
+        if stored
+            .as_ref()
+            .is_some_and(|task| task.status.state.is_terminal())
+        {
+            return Err(A2AError::unsupported_operation(format!(
+                "task {task_id} has already reached a terminal state"
+            )));
+        }
 
         // A2A §3.4.3: reject a mismatching contextId/taskId pair, and infer
         // contextId from the task when only taskId is given.
@@ -1784,6 +1792,33 @@ mod tests {
             handler.task_store.get("t-absent").await.unwrap().is_none(),
             "the rejected id must not have been created"
         );
+    }
+
+    #[tokio::test]
+    async fn test_send_message_to_terminal_task_is_rejected() {
+        install_crypto_provider();
+        let handler = make_handler();
+        handler
+            .task_store
+            .create(Task {
+                id: "t-done".into(),
+                context_id: "c-done".into(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let err = handler
+            .send_message(&ServiceParams::new(), send_req(Some("t-done"), None))
+            .await
+            .expect_err("a follow-up to a terminal task must not be accepted");
+        assert_eq!(err.code, error_code::UNSUPPORTED_OPERATION);
     }
 
     #[tokio::test]
