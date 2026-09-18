@@ -935,12 +935,25 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.authorize(params, Some(&req.id))?;
         self.require_streaming()?;
-        let (receiver, snapshot_task, sequence) = self
-            .execution_manager
-            .resubscribe(&req.id)
-            .await
-            .ok_or_else(|| A2AError::task_not_found(&req.id))?;
-        Ok(subscription_stream(receiver, snapshot_task, sequence))
+        if let Some((receiver, snapshot_task, sequence)) =
+            self.execution_manager.resubscribe(&req.id).await
+        {
+            return Ok(subscription_stream(receiver, snapshot_task, sequence));
+        }
+
+        // A registry miss also happens once a task finishes and its
+        // execution is cleaned up, so it doesn't by itself mean the task
+        // never existed -- check the store to tell the two apart before
+        // reporting TaskNotFoundError.
+        if let Some(task) = self.task_store.get(&req.id).await? {
+            if task.status.state.is_terminal() {
+                return Err(A2AError::unsupported_operation(format!(
+                    "task {} has already reached a terminal state",
+                    req.id
+                )));
+            }
+        }
+        Err(A2AError::task_not_found(&req.id))
     }
 
     async fn create_push_config(
@@ -2320,6 +2333,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_subscribe_to_terminal_task_is_unsupported_not_not_found() {
+        let handler = make_handler();
+        handler
+            .task_store
+            .create(Task {
+                id: "t-done".into(),
+                context_id: "c-done".into(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let result = handler
+            .subscribe_to_task(
+                &ServiceParams::new(),
+                SubscribeToTaskRequest {
+                    id: "t-done".into(),
+                    tenant: None,
+                },
+            )
+            .await;
+        match result {
+            Ok(_) => panic!("expected subscribe_to_task to fail"),
+            Err(error) => assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION),
+        }
+    }
+
+    #[tokio::test]
     async fn test_send_message_return_immediately_allows_resubscribe() {
         use futures::StreamExt;
 
@@ -2393,7 +2440,7 @@ mod tests {
             .await;
         match result {
             Ok(_) => panic!("expected subscribe_to_task to fail after completion"),
-            Err(error) => assert_eq!(error.code, error_code::TASK_NOT_FOUND),
+            Err(error) => assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION),
         }
     }
 
