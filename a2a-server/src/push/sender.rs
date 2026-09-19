@@ -68,16 +68,7 @@ impl HttpPushSender {
             builder = builder
                 .dns_resolver(Arc::new(SsrfGuardedResolver))
                 .no_proxy()
-                .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                    if attempt.previous().len() >= 10 {
-                        return attempt.stop();
-                    }
-                    if validate_push_url(attempt.url().as_str()).is_err() {
-                        attempt.error("push URL redirect target is blocked")
-                    } else {
-                        attempt.follow()
-                    }
-                }));
+                .redirect(ssrf_guarded_redirect_policy());
         }
         let client = builder.build().expect("failed to create HTTP client");
         HttpPushSender {
@@ -310,6 +301,27 @@ impl Resolve for SsrfGuardedResolver {
             Ok(Box::new(allowed.into_iter()) as Addrs)
         })
     }
+}
+
+/// The redirect policy installed when `validate_urls` is set: re-screens
+/// each hop with [`validate_push_url`], since a redirect to a blocked
+/// literal IP skips DNS entirely and never reaches [`SsrfGuardedResolver`].
+///
+/// Split out from [`HttpPushSender::new`] so a test can attach it to a
+/// client on its own, without the resolver -- `reqwest::redirect::Attempt`
+/// has no public constructor, so driving a real HTTP redirect through this
+/// policy is the only way to exercise it.
+fn ssrf_guarded_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.stop();
+        }
+        if validate_push_url(attempt.url().as_str()).is_err() {
+            attempt.error("push URL redirect target is blocked")
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
 #[cfg(test)]
@@ -768,5 +780,73 @@ mod tests {
         assert!(validate_push_url("http://169.254.169.254/latest/meta-data/").is_err());
         assert!(validate_push_url("http://[::1]/").is_err());
         assert!(validate_push_url("https://example.com/next").is_ok());
+    }
+
+    /// Runs a local server that redirects `/` to `location`, so a real
+    /// `reqwest::redirect::Attempt` reaches [`ssrf_guarded_redirect_policy`]
+    /// -- the type has no public constructor, so this is the only way to
+    /// drive it without faking reqwest's internals.
+    async fn spawn_redirect_server(location: String) -> String {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let location = location.clone();
+                async move { axum::response::Redirect::temporary(&location) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn test_redirect_policy_blocks_a_redirect_to_a_disallowed_target() {
+        let server_url =
+            spawn_redirect_server("http://169.254.169.254/latest/meta-data/".into()).await;
+        let client = reqwest::Client::builder()
+            .redirect(ssrf_guarded_redirect_policy())
+            .build()
+            .unwrap();
+        let err = client
+            .get(&server_url)
+            .send()
+            .await
+            .expect_err("a redirect to a blocked target must fail");
+        assert!(err.is_redirect(), "expected a redirect-policy error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_redirect_policy_rejects_a_self_redirect_loop_immediately() {
+        // A server that redirects to itself is a loopback target, so the
+        // per-hop block check (not the separate 10-hop cap, which nothing
+        // here can safely reach without a real allowed target to bounce
+        // through) is what stops it -- on the very first hop.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let self_url = format!("http://{addr}/");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let self_url = self_url.clone();
+                async move { axum::response::Redirect::temporary(&self_url) }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(ssrf_guarded_redirect_policy())
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("a loopback self-redirect must be refused, not followed");
+        assert!(err.is_redirect(), "expected a redirect-policy error: {err}");
     }
 }
