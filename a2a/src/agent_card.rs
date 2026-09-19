@@ -17,11 +17,14 @@ use crate::types::{ProtocolVersion, TRANSPORT_PROTOCOL_GRPC, TransportProtocol};
 #[serde(rename_all = "camelCase")]
 pub struct AgentCard {
     pub name: String,
+    #[serde(default)]
     pub description: String,
     pub version: String,
     pub supported_interfaces: Vec<AgentInterface>,
     pub capabilities: AgentCapabilities,
+    #[serde(default)]
     pub default_input_modes: Vec<String>,
+    #[serde(default)]
     pub default_output_modes: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_vec_null_as_default")]
     pub skills: Vec<AgentSkill>,
@@ -651,6 +654,31 @@ mod tests {
 
         let card: AgentCard = serde_json::from_value(json).unwrap();
         assert!(card.skills.is_empty());
+    }
+
+    /// #275 (SHOULD-level): `description`, `defaultInputModes` and
+    /// `defaultOutputModes` should default when absent rather than failing
+    /// deserialization outright.
+    #[test]
+    fn test_agent_card_deserialize_defaults_optional_fields() {
+        let json = serde_json::json!({
+            "name": "Test Agent",
+            "version": "1.0.0",
+            "supportedInterfaces": [
+                {
+                    "url": "http://localhost:3000",
+                    "protocolBinding": "JSONRPC",
+                    "protocolVersion": crate::VERSION
+                }
+            ],
+            "capabilities": {},
+            "skills": []
+        });
+
+        let card: AgentCard = serde_json::from_value(json).unwrap();
+        assert_eq!(card.description, "");
+        assert!(card.default_input_modes.is_empty());
+        assert!(card.default_output_modes.is_empty());
     }
 
     #[test]

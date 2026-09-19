@@ -326,14 +326,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_card_omitting_description_or_the_default_modes_is_rejected() {
-        // Not a harness limitation — an SDK finding, and the reason
-        // CLIENT-CAP-001 and CLIENT-AUTH-001 fail here while passing on the
-        // other SDKs. `AgentCard::description`, `default_input_modes` and
-        // `default_output_modes` carry no `#[serde(default)]`, so this SDK
-        // requires fields the corpus's canonical cards omit. Pinned rather
-        // than worked around: papering over it in the fixture would report a
-        // conformance the client has not got.
+    async fn a_card_omitting_description_or_the_default_modes_parses() {
+        // #275: `AgentCard::description`, `default_input_modes` and
+        // `default_output_modes` now carry `#[serde(default)]`, so a card that
+        // omits them parses and those fields fall back to their defaults
+        // instead of being rejected. Previously this SDK required fields the
+        // corpus's canonical cards omit, which is why CLIENT-CAP-001 and
+        // CLIENT-AUTH-001 failed here while passing on the other SDKs.
         let parsed = parse(
             "get_agent_card",
             json!({
@@ -346,13 +345,14 @@ mod tests {
             }),
         )
         .await;
-        assert!(
-            parsed["error"]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("failed to parse agent card"),
+        assert_eq!(
+            parsed["name"],
+            json!("Capability Gated Agent"),
             "got {parsed}"
         );
+        assert_eq!(parsed["description"], json!(""), "got {parsed}");
+        assert_eq!(parsed["defaultInputModes"], json!([]), "got {parsed}");
+        assert_eq!(parsed["defaultOutputModes"], json!([]), "got {parsed}");
     }
 
     #[tokio::test]
