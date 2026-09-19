@@ -213,7 +213,14 @@ async fn send_push_notifications(
     Ok(())
 }
 
-async fn save_task(task_store: &dyn crate::TaskStore, task: Task) -> Result<Task, A2AError> {
+async fn save_task(task_store: &dyn crate::TaskStore, mut task: Task) -> Result<Task, A2AError> {
+    // DM-SERIAL-001: a persisted/returned task status must carry a timestamp.
+    // This is the single persistence chokepoint for executor events, so
+    // backfilling here covers the task-snapshot and status-update paths alike,
+    // while preserving any timestamp the executor already supplied.
+    if task.status.timestamp.is_none() {
+        task.status.timestamp = Some(chrono::Utc::now());
+    }
     match task_store.update(task.clone()).await {
         Ok(_) => Ok(task),
         Err(error) if error.code == error_code::TASK_NOT_FOUND => {
@@ -3280,6 +3287,172 @@ mod tests {
             );
         }
     }
+    /// DM-SERIAL-001 (#274): a status update whose status omits a timestamp
+    /// must be backfilled before the task is persisted, so a returned task
+    /// never carries a timestamp-less status.
+    #[tokio::test]
+    async fn test_status_update_backfills_missing_timestamp() {
+        let store = InMemoryTaskStore::new();
+        store
+            .create(Task {
+                id: "t-backfill".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Submitted,
+                    message: None,
+                    timestamp: Some(chrono::Utc::now()),
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+
+        let updated = apply_event_to_task(
+            &store,
+            None,
+            &StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: "t-backfill".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .expect("status update yields a task");
+
+        assert_eq!(updated.status.state, TaskState::Working);
+        assert!(
+            updated.status.timestamp.is_some(),
+            "missing status timestamp must be backfilled"
+        );
+    }
+
+    /// A timestamp supplied by the executor is authoritative and must be kept
+    /// verbatim, not overwritten by the backfill.
+    #[tokio::test]
+    async fn test_status_update_preserves_supplied_timestamp() {
+        let store = InMemoryTaskStore::new();
+        store
+            .create(Task {
+                id: "t-preserve".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Submitted,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+
+        let supplied = chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let updated = apply_event_to_task(
+            &store,
+            None,
+            &StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: "t-preserve".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: Some(supplied),
+                },
+                metadata: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .expect("status update yields a task");
+
+        assert_eq!(updated.status.timestamp, Some(supplied));
+    }
+
+    /// The task-snapshot arm persists through the same `save_task` chokepoint,
+    /// so an executor `Task` event whose status omits a timestamp must also be
+    /// backfilled (DM-SERIAL-001, #274).
+    #[tokio::test]
+    async fn test_task_snapshot_backfills_missing_timestamp() {
+        let store = InMemoryTaskStore::new();
+
+        let returned = apply_event_to_task(
+            &store,
+            None,
+            &StreamResponse::Task(Task {
+                id: "t-snapshot".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .expect("task event yields a task");
+
+        assert!(
+            returned.status.timestamp.is_some(),
+            "missing status timestamp must be backfilled on the task-snapshot path"
+        );
+        let persisted = store.get("t-snapshot").await.unwrap().unwrap();
+        assert!(
+            persisted.status.timestamp.is_some(),
+            "the persisted task must carry a timestamp"
+        );
+    }
+
+    /// A timestamp already present on a task snapshot is authoritative and must
+    /// survive the persistence chokepoint unchanged.
+    #[tokio::test]
+    async fn test_task_snapshot_preserves_supplied_timestamp() {
+        let store = InMemoryTaskStore::new();
+
+        let supplied = chrono::DateTime::parse_from_rfc3339("2021-06-07T08:09:10Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let returned = apply_event_to_task(
+            &store,
+            None,
+            &StreamResponse::Task(Task {
+                id: "t-snapshot-kept".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: Some(supplied),
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .expect("task event yields a task");
+
+        assert_eq!(returned.status.timestamp, Some(supplied));
+        let persisted = store.get("t-snapshot-kept").await.unwrap().unwrap();
+        assert_eq!(persisted.status.timestamp, Some(supplied));
+    }
+
     // §12.4 / §10.1 (#204): the extended Agent Card.
 
     fn extended_card(name: &str) -> AgentCard {
