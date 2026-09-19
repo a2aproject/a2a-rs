@@ -14,6 +14,27 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.2.1...a2a-cli-v0.3.0) - 2026-09-17
+
+### Added
+
+- *(a2acli)* card get --validate against the A2A JSON schema ([#263](https://github.com/a2aproject/a2a-rs/pull/263))
+- *(a2acli)* log raw wire messages under --debug, with unconditional redaction ([#256](https://github.com/a2aproject/a2a-rs/pull/256))
+- *(a2acli)* verify card capabilities before a gated operation ([#258](https://github.com/a2aproject/a2a-rs/pull/258))
+- *(a2acli)* add completion <shell> for shell completion scripts ([#255](https://github.com/a2aproject/a2a-rs/pull/255))
+- *(fuzz)* protojson round trip and Agent Card fuzzing (#238 Phase 2) ([#262](https://github.com/a2aproject/a2a-rs/pull/262))
+- *(fuzz)* Phase 3 validation targets + weekly run ([#238](https://github.com/a2aproject/a2a-rs/pull/238)) ([#264](https://github.com/a2aproject/a2a-rs/pull/264))
+
+### Fixed
+
+- *(a2a-server)* [**breaking**] enforce the spec's taskId and contextId rules ([#249](https://github.com/a2aproject/a2a-rs/pull/249))
+- *(a2a-server)* [**breaking**] require TaskStore::begin_cancel instead of defaulting it ([#252](https://github.com/a2aproject/a2a-rs/pull/252))
+- *(server)* protect terminal task states and make cancel transition atomic ([#126](https://github.com/a2aproject/a2a-rs/pull/126))
+
+### Other
+
+- add the A2A Contributors copyright line to every header ([#260](https://github.com/a2aproject/a2a-rs/pull/260))
+
 ## [0.2.1](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.2.0...a2a-cli-v0.2.1) - 2026-09-15
 
 ### Added
