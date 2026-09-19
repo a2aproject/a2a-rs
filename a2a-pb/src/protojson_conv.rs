@@ -276,4 +276,16 @@ mod tests {
             Some(&Value::String("page-2".to_string()))
         );
     }
+
+    /// `serde_json::to_value` on a struct always yields `Value::Object`, so
+    /// `to_value` never reaches the non-object case in practice -- but
+    /// `normalize_json` is a public trait method, not an internal that gets
+    /// to lean on that invariant, so its behavior on the rest of `Value` is
+    /// still part of its contract and worth pinning directly.
+    #[test]
+    fn test_list_tasks_response_normalize_json_ignores_a_non_object_value() {
+        let mut not_an_object = Value::Null;
+        ListTasksResponse::normalize_json(&mut not_an_object);
+        assert_eq!(not_an_object, Value::Null);
+    }
 }
