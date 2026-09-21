@@ -82,7 +82,7 @@ slim_service = { package = "agntcy-slim-service", version = "0.12.10", features 
     "session",
 ] }
 slim_datapath = { package = "agntcy-slim-datapath", version = "0.18.6" }
-slim_auth = { package = "agntcy-slim-auth", version = "0.15.3" }
+slim_auth = { package = "agntcy-slim-auth", version = "0.16.0" }
 
 # Utilities
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

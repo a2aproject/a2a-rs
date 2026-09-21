@@ -2,6 +2,9 @@ name: Publish Project Coverage to Codecov
 
 on:
   # Required checks must report on queue entries too, or every entry stalls.
+  # pull_request has no itk path-ignore for the same reason: the merge queue
+  # won't accept an entry until every required check has already reported on
+  # the PR itself (#280), so an itk-only PR needs a real run here too.
   merge_group:
   push:
     branches: [main]
@@ -9,8 +12,6 @@ on:
       - 'itk/**'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - 'itk/**'
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,12 +34,12 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install just
-        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
           tool: just
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
           tool: cargo-llvm-cov
 
@@ -46,7 +47,7 @@ jobs:
         run: just coverage-lcov
 
       - name: Upload combined coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         with:
           files: coverage/lcov.info
           flags: rust

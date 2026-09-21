@@ -458,6 +458,7 @@ pub struct DefaultRequestHandler {
     push_config_store: Option<Arc<dyn crate::PushConfigStore>>,
     push_sender: Option<Arc<crate::HttpPushSender>>,
     capabilities: AgentCapabilities,
+    default_input_modes: Vec<String>,
     authorizer: Option<Arc<dyn RequestAuthorizer>>,
     extended_agent_card: Option<Arc<dyn ExtendedAgentCardResolver>>,
 }
@@ -492,6 +493,7 @@ impl DefaultRequestHandler {
             push_config_store: None,
             push_sender: None,
             capabilities: AgentCapabilities::default(),
+            default_input_modes: Vec::new(),
             authorizer: None,
             extended_agent_card: None,
         }
@@ -560,6 +562,33 @@ impl DefaultRequestHandler {
         self
     }
 
+    /// Declares the media types incoming message parts may use (§5.1's
+    /// `defaultInputModes`). Empty (the default) means unrestricted, so
+    /// embedders that never call this see no change in behavior.
+    pub fn with_default_input_modes(mut self, modes: impl Into<Vec<String>>) -> Self {
+        self.default_input_modes = modes.into();
+        self
+    }
+
+    /// A part with a declared, non-empty media type that isn't among the
+    /// advertised `defaultInputModes` is rejected; a part that declares none
+    /// is unrestricted, and so is every part when no modes were declared.
+    fn validate_content_types(&self, message: &Message) -> Result<(), A2AError> {
+        if self.default_input_modes.is_empty() {
+            return Ok(());
+        }
+        let supported = message.parts.iter().all(|part| {
+            part.media_type.as_deref().is_none_or(|media_type| {
+                media_type.is_empty() || self.default_input_modes.iter().any(|m| m == media_type)
+            })
+        });
+        if supported {
+            Ok(())
+        } else {
+            Err(A2AError::content_type_not_supported())
+        }
+    }
+
     /// §13.3: refuse a capability-gated operation the card does not declare.
     ///
     /// `None` means "not restricted", not "refused". `AgentCapabilities::
@@ -625,6 +654,14 @@ impl DefaultRequestHandler {
         let stored = self.task_store.get(&task_id).await?;
         if stored.is_none() && req.message.task_id.is_some() {
             return Err(A2AError::task_not_found(&task_id));
+        }
+        if stored
+            .as_ref()
+            .is_some_and(|task| task.status.state.is_terminal())
+        {
+            return Err(A2AError::unsupported_operation(format!(
+                "task {task_id} has already reached a terminal state"
+            )));
         }
 
         // A2A §3.4.3: reject a mismatching contextId/taskId pair, and infer
@@ -699,6 +736,7 @@ impl DefaultRequestHandler {
         req: SendMessageRequest,
         include_task_snapshot_in_context: bool,
     ) -> Result<(TaskId, BoxStream<'static, Result<StreamResponse, A2AError>>), A2AError> {
+        self.validate_content_types(&req.message)?;
         let (task, stored_task, context_id) = self.prepare_task_for_execution(&req).await?;
         let task_id = task.id.clone();
         self.save_request_push_config(&task_id, &req).await?;
@@ -935,12 +973,25 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.authorize(params, Some(&req.id))?;
         self.require_streaming()?;
-        let (receiver, snapshot_task, sequence) = self
-            .execution_manager
-            .resubscribe(&req.id)
-            .await
-            .ok_or_else(|| A2AError::task_not_found(&req.id))?;
-        Ok(subscription_stream(receiver, snapshot_task, sequence))
+        if let Some((receiver, snapshot_task, sequence)) =
+            self.execution_manager.resubscribe(&req.id).await
+        {
+            return Ok(subscription_stream(receiver, snapshot_task, sequence));
+        }
+
+        // A registry miss also happens once a task finishes and its
+        // execution is cleaned up, so it doesn't by itself mean the task
+        // never existed -- check the store to tell the two apart before
+        // reporting TaskNotFoundError.
+        if let Some(task) = self.task_store.get(&req.id).await? {
+            if task.status.state.is_terminal() {
+                return Err(A2AError::unsupported_operation(format!(
+                    "task {} has already reached a terminal state",
+                    req.id
+                )));
+            }
+        }
+        Err(A2AError::task_not_found(&req.id))
     }
 
     async fn create_push_config(
@@ -1769,6 +1820,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_send_message_rejects_unsupported_content_type() {
+        install_crypto_provider();
+        let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
+        let mut req = send_req(None, None);
+        req.message.parts = vec![
+            Part::data(serde_json::json!({"value": "unsupported"}))
+                .with_media_type("application/x-unsupported-type-12345"),
+        ];
+        let err = handler
+            .send_message(&ServiceParams::new(), req)
+            .await
+            .expect_err("an undeclared content type must be rejected");
+        assert_eq!(err.code, error_code::CONTENT_TYPE_NOT_SUPPORTED);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_accepts_a_declared_content_type() {
+        install_crypto_provider();
+        let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
+        let mut req = send_req(None, None);
+        req.message.parts = vec![Part::text("hello").with_media_type("text/plain")];
+        handler
+            .send_message(&ServiceParams::new(), req)
+            .await
+            .expect("a declared content type must be accepted");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_allows_any_content_type_when_none_declared() {
+        install_crypto_provider();
+        let handler = make_handler();
+        let mut req = send_req(None, None);
+        req.message.parts = vec![
+            Part::data(serde_json::json!({"value": "x"})).with_media_type("application/x-anything"),
+        ];
+        handler
+            .send_message(&ServiceParams::new(), req)
+            .await
+            .expect("no declared modes means no restriction");
+    }
+
+    #[tokio::test]
     async fn test_send_message_unknown_task_id_is_not_found() {
         install_crypto_provider();
         let handler = make_handler();
@@ -1784,6 +1877,33 @@ mod tests {
             handler.task_store.get("t-absent").await.unwrap().is_none(),
             "the rejected id must not have been created"
         );
+    }
+
+    #[tokio::test]
+    async fn test_send_message_to_terminal_task_is_rejected() {
+        install_crypto_provider();
+        let handler = make_handler();
+        handler
+            .task_store
+            .create(Task {
+                id: "t-done".into(),
+                context_id: "c-done".into(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let err = handler
+            .send_message(&ServiceParams::new(), send_req(Some("t-done"), None))
+            .await
+            .expect_err("a follow-up to a terminal task must not be accepted");
+        assert_eq!(err.code, error_code::UNSUPPORTED_OPERATION);
     }
 
     #[tokio::test]
@@ -2320,6 +2440,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_subscribe_to_terminal_task_is_unsupported_not_not_found() {
+        let handler = make_handler();
+        handler
+            .task_store
+            .create(Task {
+                id: "t-done".into(),
+                context_id: "c-done".into(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let result = handler
+            .subscribe_to_task(
+                &ServiceParams::new(),
+                SubscribeToTaskRequest {
+                    id: "t-done".into(),
+                    tenant: None,
+                },
+            )
+            .await;
+        match result {
+            Ok(_) => panic!("expected subscribe_to_task to fail"),
+            Err(error) => assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION),
+        }
+    }
+
+    #[tokio::test]
     async fn test_send_message_return_immediately_allows_resubscribe() {
         use futures::StreamExt;
 
@@ -2393,7 +2547,7 @@ mod tests {
             .await;
         match result {
             Ok(_) => panic!("expected subscribe_to_task to fail after completion"),
-            Err(error) => assert_eq!(error.code, error_code::TASK_NOT_FOUND),
+            Err(error) => assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION),
         }
     }
 

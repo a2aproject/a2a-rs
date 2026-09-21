@@ -654,7 +654,8 @@ impl ItkHandler {
         // its own make the agent refuse push. Withholding the store does: the
         // handler answers `push_notification_not_supported` when it is unset,
         // which is what the ACTS reduced pass is checking for.
-        let mut inner = DefaultRequestHandler::new(ItkExecutor, InMemoryTaskStore::new());
+        let mut inner = DefaultRequestHandler::new(ItkExecutor, InMemoryTaskStore::new())
+            .with_default_input_modes(card.default_input_modes.clone());
         if advertises_push {
             // The ITK/interop harness's own webhook receiver runs on
             // 127.0.0.1, which HttpPushSender's default SSRF guard blocks --
