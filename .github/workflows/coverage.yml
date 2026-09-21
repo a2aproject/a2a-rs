@@ -2,6 +2,9 @@ name: Publish Project Coverage to Codecov
 
 on:
   # Required checks must report on queue entries too, or every entry stalls.
+  # pull_request has no itk path-ignore for the same reason: the merge queue
+  # won't accept an entry until every required check has already reported on
+  # the PR itself (#280), so an itk-only PR needs a real run here too.
   merge_group:
   push:
     branches: [main]
@@ -9,8 +12,6 @@ on:
       - 'itk/**'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - 'itk/**'
 
 env:
   CARGO_TERM_COLOR: always
