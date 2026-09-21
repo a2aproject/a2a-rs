@@ -458,6 +458,7 @@ pub struct DefaultRequestHandler {
     push_config_store: Option<Arc<dyn crate::PushConfigStore>>,
     push_sender: Option<Arc<crate::HttpPushSender>>,
     capabilities: AgentCapabilities,
+    default_input_modes: Vec<String>,
     authorizer: Option<Arc<dyn RequestAuthorizer>>,
     extended_agent_card: Option<Arc<dyn ExtendedAgentCardResolver>>,
 }
@@ -492,6 +493,7 @@ impl DefaultRequestHandler {
             push_config_store: None,
             push_sender: None,
             capabilities: AgentCapabilities::default(),
+            default_input_modes: Vec::new(),
             authorizer: None,
             extended_agent_card: None,
         }
@@ -558,6 +560,33 @@ impl DefaultRequestHandler {
     pub fn with_capabilities(mut self, capabilities: AgentCapabilities) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Declares the media types incoming message parts may use (§5.1's
+    /// `defaultInputModes`). Empty (the default) means unrestricted, so
+    /// embedders that never call this see no change in behavior.
+    pub fn with_default_input_modes(mut self, modes: impl Into<Vec<String>>) -> Self {
+        self.default_input_modes = modes.into();
+        self
+    }
+
+    /// A part with a declared, non-empty media type that isn't among the
+    /// advertised `defaultInputModes` is rejected; a part that declares none
+    /// is unrestricted, and so is every part when no modes were declared.
+    fn validate_content_types(&self, message: &Message) -> Result<(), A2AError> {
+        if self.default_input_modes.is_empty() {
+            return Ok(());
+        }
+        let supported = message.parts.iter().all(|part| {
+            part.media_type.as_deref().is_none_or(|media_type| {
+                media_type.is_empty() || self.default_input_modes.iter().any(|m| m == media_type)
+            })
+        });
+        if supported {
+            Ok(())
+        } else {
+            Err(A2AError::content_type_not_supported())
+        }
     }
 
     /// §13.3: refuse a capability-gated operation the card does not declare.
@@ -707,6 +736,7 @@ impl DefaultRequestHandler {
         req: SendMessageRequest,
         include_task_snapshot_in_context: bool,
     ) -> Result<(TaskId, BoxStream<'static, Result<StreamResponse, A2AError>>), A2AError> {
+        self.validate_content_types(&req.message)?;
         let (task, stored_task, context_id) = self.prepare_task_for_execution(&req).await?;
         let task_id = task.id.clone();
         self.save_request_push_config(&task_id, &req).await?;
@@ -1787,6 +1817,48 @@ mod tests {
             metadata: None,
             tenant: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_send_message_rejects_unsupported_content_type() {
+        install_crypto_provider();
+        let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
+        let mut req = send_req(None, None);
+        req.message.parts = vec![
+            Part::data(serde_json::json!({"value": "unsupported"}))
+                .with_media_type("application/x-unsupported-type-12345"),
+        ];
+        let err = handler
+            .send_message(&ServiceParams::new(), req)
+            .await
+            .expect_err("an undeclared content type must be rejected");
+        assert_eq!(err.code, error_code::CONTENT_TYPE_NOT_SUPPORTED);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_accepts_a_declared_content_type() {
+        install_crypto_provider();
+        let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
+        let mut req = send_req(None, None);
+        req.message.parts = vec![Part::text("hello").with_media_type("text/plain")];
+        handler
+            .send_message(&ServiceParams::new(), req)
+            .await
+            .expect("a declared content type must be accepted");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_allows_any_content_type_when_none_declared() {
+        install_crypto_provider();
+        let handler = make_handler();
+        let mut req = send_req(None, None);
+        req.message.parts = vec![
+            Part::data(serde_json::json!({"value": "x"})).with_media_type("application/x-anything"),
+        ];
+        handler
+            .send_message(&ServiceParams::new(), req)
+            .await
+            .expect("no declared modes means no restriction");
     }
 
     #[tokio::test]
