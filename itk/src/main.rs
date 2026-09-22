@@ -68,7 +68,10 @@ fn build_agent_card(http_port: u16, grpc_port: u16) -> AgentCard {
             ),
         ],
         capabilities: acts::capabilities(),
-        default_input_modes: vec!["text/plain".to_string()],
+        default_input_modes: vec![
+            "text/plain".to_string(),
+            "application/x-protobuf".to_string(),
+        ],
         default_output_modes: vec!["text/plain".to_string()],
         skills: vec![AgentSkill {
             id: "itk".to_string(),
