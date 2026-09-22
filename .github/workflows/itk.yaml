@@ -1,0 +1,70 @@
+name: ITK
+
+on:
+  # Shaped so branch protection can require this check, which is the only way
+  # it blocks anything. Both halves are load-bearing and neither is an
+  # oversight: merge_group because a required check must report on queue
+  # entries too, and an unfiltered pull_request because a required check that
+  # a path filter skips never reports at all, leaving the pull request stuck
+  # on a status that will never arrive. Same reasoning as ci.yml.
+  merge_group:
+  pull_request:
+  # Also on main: a cache is scoped to the ref that created it, so without
+  # this every launcher cache is pull-request-scoped and no pull request can
+  # share one.
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Least privilege by default; nothing is published from the PR tier. Only the
+# nightly writes, and it raises its own permissions to do so.
+permissions:
+  contents: read
+
+concurrency:
+  group: itk-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  itk:
+    name: ITK Run
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Clone a2a-itk
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: a2aproject/a2a-itk
+          ref: main
+          path: itk/a2a-itk
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build itk_service image (GHA layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: itk/a2a-itk
+          tags: itk_service:latest
+          load: true
+          cache-from: type=gha,scope=itk_service
+          cache-to: type=gha,mode=max,scope=itk_service
+
+      - name: Cache launcher peer-SDK checkouts + build outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/a2a-itk-launcher
+          key: itk-launcher-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            itk-launcher-${{ runner.os }}-
+
+      - name: Run ITK PR Suite
+        run: bash run_itk.sh
+        working-directory: itk
+        env:
+          A2A_ITK_REVISION: main
+          ITK_SKIP_BUILD: "1"
