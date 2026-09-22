@@ -68,7 +68,14 @@ fn build_agent_card(http_port: u16, grpc_port: u16) -> AgentCard {
             ),
         ],
         capabilities: acts::capabilities(),
-        default_input_modes: vec!["text/plain".to_string()],
+        // "text/plain" carries ACTS's tck-* text commands; "application/x-protobuf"
+        // carries this harness's own encoded traversal instructions (wrap_instruction)
+        // between peer agents -- omitting it here made #278's content-type
+        // validation reject every instruction this agent receives from a peer.
+        default_input_modes: vec![
+            "text/plain".to_string(),
+            "application/x-protobuf".to_string(),
+        ],
         default_output_modes: vec!["text/plain".to_string()],
         skills: vec![AgentSkill {
             id: "itk".to_string(),
