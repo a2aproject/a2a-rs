@@ -268,7 +268,23 @@ async fn apply_event_to_task(
                 .or(task_store.get(&update.task_id).await?)
                 .ok_or_else(|| A2AError::task_not_found(&update.task_id))?;
             let artifacts = task.artifacts.get_or_insert_with(Vec::new);
-            artifacts.push(update.artifact.clone());
+            let existing = artifacts
+                .iter_mut()
+                .find(|artifact| artifact.artifact_id == update.artifact.artifact_id);
+            if update.append.unwrap_or(false) {
+                let artifact = existing.ok_or_else(A2AError::invalid_agent_response)?;
+                artifact.parts.extend(update.artifact.parts.iter().cloned());
+                if let Some(metadata) = &update.artifact.metadata {
+                    artifact
+                        .metadata
+                        .get_or_insert_with(Default::default)
+                        .extend(metadata.clone());
+                }
+            } else if let Some(artifact) = existing {
+                *artifact = update.artifact.clone();
+            } else {
+                artifacts.push(update.artifact.clone());
+            }
             save_task(task_store, task).await.map(Some)
         }
         StreamResponse::Message(_) => Ok(current_task),
