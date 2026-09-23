@@ -32,6 +32,13 @@ enum Command {
     Info,
 }
 
+/// Serializes tests that touch the `A2A_SLIMRPC_PLUGIN_CONFIG` env var, which
+/// is process-global and would otherwise race across `cargo test`'s parallel
+/// threads. Held for the duration of any such test, across `.await` points,
+/// hence `tokio::sync::Mutex` rather than `std::sync::Mutex`.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Runs the parsed subcommand. Split out from `main` so it's testable
 /// without the process-wide setup (tracing/crypto-provider init, which can't
 /// safely run twice in the same process) or `std::process::exit`.
@@ -105,7 +112,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_serve_reports_a_missing_config_env_var() {
-        // SAFETY: no other test in this crate reads or writes this env var.
+        let _guard = ENV_LOCK.lock().await;
+        // SAFETY: ENV_LOCK serializes every test in this crate that touches
+        // this env var.
         unsafe {
             std::env::remove_var("A2A_SLIMRPC_PLUGIN_CONFIG");
         }

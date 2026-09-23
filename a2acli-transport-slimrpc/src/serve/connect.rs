@@ -315,7 +315,14 @@ async fn run_with_config(endpoint: &str, config: PluginConfig) -> Result<(), Plu
 }
 
 async fn wait_stdin_close() {
-    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+    wait_for_close(tokio::io::stdin()).await
+}
+
+/// Blocks until `reader` hits a null byte or EOF. Generic over the reader
+/// (rather than hardcoding `tokio::io::stdin()`) so this is testable against
+/// an in-memory pipe instead of the process's real, unmockable stdin.
+async fn wait_for_close<R: tokio::io::AsyncRead + Unpin>(reader: R) {
+    let mut reader = tokio::io::BufReader::new(reader);
     let mut buf = Vec::new();
     let _ = tokio::io::AsyncBufReadExt::read_until(&mut reader, 0, &mut buf).await;
 }
@@ -733,8 +740,8 @@ mod tests {
     // string parsing, and connecting to a closed local port fails immediately
     // with "connection refused" rather than needing a real peer.
 
-    fn minimal_config(client_endpoint: &str) -> PluginConfig {
-        let yaml = format!(
+    fn minimal_config_yaml(client_endpoint: &str) -> String {
+        format!(
             r#"
 client:
   endpoint: "{client_endpoint}"
@@ -749,8 +756,11 @@ app:
     id: "my-id"
     data: "shared-secret-value-0123456789abcdef"
 "#
-        );
-        serde_yaml::from_str(&yaml).unwrap()
+        )
+    }
+
+    fn minimal_config(client_endpoint: &str) -> PluginConfig {
+        serde_yaml::from_str(&minimal_config_yaml(client_endpoint)).unwrap()
     }
 
     /// Binds an ephemeral loopback port and immediately drops the listener,
@@ -780,6 +790,30 @@ app:
         assert!(matches!(err, PluginError::Slim(_)));
     }
 
+    #[tokio::test]
+    async fn test_run_reads_the_env_var_and_delegates_to_run_with_config() {
+        // Guarded so this can't race main.rs's test of the same env var.
+        let _guard = crate::ENV_LOCK.lock().await;
+
+        let path = std::env::temp_dir().join("a2acli-slimrpc-test-run-reads-env-var.yaml");
+        std::fs::write(&path, minimal_config_yaml("http://127.0.0.1:1")).unwrap();
+
+        // SAFETY: guarded by ENV_LOCK above.
+        unsafe {
+            std::env::set_var("A2A_SLIMRPC_PLUGIN_CONFIG", &path);
+        }
+        let err = run("not-a-valid-target").await.unwrap_err();
+        unsafe {
+            std::env::remove_var("A2A_SLIMRPC_PLUGIN_CONFIG");
+        }
+        let _ = std::fs::remove_file(&path);
+
+        // Reaching the InvalidEndpoint error (from run_with_config, past the
+        // env var read and load_config call) proves run() actually loaded
+        // this file rather than short-circuiting on ConfigEnvMissing.
+        assert!(matches!(err, PluginError::InvalidEndpoint(_)));
+    }
+
     #[test]
     fn test_failure_handshake_carries_the_error_message_and_no_payload() {
         let hs = failure_handshake(&PluginError::ConfigEnvMissing);
@@ -788,5 +822,23 @@ app:
             hs.error.as_deref(),
             Some(PluginError::ConfigEnvMissing.to_string().as_str())
         );
+    }
+
+    // ── wait_for_close ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_wait_for_close_returns_on_eof() {
+        let (writer, reader) = tokio::io::duplex(64);
+        drop(writer);
+        wait_for_close(reader).await;
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_close_returns_on_a_null_byte() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(&[0]).await.unwrap();
+        wait_for_close(reader).await;
     }
 }
