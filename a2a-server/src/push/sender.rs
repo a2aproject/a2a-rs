@@ -2,6 +2,9 @@
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 use a2a::*;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// HTTP push notification sender.
@@ -19,10 +22,17 @@ pub struct HttpPushSenderConfig {
     pub timeout: Duration,
     /// If true, push sending errors abort execution.
     pub fail_on_error: bool,
-    /// If true (default), reject push URLs that target loopback, private,
-    /// link-local, multicast, unspecified, or cloud-metadata addresses, and
-    /// URLs whose scheme is not http/https. Disable only when pushing to
-    /// local webhooks in trusted test environments.
+    /// If true (default), guard push URLs against SSRF. A string pre-check
+    /// (scheme must be http/https; host must not be a loopback, private,
+    /// link-local, multicast, unspecified, or cloud-metadata literal) fails
+    /// before any network activity. A connect-time resolver then drops any
+    /// resolved address in those ranges before dialing, so a hostname cannot
+    /// reach a blocked address through DNS (split-horizon, attacker-controlled
+    /// records, or rebinding). Redirects are re-screened per hop with the same
+    /// string check, and the sender uses no system proxy, since either path
+    /// would otherwise reach an address the guard never saw. Disable only when
+    /// pushing to local webhooks in trusted test environments; that turns off
+    /// the whole guard.
     pub validate_urls: bool,
 }
 
@@ -39,10 +49,28 @@ impl Default for HttpPushSenderConfig {
 impl HttpPushSender {
     pub fn new(config: Option<HttpPushSenderConfig>) -> Self {
         let config = config.unwrap_or_default();
-        let client = reqwest::Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .expect("failed to create HTTP client");
+        // When URL validation is on, the guard needs three things reqwest does
+        // not do by default, because each one is a way a request reaches an
+        // address the string check never saw:
+        //   - a resolver that screens every resolved address at connect time
+        //     (see SsrfGuardedResolver), since the string check cannot see
+        //     where a hostname actually resolves;
+        //   - a redirect policy that re-screens each hop with validate_push_url,
+        //     since a redirect to a blocked literal IP skips DNS entirely and so
+        //     never reaches the resolver, and the string check only ran on the
+        //     original URL;
+        //   - no system proxy, since a proxy would resolve and reach the target
+        //     itself, leaving only the proxy address screened.
+        // When validation is off (the single documented opt-out for local test
+        // webhooks), keep reqwest's defaults so loopback targets still work.
+        let mut builder = reqwest::Client::builder().timeout(config.timeout);
+        if config.validate_urls {
+            builder = builder
+                .dns_resolver(Arc::new(SsrfGuardedResolver))
+                .no_proxy()
+                .redirect(ssrf_guarded_redirect_policy());
+        }
+        let client = builder.build().expect("failed to create HTTP client");
         HttpPushSender {
             client,
             fail_on_error: config.fail_on_error,
@@ -228,6 +256,72 @@ pub(crate) fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
                 || v6.is_multicast()
         }
     }
+}
+
+/// Retain only the socket addresses safe to dial, dropping any whose IP
+/// [`is_blocked_ip`] rejects. Split out from [`SsrfGuardedResolver`] so the
+/// connect-time filter is unit-testable without performing real DNS.
+fn connectable_addrs(addrs: impl Iterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    addrs.filter(|addr| !is_blocked_ip(addr.ip())).collect()
+}
+
+/// A `reqwest` resolver that screens resolved addresses against
+/// [`is_blocked_ip`] before the socket is dialed (#224).
+///
+/// `validate_push_url` screens the URL *string*, but a hostname can still
+/// resolve to a loopback, private, or link-local address through split-horizon
+/// DNS, an attacker-controlled A record, or DNS rebinding. This resolver is the
+/// connect-time half of the guard: reqwest dials exactly the addresses returned
+/// here, so filtering them is not subject to a resolve-then-reconnect TOCTOU.
+/// Installed only when `validate_urls` is set.
+///
+/// This resolver only sees addresses reqwest resolves from a hostname. Two
+/// paths reach an address without hitting it, so [`HttpPushSender::new`] closes
+/// them alongside installing this resolver: a redirect to a blocked literal IP
+/// skips DNS entirely (handled by re-screening every redirect hop with
+/// `validate_push_url`), and a system proxy would resolve the target itself
+/// (handled by disabling the proxy). All three are gated on the same
+/// `validate_urls` flag.
+struct SsrfGuardedResolver;
+
+impl Resolve for SsrfGuardedResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            // Port 0: reqwest replaces it with the request's port before
+            // dialing; only the resolved IP matters for the range check.
+            let resolved = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            let allowed = connectable_addrs(resolved);
+            if allowed.is_empty() {
+                return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                    "push URL host resolves only to blocked (loopback, private, \
+                     link-local, or metadata) addresses",
+                ));
+            }
+            Ok(Box::new(allowed.into_iter()) as Addrs)
+        })
+    }
+}
+
+/// The redirect policy installed when `validate_urls` is set: re-screens
+/// each hop with [`validate_push_url`], since a redirect to a blocked
+/// literal IP skips DNS entirely and never reaches [`SsrfGuardedResolver`].
+///
+/// Split out from [`HttpPushSender::new`] so a test can attach it to a
+/// client on its own, without the resolver -- `reqwest::redirect::Attempt`
+/// has no public constructor, so driving a real HTTP redirect through this
+/// policy is the only way to exercise it.
+fn ssrf_guarded_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.stop();
+        }
+        if validate_push_url(attempt.url().as_str()).is_err() {
+            attempt.error("push URL redirect target is blocked")
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
 #[cfg(test)]
@@ -625,5 +719,134 @@ mod tests {
     #[test]
     fn test_validate_push_url_accepts_global_ipv6() {
         assert!(validate_push_url("http://[2606:4700::1111]/cb").is_ok());
+    }
+
+    #[test]
+    fn test_connectable_addrs_drops_blocked_keeps_public() {
+        // The connect-time filter (#224) must drop every restricted resolved
+        // address and keep the routable ones, so a hostname that resolves to a
+        // mix cannot reach the blocked members.
+        let addrs: Vec<SocketAddr> = vec![
+            "127.0.0.1:443".parse().unwrap(),         // loopback
+            "10.0.0.5:443".parse().unwrap(),          // RFC 1918
+            "169.254.169.254:80".parse().unwrap(),    // link-local metadata
+            "93.184.216.34:443".parse().unwrap(),     // public v4
+            "[fc00::1]:443".parse().unwrap(),         // IPv6 ULA
+            "[2606:4700::1111]:443".parse().unwrap(), // public v6
+        ];
+        let ips: Vec<std::net::IpAddr> = connectable_addrs(addrs.into_iter())
+            .iter()
+            .map(|a| a.ip())
+            .collect();
+        assert_eq!(
+            ips,
+            vec![
+                "93.184.216.34".parse::<std::net::IpAddr>().unwrap(),
+                "2606:4700::1111".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_connectable_addrs_all_blocked_is_empty() {
+        let addrs: Vec<SocketAddr> = vec![
+            "127.0.0.1:443".parse().unwrap(),
+            "192.168.1.1:443".parse().unwrap(),
+        ];
+        assert!(connectable_addrs(addrs.into_iter()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_resolver_rejects_host_resolving_to_loopback() {
+        // A bare hostname that resolves only to loopback must be refused at
+        // connect time, even though the resolver never sees an IP literal.
+        // "localhost" resolves to 127.0.0.1 / ::1 without leaving the machine,
+        // so this is deterministic.
+        let name: Name = "localhost".parse().expect("localhost is a valid dns name");
+        let result = SsrfGuardedResolver.resolve(name).await;
+        assert!(
+            result.is_err(),
+            "a host resolving only to loopback must be refused at connect time"
+        );
+    }
+
+    #[test]
+    fn test_redirect_hop_check_rejects_blocked_targets() {
+        // The custom redirect policy re-runs validate_push_url on each hop, so a
+        // redirect to a blocked literal IP (which skips DNS and never reaches
+        // SsrfGuardedResolver) is refused, while a public hop follows. This pins
+        // the per-hop check the policy relies on.
+        assert!(validate_push_url("http://127.0.0.1/").is_err());
+        assert!(validate_push_url("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(validate_push_url("http://[::1]/").is_err());
+        assert!(validate_push_url("https://example.com/next").is_ok());
+    }
+
+    /// Runs a local server that redirects `/` to `location`, so a real
+    /// `reqwest::redirect::Attempt` reaches [`ssrf_guarded_redirect_policy`]
+    /// -- the type has no public constructor, so this is the only way to
+    /// drive it without faking reqwest's internals.
+    async fn spawn_redirect_server(location: String) -> String {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let location = location.clone();
+                async move { axum::response::Redirect::temporary(&location) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn test_redirect_policy_blocks_a_redirect_to_a_disallowed_target() {
+        let server_url =
+            spawn_redirect_server("http://169.254.169.254/latest/meta-data/".into()).await;
+        let client = reqwest::Client::builder()
+            .redirect(ssrf_guarded_redirect_policy())
+            .build()
+            .unwrap();
+        let err = client
+            .get(&server_url)
+            .send()
+            .await
+            .expect_err("a redirect to a blocked target must fail");
+        assert!(err.is_redirect(), "expected a redirect-policy error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_redirect_policy_rejects_a_self_redirect_loop_immediately() {
+        // A server that redirects to itself is a loopback target, so the
+        // per-hop block check (not the separate 10-hop cap, which nothing
+        // here can safely reach without a real allowed target to bounce
+        // through) is what stops it -- on the very first hop.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let self_url = format!("http://{addr}/");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let self_url = self_url.clone();
+                async move { axum::response::Redirect::temporary(&self_url) }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(ssrf_guarded_redirect_policy())
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("a loopback self-redirect must be refused, not followed");
+        assert!(err.is_redirect(), "expected a redirect-policy error: {err}");
     }
 }
