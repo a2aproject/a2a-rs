@@ -485,6 +485,13 @@ mod tests {
         TransportHandler::new(FakeTransport::default(), TOKEN.to_string())
     }
 
+    #[tokio::test]
+    async fn test_fake_transport_destroy_is_a_noop() {
+        // Exercises the `Transport::destroy` arm of the test double itself;
+        // `TransportHandler` never calls it (it's outside `RequestHandler`).
+        assert!(handler().transport.destroy().await.is_ok());
+    }
+
     fn authorized_params() -> ServiceParams {
         let mut p = ServiceParams::new();
         p.insert(TOKEN_HEADER.to_string(), vec![TOKEN.to_string()]);

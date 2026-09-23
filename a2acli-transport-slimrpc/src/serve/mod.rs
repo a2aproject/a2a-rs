@@ -325,4 +325,20 @@ app:
         );
         assert_eq!(json["error"], "SLIM gateway connect failed: timed out");
     }
+
+    #[test]
+    fn test_write_handshake_succeeds_for_a_serializable_handshake() {
+        let hs = Handshake {
+            success: true,
+            error: None,
+            endpoint: Some(EndpointPayload {
+                address: "127.0.0.1:5555".into(),
+                binding: TRANSPORT_PROTOCOL_GRPC,
+                protocol: VERSION,
+                token: "tok".into(),
+                cert_pem: "-----BEGIN CERTIFICATE-----".into(),
+            }),
+        };
+        assert!(write_handshake(&hs).is_ok());
+    }
 }

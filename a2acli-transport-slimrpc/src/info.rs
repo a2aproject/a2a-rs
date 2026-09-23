@@ -48,4 +48,9 @@ mod tests {
             assert!(json.get(key).is_some(), "missing key: {key}");
         }
     }
+
+    #[test]
+    fn test_run_prints_the_info_json_and_returns_ok() {
+        assert!(run().is_ok());
+    }
 }
