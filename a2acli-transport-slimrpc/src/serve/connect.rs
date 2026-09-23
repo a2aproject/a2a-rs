@@ -33,8 +33,8 @@ use crate::error::PluginError;
 use crate::tls::generate_loopback_tls;
 
 use super::{
-    EndpointPayload, Handshake, check_token, forward_params, load_config, parse_proto_name,
-    write_handshake,
+    EndpointPayload, Handshake, PluginConfig, check_token, forward_params, load_config,
+    parse_proto_name, write_handshake,
 };
 
 // ── Transport → RequestHandler adapter ────────────────────────────────────────
@@ -185,7 +185,13 @@ pub async fn run(endpoint: &str) -> Result<(), PluginError> {
     let config_path =
         std::env::var("A2A_SLIMRPC_PLUGIN_CONFIG").map_err(|_| PluginError::ConfigEnvMissing)?;
     let config = load_config(&config_path)?;
+    run_with_config(endpoint, config).await
+}
 
+/// The bulk of `run`, taking an already-loaded config directly. Split out so
+/// tests can exercise it without touching the process-global
+/// `A2A_SLIMRPC_PLUGIN_CONFIG` env var (see `load_config`'s own doc comment).
+async fn run_with_config(endpoint: &str, config: PluginConfig) -> Result<(), PluginError> {
     // 2. Parse SLIMRPC remote target
     let remote = parse_slimrpc_target(endpoint)
         .map_err(|e| PluginError::InvalidEndpoint(format!("{endpoint}: {}", e.message)))?;
@@ -819,5 +825,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(card.name, "fake-agent");
+    }
+
+    // ── run_with_config: fail-fast paths ────────────────────────────────────
+    //
+    // These exercise real (not mocked) error handling in `run_with_config`
+    // itself, up to the point where a live SLIM gateway would be required.
+    // No live gateway is needed for either: `parse_slimrpc_target` is pure
+    // string parsing, and connecting to a closed local port fails immediately
+    // with "connection refused" rather than needing a real peer.
+
+    fn minimal_config(client_endpoint: &str) -> PluginConfig {
+        let yaml = format!(
+            r#"
+client:
+  endpoint: "{client_endpoint}"
+app:
+  name: "org/namespace/agent"
+  identity_provider:
+    type: shared_secret
+    id: "my-id"
+    data: "shared-secret-value-0123456789abcdef"
+  identity_verifier:
+    type: shared_secret
+    id: "my-id"
+    data: "shared-secret-value-0123456789abcdef"
+"#
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    /// Binds an ephemeral loopback port and immediately drops the listener,
+    /// so connecting to it fails fast with "connection refused" instead of
+    /// hanging or needing a real SLIM gateway.
+    fn closed_local_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn test_run_with_config_rejects_an_invalid_endpoint() {
+        let config = minimal_config("http://127.0.0.1:1");
+        let err = run_with_config("not-a-valid-target", config)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::InvalidEndpoint(_)));
+    }
+
+    #[tokio::test]
+    async fn test_run_with_config_reports_a_connect_failure_for_an_unreachable_gateway() {
+        let port = closed_local_port();
+        let config = minimal_config(&format!("http://127.0.0.1:{port}"));
+        let err = run_with_config("org/namespace/agent", config)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Slim(_)));
     }
 }
