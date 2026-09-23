@@ -74,7 +74,12 @@ jobs:
         # handshake: EOF" instead of the plugin's actual error. Asserting on
         # our specific message (not just a nonzero exit) is what would catch
         # a regression back to that generic failure.
+        #
+        # This step intentionally runs a command expected to fail, and
+        # PASSES when it fails with the right message -- the "Error: ..."
+        # line below is the expected assertion target, not a build failure.
         run: |
+          echo "::notice::The following 'a2a send' failure is expected -- no SLIM gateway is configured in this job. This step passes if the error names A2A_SLIMRPC_PLUGIN_CONFIG (our real cause), and fails if it doesn't (e.g. a regression to a generic EOF)."
           set +e
           output=$(a2a send --transport slimrpc --endpoint org/namespace/agent "hello" 2>&1)
           exit_code=$?
