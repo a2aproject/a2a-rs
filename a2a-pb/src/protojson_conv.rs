@@ -53,8 +53,43 @@ pub fn to_value<T: ProtoJsonPayload>(value: &T) -> Result<Value, ProtoJsonPayloa
     let proto = T::to_proto(value);
     let protojson: T::ProtoJson = transcode_message(&proto)?;
     let mut json = serde_json::to_value(protojson).map_err(ProtoJsonPayloadError::Json)?;
+    normalize_timestamp_strings(&mut json);
     T::normalize_json(&mut json);
     Ok(json)
+}
+
+/// JSON field names in `a2a.proto` whose value is a `google.protobuf.Timestamp`.
+const TIMESTAMP_FIELD_NAMES: &[&str] = &["timestamp", "statusTimestampAfter"];
+
+/// `pbjson_types::Timestamp`'s own `Serialize` emits an RFC 3339 string with
+/// a numeric `+00:00` offset (e.g. `"...846477544+00:00"`); the protobuf
+/// JSON canonical mapping requires the `Z` UTC designator instead
+/// (<https://protobuf.dev/programming-guides/proto3/#json>), and DM-SERIAL-001
+/// enforces exactly that. Recurses through the whole tree, keyed by field
+/// name rather than a blind string match, so an unrelated string value that
+/// happens to end the same way (e.g. user-supplied message text) is never
+/// touched.
+fn normalize_timestamp_strings(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, v) in map.iter_mut() {
+                if TIMESTAMP_FIELD_NAMES.contains(&key.as_str()) {
+                    if let Value::String(s) = v {
+                        if let Some(prefix) = s.strip_suffix("+00:00") {
+                            *s = format!("{prefix}Z");
+                        }
+                    }
+                }
+                normalize_timestamp_strings(v);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_timestamp_strings(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn from_value<T: ProtoJsonPayload>(value: Value) -> Result<T, ProtoJsonPayloadError> {
@@ -287,5 +322,64 @@ mod tests {
         let mut not_an_object = Value::Null;
         ListTasksResponse::normalize_json(&mut not_an_object);
         assert_eq!(not_an_object, Value::Null);
+    }
+
+    fn sample_task_with_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> Task {
+        Task {
+            id: "task-1".to_string(),
+            context_id: "ctx-1".to_string(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Working,
+                message: None,
+                timestamp: Some(timestamp),
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        }
+    }
+
+    /// DM-SERIAL-001: the protobuf JSON canonical mapping requires a
+    /// `Z`-suffixed RFC 3339 timestamp, but `pbjson_types::Timestamp`'s own
+    /// `Serialize` emits the numeric `+00:00` offset form instead.
+    #[test]
+    fn test_task_status_timestamp_uses_z_suffix_not_offset() {
+        let timestamp = "2026-09-23T02:07:57.846477544Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let json = to_value(&sample_task_with_timestamp(timestamp)).unwrap();
+        let rendered = json["status"]["timestamp"].as_str().unwrap();
+        assert_eq!(rendered, "2026-09-23T02:07:57.846477544Z");
+        assert!(!rendered.ends_with("+00:00"));
+    }
+
+    #[test]
+    fn test_normalize_timestamp_strings_recurses_into_nested_tasks() {
+        let timestamp = "2026-09-23T02:07:57Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let response = ListTasksResponse {
+            tasks: vec![sample_task_with_timestamp(timestamp)],
+            next_page_token: String::new(),
+            page_size: 1,
+            total_size: 1,
+        };
+        let json = to_value(&response).unwrap();
+        let rendered = json["tasks"][0]["status"]["timestamp"].as_str().unwrap();
+        assert_eq!(rendered, "2026-09-23T02:07:57Z");
+    }
+
+    /// A key-based fix rather than a blind string replace: an unrelated
+    /// field whose value happens to end the same way as the buggy timestamp
+    /// format (e.g. user-supplied text) must never be rewritten.
+    #[test]
+    fn test_normalize_timestamp_strings_ignores_unrelated_fields() {
+        let mut json = serde_json::json!({
+            "notATimestamp": "ends with +00:00",
+            "nested": { "alsoNotATimestamp": "also +00:00" }
+        });
+        normalize_timestamp_strings(&mut json);
+        assert_eq!(json["notATimestamp"], "ends with +00:00");
+        assert_eq!(json["nested"]["alsoNotATimestamp"], "also +00:00");
     }
 }
