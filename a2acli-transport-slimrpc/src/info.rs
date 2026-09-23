@@ -11,6 +11,9 @@ pub struct Info {
     pub description: &'static str,
     pub protocol: &'static str,
     pub binding: &'static str,
+    pub commit: &'static str,
+    #[serde(rename = "buildDate")]
+    pub build_date: &'static str,
 }
 
 fn build_info() -> Info {
@@ -20,6 +23,8 @@ fn build_info() -> Info {
         description: "SLIMRPC transport plugin for a2a-cli",
         protocol: a2a::VERSION,
         binding: a2a::TRANSPORT_PROTOCOL_GRPC,
+        commit: env!("A2ACLI_SLIMRPC_GIT_COMMIT"),
+        build_date: env!("A2ACLI_SLIMRPC_BUILD_DATE"),
     }
 }
 
@@ -44,7 +49,15 @@ mod tests {
     #[test]
     fn test_info_serializes_with_the_expected_keys() {
         let json = serde_json::to_value(build_info()).unwrap();
-        for key in ["name", "version", "description", "protocol", "binding"] {
+        for key in [
+            "name",
+            "version",
+            "description",
+            "protocol",
+            "binding",
+            "commit",
+            "buildDate",
+        ] {
             assert!(json.get(key).is_some(), "missing key: {key}");
         }
     }

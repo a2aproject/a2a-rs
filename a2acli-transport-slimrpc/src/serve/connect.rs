@@ -4,14 +4,15 @@
 
 //! SLIM gateway connection and gRPC-proxy serve loop.
 //!
-//! `TransportHandler`'s dispatch and token-gating logic is generic over the
-//! `Transport` it wraps, so it's unit-tested here against a fake transport
-//! (see the `tests` module below) without needing a live SLIM connection.
+//! `TransportHandler`'s dispatch logic is generic over the `Transport` it
+//! wraps, so it's unit-tested here against a fake transport (see the
+//! `tests` module below) without needing a live SLIM connection. The
+//! per-launch plugin token is enforced once, before a call ever reaches
+//! `TransportHandler`, by `check_token_interceptor` at the gRPC layer.
 //! `run()` itself -- the actual SLIM gateway connect, TLS/TCP bind, and
 //! serve loop -- has no fake-able seam and is instead exercised end-to-end
 //! via the itk/csit integration suites.
 
-use std::io::{self, BufRead};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -33,26 +34,27 @@ use crate::error::PluginError;
 use crate::tls::generate_loopback_tls;
 
 use super::{
-    EndpointPayload, Handshake, PluginConfig, check_token, forward_params, load_config,
+    EndpointPayload, Handshake, PluginConfig, TOKEN_HEADER, forward_params, load_config,
     parse_proto_name, write_handshake,
 };
 
 // ── Transport → RequestHandler adapter ────────────────────────────────────────
 
 /// Adapts a client [`Transport`] into a server [`RequestHandler`], forwarding
-/// all calls while enforcing the per-launch plugin token.
+/// all calls and stripping the plugin token before they reach the upstream
+/// transport. Callers are already authenticated by `check_token_interceptor`
+/// before a call reaches here.
 ///
 /// Generic over `T` (rather than naming `SlimRpcTransport` directly) so the
-/// dispatch/token-gating logic below is unit-testable against a fake
-/// transport, without requiring a live SLIM connection.
+/// dispatch logic below is unit-testable against a fake transport, without
+/// requiring a live SLIM connection.
 struct TransportHandler<T: Transport + 'static> {
     transport: T,
-    token: String,
 }
 
 impl<T: Transport + 'static> TransportHandler<T> {
-    fn new(transport: T, token: String) -> Self {
-        Self { transport, token }
+    fn new(transport: T) -> Self {
+        Self { transport }
     }
 }
 
@@ -63,7 +65,6 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        check_token(&self.token, params)?;
         self.transport
             .send_message(&forward_params(params), &req)
             .await
@@ -74,7 +75,6 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        check_token(&self.token, params)?;
         self.transport
             .send_streaming_message(&forward_params(params), &req)
             .await
@@ -85,7 +85,6 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
         params: &ServiceParams,
         req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
-        check_token(&self.token, params)?;
         self.transport.get_task(&forward_params(params), &req).await
     }
 
@@ -94,7 +93,6 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
         params: &ServiceParams,
         req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
-        check_token(&self.token, params)?;
         self.transport
             .list_tasks(&forward_params(params), &req)
             .await
@@ -105,7 +103,6 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
         params: &ServiceParams,
         req: CancelTaskRequest,
     ) -> Result<Task, A2AError> {
-        check_token(&self.token, params)?;
         self.transport
             .cancel_task(&forward_params(params), &req)
             .await
@@ -116,7 +113,6 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
         params: &ServiceParams,
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        check_token(&self.token, params)?;
         self.transport
             .subscribe_to_task(&forward_params(params), &req)
             .await
@@ -127,7 +123,6 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
         params: &ServiceParams,
         req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        check_token(&self.token, params)?;
         self.transport
             .create_push_config(&forward_params(params), &req)
             .await
@@ -138,7 +133,6 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
         params: &ServiceParams,
         req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        check_token(&self.token, params)?;
         self.transport
             .get_push_config(&forward_params(params), &req)
             .await
@@ -149,7 +143,6 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
         params: &ServiceParams,
         req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        check_token(&self.token, params)?;
         self.transport
             .list_push_configs(&forward_params(params), &req)
             .await
@@ -160,7 +153,6 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
         params: &ServiceParams,
         req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
-        check_token(&self.token, params)?;
         self.transport
             .delete_push_config(&forward_params(params), &req)
             .await
@@ -171,10 +163,29 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
         params: &ServiceParams,
         req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
-        check_token(&self.token, params)?;
         self.transport
             .get_extended_agent_card(&forward_params(params), &req)
             .await
+    }
+}
+
+// ── gRPC-layer token check ───────────────────────────────────────────────────
+
+/// A tonic interceptor rejecting any call that doesn't carry exactly one
+/// `a2a-plugin-token` metadata entry matching `token`. Runs once per call,
+/// before it ever reaches `TransportHandler`, instead of repeating the check
+/// in every `RequestHandler` method.
+fn check_token_interceptor(
+    token: String,
+) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone {
+    move |req: tonic::Request<()>| {
+        let mut values = req.metadata().get_all(TOKEN_HEADER).iter();
+        match (values.next(), values.next()) {
+            (Some(v), None) if v.to_str().ok() == Some(token.as_str()) => Ok(req),
+            _ => Err(tonic::Status::unauthenticated(
+                "invalid or missing plugin token",
+            )),
+        }
     }
 }
 
@@ -261,9 +272,14 @@ async fn run_with_config(endpoint: &str, config: PluginConfig) -> Result<(), Plu
     let tcp_incoming = TcpIncoming::from(tokio_listener);
     let tls_incoming = TlsIncoming::new(tcp_incoming, tls.server_config);
 
-    // 8. Build gRPC service
-    let handler = Arc::new(TransportHandler::new(transport, token.clone()));
-    let grpc_service = A2aServiceServer::new(GrpcHandler::new(handler));
+    // 8. Build gRPC service, enforcing the plugin token via an interceptor
+    // (once per call, before it reaches TransportHandler) rather than in
+    // every RequestHandler method.
+    let handler = Arc::new(TransportHandler::new(transport));
+    let grpc_service = A2aServiceServer::with_interceptor(
+        GrpcHandler::new(handler),
+        check_token_interceptor(token.clone()),
+    );
 
     // 9. Print handshake
     let hs = Handshake {
@@ -299,14 +315,9 @@ async fn run_with_config(endpoint: &str, config: PluginConfig) -> Result<(), Plu
 }
 
 async fn wait_stdin_close() {
-    tokio::task::spawn_blocking(|| {
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        let mut buf = Vec::new();
-        let _ = reader.read_until(0, &mut buf);
-    })
-    .await
-    .ok();
+    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut buf = Vec::new();
+    let _ = tokio::io::AsyncBufReadExt::read_until(&mut reader, 0, &mut buf).await;
 }
 
 #[cfg(test)]
@@ -316,14 +327,13 @@ mod tests {
     use futures::stream;
     use futures::stream::StreamExt;
 
-    use super::super::TOKEN_HEADER;
     use super::*;
 
     /// A [`Transport`] test double: records the params of the last call it
-    /// received (after `TransportHandler` has already applied `check_token`
-    /// and `forward_params`) and returns canned responses. Lets the
-    /// dispatch/token-gating logic in `TransportHandler` be exercised without
-    /// a live SLIM connection.
+    /// received (after `TransportHandler` has already applied
+    /// `forward_params`) and returns canned responses. Lets the dispatch
+    /// logic in `TransportHandler` be exercised without a live SLIM
+    /// connection.
     #[derive(Default)]
     struct FakeTransport {
         last_params: Mutex<Option<ServiceParams>>,
@@ -507,10 +517,8 @@ mod tests {
         }
     }
 
-    const TOKEN: &str = "secret";
-
     fn handler() -> TransportHandler<FakeTransport> {
-        TransportHandler::new(FakeTransport::default(), TOKEN.to_string())
+        TransportHandler::new(FakeTransport::default())
     }
 
     #[tokio::test]
@@ -520,38 +528,14 @@ mod tests {
         assert!(handler().transport.destroy().await.is_ok());
     }
 
-    fn authorized_params() -> ServiceParams {
+    /// Params as `TransportHandler` sees them once past the gRPC
+    /// interceptor: still carrying the plugin token (`forward_params`, not
+    /// the interceptor, is what strips it).
+    fn sample_params() -> ServiceParams {
         let mut p = ServiceParams::new();
-        p.insert(TOKEN_HEADER.to_string(), vec![TOKEN.to_string()]);
+        p.insert(TOKEN_HEADER.to_string(), vec!["secret".to_string()]);
         p.insert("x-tenant-id".to_string(), vec!["acme".to_string()]);
         p
-    }
-
-    fn unauthorized_params() -> ServiceParams {
-        let mut p = ServiceParams::new();
-        p.insert(TOKEN_HEADER.to_string(), vec!["wrong".to_string()]);
-        p
-    }
-
-    #[tokio::test]
-    async fn test_send_message_rejects_an_invalid_token_without_reaching_the_transport() {
-        let h = handler();
-        let req = SendMessageRequest {
-            message: fake_message(),
-            configuration: None,
-            metadata: None,
-            tenant: None,
-        };
-        let err = h
-            .send_message(&unauthorized_params(), req)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, error_code::INVALID_REQUEST);
-        assert_eq!(
-            h.transport.last_params(),
-            None,
-            "transport must not be called"
-        );
     }
 
     #[tokio::test]
@@ -563,28 +547,12 @@ mod tests {
             metadata: None,
             tenant: None,
         };
-        let resp = h.send_message(&authorized_params(), req).await.unwrap();
+        let resp = h.send_message(&sample_params(), req).await.unwrap();
         assert!(matches!(resp, SendMessageResponse::Task(t) if t.id == "task-1"));
 
         let seen = h.transport.last_params().expect("transport was called");
         assert!(!seen.contains_key(TOKEN_HEADER), "token must be stripped");
         assert_eq!(seen.get("x-tenant-id"), Some(&vec!["acme".to_string()]));
-    }
-
-    #[tokio::test]
-    async fn test_send_streaming_message_rejects_an_invalid_token() {
-        let h = handler();
-        let req = SendMessageRequest {
-            message: fake_message(),
-            configuration: None,
-            metadata: None,
-            tenant: None,
-        };
-        assert!(
-            h.send_streaming_message(&unauthorized_params(), req)
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]
@@ -597,22 +565,11 @@ mod tests {
             tenant: None,
         };
         let mut stream = h
-            .send_streaming_message(&authorized_params(), req)
+            .send_streaming_message(&sample_params(), req)
             .await
             .unwrap();
         let first = stream.next().await.unwrap().unwrap();
         assert!(matches!(first, StreamResponse::Task(t) if t.id == "task-1"));
-    }
-
-    #[tokio::test]
-    async fn test_get_task_rejects_an_invalid_token() {
-        let h = handler();
-        let req = GetTaskRequest {
-            id: "task-1".into(),
-            history_length: None,
-            tenant: None,
-        };
-        assert!(h.get_task(&unauthorized_params(), req).await.is_err());
     }
 
     #[tokio::test]
@@ -623,7 +580,7 @@ mod tests {
             history_length: None,
             tenant: None,
         };
-        let task = h.get_task(&authorized_params(), req).await.unwrap();
+        let task = h.get_task(&sample_params(), req).await.unwrap();
         assert_eq!(task.id, "task-1");
         assert!(
             !h.transport
@@ -631,22 +588,6 @@ mod tests {
                 .unwrap()
                 .contains_key(TOKEN_HEADER)
         );
-    }
-
-    #[tokio::test]
-    async fn test_list_tasks_rejects_an_invalid_token() {
-        let h = handler();
-        let req = ListTasksRequest {
-            context_id: None,
-            status: None,
-            page_size: None,
-            page_token: None,
-            history_length: None,
-            status_timestamp_after: None,
-            include_artifacts: None,
-            tenant: None,
-        };
-        assert!(h.list_tasks(&unauthorized_params(), req).await.is_err());
     }
 
     #[tokio::test]
@@ -662,19 +603,8 @@ mod tests {
             include_artifacts: None,
             tenant: None,
         };
-        let resp = h.list_tasks(&authorized_params(), req).await.unwrap();
+        let resp = h.list_tasks(&sample_params(), req).await.unwrap();
         assert_eq!(resp.total_size, 1);
-    }
-
-    #[tokio::test]
-    async fn test_cancel_task_rejects_an_invalid_token() {
-        let h = handler();
-        let req = CancelTaskRequest {
-            id: "task-1".into(),
-            metadata: None,
-            tenant: None,
-        };
-        assert!(h.cancel_task(&unauthorized_params(), req).await.is_err());
     }
 
     #[tokio::test]
@@ -685,22 +615,8 @@ mod tests {
             metadata: None,
             tenant: None,
         };
-        let task = h.cancel_task(&authorized_params(), req).await.unwrap();
-        assert_eq!(task.id, "task-1");
-    }
-
-    #[tokio::test]
-    async fn test_subscribe_to_task_rejects_an_invalid_token() {
-        let h = handler();
-        let req = SubscribeToTaskRequest {
-            id: "task-1".into(),
-            tenant: None,
-        };
-        assert!(
-            h.subscribe_to_task(&unauthorized_params(), req)
-                .await
-                .is_err()
-        );
+        let task = h.cancel_task(&sample_params(), req).await.unwrap();
+        assert_eq!(task.status.state, TaskState::Working);
     }
 
     #[tokio::test]
@@ -710,47 +626,19 @@ mod tests {
             id: "task-1".into(),
             tenant: None,
         };
-        let mut stream = h
-            .subscribe_to_task(&authorized_params(), req)
-            .await
-            .unwrap();
+        let mut stream = h.subscribe_to_task(&sample_params(), req).await.unwrap();
         let first = stream.next().await.unwrap().unwrap();
         assert!(matches!(first, StreamResponse::Message(_)));
-    }
-
-    #[tokio::test]
-    async fn test_create_push_config_rejects_an_invalid_token() {
-        let h = handler();
-        assert!(
-            h.create_push_config(&unauthorized_params(), fake_push_config())
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]
     async fn test_create_push_config_forwards_and_returns_the_transport_response() {
         let h = handler();
         let cfg = h
-            .create_push_config(&authorized_params(), fake_push_config())
+            .create_push_config(&sample_params(), fake_push_config())
             .await
             .unwrap();
         assert_eq!(cfg.id, Some("cfg-1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_get_push_config_rejects_an_invalid_token() {
-        let h = handler();
-        let req = GetTaskPushNotificationConfigRequest {
-            task_id: "task-1".into(),
-            id: "cfg-1".into(),
-            tenant: None,
-        };
-        assert!(
-            h.get_push_config(&unauthorized_params(), req)
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]
@@ -761,24 +649,8 @@ mod tests {
             id: "cfg-1".into(),
             tenant: None,
         };
-        let cfg = h.get_push_config(&authorized_params(), req).await.unwrap();
+        let cfg = h.get_push_config(&sample_params(), req).await.unwrap();
         assert_eq!(cfg.id, Some("cfg-1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_list_push_configs_rejects_an_invalid_token() {
-        let h = handler();
-        let req = ListTaskPushNotificationConfigsRequest {
-            task_id: "task-1".into(),
-            page_size: None,
-            page_token: None,
-            tenant: None,
-        };
-        assert!(
-            h.list_push_configs(&unauthorized_params(), req)
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]
@@ -790,26 +662,8 @@ mod tests {
             page_token: None,
             tenant: None,
         };
-        let resp = h
-            .list_push_configs(&authorized_params(), req)
-            .await
-            .unwrap();
+        let resp = h.list_push_configs(&sample_params(), req).await.unwrap();
         assert_eq!(resp.configs.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_delete_push_config_rejects_an_invalid_token() {
-        let h = handler();
-        let req = DeleteTaskPushNotificationConfigRequest {
-            task_id: "task-1".into(),
-            id: "cfg-1".into(),
-            tenant: None,
-        };
-        assert!(
-            h.delete_push_config(&unauthorized_params(), req)
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]
@@ -820,22 +674,7 @@ mod tests {
             id: "cfg-1".into(),
             tenant: None,
         };
-        assert!(
-            h.delete_push_config(&authorized_params(), req)
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_extended_agent_card_rejects_an_invalid_token() {
-        let h = handler();
-        let req = GetExtendedAgentCardRequest { tenant: None };
-        assert!(
-            h.get_extended_agent_card(&unauthorized_params(), req)
-                .await
-                .is_err()
-        );
+        assert!(h.delete_push_config(&sample_params(), req).await.is_ok());
     }
 
     #[tokio::test]
@@ -843,10 +682,47 @@ mod tests {
         let h = handler();
         let req = GetExtendedAgentCardRequest { tenant: None };
         let card = h
-            .get_extended_agent_card(&authorized_params(), req)
+            .get_extended_agent_card(&sample_params(), req)
             .await
             .unwrap();
         assert_eq!(card.name, "fake-agent");
+    }
+
+    // ── check_token_interceptor ─────────────────────────────────────────────
+
+    const TOKEN: &str = "secret";
+
+    fn request_with_tokens(tokens: &[&str]) -> tonic::Request<()> {
+        let mut req = tonic::Request::new(());
+        for t in tokens {
+            req.metadata_mut().append(TOKEN_HEADER, t.parse().unwrap());
+        }
+        req
+    }
+
+    #[test]
+    fn test_check_token_interceptor_accepts_the_matching_token() {
+        let mut interceptor = check_token_interceptor(TOKEN.to_string());
+        assert!(interceptor(request_with_tokens(&[TOKEN])).is_ok());
+    }
+
+    #[test]
+    fn test_check_token_interceptor_rejects_a_wrong_token() {
+        let mut interceptor = check_token_interceptor(TOKEN.to_string());
+        let err = interceptor(request_with_tokens(&["wrong"])).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn test_check_token_interceptor_rejects_a_missing_header() {
+        let mut interceptor = check_token_interceptor(TOKEN.to_string());
+        assert!(interceptor(request_with_tokens(&[])).is_err());
+    }
+
+    #[test]
+    fn test_check_token_interceptor_rejects_a_duplicated_header() {
+        let mut interceptor = check_token_interceptor(TOKEN.to_string());
+        assert!(interceptor(request_with_tokens(&[TOKEN, TOKEN])).is_err());
     }
 
     // ── run_with_config: fail-fast paths ────────────────────────────────────

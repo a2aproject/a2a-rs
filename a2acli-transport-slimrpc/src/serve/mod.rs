@@ -2,7 +2,6 @@
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 
-use a2a::*;
 use a2a_client::transport::ServiceParams;
 use serde::{Deserialize, Serialize};
 use slim_config::auth::identity::{IdentityProviderConfig, IdentityVerifierConfig};
@@ -75,21 +74,9 @@ fn write_handshake(hs: &Handshake) -> Result<(), PluginError> {
     Ok(())
 }
 
-/// Rejects a call unless it carries exactly one `a2a-plugin-token` header
-/// matching `token`. Free function (not a method) so it's testable without
-/// constructing a `TransportHandler`, which needs a live SLIM connection.
-fn check_token(token: &str, params: &ServiceParams) -> Result<(), A2AError> {
-    let provided = params.get(TOKEN_HEADER);
-    match provided {
-        Some(values) if values.len() == 1 && values[0] == token => Ok(()),
-        _ => Err(A2AError::new(
-            error_code::INVALID_REQUEST,
-            "invalid or missing plugin token",
-        )),
-    }
-}
-
-/// Strips the plugin token before forwarding a call upstream.
+/// Strips the plugin token before forwarding a call upstream. The token
+/// itself is checked once at the gRPC layer by `connect::check_token_interceptor`,
+/// before a call ever reaches this point.
 fn forward_params(params: &ServiceParams) -> ServiceParams {
     let mut fwd = ServiceParams::new();
     for (k, v) in params.iter() {
@@ -136,6 +123,8 @@ fn load_config(path: &str) -> Result<PluginConfig, PluginError> {
 
 #[cfg(test)]
 mod tests {
+    use a2a::{TRANSPORT_PROTOCOL_GRPC, VERSION};
+
     use super::*;
 
     const VALID_CONFIG_YAML: &str = r#"
@@ -246,32 +235,6 @@ app:
             .iter()
             .map(|(k, v)| (k.to_string(), vec![v.to_string()]))
             .collect()
-    }
-
-    #[test]
-    fn test_check_token_accepts_the_matching_token() {
-        assert!(check_token("secret", &params(&[(TOKEN_HEADER, "secret")])).is_ok());
-    }
-
-    #[test]
-    fn test_check_token_rejects_a_wrong_token() {
-        let err = check_token("secret", &params(&[(TOKEN_HEADER, "wrong")])).unwrap_err();
-        assert_eq!(err.code, error_code::INVALID_REQUEST);
-    }
-
-    #[test]
-    fn test_check_token_rejects_a_missing_header() {
-        assert!(check_token("secret", &ServiceParams::new()).is_err());
-    }
-
-    #[test]
-    fn test_check_token_rejects_a_duplicated_header() {
-        let mut p = ServiceParams::new();
-        p.insert(
-            TOKEN_HEADER.to_string(),
-            vec!["secret".into(), "secret".into()],
-        );
-        assert!(check_token("secret", &p).is_err());
     }
 
     #[test]
