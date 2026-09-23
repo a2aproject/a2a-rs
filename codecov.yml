@@ -12,20 +12,3 @@ ignore:
   # the test runner. The CLI arg parsing it defines is still exercised by
   # its own test module and stays covered.
   - "a2acli-transport-slimrpc/src/main.rs"
-
-coverage:
-  status:
-    patch:
-      default:
-        # a2acli-transport-slimrpc gets its own, more realistic target below
-        # (its serve loop drives a live SLIM gateway connection, which has no
-        # unit-testable seam); everything else keeps today's effective bar.
-        paths:
-          - "^(?!a2acli-transport-slimrpc/).*"
-      # SLIM gateway connect + TLS/TCP bind + serve loop in serve/connect.rs
-      # is exercised end-to-end by the itk/csit integration suites, not unit
-      # tests; 85% covers everything else in the crate with headroom.
-      slimrpc-transport:
-        target: 85%
-        paths:
-          - "a2acli-transport-slimrpc/**"
