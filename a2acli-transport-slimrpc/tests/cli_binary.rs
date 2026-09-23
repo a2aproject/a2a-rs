@@ -31,6 +31,23 @@ fn test_main_exits_nonzero_and_reports_a_missing_config_env_var() {
         stderr.contains("a2a-transport-slimrpc:"),
         "unexpected stderr: {stderr}"
     );
+
+    // The a2a-cli plugin contract reads a single JSON line from stdout to
+    // learn startup succeeded or failed; without it, the host sees a bare
+    // EOF instead of our actual error (see a2a-cli's
+    // internal/transportplugin/launch.go: readHandshake).
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let handshake: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap_or(""))
+        .unwrap_or_else(|e| {
+            panic!("stdout was not a single JSON handshake line: {e}\nstdout: {stdout}")
+        });
+    assert_eq!(handshake["success"], false);
+    assert!(
+        handshake["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("A2A_SLIMRPC_PLUGIN_CONFIG")),
+        "unexpected handshake: {handshake}"
+    );
 }
 
 #[test]

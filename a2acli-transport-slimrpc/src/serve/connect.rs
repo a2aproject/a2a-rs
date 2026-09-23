@@ -181,11 +181,33 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
 // ── Serve entry point ──────────────────────────────────────────────────────────
 
 pub async fn run(endpoint: &str) -> Result<(), PluginError> {
-    // 1. Load config
-    let config_path =
-        std::env::var("A2A_SLIMRPC_PLUGIN_CONFIG").map_err(|_| PluginError::ConfigEnvMissing)?;
-    let config = load_config(&config_path)?;
-    run_with_config(endpoint, config).await
+    let outcome = async {
+        // 1. Load config
+        let config_path = std::env::var("A2A_SLIMRPC_PLUGIN_CONFIG")
+            .map_err(|_| PluginError::ConfigEnvMissing)?;
+        let config = load_config(&config_path)?;
+        run_with_config(endpoint, config).await
+    }
+    .await;
+
+    // The a2a-cli plugin contract requires a `{"success":false,"error":...}`
+    // handshake line on stdout for ANY startup failure -- the host reads a
+    // single line from our stdout to learn whether we're ready, and an EOF
+    // there (rather than this envelope) surfaces to the user as a bare
+    // "reading handshake: EOF" instead of the real cause.
+    if let Err(ref e) = outcome {
+        let _ = write_handshake(&failure_handshake(e));
+    }
+    outcome
+}
+
+/// Builds the failure half of the handshake envelope for a startup error.
+fn failure_handshake(err: &PluginError) -> Handshake {
+    Handshake {
+        success: false,
+        error: Some(err.to_string()),
+        endpoint: None,
+    }
 }
 
 /// The bulk of `run`, taking an already-loaded config directly. Split out so
@@ -880,5 +902,15 @@ app:
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::Slim(_)));
+    }
+
+    #[test]
+    fn test_failure_handshake_carries_the_error_message_and_no_payload() {
+        let hs = failure_handshake(&PluginError::ConfigEnvMissing);
+        assert!(!hs.success);
+        assert_eq!(
+            hs.error.as_deref(),
+            Some(PluginError::ConfigEnvMissing.to_string().as_str())
+        );
     }
 }

@@ -1,0 +1,84 @@
+# Copyright AGNTCY Contributors (https://github.com/agntcy)
+# Copyright A2A Contributors (https://github.com/a2aproject)
+# SPDX-License-Identifier: Apache-2.0
+
+name: CLI Plugin Interop
+
+on:
+  pull_request:
+    paths:
+      - 'a2acli-transport-slimrpc/**'
+      - '.github/workflows/cli-plugin-interop.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'a2acli-transport-slimrpc/**'
+      - '.github/workflows/cli-plugin-interop.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege by default; nothing is published from this job.
+permissions:
+  contents: read
+
+jobs:
+  cli-plugin-interop:
+    name: a2a-cli plugin discovery
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-save-if: false
+
+      - name: Build the slimrpc transport plugin
+        run: cargo build -p a2acli-transport-slimrpc --locked
+
+      - name: Download the a2a-cli release binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/a2a-cli"
+          gh release download --repo a2aproject/a2a-cli \
+            --pattern '*_linux_amd64.tar.gz' \
+            --dir "$RUNNER_TEMP/a2a-cli" \
+            --clobber
+          tar -xzf "$RUNNER_TEMP"/a2a-cli/*_linux_amd64.tar.gz -C "$RUNNER_TEMP/a2a-cli"
+
+      - name: Put a2a and the plugin on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          install -m 0755 target/debug/a2a-transport-slimrpc "$RUNNER_TEMP/bin/"
+          install -m 0755 "$RUNNER_TEMP/a2a-cli/a2a" "$RUNNER_TEMP/bin/"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: a2a-cli discovers the slimrpc plugin
+        # `a2a transport list` launches every plugin's `info` subcommand and
+        # renders its metadata as a table; the plugin never needs a SLIM
+        # gateway for this. Real slimrpc/1.0.0 metadata surfacing through the
+        # real a2a-cli binary is the actual thing this job proves.
+        run: |
+          a2a transport list | tee transport-list.txt
+          grep -qE '^slimrpc\s' transport-list.txt
+
+      - name: a2a-cli surfaces the plugin's real startup error
+        # Without $A2A_SLIMRPC_PLUGIN_CONFIG, `serve` fails immediately.
+        # a2a-cli reads a single JSON handshake line from the plugin's
+        # stdout to learn this; without one, it reports a bare "reading
+        # handshake: EOF" instead of the plugin's actual error. Asserting on
+        # our specific message (not just a nonzero exit) is what would catch
+        # a regression back to that generic failure.
+        run: |
+          set +e
+          output=$(a2a send --transport slimrpc --endpoint org/namespace/agent "hello" 2>&1)
+          exit_code=$?
+          set -e
+          echo "$output"
+          [ "$exit_code" -ne 0 ]
+          echo "$output" | grep -q 'A2A_SLIMRPC_PLUGIN_CONFIG'
