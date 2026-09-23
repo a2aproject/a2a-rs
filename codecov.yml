@@ -1,0 +1,8 @@
+# Codecov configuration.
+#
+# `ignore` excludes specific paths from coverage reporting. Keep this list
+# narrow and deliberate -- entries here affect every crate's PR checks, not
+# just the one that motivated them.
+ignore:
+  # Generated protobuf/gRPC code, never hand-written or unit-tested.
+  - "**/gen/**"
