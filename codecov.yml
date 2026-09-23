@@ -6,9 +6,3 @@
 ignore:
   # Generated protobuf/gRPC code, never hand-written or unit-tested.
   - "**/gen/**"
-  # Binary entry point: `main()` wires up tracing, installs the TLS crypto
-  # provider, and dispatches to a subcommand, ending in `std::process::exit`
-  # on error -- there's no way to unit-test that in-process without killing
-  # the test runner. The CLI arg parsing it defines is still exercised by
-  # its own test module and stays covered.
-  - "a2acli-transport-slimrpc/src/main.rs"

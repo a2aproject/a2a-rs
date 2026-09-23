@@ -32,6 +32,16 @@ enum Command {
     Info,
 }
 
+/// Runs the parsed subcommand. Split out from `main` so it's testable
+/// without the process-wide setup (tracing/crypto-provider init, which can't
+/// safely run twice in the same process) or `std::process::exit`.
+async fn dispatch(command: Command) -> Result<(), error::PluginError> {
+    match command {
+        Command::Serve { endpoint } => serve::run(&endpoint).await,
+        Command::Info => info::run(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -47,12 +57,7 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    let result = match cli.command {
-        Command::Serve { endpoint } => serve::run(&endpoint).await,
-        Command::Info => info::run(),
-    };
-
-    if let Err(e) = result {
+    if let Err(e) = dispatch(cli.command).await {
         eprintln!("a2a-transport-slimrpc: {e}");
         std::process::exit(1);
     }
@@ -91,5 +96,24 @@ mod tests {
     #[test]
     fn test_an_unknown_subcommand_is_rejected() {
         assert!(Cli::try_parse_from(["a2a-transport-slimrpc", "bogus"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_info_succeeds() {
+        assert!(dispatch(Command::Info).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_serve_reports_a_missing_config_env_var() {
+        // SAFETY: no other test in this crate reads or writes this env var.
+        unsafe {
+            std::env::remove_var("A2A_SLIMRPC_PLUGIN_CONFIG");
+        }
+        let err = dispatch(Command::Serve {
+            endpoint: "org/namespace/agent".to_string(),
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, error::PluginError::ConfigEnvMissing));
     }
 }
