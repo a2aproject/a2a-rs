@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io::{self, BufRead};
@@ -81,8 +82,7 @@ struct EndpointPayload {
 }
 
 fn write_handshake(hs: &Handshake) -> Result<(), PluginError> {
-    let json = serde_json::to_string(hs)
-        .map_err(|e| PluginError::Handshake(e.to_string()))?;
+    let json = serde_json::to_string(hs).map_err(|e| PluginError::Handshake(e.to_string()))?;
     println!("{json}");
     Ok(())
 }
@@ -255,7 +255,9 @@ impl RequestHandler for TransportHandler {
 fn parse_proto_name(name: &str) -> Result<ProtoName, PluginError> {
     let parts: Vec<&str> = name.splitn(3, '/').collect();
     match parts.as_slice() {
-        [org, namespace, agent] if !org.is_empty() && !namespace.is_empty() && !agent.is_empty() => {
+        [org, namespace, agent]
+            if !org.is_empty() && !namespace.is_empty() && !agent.is_empty() =>
+        {
             Ok(ProtoName::from_strings([*org, *namespace, *agent]))
         }
         _ => Err(PluginError::InvalidEndpoint(format!(
@@ -268,23 +270,21 @@ fn parse_proto_name(name: &str) -> Result<ProtoName, PluginError> {
 
 pub async fn run(endpoint: &str) -> Result<(), PluginError> {
     // 1. Load config
-    let config_path = std::env::var("A2A_SLIMRPC_PLUGIN_CONFIG")
-        .map_err(|_| PluginError::ConfigEnvMissing)?;
+    let config_path =
+        std::env::var("A2A_SLIMRPC_PLUGIN_CONFIG").map_err(|_| PluginError::ConfigEnvMissing)?;
     let config_bytes = std::fs::read(&config_path).map_err(|e| PluginError::ConfigRead {
         path: config_path.clone(),
         source: e,
     })?;
-    let config: PluginConfig = serde_yaml::from_slice(&config_bytes).map_err(|e| {
-        PluginError::ConfigParse {
+    let config: PluginConfig =
+        serde_yaml::from_slice(&config_bytes).map_err(|e| PluginError::ConfigParse {
             path: config_path.clone(),
             source: e,
-        }
-    })?;
+        })?;
 
     // 2. Parse SLIMRPC remote target
-    let remote = parse_slimrpc_target(endpoint).map_err(|e| {
-        PluginError::InvalidEndpoint(format!("{endpoint}: {}", e.message))
-    })?;
+    let remote = parse_slimrpc_target(endpoint)
+        .map_err(|e| PluginError::InvalidEndpoint(format!("{endpoint}: {}", e.message)))?;
 
     // 3. Build auth provider + verifier from app config
     let provider = config.app.identity_provider.build_auth_provider()?;
@@ -320,8 +320,11 @@ pub async fn run(endpoint: &str) -> Result<(), PluginError> {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
     let std_listener = std::net::TcpListener::bind(addr).map_err(PluginError::Bind)?;
     let local_addr = std_listener.local_addr().map_err(PluginError::Bind)?;
-    std_listener.set_nonblocking(true).map_err(PluginError::Bind)?;
-    let tokio_listener = tokio::net::TcpListener::from_std(std_listener).map_err(PluginError::Bind)?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(PluginError::Bind)?;
+    let tokio_listener =
+        tokio::net::TcpListener::from_std(std_listener).map_err(PluginError::Bind)?;
 
     let tcp_incoming = TcpIncoming::from(tokio_listener);
     let tls_incoming = TlsIncoming::new(tcp_incoming, tls.server_config);

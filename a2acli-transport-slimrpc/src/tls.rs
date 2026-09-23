@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
@@ -29,10 +30,9 @@ pub fn generate_loopback_tls() -> Result<LoopbackTls, PluginError> {
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
 
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_pem.as_bytes())
-            .collect::<Result<_, _>>()
-            .map_err(|e| PluginError::Tls(format!("parse cert: {e}")))?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<_, _>>()
+        .map_err(|e| PluginError::Tls(format!("parse cert: {e}")))?;
 
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_bytes())
         .map_err(|e| PluginError::Tls(format!("parse key: {e}")))?
