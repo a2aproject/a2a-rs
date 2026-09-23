@@ -51,3 +51,37 @@ pub fn generate_loopback_tls() -> Result<LoopbackTls, PluginError> {
         server_config: std::sync::Arc::new(server_config),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_loopback_tls_produces_a_pem_encoded_cert() {
+        let tls = generate_loopback_tls().unwrap();
+        assert!(tls.cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(
+            tls.cert_pem
+                .trim_end()
+                .ends_with("-----END CERTIFICATE-----")
+        );
+    }
+
+    #[test]
+    fn test_generate_loopback_tls_negotiates_h2_for_grpc() {
+        let tls = generate_loopback_tls().unwrap();
+        assert_eq!(
+            tls.server_config.alpn_protocols,
+            vec![tonic_tls::ALPN_H2.to_vec()]
+        );
+    }
+
+    #[test]
+    fn test_generate_loopback_tls_produces_a_fresh_cert_each_call() {
+        // Each launch gets its own self-signed cert; nothing should be cached
+        // across calls.
+        let first = generate_loopback_tls().unwrap();
+        let second = generate_loopback_tls().unwrap();
+        assert_ne!(first.cert_pem, second.cert_pem);
+    }
+}

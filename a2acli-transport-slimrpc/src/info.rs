@@ -13,16 +13,39 @@ pub struct Info {
     pub binding: &'static str,
 }
 
-pub fn run() -> Result<(), crate::error::PluginError> {
-    let info = Info {
+fn build_info() -> Info {
+    Info {
         name: "slimrpc",
         version: env!("CARGO_PKG_VERSION"),
         description: "SLIMRPC transport plugin for a2a-cli",
         protocol: a2a::VERSION,
         binding: a2a::TRANSPORT_PROTOCOL_GRPC,
-    };
-    let json = serde_json::to_string(&info)
+    }
+}
+
+pub fn run() -> Result<(), crate::error::PluginError> {
+    let json = serde_json::to_string(&build_info())
         .map_err(|e| crate::error::PluginError::Handshake(e.to_string()))?;
     println!("{json}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_info_reports_the_grpc_binding() {
+        let info = build_info();
+        assert_eq!(info.name, "slimrpc");
+        assert_eq!(info.binding, a2a::TRANSPORT_PROTOCOL_GRPC);
+    }
+
+    #[test]
+    fn test_info_serializes_with_the_expected_keys() {
+        let json = serde_json::to_value(build_info()).unwrap();
+        for key in ["name", "version", "description", "protocol", "binding"] {
+            assert!(json.get(key).is_some(), "missing key: {key}");
+        }
+    }
 }

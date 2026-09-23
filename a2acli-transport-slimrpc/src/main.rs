@@ -57,3 +57,39 @@ async fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serve_parses_the_endpoint_flag() {
+        let cli = Cli::try_parse_from([
+            "a2a-transport-slimrpc",
+            "serve",
+            "--endpoint",
+            "slim://acme/billing/invoicer",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Serve { endpoint } => assert_eq!(endpoint, "slim://acme/billing/invoicer"),
+            Command::Info => panic!("expected Serve"),
+        }
+    }
+
+    #[test]
+    fn test_info_takes_no_arguments() {
+        let cli = Cli::try_parse_from(["a2a-transport-slimrpc", "info"]).unwrap();
+        assert!(matches!(cli.command, Command::Info));
+    }
+
+    #[test]
+    fn test_serve_requires_the_endpoint_flag() {
+        assert!(Cli::try_parse_from(["a2a-transport-slimrpc", "serve"]).is_err());
+    }
+
+    #[test]
+    fn test_an_unknown_subcommand_is_rejected() {
+        assert!(Cli::try_parse_from(["a2a-transport-slimrpc", "bogus"]).is_err());
+    }
+}
