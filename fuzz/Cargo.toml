@@ -1,0 +1,69 @@
+[package]
+name = "a2a-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+a2a-client-lf = { path = "../a2a-client", features = ["fuzzing"] }
+a2a-lf = { path = "../a2a", features = ["fuzzing"] }
+a2a-pb = { path = "../a2a-pb" }
+a2a-server-lf = { path = "../a2a-server", features = ["fuzzing"] }
+a2a-slimrpc = { path = "../a2a-slimrpc", features = ["fuzzing"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+url = "2"
+
+[[bin]]
+name = "sse_framing"
+path = "fuzz_targets/sse_framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protojson_roundtrip"
+path = "fuzz_targets/protojson_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_card_deserialize"
+path = "fuzz_targets/agent_card_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_card_roundtrip"
+path = "fuzz_targets/agent_card_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rest_query_deserialize"
+path = "fuzz_targets/rest_query_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slimrpc_roundtrip"
+path = "fuzz_targets/slimrpc_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "push_url_validation"
+path = "fuzz_targets/push_url_validation.rs"
+test = false
+doc = false
+bench = false

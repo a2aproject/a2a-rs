@@ -1,6 +1,6 @@
 [package]
 name = "a2a-lf"
-version = "0.3.0"
+version = "0.3.1"
 description = "A2A v1 protocol types and core definitions"
 readme = "README.md"
 edition.workspace = true
@@ -18,3 +18,11 @@ chrono = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+
+[dependencies.arbitrary]
+version = "1"
+features = ["derive"]
+optional = true
+
+[features]
+fuzzing = ["arbitrary", "chrono/arbitrary"]

@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 use std::path::{Path, PathBuf};
 
@@ -120,6 +121,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = pbjson_build::Builder::new();
     builder.out_dir(&out_dir);
     builder.register_descriptors(&descriptor_set)?;
+    // Spec §5.7: implementations SHOULD ignore unrecognized fields in
+    // messages, allowing for forward compatibility. Unknown enum string
+    // values are still rejected.
+    builder.ignore_unknown_fields();
     builder.build(PROTOJSON_PACKAGES)?;
     patch_generated_protojson_serde(&out_dir)?;
 

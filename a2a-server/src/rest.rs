@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 use std::sync::Arc;
 
@@ -115,6 +116,9 @@ pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
             REST_EXTENDED_AGENT_CARD_LEGACY_PATH,
             axum::routing::get(handle_get_extended_agent_card::<H>),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::jsonrpc::MAX_REQUEST_BODY_BYTES,
+        ))
         .with_state(state)
 }
 
@@ -213,9 +217,15 @@ async fn handle_list_tasks<H: RequestHandler>(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
-    let status = query
-        .status
-        .and_then(|s| serde_json::from_value::<TaskState>(serde_json::Value::String(s)).ok());
+    let status = match query.status {
+        Some(s) => match serde_json::from_value::<TaskState>(serde_json::Value::String(s)) {
+            Ok(state) => Some(state),
+            Err(_) => {
+                return rest_error_response(A2AError::invalid_params("invalid status filter"));
+            }
+        },
+        None => None,
+    };
     let req = ListTasksRequest {
         context_id: query.context_id,
         status,
@@ -948,12 +958,27 @@ mod tests {
     async fn test_list_tasks_with_query_params() {
         let app = make_app();
         let req = Request::builder()
-            .uri("/tasks?contextId=c1&pageSize=5&pageToken=tok&historyLength=3&includeArtifacts=true&statusTimestampAfter=2025-01-01T00:00:00Z")
+            .uri("/tasks?contextId=c1&pageSize=5&pageToken=0&historyLength=3&includeArtifacts=true&statusTimestampAfter=2025-01-01T00:00:00Z")
             .method("GET")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_invalid_status_returns_bad_request() {
+        let app = make_app();
+        let req = Request::builder()
+            .uri("/tasks?status=invalid")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["message"], "invalid status filter");
     }
 
     #[tokio::test]
@@ -1272,5 +1297,23 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // Each make_app() creates a new store, so this will be not found
         assert!(resp.status() == StatusCode::OK || resp.status() == StatusCode::NOT_FOUND);
+    }
+
+    /// The REST binding is bounded by the same limit as JSON-RPC: an
+    /// oversized body is rejected at the framework boundary, before any
+    /// handler runs.
+    #[tokio::test]
+    async fn test_request_body_over_the_limit_is_rejected() {
+        let app = make_app();
+        let oversized = Body::from("x".repeat(crate::jsonrpc::MAX_REQUEST_BODY_BYTES + 1));
+        let req = Request::builder()
+            .uri(REST_SEND_MESSAGE_PATH)
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(oversized)
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 use std::sync::Arc;
 
@@ -6,6 +7,7 @@ use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use axum::{
     Json,
+    body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -30,6 +32,13 @@ impl<H: RequestHandler> Clone for JsonRpcState<H> {
     }
 }
 
+/// Largest request body either binding accepts.
+///
+/// Without an explicit bound a single large POST is read into memory. The
+/// limit matches a2a-go's `MaxSSETokenSize` (`internal/sse/sse.go`), so a
+/// payload one SDK accepts is not rejected by the other.
+pub const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 /// Create an axum router for the JSON-RPC protocol binding.
 ///
 /// All requests are dispatched to a single POST endpoint that routes
@@ -38,15 +47,25 @@ pub fn jsonrpc_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
     let state = JsonRpcState { handler };
     axum::Router::new()
         .route("/", axum::routing::post(handle_jsonrpc::<H>))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
 async fn handle_jsonrpc<H: RequestHandler>(
     State(state): State<JsonRpcState<H>>,
     headers: HeaderMap,
-    Json(request): Json<JsonRpcRequest>,
+    body: Bytes,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
+
+    // A `Json<JsonRpcRequest>` extractor would reject a malformed body with
+    // axum's own error response before this handler runs at all, which is
+    // the wrong shape for JSON-RPC over HTTP: the status stays 200 and the
+    // error belongs inside the envelope regardless of what failed.
+    let request: JsonRpcRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => return malformed_request_response(&body, error),
+    };
     let id = request.id.clone();
     let method = request.method.as_str();
 
@@ -54,11 +73,43 @@ async fn handle_jsonrpc<H: RequestHandler>(
         return error_response(id, A2AError::invalid_request("invalid jsonrpc version"));
     }
 
+    if let Err(error) = check_a2a_version(&params) {
+        return error_response(id, error);
+    }
+
     if methods::is_streaming(method) {
         return handle_streaming_request(&state, &params, &request).await;
     }
 
     handle_unary_request(&state, &params, &request).await
+}
+
+/// A body that failed to deserialize into [`JsonRpcRequest`]: invalid JSON
+/// syntax is `ParseError` (-32700); well-formed JSON with the wrong shape
+/// (e.g. a missing `method`) is `InvalidRequestError` (-32600). The id is
+/// recovered on a best-effort basis for the latter, since JSON-RPC 2.0 asks
+/// for it to be echoed back when it can be determined; a syntax error, by
+/// definition, cannot.
+fn malformed_request_response(body: &[u8], error: serde_json::Error) -> axum::response::Response {
+    if !error.is_data() {
+        return error_response(
+            JsonRpcId::Null,
+            A2AError {
+                code: error_code::PARSE_ERROR,
+                message: format!("parse error: {error}"),
+                details: None,
+            },
+        );
+    }
+    let id = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("id").cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or(JsonRpcId::Null);
+    error_response(
+        id,
+        A2AError::invalid_request(format!("invalid request: {error}")),
+    )
 }
 
 async fn handle_unary_request<H: RequestHandler>(
@@ -236,6 +287,30 @@ fn parse_error(e: impl std::fmt::Display) -> A2AError {
     }
 }
 
+/// The major version this build implements (§3.6.2). Minor is accepted
+/// unconditionally since nothing here branches on it.
+const SUPPORTED_MAJOR_VERSION: u32 = 1;
+
+/// Mirrors a2acli's own `parse_protocol_version`: tolerant of a bare major,
+/// extra trailing components, and surrounding whitespace.
+fn parse_major_version(value: &str) -> Option<u32> {
+    value.trim().split('.').next()?.parse().ok()
+}
+
+/// §3.6.2: reject a request whose `A2A-Version` header names an
+/// unsupported major version. An absent header is left alone -- §3.6.1
+/// only requires *sending* it, and this server has one version to speak
+/// regardless.
+fn check_a2a_version(params: &ServiceParams) -> Result<(), A2AError> {
+    let Some(requested) = params.get("a2a-version").and_then(|v| v.first()) else {
+        return Ok(());
+    };
+    match parse_major_version(requested) {
+        Some(SUPPORTED_MAJOR_VERSION) => Ok(()),
+        _ => Err(A2AError::version_not_supported(requested)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +404,23 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    /// An unbounded body is read into memory; the limit rejects it at the
+    /// framework boundary instead, before any handler runs.
+    #[tokio::test]
+    async fn test_request_body_over_the_limit_is_rejected() {
+        let app = make_app();
+        let oversized = Body::from("x".repeat(MAX_REQUEST_BODY_BYTES + 1));
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(oversized)
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     #[tokio::test]
     async fn test_send_message() {
         let app = make_app();
@@ -407,13 +499,82 @@ mod tests {
         assert!(rpc_resp.error.is_some());
     }
 
+    /// A `Json<T>` extractor would have axum reject this with a 422 before
+    /// the handler runs; JSON-RPC over HTTP always answers 200 with the
+    /// error inside the envelope, regardless of what about the body failed.
+    #[tokio::test]
+    async fn test_missing_method_field_is_invalid_request_not_a_422() {
+        let app = make_app();
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"params":{}}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let code = rpc_resp.error.expect("expected an error").code;
+        assert!(
+            code == error_code::INVALID_REQUEST || code == error_code::INVALID_PARAMS,
+            "got {code}"
+        );
+        assert_eq!(rpc_resp.id, JsonRpcId::Number(1), "id should be recovered");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_syntax_is_parse_error_not_a_400() {
+        let app = make_app();
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from("{this is not valid json"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            rpc_resp.error.expect("expected an error").code,
+            error_code::PARSE_ERROR
+        );
+        assert_eq!(rpc_resp.id, JsonRpcId::Null, "id cannot be recovered");
+    }
+
     #[tokio::test]
     async fn test_invalid_params() {
         let app = make_app();
-        let params = serde_json::json!({"bogus": true});
+        // Type mismatch: `message` must be an object. A merely-unknown field
+        // is not invalid params; it is ignored per spec §5.7.
+        let params = serde_json::json!({"message": "not-an-object"});
         let resp = post_jsonrpc(app, methods::SEND_MESSAGE, params).await;
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, error_code::PARSE_ERROR);
+    }
+
+    /// Spec §5.7: unrecognized fields in request params are ignored for
+    /// forward compatibility instead of being rejected.
+    #[tokio::test]
+    async fn test_unknown_params_fields_are_ignored() {
+        let app = make_app();
+        let params = serde_json::json!({
+            "message": {
+                "messageId": "m1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hi"}],
+                "futureField": true
+            },
+            "anotherFutureField": {"nested": 1}
+        });
+        let resp = post_jsonrpc(app, methods::SEND_MESSAGE, params).await;
+        assert!(
+            resp.error.is_none(),
+            "unknown fields must be ignored: {:?}",
+            resp.error
+        );
+        assert!(resp.result.is_some());
     }
 
     #[tokio::test]
@@ -621,6 +782,78 @@ mod tests {
             "Bearer jsonrpc-token",
         );
         assert_header_captured(&captured, "send_message", "x-tenant-id", "acme");
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_a2a_version_is_rejected() {
+        let app = make_app();
+        let rpc = JsonRpcRequest::new(
+            JsonRpcId::Number(1),
+            methods::SEND_MESSAGE,
+            Some(serde_json::json!({
+                "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+            })),
+        );
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("a2a-version", "99.0")
+            .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let parsed: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed.error.expect("expected an error").code,
+            error_code::VERSION_NOT_SUPPORTED
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_a2a_version_is_accepted() {
+        let resp = post_jsonrpc(
+            make_app(),
+            methods::SEND_MESSAGE,
+            serde_json::json!({
+                "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+            }),
+        )
+        .await;
+        assert!(
+            resp.error.is_none(),
+            "expected success, got {:?}",
+            resp.error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_supported_a2a_version_is_accepted() {
+        let app = make_app();
+        let rpc = JsonRpcRequest::new(
+            JsonRpcId::Number(1),
+            methods::SEND_MESSAGE,
+            Some(serde_json::json!({
+                "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+            })),
+        );
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("a2a-version", "1.0")
+            .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let parsed: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            parsed.error.is_none(),
+            "expected success, got {:?}",
+            parsed.error
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,6 +13,7 @@ use crate::types::*;
 
 /// A streaming event. Uses field-presence serialization for wire compatibility.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum StreamResponse {
     Task(Task),
     Message(Message),
@@ -64,6 +66,7 @@ impl<'de> Deserialize<'de> for StreamResponse {
 
 /// Event: a task's status has changed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct TaskStatusUpdateEvent {
     pub task_id: TaskId,
@@ -71,6 +74,7 @@ pub struct TaskStatusUpdateEvent {
     pub status: TaskStatus,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "fuzzing", arbitrary(default))]
     pub metadata: Option<HashMap<String, Value>>,
 }
 
@@ -80,6 +84,7 @@ pub struct TaskStatusUpdateEvent {
 
 /// Event: an artifact has been generated or updated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct TaskArtifactUpdateEvent {
     pub task_id: TaskId,
@@ -93,6 +98,7 @@ pub struct TaskArtifactUpdateEvent {
     pub last_chunk: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "fuzzing", arbitrary(default))]
     pub metadata: Option<HashMap<String, Value>>,
 }
 

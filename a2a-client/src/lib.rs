@@ -1,5 +1,25 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+// Framing internals reached by the fuzz targets in fuzz/ — see #238.
+// Thin wrappers, not re-exports: the originals stay crate-private.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz_support {
+    use a2a::{A2AError, StreamResponse};
+
+    pub fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+        crate::jsonrpc::find_event_boundary(buf)
+    }
+
+    pub fn parse_stream_tail(
+        buf: &[u8],
+        parse_event: &dyn Fn(&str) -> Option<Result<StreamResponse, A2AError>>,
+    ) -> Option<Result<StreamResponse, A2AError>> {
+        crate::jsonrpc::parse_stream_tail(buf, parse_event)
+    }
+}
+
 pub mod agent_card;
 pub mod auth;
 pub mod client;
@@ -9,6 +29,7 @@ pub mod middleware;
 mod push_config_compat;
 pub mod rest;
 pub mod transport;
+mod wire;
 
 pub use client::A2AClient;
 pub use factory::A2AClientFactory;

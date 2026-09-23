@@ -1,35 +1,45 @@
 name: Publish Project Coverage to Codecov
 
 on:
+  # Required checks must report on queue entries too, or every entry stalls.
+  # pull_request has no itk path-ignore for the same reason: the merge queue
+  # won't accept an entry until every required check has already reported on
+  # the PR itself (#280), so an itk-only PR needs a real run here too.
+  merge_group:
   push:
     branches: [main]
     paths-ignore:
       - 'itk/**'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - 'itk/**'
 
 env:
   CARGO_TERM_COLOR: always
+
+# Least privilege by default; jobs that need more raise it themselves.
+permissions:
+  contents: read
 
 jobs:
   coverage:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # Only main writes; pull requests restore. See ci.yml.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install just
-        uses: taiki-e/install-action@80779d0b81222e7a5d0c5751d3c2537d4a36f556 # v2
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
           tool: just
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@80779d0b81222e7a5d0c5751d3c2537d4a36f556 # v2
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
           tool: cargo-llvm-cov
 
@@ -37,7 +47,7 @@ jobs:
         run: just coverage-lcov
 
       - name: Upload combined coverage to Codecov
-        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         with:
           files: coverage/lcov.info
           flags: rust

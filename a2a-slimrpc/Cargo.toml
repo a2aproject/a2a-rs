@@ -1,6 +1,6 @@
 [package]
 name = "a2a-slimrpc"
-version = "0.2.7"
+version = "0.2.9"
 description = "A2A v1 SLIMRPC protocol binding for client and server"
 readme = "README.md"
 edition.workspace = true
@@ -27,6 +27,9 @@ slim_datapath = { workspace = true }
 slim_auth = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+
+[features]
+fuzzing = []
 
 [dev-dependencies]
 slim_config = { workspace = true }

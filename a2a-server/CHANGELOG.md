@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.4.3...a2a-server-lf-v0.4.4) - 2026-09-14
+
+### Added
+
+- *(a2a-server)* serve the extended Agent Card, with its own error code ([#212](https://github.com/a2aproject/a2a-rs/pull/212))
+
+### Fixed
+
+- *(a2a-server)* bound list responses for every store, not just the in-tree ones ([#226](https://github.com/a2aproject/a2a-rs/pull/226))
+- *(a2a-server)* close the trailing-dot bypass in the push URL blocklist ([#225](https://github.com/a2aproject/a2a-rs/pull/225))
+- *(server)* harden push notifications (URL validation, CRLF credentials, per-task config cap) ([#124](https://github.com/a2aproject/a2a-rs/pull/124))
+- *(server)* validate list task inputs (status, pageSize, pageToken) ([#122](https://github.com/a2aproject/a2a-rs/pull/122))
+- *(a2a-server)* enforce the capabilities the Agent Card declares ([#205](https://github.com/a2aproject/a2a-rs/pull/205))
+- *(a2a-server)* SSE event ids, keep-alive, and a request body limit ([#202](https://github.com/a2aproject/a2a-rs/pull/202))
+- *(a2a-pb)* ignore unknown fields in ProtoJSON decode (spec §5.7) ([#81](https://github.com/a2aproject/a2a-rs/pull/81))
+
+### Other
+
+- *(a2a-server)* pin that artifacts do not aggregate across tasks in one context ([#211](https://github.com/a2aproject/a2a-rs/pull/211))
+- add authorize callback and align historyLength ([#196](https://github.com/a2aproject/a2a-rs/pull/196))
+
+### Added
+
+- `with_extended_agent_card` / `with_extended_agent_card_resolver` on
+  `DefaultRequestHandler`, so a server can actually serve an extended Agent
+  Card; configuring one also declares the capability
+
+### Fixed
+
+- report `EXTENDED_CARD_NOT_CONFIGURED` (-32007) when no extended card is
+  configured, instead of `UNSUPPORTED_OPERATION` (-32004)
+
+### Fixed
+
+- apply `historyLength` on `get_task` and clamp `<= 0` on both get and list
+- treat `cancel_task` on an already-`CANCELED` task as idempotent; other terminal states stay `TASK_NOT_CANCELABLE`
+- assign a monotonic `id` to every SSE event, so a client can detect a gap
+  and has a value for `Last-Event-ID`
+- keep SSE responses alive with a 15s comment frame, so idle subscriptions
+  are not dropped by intermediaries
+- bound request bodies on both bindings at 10 MB, rejecting oversized ones
+  with `413` instead of reading them into memory
+- enforce the `AgentCapabilities` a server declares: `streaming: false` and
+  `push_notifications: false` now refuse the corresponding operations instead
+  of being stored and ignored. An undeclared (`None`) capability stays
+  permissive, and supplying a push store no longer overrides an explicit
+  `false`
+
+### Added
+
+- `RequestAuthorizer` callback on `DefaultRequestHandler` (`with_authorizer`)
+
 ## [0.4.3](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.4.2...a2a-server-lf-v0.4.3) - 2026-08-27
 
 ### Fixed

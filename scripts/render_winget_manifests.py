@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright AGNTCY Contributors (https://github.com/agntcy)
+# Copyright A2A Contributors (https://github.com/a2aproject)
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -23,11 +24,21 @@ CLI_MANIFEST = ROOT / "a2acli" / "Cargo.toml"
 DEFAULT_OUTPUT_DIR = ROOT / "dist" / "winget"
 
 MANIFEST_VERSION = "1.12.0"
-PACKAGE_IDENTIFIER = "a2aproject.a2acli"
+# a2aproject.a2acli belongs to the Go CLI at a2aproject/a2a-cli, which
+# declares it in .goreleaser.yaml and installs a binary named `a2a`. This
+# CLI is a different program, so it publishes under its own identifier.
+# The binary is still `a2acli`; only the WinGet package is renamed.
+PACKAGE_IDENTIFIER = "a2aproject.a2acli-rs"
 PACKAGE_LOCALE = "en-US"
 PUBLISHER = "a2aproject"
-PACKAGE_NAME = "a2acli"
-MONIKER = "a2acli"
+PACKAGE_NAME = "a2acli-rs"
+MONIKER = "a2acli-rs"
+# The command users type. This is the binary's own name and must not follow
+# the package rename: every other install path gives them `a2acli`.
+COMMAND_NAME = "a2acli"
+# WinGet lists both A2A CLIs side by side, and the crate description does not
+# say which implementation it is. Name it, so a search for "a2a" is decidable.
+DESCRIPTION_SUFFIX = " (Rust implementation)"
 # The MSVC-target binary imports VCRUNTIME140.dll, which a clean Windows
 # install does not carry, so WinGet validation cannot start it.
 VCREDIST_DEPENDENCY = "Microsoft.VCRedist.2015+.x64"
@@ -232,7 +243,7 @@ def render_default_locale_manifest(
         f"PackageUrl: {repository_url}\n"
         f"License: {license_id}\n"
         f"LicenseUrl: {repository_url}/blob/{tag}/LICENSE.md\n"
-        f"ShortDescription: {description}\n"
+        f"ShortDescription: {description}{DESCRIPTION_SUFFIX}\n"
         f"Moniker: {MONIKER}\n"
         f"Tags:\n"
         f"- a2a\n"
@@ -240,6 +251,7 @@ def render_default_locale_manifest(
         f"- cli\n"
         f"- llm\n"
         f"- protocol\n"
+        f"- rust\n"
         f"ReleaseNotesUrl: {repository_url}/releases/tag/{tag}\n"
         f"ManifestType: defaultLocale\n"
         f"ManifestVersion: {MANIFEST_VERSION}\n"
@@ -248,7 +260,7 @@ def render_default_locale_manifest(
 
 def render_installer_manifest(release_assets: ReleaseAssets) -> str:
     relative_file_path = (
-        f"a2acli-v{release_assets.version}-{WINDOWS_TARGET}\\a2acli.exe"
+        f"a2acli-v{release_assets.version}-{WINDOWS_TARGET}\\{COMMAND_NAME}.exe"
     )
     return (
         f"# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.{MANIFEST_VERSION}.schema.json\n"
@@ -258,7 +270,7 @@ def render_installer_manifest(release_assets: ReleaseAssets) -> str:
         f"InstallerType: zip\n"
         f"NestedInstallerType: portable\n"
         f"Commands:\n"
-        f"- {MONIKER}\n"
+        f"- {COMMAND_NAME}\n"
         f"ReleaseDate: {release_assets.release_date}\n"
         f"Dependencies:\n"
         f"  PackageDependencies:\n"
@@ -269,7 +281,7 @@ def render_installer_manifest(release_assets: ReleaseAssets) -> str:
         f"  InstallerSha256: {release_assets.installer_sha256}\n"
         f"  NestedInstallerFiles:\n"
         f"  - RelativeFilePath: {relative_file_path}\n"
-        f"    PortableCommandAlias: {MONIKER}\n"
+        f"    PortableCommandAlias: {COMMAND_NAME}\n"
         f"ManifestType: installer\n"
         f"ManifestVersion: {MANIFEST_VERSION}\n"
     )

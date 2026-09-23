@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7](https://github.com/a2aproject/a2a-rs/compare/a2a-grpc-v0.3.6...a2a-grpc-v0.3.7) - 2026-09-15
+
+### Other
+
+- updated the following local packages: a2a-client-lf
+
+## [0.3.6](https://github.com/a2aproject/a2a-rs/compare/a2a-grpc-v0.3.5...a2a-grpc-v0.3.6) - 2026-09-14
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.3.5](https://github.com/a2aproject/a2a-rs/compare/a2a-grpc-v0.3.4...a2a-grpc-v0.3.5) - 2026-08-27
 
 ### Other

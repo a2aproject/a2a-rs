@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 use a2a::*;
 use async_trait::async_trait;
@@ -7,6 +8,8 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{RwLock, broadcast};
 
 use crate::middleware::ServiceParams;
+use crate::pagination::resolve_page_size;
+use crate::task_store::apply_history_length;
 
 const EXECUTION_BUFFER_CAPACITY: usize = 32;
 
@@ -210,7 +213,14 @@ async fn send_push_notifications(
     Ok(())
 }
 
-async fn save_task(task_store: &dyn crate::TaskStore, task: Task) -> Result<Task, A2AError> {
+async fn save_task(task_store: &dyn crate::TaskStore, mut task: Task) -> Result<Task, A2AError> {
+    // DM-SERIAL-001: a persisted/returned task status must carry a timestamp.
+    // This is the single persistence chokepoint for executor events, so
+    // backfilling here covers the task-snapshot and status-update paths
+    // alike, while preserving any timestamp the executor already supplied.
+    if task.status.timestamp.is_none() {
+        task.status.timestamp = Some(chrono::Utc::now());
+    }
     match task_store.update(task.clone()).await {
         Ok(_) => Ok(task),
         Err(error) if error.code == error_code::TASK_NOT_FOUND => {
@@ -218,6 +228,24 @@ async fn save_task(task_store: &dyn crate::TaskStore, task: Task) -> Result<Task
             Ok(task)
         }
         Err(error) => Err(error),
+    }
+}
+
+/// DM-SERIAL-001: backfills a missing status timestamp on the event itself,
+/// before it is both persisted (via `apply_event_to_task`/`save_task`) and
+/// broadcast to any live subscriber -- `save_task`'s own backfill only
+/// covers what gets persisted; a subscriber watching `send_streaming_message`
+/// or `subscribe_to_task` receives the broadcast event directly, never a
+/// reload from the store, so backfilling only at persistence time still
+/// leaves a live subscriber seeing a timestamp-less status.
+fn backfill_status_timestamp(event: &mut StreamResponse) {
+    let status = match event {
+        StreamResponse::Task(task) => &mut task.status,
+        StreamResponse::StatusUpdate(update) => &mut update.status,
+        StreamResponse::ArtifactUpdate(_) | StreamResponse::Message(_) => return,
+    };
+    if status.timestamp.is_none() {
+        status.timestamp = Some(chrono::Utc::now());
     }
 }
 
@@ -240,7 +268,23 @@ async fn apply_event_to_task(
                 .or(task_store.get(&update.task_id).await?)
                 .ok_or_else(|| A2AError::task_not_found(&update.task_id))?;
             let artifacts = task.artifacts.get_or_insert_with(Vec::new);
-            artifacts.push(update.artifact.clone());
+            let existing = artifacts
+                .iter_mut()
+                .find(|artifact| artifact.artifact_id == update.artifact.artifact_id);
+            if update.append.unwrap_or(false) {
+                let artifact = existing.ok_or_else(A2AError::invalid_agent_response)?;
+                artifact.parts.extend(update.artifact.parts.iter().cloned());
+                if let Some(metadata) = &update.artifact.metadata {
+                    artifact
+                        .metadata
+                        .get_or_insert_with(Default::default)
+                        .extend(metadata.clone());
+                }
+            } else if let Some(artifact) = existing {
+                *artifact = update.artifact.clone();
+            } else {
+                artifacts.push(update.artifact.clone());
+            }
             save_task(task_store, task).await.map(Some)
         }
         StreamResponse::Message(_) => Ok(current_task),
@@ -317,7 +361,8 @@ async fn drive_execution(
         }
 
         match result {
-            Ok(event) => {
+            Ok(mut event) => {
+                backfill_status_timestamp(&mut event);
                 match apply_event_to_task(runtime.task_store.as_ref(), current_task.clone(), &event)
                     .await
                 {
@@ -427,6 +472,25 @@ pub trait RequestHandler: Send + Sync + 'static {
     ) -> Result<AgentCard, A2AError>;
 }
 
+/// Decides whether a request may proceed.
+///
+/// The handler never treats a non-empty header as a principal. An
+/// implementation must validate whatever credential it accepts (token, DID,
+/// session) and return [`A2AError`] when that check fails. `task_id` is set
+/// when the method addresses one task and is reserved for owner checks.
+pub trait RequestAuthorizer: Send + Sync {
+    fn authorize(&self, params: &ServiceParams, task_id: Option<&str>) -> Result<(), A2AError>;
+}
+
+impl<F> RequestAuthorizer for F
+where
+    F: Fn(&ServiceParams, Option<&str>) -> Result<(), A2AError> + Send + Sync,
+{
+    fn authorize(&self, params: &ServiceParams, task_id: Option<&str>) -> Result<(), A2AError> {
+        self(params, task_id)
+    }
+}
+
 /// Default implementation of [`RequestHandler`] that orchestrates
 /// task lifecycle management, storage, and executor dispatch.
 pub struct DefaultRequestHandler {
@@ -436,6 +500,30 @@ pub struct DefaultRequestHandler {
     push_config_store: Option<Arc<dyn crate::PushConfigStore>>,
     push_sender: Option<Arc<crate::HttpPushSender>>,
     capabilities: AgentCapabilities,
+    default_input_modes: Vec<String>,
+    authorizer: Option<Arc<dyn RequestAuthorizer>>,
+    extended_agent_card: Option<Arc<dyn ExtendedAgentCardResolver>>,
+}
+
+/// Supplies the authenticated extended Agent Card (§12.4, §10.1).
+///
+/// A resolver rather than a stored card because §12.4 has the extended card
+/// fetched *under a security scheme*: which skills an agent reveals can
+/// legitimately differ by caller, and `ServiceParams` is where the caller's
+/// credentials arrive. An agent serving one card to everyone can ignore the
+/// argument — [`DefaultRequestHandler::with_extended_agent_card`] wraps a
+/// plain card for exactly that case.
+pub trait ExtendedAgentCardResolver: Send + Sync {
+    fn resolve(&self, params: &ServiceParams) -> Result<AgentCard, A2AError>;
+}
+
+impl<F> ExtendedAgentCardResolver for F
+where
+    F: Fn(&ServiceParams) -> Result<AgentCard, A2AError> + Send + Sync,
+{
+    fn resolve(&self, params: &ServiceParams) -> Result<AgentCard, A2AError> {
+        self(params)
+    }
 }
 
 impl DefaultRequestHandler {
@@ -447,6 +535,43 @@ impl DefaultRequestHandler {
             push_config_store: None,
             push_sender: None,
             capabilities: AgentCapabilities::default(),
+            default_input_modes: Vec::new(),
+            authorizer: None,
+            extended_agent_card: None,
+        }
+    }
+
+    /// Serve `card` as the extended Agent Card, identically for every caller.
+    ///
+    /// Also declares the `extendedAgentCard` capability, since serving one
+    /// and advertising it should not be two separate things to remember —
+    /// an explicit `with_capabilities(..)` still overrides it either way.
+    pub fn with_extended_agent_card(mut self, card: AgentCard) -> Self {
+        self.capabilities.extended_agent_card.get_or_insert(true);
+        self.with_extended_agent_card_resolver(move |_: &ServiceParams| Ok(card.clone()))
+    }
+
+    /// Serve an extended Agent Card computed per caller, so an agent can
+    /// reveal different skills to different principals (§12.4).
+    pub fn with_extended_agent_card_resolver(
+        mut self,
+        resolver: impl ExtendedAgentCardResolver + 'static,
+    ) -> Self {
+        self.capabilities.extended_agent_card.get_or_insert(true);
+        self.extended_agent_card = Some(Arc::new(resolver));
+        self
+    }
+
+    /// Install an authorizer. The default handler does not enforce one.
+    pub fn with_authorizer(mut self, authorizer: impl RequestAuthorizer + 'static) -> Self {
+        self.authorizer = Some(Arc::new(authorizer));
+        self
+    }
+
+    fn authorize(&self, params: &ServiceParams, task_id: Option<&str>) -> Result<(), A2AError> {
+        match &self.authorizer {
+            Some(authorizer) => authorizer.authorize(params, task_id),
+            None => Ok(()),
         }
     }
 
@@ -456,7 +581,10 @@ impl DefaultRequestHandler {
     ) -> Self {
         self.push_sender = Some(Arc::new(crate::HttpPushSender::new(None)));
         self.push_config_store = Some(Arc::new(push_config_store));
-        self.capabilities.push_notifications = Some(true);
+        // Only a default: an explicit `Some(false)` from `with_capabilities`
+        // stands, so the result no longer depends on which builder method was
+        // called last.
+        self.capabilities.push_notifications.get_or_insert(true);
         self
     }
 
@@ -467,13 +595,78 @@ impl DefaultRequestHandler {
     ) -> Self {
         self.push_config_store = Some(Arc::new(push_config_store));
         self.push_sender = Some(Arc::new(push_sender));
-        self.capabilities.push_notifications = Some(true);
+        self.capabilities.push_notifications.get_or_insert(true);
         self
     }
 
     pub fn with_capabilities(mut self, capabilities: AgentCapabilities) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Declares the media types incoming message parts may use (§5.1's
+    /// `defaultInputModes`). Empty (the default) means unrestricted, so
+    /// embedders that never call this see no change in behavior.
+    pub fn with_default_input_modes(mut self, modes: impl Into<Vec<String>>) -> Self {
+        self.default_input_modes = modes.into();
+        self
+    }
+
+    /// A part with a declared, non-empty media type that isn't among the
+    /// advertised `defaultInputModes` is rejected; a part that declares none
+    /// is unrestricted, and so is every part when no modes were declared.
+    fn validate_content_types(&self, message: &Message) -> Result<(), A2AError> {
+        if self.default_input_modes.is_empty() {
+            return Ok(());
+        }
+        let supported = message.parts.iter().all(|part| {
+            part.media_type.as_deref().is_none_or(|media_type| {
+                media_type.is_empty() || self.default_input_modes.iter().any(|m| m == media_type)
+            })
+        });
+        if supported {
+            Ok(())
+        } else {
+            Err(A2AError::content_type_not_supported())
+        }
+    }
+
+    /// §13.3: refuse a capability-gated operation the card does not declare.
+    ///
+    /// `None` means "not restricted", not "refused". `AgentCapabilities::
+    /// default()` leaves every field `None` and most embedders never call
+    /// [`Self::with_capabilities`], so treating `None` as a refusal would
+    /// break all of them at once. Only an explicit `Some(false)` refuses.
+    fn require_capability(
+        declared: Option<bool>,
+        unsupported: impl FnOnce() -> A2AError,
+    ) -> Result<(), A2AError> {
+        match declared {
+            Some(false) => Err(unsupported()),
+            _ => Ok(()),
+        }
+    }
+
+    fn require_streaming(&self) -> Result<(), A2AError> {
+        Self::require_capability(self.capabilities.streaming, || {
+            A2AError::unsupported_operation("the agent card does not declare streaming")
+        })
+    }
+
+    fn require_push_notifications(&self) -> Result<(), A2AError> {
+        Self::require_capability(
+            self.capabilities.push_notifications,
+            A2AError::push_notification_not_supported,
+        )
+    }
+
+    /// The push-config store, refusing first when the card declares that the
+    /// agent does not support push notifications (§13.3). Distinct from
+    /// [`Self::push_config_store`], which reports the *deployment* state — a
+    /// store that was never supplied — with the same error code.
+    fn push_config_store_checked(&self) -> Result<&dyn crate::PushConfigStore, A2AError> {
+        self.require_push_notifications()?;
+        self.push_config_store()
     }
 
     fn push_config_store(&self) -> Result<&dyn crate::PushConfigStore, A2AError> {
@@ -493,13 +686,47 @@ impl DefaultRequestHandler {
         &self,
         req: &SendMessageRequest,
     ) -> Result<(Task, Option<Task>, String), A2AError> {
-        let task_id = req.message.task_id.clone().unwrap_or_else(new_task_id);
+        // A2A §3.4.2: a client-provided taskId MUST reference an existing task,
+        // and client-provided ids for *creating* tasks are not supported. Only
+        // an absent taskId may mint a new one.
+        let task_id = match req.message.task_id.clone() {
+            Some(id) => id,
+            None => new_task_id(),
+        };
         let stored = self.task_store.get(&task_id).await?;
-        let context_id = stored
+        if stored.is_none() && req.message.task_id.is_some() {
+            return Err(A2AError::task_not_found(&task_id));
+        }
+        if stored
             .as_ref()
-            .map(|task| task.context_id.clone())
-            .or_else(|| req.message.context_id.clone())
-            .unwrap_or_else(new_context_id);
+            .is_some_and(|task| task.status.state.is_terminal())
+        {
+            return Err(A2AError::unsupported_operation(format!(
+                "task {task_id} has already reached a terminal state"
+            )));
+        }
+
+        // A2A §3.4.3: reject a mismatching contextId/taskId pair, and infer
+        // contextId from the task when only taskId is given.
+        let context_id = match stored.as_ref() {
+            Some(task) => {
+                if let Some(requested) = req.message.context_id.as_deref() {
+                    if requested != task.context_id {
+                        return Err(A2AError::invalid_params(format!(
+                            "contextId {requested} does not match task {task_id}, \
+                             which belongs to context {}",
+                            task.context_id
+                        )));
+                    }
+                }
+                task.context_id.clone()
+            }
+            None => req
+                .message
+                .context_id
+                .clone()
+                .unwrap_or_else(new_context_id),
+        };
 
         let task = if let Some(existing) = stored.clone() {
             existing
@@ -541,7 +768,7 @@ impl DefaultRequestHandler {
         if config.tenant.is_none() {
             config.tenant = req.tenant.clone();
         }
-        self.push_config_store()?.save(config).await?;
+        self.push_config_store_checked()?.save(config).await?;
         Ok(())
     }
 
@@ -551,6 +778,7 @@ impl DefaultRequestHandler {
         req: SendMessageRequest,
         include_task_snapshot_in_context: bool,
     ) -> Result<(TaskId, BoxStream<'static, Result<StreamResponse, A2AError>>), A2AError> {
+        self.validate_content_types(&req.message)?;
         let (task, stored_task, context_id) = self.prepare_task_for_execution(&req).await?;
         let task_id = task.id.clone();
         self.save_request_push_config(&task_id, &req).await?;
@@ -597,6 +825,7 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
+        self.authorize(params, req.message.task_id.as_deref())?;
         let (task_id, mut stream) = self.start_execution(params, req.clone(), true).await?;
         let mut last_event = None;
 
@@ -635,27 +864,56 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        self.authorize(params, req.message.task_id.as_deref())?;
+        self.require_streaming()?;
         let (_, stream) = self.start_execution(params, req, false).await?;
         Ok(stream)
     }
 
     async fn get_task(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
-        self.task_store
+        self.authorize(params, Some(&req.id))?;
+        let mut task = self
+            .task_store
             .get(&req.id)
             .await?
-            .ok_or_else(|| A2AError::task_not_found(&req.id))
+            .ok_or_else(|| A2AError::task_not_found(&req.id))?;
+        apply_history_length(&mut task, req.history_length);
+        Ok(task)
     }
 
+    /// Bounds the page twice, and neither is redundant: `TaskStore` is a
+    /// public trait.
+    ///
+    /// Clamping `page_size` before the call bounds a store that honours it
+    /// -- the ordinary case, and the one that turns `pageSize=999999999`
+    /// into a real query. Truncating the response bounds a store that
+    /// ignores it, which cannot be detected from here.
+    ///
+    /// On truncation the store's `next_page_token` is left alone: paging is
+    /// the store's own scheme (the in-tree stores use offsets, another may
+    /// use an opaque cursor) so no correct token can be synthesised. See
+    /// [`TaskStore::list`].
     async fn list_tasks(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
-        self.task_store.list(&req).await
+        self.authorize(params, None)?;
+        let page_size = resolve_page_size(req.page_size);
+        let req = ListTasksRequest {
+            page_size: Some(page_size as i32),
+            ..req
+        };
+        let mut response = self.task_store.list(&req).await?;
+        response.tasks.truncate(page_size);
+        for task in &mut response.tasks {
+            apply_history_length(task, req.history_length);
+        }
+        Ok(response)
     }
 
     async fn cancel_task(
@@ -663,11 +921,36 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: CancelTaskRequest,
     ) -> Result<Task, A2AError> {
+        self.authorize(params, Some(&req.id))?;
         let task = self.load_task(&req.id).await?;
 
+        // Idempotent: re-cancelling an already-canceled task is a no-op that
+        // returns the current task (matching a2a-go). Other terminal states
+        // are still not cancelable, per A2A and a2a-cli SPEC.md §10.4.
+        if task.status.state == TaskState::Canceled {
+            return Ok(task);
+        }
         if task.status.state.is_terminal() {
             return Err(A2AError::task_not_cancelable(&req.id));
         }
+
+        // Atomically transition the task to CANCELED so two concurrent cancel
+        // requests cannot both pass the check-then-act window.
+        let task = match self.task_store.begin_cancel(&req.id).await {
+            Ok(task) => task,
+            Err(error) if error.code == error_code::TASK_NOT_CANCELABLE => {
+                // Raced with another cancel or with task completion. Keep the
+                // same semantics as the upfront check: a task another cancel
+                // already moved to CANCELED is returned (idempotent); any
+                // other terminal state is still not cancelable.
+                let raced = self.load_task(&req.id).await?;
+                if raced.status.state == TaskState::Canceled {
+                    return Ok(raced);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
 
         let active_execution = self.execution_manager.get(&req.id).await;
 
@@ -687,7 +970,8 @@ impl RequestHandler for DefaultRequestHandler {
 
         while let Some(event) = stream.next().await {
             match event {
-                Ok(event) => {
+                Ok(mut event) => {
+                    backfill_status_timestamp(&mut event);
                     let updated_task =
                         apply_event_to_task(self.task_store.as_ref(), current_task.clone(), &event)
                             .await?;
@@ -727,51 +1011,74 @@ impl RequestHandler for DefaultRequestHandler {
 
     async fn subscribe_to_task(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let (receiver, snapshot_task, sequence) = self
-            .execution_manager
-            .resubscribe(&req.id)
-            .await
-            .ok_or_else(|| A2AError::task_not_found(&req.id))?;
-        Ok(subscription_stream(receiver, snapshot_task, sequence))
+        self.authorize(params, Some(&req.id))?;
+        self.require_streaming()?;
+        if let Some((receiver, snapshot_task, sequence)) =
+            self.execution_manager.resubscribe(&req.id).await
+        {
+            return Ok(subscription_stream(receiver, snapshot_task, sequence));
+        }
+
+        // A registry miss also happens once a task finishes and its
+        // execution is cleaned up, so it doesn't by itself mean the task
+        // never existed -- check the store to tell the two apart before
+        // reporting TaskNotFoundError.
+        if let Some(task) = self.task_store.get(&req.id).await? {
+            if task.status.state.is_terminal() {
+                return Err(A2AError::unsupported_operation(format!(
+                    "task {} has already reached a terminal state",
+                    req.id
+                )));
+            }
+        }
+        Err(A2AError::task_not_found(&req.id))
     }
 
     async fn create_push_config(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.push_config_store()?.save(req).await
+        self.authorize(params, Some(&req.task_id))?;
+        self.push_config_store_checked()?.save(req).await
     }
 
     async fn get_push_config(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        self.push_config_store()?.get(&req.task_id, &req.id).await
+        self.authorize(params, Some(&req.task_id))?;
+        self.push_config_store_checked()?
+            .get(&req.task_id, &req.id)
+            .await
     }
 
     async fn list_push_configs(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        let mut configs = self.push_config_store()?.list(&req.task_id).await?;
+        self.authorize(params, Some(&req.task_id))?;
+        let mut configs = self.push_config_store_checked()?.list(&req.task_id).await?;
         configs.sort_by(|left, right| left.id.cmp(&right.id));
 
-        let page_size = match req.page_size {
-            Some(size) if size > 0 => size as usize,
-            _ => 50,
+        // Paging for push configs is done here, not in the store: the store
+        // is asked for every config for the task and the page is cut from
+        // that. PushConfigStore is public, so this clamp is what bounds the
+        // response for an implementation with no per-task limit of its own.
+        let page_size = resolve_page_size(req.page_size);
+        let start = if let Some(ref token) = req.page_token {
+            token
+                .parse::<usize>()
+                .map_err(|_| A2AError::invalid_params("invalid page token"))?
+        } else {
+            0
         };
-        let start = req
-            .page_token
-            .as_deref()
-            .and_then(|token| token.parse::<usize>().ok())
-            .unwrap_or(0)
-            .min(configs.len());
+        let start = start.min(configs.len());
         let end = (start + page_size).min(configs.len());
         let next_page_token = (end < configs.len()).then(|| end.to_string());
 
@@ -783,22 +1090,34 @@ impl RequestHandler for DefaultRequestHandler {
 
     async fn delete_push_config(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
-        self.push_config_store()?
+        self.authorize(params, Some(&req.task_id))?;
+        self.push_config_store_checked()?
             .delete(&req.task_id, &req.id)
             .await
     }
 
     async fn get_extended_agent_card(
         &self,
-        _params: &ServiceParams,
+        params: &ServiceParams,
         _req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
-        Err(A2AError::unsupported_operation(
-            "extended agent card not configured",
-        ))
+        self.authorize(params, None)?;
+        Self::require_capability(self.capabilities.extended_agent_card, || {
+            A2AError::unsupported_operation(
+                "the agent card does not declare an extended agent card",
+            )
+        })?;
+        match &self.extended_agent_card {
+            Some(resolver) => resolver.resolve(params),
+            // A2A defines a code for exactly this condition.
+            // UNSUPPORTED_OPERATION would say the agent does not do extended
+            // cards at all, when the truth is that this deployment has not
+            // configured one — the client can act on that difference.
+            None => Err(A2AError::extended_card_not_configured()),
+        }
     }
 }
 
@@ -806,8 +1125,9 @@ impl RequestHandler for DefaultRequestHandler {
 mod tests {
     use super::*;
     use crate::executor::ExecutorContext;
-    use crate::push::InMemoryPushConfigStore;
-    use crate::task_store::InMemoryTaskStore;
+    use crate::pagination::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
+    use crate::push::{InMemoryPushConfigStore, PushConfigStore};
+    use crate::task_store::{InMemoryTaskStore, TaskStore, TaskVersion};
 
     use crate::test_util::install_crypto_provider;
     use axum::{
@@ -819,6 +1139,7 @@ mod tests {
     };
     use futures::stream;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicI32, Ordering};
     use tokio::{
         net::TcpListener,
         sync::{Notify, mpsc, oneshot},
@@ -999,6 +1320,176 @@ mod tests {
         }
     }
 
+    /// A `TaskStore` that behaves exactly like `InMemoryTaskStore` except
+    /// for `list`, which it drives from the fields below.
+    ///
+    /// `TaskStore` is public, so nothing obliges a third-party
+    /// implementation to bound its own response. Only a decorator can model
+    /// that; everything else delegates, so a cap test cannot accidentally
+    /// depend on stub behaviour.
+    struct PagingTaskStore {
+        inner: InMemoryTaskStore,
+        count: usize,
+        /// `true` models a well-behaved store, bounded by the handler
+        /// clamping the request; `false` models one that ignores
+        /// `page_size`, bounded only by the handler truncating the response.
+        honour_page_size: bool,
+        /// The `page_size` the handler actually asked for. Recorded because
+        /// the response bound alone cannot distinguish a clamped request
+        /// from an unclamped one -- both end up 100 items wide.
+        seen_page_size: Arc<AtomicI32>,
+        /// Continuation token the store reports, so truncation's handling of
+        /// it can be observed.
+        next_page_token: String,
+    }
+
+    impl PagingTaskStore {
+        fn new(count: usize, honour_page_size: bool) -> Self {
+            Self {
+                inner: InMemoryTaskStore::new(),
+                count,
+                honour_page_size,
+                seen_page_size: Arc::new(AtomicI32::new(-1)),
+                next_page_token: String::new(),
+            }
+        }
+
+        fn with_next_page_token(mut self, token: &str) -> Self {
+            self.next_page_token = token.to_string();
+            self
+        }
+    }
+
+    #[async_trait]
+    impl TaskStore for PagingTaskStore {
+        async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.create(task).await
+        }
+
+        async fn update(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.update(task).await
+        }
+
+        async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
+            self.inner.get(task_id).await
+        }
+
+        async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError> {
+            self.inner.begin_cancel(task_id).await
+        }
+
+        async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+            self.seen_page_size
+                .store(req.page_size.unwrap_or(-1), Ordering::SeqCst);
+            let served = if self.honour_page_size {
+                req.page_size.unwrap_or(i32::MAX).max(0) as usize
+            } else {
+                self.count
+            }
+            .min(self.count);
+            let tasks = (0..served)
+                .map(|i| Task {
+                    id: format!("t-{i:04}"),
+                    context_id: "c1".into(),
+                    status: TaskStatus {
+                        state: TaskState::Completed,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: None,
+                    metadata: None,
+                })
+                .collect::<Vec<_>>();
+            let total = tasks.len() as i32;
+            Ok(ListTasksResponse {
+                tasks,
+                next_page_token: self.next_page_token.clone(),
+                page_size: total,
+                total_size: total,
+            })
+        }
+    }
+
+    /// The push-config equivalent, and the only way to reach the handler's
+    /// page cap on that path: `InMemoryPushConfigStore` caps a task at
+    /// `MAX_PUSH_CONFIGS_PER_TASK` (50), below the page cap of 100, so
+    /// nothing routed through it can make the clamp bind. Everything but
+    /// `list` delegates.
+    struct PagingPushConfigStore {
+        inner: InMemoryPushConfigStore,
+        count: usize,
+    }
+
+    impl PagingPushConfigStore {
+        fn new(count: usize) -> Self {
+            Self {
+                inner: InMemoryPushConfigStore::new(),
+                count,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::PushConfigStore for PagingPushConfigStore {
+        async fn save(
+            &self,
+            config: TaskPushNotificationConfig,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.inner.save(config).await
+        }
+
+        async fn get(
+            &self,
+            task_id: &str,
+            config_id: &str,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.inner.get(task_id, config_id).await
+        }
+
+        async fn list(&self, task_id: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
+            Ok((0..self.count)
+                .map(|i| TaskPushNotificationConfig {
+                    task_id: task_id.to_string(),
+                    url: format!("https://example.com/hook/{i}"),
+                    id: Some(format!("cfg-{i:04}")),
+                    token: None,
+                    authentication: None,
+                    tenant: None,
+                })
+                .collect())
+        }
+
+        async fn delete(&self, task_id: &str, config_id: &str) -> Result<(), A2AError> {
+            self.inner.delete(task_id, config_id).await
+        }
+
+        async fn delete_all(&self, task_id: &str) -> Result<(), A2AError> {
+            self.inner.delete_all(task_id).await
+        }
+    }
+
+    /// Pre-create a task so a message may legitimately reference it: A2A
+    /// §3.4.2 forbids client-provided taskIds for *creating* tasks.
+    async fn seed_task(handler: &DefaultRequestHandler, task_id: &str, context_id: &str) {
+        handler
+            .task_store
+            .create(Task {
+                id: task_id.into(),
+                context_id: context_id.into(),
+                status: TaskStatus {
+                    state: TaskState::Submitted,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+    }
+
     fn make_handler() -> DefaultRequestHandler {
         DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
     }
@@ -1009,8 +1500,16 @@ mod tests {
     }
 
     fn make_push_delivery_handler() -> DefaultRequestHandler {
+        // URL validation is disabled because the test webhook runs on
+        // 127.0.0.1; the default HttpPushSender rejects loopback targets.
         DefaultRequestHandler::new(PushEventExecutor, InMemoryTaskStore::new())
-            .with_push_config_store(InMemoryPushConfigStore::new())
+            .with_push_notifications(
+                InMemoryPushConfigStore::new(),
+                crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                    validate_urls: false,
+                    ..Default::default()
+                })),
+            )
     }
 
     fn make_resumable_handler() -> (DefaultRequestHandler, Arc<Notify>) {
@@ -1117,6 +1616,227 @@ mod tests {
         assert!(matches!(event, StreamResponse::Task(_)));
     }
 
+    /// DM-SERIAL-001: `save_task`'s backfill only covers what gets persisted
+    /// -- a live subscriber receives the broadcast event directly, never a
+    /// reload from the store, so the timestamp must also be backfilled on
+    /// the event itself before it is published.
+    #[tokio::test]
+    async fn test_streamed_task_event_has_a_backfilled_timestamp() {
+        use futures::StreamExt;
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        let req = SendMessageRequest {
+            message: make_message(),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        let mut stream = handler.send_streaming_message(&params, req).await.unwrap();
+        let event = stream.next().await.unwrap().unwrap();
+        match event {
+            StreamResponse::Task(task) => assert!(
+                task.status.timestamp.is_some(),
+                "a live-streamed task event must carry a backfilled timestamp"
+            ),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// `ArtifactUpdate` and `Message` carry no status of their own, so the
+    /// backfill must leave them alone rather than panic on the missing arm.
+    #[test]
+    fn test_backfill_status_timestamp_ignores_events_without_a_status() {
+        let mut artifact_update = StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            task_id: "t1".into(),
+            context_id: "c1".into(),
+            artifact: Artifact {
+                artifact_id: "a1".into(),
+                name: None,
+                description: None,
+                parts: vec![Part::text("payload")],
+                metadata: None,
+                extensions: None,
+            },
+            append: None,
+            last_chunk: None,
+            metadata: None,
+        });
+        let before = artifact_update.clone();
+        backfill_status_timestamp(&mut artifact_update);
+        assert_eq!(artifact_update, before);
+
+        let mut message = StreamResponse::Message(make_message());
+        let before = message.clone();
+        backfill_status_timestamp(&mut message);
+        assert_eq!(message, before);
+    }
+
+    /// DM-SERIAL-001: a status update whose status omits a timestamp must be
+    /// backfilled before the task is persisted, so a returned task never
+    /// carries a timestamp-less status.
+    #[tokio::test]
+    async fn test_status_update_backfills_missing_timestamp() {
+        let store = InMemoryTaskStore::new();
+        store
+            .create(Task {
+                id: "t-backfill".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Submitted,
+                    message: None,
+                    timestamp: Some(chrono::Utc::now()),
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+
+        let updated = apply_event_to_task(
+            &store,
+            None,
+            &StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: "t-backfill".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .expect("status update yields a task");
+
+        assert_eq!(updated.status.state, TaskState::Working);
+        assert!(
+            updated.status.timestamp.is_some(),
+            "missing status timestamp must be backfilled"
+        );
+    }
+
+    /// A timestamp supplied by the executor is authoritative and must be kept
+    /// verbatim, not overwritten by the backfill.
+    #[tokio::test]
+    async fn test_status_update_preserves_supplied_timestamp() {
+        let store = InMemoryTaskStore::new();
+        store
+            .create(Task {
+                id: "t-preserve".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Submitted,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+
+        let supplied = chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let updated = apply_event_to_task(
+            &store,
+            None,
+            &StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: "t-preserve".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: Some(supplied),
+                },
+                metadata: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .expect("status update yields a task");
+
+        assert_eq!(updated.status.timestamp, Some(supplied));
+    }
+
+    /// The task-snapshot arm persists through the same `save_task` chokepoint,
+    /// so an executor `Task` event whose status omits a timestamp must also be
+    /// backfilled (DM-SERIAL-001).
+    #[tokio::test]
+    async fn test_task_snapshot_backfills_missing_timestamp() {
+        let store = InMemoryTaskStore::new();
+
+        let returned = apply_event_to_task(
+            &store,
+            None,
+            &StreamResponse::Task(Task {
+                id: "t-snapshot".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .expect("task event yields a task");
+
+        assert!(
+            returned.status.timestamp.is_some(),
+            "missing status timestamp must be backfilled on the task-snapshot path"
+        );
+        let persisted = store.get("t-snapshot").await.unwrap().unwrap();
+        assert!(
+            persisted.status.timestamp.is_some(),
+            "the persisted task must carry a timestamp"
+        );
+    }
+
+    /// A timestamp already present on a task snapshot is authoritative and
+    /// must survive the persistence chokepoint unchanged.
+    #[tokio::test]
+    async fn test_task_snapshot_preserves_supplied_timestamp() {
+        let store = InMemoryTaskStore::new();
+
+        let supplied = chrono::DateTime::parse_from_rfc3339("2021-06-07T08:09:10Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let returned = apply_event_to_task(
+            &store,
+            None,
+            &StreamResponse::Task(Task {
+                id: "t-snapshot-kept".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: Some(supplied),
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .expect("task event yields a task");
+
+        assert_eq!(returned.status.timestamp, Some(supplied));
+        let persisted = store.get("t-snapshot-kept").await.unwrap().unwrap();
+        assert_eq!(persisted.status.timestamp, Some(supplied));
+    }
+
     #[tokio::test]
     async fn test_stream_disconnect_preserves_execution_for_resubscription() {
         use futures::StreamExt;
@@ -1126,6 +1846,7 @@ mod tests {
         let mut message = make_message();
         message.task_id = Some("t-disconnect".into());
         message.context_id = Some("c-disconnect".into());
+        seed_task(&handler, "t-disconnect", "c-disconnect").await;
 
         let mut stream = handler
             .send_streaming_message(
@@ -1348,6 +2069,183 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // A2A §3.4.2 / §3.4.3: taskId and contextId rules on send_message (#248).
+
+    fn send_req(task_id: Option<&str>, context_id: Option<&str>) -> SendMessageRequest {
+        let mut msg = make_message();
+        msg.task_id = task_id.map(Into::into);
+        msg.context_id = context_id.map(Into::into);
+        SendMessageRequest {
+            message: msg,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_message_rejects_unsupported_content_type() {
+        install_crypto_provider();
+        let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
+        let mut req = send_req(None, None);
+        req.message.parts = vec![
+            Part::data(serde_json::json!({"value": "unsupported"}))
+                .with_media_type("application/x-unsupported-type-12345"),
+        ];
+        let err = handler
+            .send_message(&ServiceParams::new(), req)
+            .await
+            .expect_err("an undeclared content type must be rejected");
+        assert_eq!(err.code, error_code::CONTENT_TYPE_NOT_SUPPORTED);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_accepts_a_declared_content_type() {
+        install_crypto_provider();
+        let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
+        let mut req = send_req(None, None);
+        req.message.parts = vec![Part::text("hello").with_media_type("text/plain")];
+        handler
+            .send_message(&ServiceParams::new(), req)
+            .await
+            .expect("a declared content type must be accepted");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_allows_any_content_type_when_none_declared() {
+        install_crypto_provider();
+        let handler = make_handler();
+        let mut req = send_req(None, None);
+        req.message.parts = vec![
+            Part::data(serde_json::json!({"value": "x"})).with_media_type("application/x-anything"),
+        ];
+        handler
+            .send_message(&ServiceParams::new(), req)
+            .await
+            .expect("no declared modes means no restriction");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_unknown_task_id_is_not_found() {
+        install_crypto_provider();
+        let handler = make_handler();
+        // §3.4.2: a client-provided taskId MUST reference an existing task, and
+        // MUST NOT create one. Silently minting a task here is what let a
+        // mistyped or replayed id start a fresh conversation.
+        let err = handler
+            .send_message(&ServiceParams::new(), send_req(Some("t-absent"), None))
+            .await
+            .expect_err("an unknown taskId must not create a task");
+        assert_eq!(err.code, error_code::TASK_NOT_FOUND);
+        assert!(
+            handler.task_store.get("t-absent").await.unwrap().is_none(),
+            "the rejected id must not have been created"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_message_to_terminal_task_is_rejected() {
+        install_crypto_provider();
+        let handler = make_handler();
+        handler
+            .task_store
+            .create(Task {
+                id: "t-done".into(),
+                context_id: "c-done".into(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let err = handler
+            .send_message(&ServiceParams::new(), send_req(Some("t-done"), None))
+            .await
+            .expect_err("a follow-up to a terminal task must not be accepted");
+        assert_eq!(err.code, error_code::UNSUPPORTED_OPERATION);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_mismatched_context_id_is_rejected() {
+        install_crypto_provider();
+        let handler = make_handler();
+        seed_task(&handler, "t-ctx", "c-real").await;
+        // §3.4.3: previously the stored contextId silently won, so a client
+        // addressing the wrong conversation was never told.
+        let err = handler
+            .send_message(
+                &ServiceParams::new(),
+                send_req(Some("t-ctx"), Some("c-wrong")),
+            )
+            .await
+            .expect_err("a mismatching contextId must be rejected");
+        assert_eq!(err.code, error_code::INVALID_PARAMS);
+        assert!(
+            err.message.contains("c-wrong"),
+            "error names the bad id: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_message_matching_context_id_is_accepted() {
+        install_crypto_provider();
+        let handler = make_handler();
+        seed_task(&handler, "t-ok", "c-ok").await;
+        handler
+            .send_message(&ServiceParams::new(), send_req(Some("t-ok"), Some("c-ok")))
+            .await
+            .expect("a matching pair must be accepted");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_infers_context_id_from_the_task() {
+        install_crypto_provider();
+        let handler = make_handler();
+        seed_task(&handler, "t-infer", "c-infer").await;
+        // §3.4.3: contextId MUST be inferred when only taskId is given.
+        handler
+            .send_message(&ServiceParams::new(), send_req(Some("t-infer"), None))
+            .await
+            .unwrap();
+        let task = handler.task_store.get("t-infer").await.unwrap().unwrap();
+        assert_eq!(task.context_id, "c-infer");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_without_task_id_still_creates_one() {
+        install_crypto_provider();
+        let handler = make_handler();
+        // The server generates the id. A contextId alone is allowed and starts
+        // a new task within that conversation.
+        let resp = handler
+            .send_message(&ServiceParams::new(), send_req(None, Some("c-new")))
+            .await
+            .expect("a message with no taskId must still create a task");
+        let _ = resp;
+        let listed = handler
+            .task_store
+            .list(&ListTasksRequest {
+                context_id: Some("c-new".into()),
+                status: None,
+                page_size: None,
+                page_token: None,
+                history_length: None,
+                include_artifacts: None,
+                status_timestamp_after: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed.tasks.len(), 1);
+        assert_eq!(listed.tasks[0].context_id, "c-new");
+    }
+
     #[tokio::test]
     async fn test_get_task_after_send() {
         let handler = make_handler();
@@ -1355,6 +2253,7 @@ mod tests {
         let mut msg = make_message();
         msg.task_id = Some("t1".into());
         msg.context_id = Some("c1".into());
+        seed_task(&handler, "t1", "c1").await;
         let req = SendMessageRequest {
             message: msg,
             configuration: None,
@@ -1435,6 +2334,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cancel_task_concurrent_both_succeed_idempotently() {
+        let handler = Arc::new(make_handler());
+        let params = ServiceParams::new();
+        let task = Task {
+            id: "t-race".into(),
+            context_id: "c-race".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        handler.task_store.create(task).await.unwrap();
+
+        let handlers = vec![Arc::clone(&handler), Arc::clone(&handler)];
+        let mut results = Vec::new();
+        for handler in handlers {
+            let params = params.clone();
+            let req = CancelTaskRequest {
+                id: "t-race".into(),
+                metadata: None,
+                tenant: None,
+            };
+            results.push(tokio::spawn(async move {
+                handler.cancel_task(&params, req).await
+            }));
+        }
+        for result in results {
+            let task = result.await.unwrap().unwrap();
+            assert_eq!(task.status.state, TaskState::Canceled);
+        }
+    }
+
+    #[tokio::test]
     async fn test_cancel_task_already_completed() {
         let handler = make_handler();
         let params = ServiceParams::new();
@@ -1457,7 +2393,299 @@ mod tests {
             tenant: None,
         };
         let result = handler.cancel_task(&params, req).await;
-        assert!(result.is_err());
+        match result {
+            Ok(_) => panic!("expected cancel of COMPLETED to fail"),
+            Err(error) => assert_eq!(error.code, error_code::TASK_NOT_CANCELABLE),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_already_canceled_is_idempotent() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        let task = Task {
+            id: "t-canceled".into(),
+            context_id: "c-canceled".into(),
+            status: TaskStatus {
+                state: TaskState::Canceled,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        handler.task_store.create(task).await.unwrap();
+        let req = CancelTaskRequest {
+            id: "t-canceled".into(),
+            metadata: None,
+            tenant: None,
+        };
+        let result = handler.cancel_task(&params, req).await.unwrap();
+        assert_eq!(result.status.state, TaskState::Canceled);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_failed_and_rejected_are_not_cancelable() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        for (id, state) in [
+            ("t-failed", TaskState::Failed),
+            ("t-rejected", TaskState::Rejected),
+        ] {
+            handler
+                .task_store
+                .create(Task {
+                    id: id.into(),
+                    context_id: format!("c-{id}"),
+                    status: TaskStatus {
+                        state,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: None,
+                    metadata: None,
+                })
+                .await
+                .unwrap();
+            let result = handler
+                .cancel_task(
+                    &params,
+                    CancelTaskRequest {
+                        id: id.into(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await;
+            match result {
+                Ok(_) => panic!("expected cancel of {id} to fail"),
+                Err(error) => assert_eq!(error.code, error_code::TASK_NOT_CANCELABLE),
+            }
+        }
+    }
+
+    fn task_with_history(id: &str, context_id: &str, n: usize) -> Task {
+        Task {
+            id: id.into(),
+            context_id: context_id.into(),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: Some(
+                (0..n)
+                    .map(|i| Message::new(Role::User, vec![Part::text(format!("m{i}"))]))
+                    .collect(),
+            ),
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_task_applies_history_length() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        handler
+            .task_store
+            .create(task_with_history("hist", "c", 3))
+            .await
+            .unwrap();
+
+        let full = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: "hist".into(),
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(full.history.as_ref().unwrap().len(), 3);
+
+        let last = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: "hist".into(),
+                    history_length: Some(1),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(last.history.as_ref().unwrap().len(), 1);
+
+        for hl in [0, -1] {
+            let empty = handler
+                .get_task(
+                    &params,
+                    GetTaskRequest {
+                        id: "hist".into(),
+                        history_length: Some(hl),
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                empty.history.as_ref().unwrap().is_empty(),
+                "history_length={hl} must clear history"
+            );
+        }
+    }
+
+    fn reject_unauthenticated(
+        _params: &ServiceParams,
+        _task_id: Option<&str>,
+    ) -> Result<(), A2AError> {
+        Err(A2AError::invalid_request("authentication required"))
+    }
+
+    #[tokio::test]
+    async fn test_authorizer_rejects_handler_methods() {
+        let handler = DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+            .with_authorizer(reject_unauthenticated)
+            .with_push_config_store(InMemoryPushConfigStore::new());
+        let params = ServiceParams::new();
+
+        assert!(
+            handler
+                .send_message(
+                    &params,
+                    SendMessageRequest {
+                        message: make_message(),
+                        configuration: None,
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .get_task(
+                    &params,
+                    GetTaskRequest {
+                        id: "t".into(),
+                        history_length: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .list_tasks(
+                    &params,
+                    ListTasksRequest {
+                        context_id: None,
+                        status: None,
+                        page_size: None,
+                        page_token: None,
+                        history_length: None,
+                        status_timestamp_after: None,
+                        include_artifacts: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .cancel_task(
+                    &params,
+                    CancelTaskRequest {
+                        id: "t".into(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .subscribe_to_task(
+                    &params,
+                    SubscribeToTaskRequest {
+                        id: "t".into(),
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .create_push_config(
+                    &params,
+                    TaskPushNotificationConfig {
+                        url: "https://example.com/push".into(),
+                        id: None,
+                        task_id: "t".into(),
+                        token: None,
+                        authentication: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .get_push_config(
+                    &params,
+                    GetTaskPushNotificationConfigRequest {
+                        task_id: "t".into(),
+                        id: "cfg".into(),
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .list_push_configs(
+                    &params,
+                    ListTaskPushNotificationConfigsRequest {
+                        task_id: "t".into(),
+                        page_size: None,
+                        page_token: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .delete_push_config(
+                    &params,
+                    DeleteTaskPushNotificationConfigRequest {
+                        task_id: "t".into(),
+                        id: "cfg".into(),
+                        tenant: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            handler
+                .get_extended_agent_card(&params, GetExtendedAgentCardRequest { tenant: None })
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1476,6 +2704,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_subscribe_to_terminal_task_is_unsupported_not_not_found() {
+        let handler = make_handler();
+        handler
+            .task_store
+            .create(Task {
+                id: "t-done".into(),
+                context_id: "c-done".into(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let result = handler
+            .subscribe_to_task(
+                &ServiceParams::new(),
+                SubscribeToTaskRequest {
+                    id: "t-done".into(),
+                    tenant: None,
+                },
+            )
+            .await;
+        match result {
+            Ok(_) => panic!("expected subscribe_to_task to fail"),
+            Err(error) => assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION),
+        }
+    }
+
+    #[tokio::test]
     async fn test_send_message_return_immediately_allows_resubscribe() {
         use futures::StreamExt;
 
@@ -1484,6 +2746,7 @@ mod tests {
         let mut message = make_message();
         message.task_id = Some("t-resume".into());
         message.context_id = Some("c-resume".into());
+        seed_task(&handler, "t-resume", "c-resume").await;
 
         let response = handler
             .send_message(
@@ -1548,7 +2811,7 @@ mod tests {
             .await;
         match result {
             Ok(_) => panic!("expected subscribe_to_task to fail after completion"),
-            Err(error) => assert_eq!(error.code, error_code::TASK_NOT_FOUND),
+            Err(error) => assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION),
         }
     }
 
@@ -1570,6 +2833,322 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_push_configs_invalid_page_token_errors() {
+        install_crypto_provider();
+        let handler = make_handler_with_push_configs();
+        let params = ServiceParams::new();
+        handler
+            .create_push_config(
+                &params,
+                TaskPushNotificationConfig {
+                    task_id: "t1".into(),
+                    url: "https://example.com/callback".into(),
+                    id: Some("cfg-1".into()),
+                    token: None,
+                    authentication: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = handler
+            .list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: None,
+                    page_token: Some("not-a-number".into()),
+                    tenant: None,
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, error_code::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_page_size_cap_bounds_a_store_that_ignores_it() {
+        install_crypto_provider();
+        // A store that pays no attention to page_size. Clamping the request
+        // does nothing here; only truncating the response bounds it.
+        let handler = DefaultRequestHandler::new(
+            EchoExecutor,
+            PagingTaskStore::new(MAX_PAGE_SIZE * 3, false),
+        );
+
+        let resp = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: Some(1_000_000),
+                    page_token: None,
+                    history_length: None,
+                    include_artifacts: None,
+                    status_timestamp_after: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.tasks.len(), MAX_PAGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_paging_stores_delegate_everything_except_list() {
+        install_crypto_provider();
+        // The cap tests above are only measuring the handler if these two
+        // doubles differ from the real stores in `list` and nowhere else.
+        // Pin that, so a later edit cannot quietly make them lie.
+        let tasks = PagingTaskStore::new(0, true);
+        let task = Task {
+            id: "t-delegated".into(),
+            context_id: "c1".into(),
+            status: TaskStatus {
+                state: TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        tasks.create(task.clone()).await.unwrap();
+        assert_eq!(
+            tasks
+                .get("t-delegated")
+                .await
+                .unwrap()
+                .map(|t| t.status.state),
+            Some(TaskState::Submitted)
+        );
+        let mut done = task.clone();
+        done.status.state = TaskState::Completed;
+        tasks.update(done).await.unwrap();
+        assert_eq!(
+            tasks
+                .get("t-delegated")
+                .await
+                .unwrap()
+                .map(|t| t.status.state),
+            Some(TaskState::Completed)
+        );
+
+        // begin_cancel has no default (#250), so this must reach
+        // InMemoryTaskStore's atomic implementation -- and refuse a task that
+        // is already terminal, as the trait documents.
+        let mut cancelable = task.clone();
+        cancelable.id = "t-cancelable".into();
+        cancelable.status.state = TaskState::Working;
+        tasks.create(cancelable).await.unwrap();
+        assert_eq!(
+            tasks
+                .begin_cancel("t-cancelable")
+                .await
+                .unwrap()
+                .status
+                .state,
+            TaskState::Canceled
+        );
+        assert_eq!(
+            tasks.begin_cancel("t-delegated").await.unwrap_err().code,
+            error_code::TASK_NOT_CANCELABLE
+        );
+
+        let configs = PagingPushConfigStore::new(0);
+        configs
+            .save(TaskPushNotificationConfig {
+                task_id: "t1".into(),
+                url: "https://example.com/callback".into(),
+                id: Some("cfg-1".into()),
+                token: None,
+                authentication: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            configs.get("t1", "cfg-1").await.unwrap().id.as_deref(),
+            Some("cfg-1")
+        );
+        configs.delete("t1", "cfg-1").await.unwrap();
+        assert!(configs.get("t1", "cfg-1").await.is_err());
+        configs.delete_all("t1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_page_size_cap_bounds_a_store_that_honours_it() {
+        install_crypto_provider();
+        // The ordinary case: the store does what it is asked, so what it is
+        // asked for has to be bounded. Without the clamp this store would
+        // build a million tasks.
+        let store = PagingTaskStore::new(MAX_PAGE_SIZE * 3, true);
+        let seen = Arc::clone(&store.seen_page_size);
+        let handler = DefaultRequestHandler::new(EchoExecutor, store);
+
+        let resp = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: Some(1_000_000),
+                    page_token: None,
+                    history_length: None,
+                    include_artifacts: None,
+                    status_timestamp_after: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.tasks.len(), MAX_PAGE_SIZE);
+        // The point of the clamp: the store is never asked for the million.
+        // Asserting only on the response would pass with no clamp at all,
+        // because the response bound would hide it.
+        assert_eq!(seen.load(Ordering::SeqCst), MAX_PAGE_SIZE as i32);
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_truncation_keeps_the_store_continuation_token() {
+        install_crypto_provider();
+        // Truncating must not strand the remainder. The handler cannot
+        // synthesise a token for a paging scheme it does not own, so the
+        // store's own token has to survive untouched -- otherwise a caller
+        // that lost 200 tasks has no way to ask for them.
+        let handler = DefaultRequestHandler::new(
+            EchoExecutor,
+            PagingTaskStore::new(MAX_PAGE_SIZE * 3, false)
+                .with_next_page_token("cursor-from-store"),
+        );
+
+        let resp = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    include_artifacts: None,
+                    status_timestamp_after: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.tasks.len(), DEFAULT_PAGE_SIZE);
+        assert_eq!(resp.next_page_token, "cursor-from-store");
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_honours_a_page_size_under_the_cap() {
+        install_crypto_provider();
+        // The clamp is an upper bound, not a floor: a modest request must
+        // reach the store unchanged.
+        let store = PagingTaskStore::new(MAX_PAGE_SIZE * 3, true);
+        let seen = Arc::clone(&store.seen_page_size);
+        let handler = DefaultRequestHandler::new(EchoExecutor, store);
+
+        let resp = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: Some(7),
+                    page_token: None,
+                    history_length: None,
+                    include_artifacts: None,
+                    status_timestamp_after: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(seen.load(Ordering::SeqCst), 7);
+        assert_eq!(resp.tasks.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_list_push_configs_page_size_cap_bounds_a_custom_store() {
+        install_crypto_provider();
+        // InMemoryPushConfigStore caps a task at 50 configs, below the page
+        // cap of 100, so it can never reach the clamp. A store without that
+        // limit can, and is what the clamp exists for.
+        let handler = DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+            .with_push_config_store(PagingPushConfigStore::new(MAX_PAGE_SIZE * 3));
+
+        let resp = handler
+            .list_push_configs(
+                &ServiceParams::new(),
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: Some(1_000_000),
+                    page_token: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.configs.len(), MAX_PAGE_SIZE);
+        // The remainder must stay reachable, or the cap silently truncates.
+        assert_eq!(resp.next_page_token.as_deref(), Some("100"));
+    }
+
+    #[tokio::test]
+    async fn test_list_push_configs_page_size_is_capped() {
+        install_crypto_provider();
+        let handler = make_handler_with_push_configs();
+        let params = ServiceParams::new();
+        // Keep the count below InMemoryPushConfigStore's per-task cap
+        // (MAX_PUSH_CONFIGS_PER_TASK), which rejects the 51st config.
+        for i in 0..40 {
+            handler
+                .create_push_config(
+                    &params,
+                    TaskPushNotificationConfig {
+                        task_id: "t1".into(),
+                        url: format!("https://example.com/callback/{i}"),
+                        id: Some(format!("cfg-{i:03}")),
+                        token: None,
+                        authentication: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // Requesting a huge page size must not error and returns everything
+        // available. This does NOT exercise the cap -- 40 < MAX_PAGE_SIZE, so
+        // a capped and an uncapped implementation agree here. The cap itself
+        // is pinned by test_list_push_configs_page_size_cap_bounds_a_custom_store,
+        // which is the only route that can reach it.
+        let resp = handler
+            .list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: Some(1000),
+                    page_token: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.configs.len(), 40);
     }
 
     #[tokio::test]
@@ -1690,6 +3269,7 @@ mod tests {
         let mut message = make_message();
         message.task_id = Some("t-push-request".into());
         message.context_id = Some("c-push-request".into());
+        seed_task(&handler, "t-push-request", "c-push-request").await;
 
         let response = handler
             .send_message(
@@ -1788,6 +3368,7 @@ mod tests {
         let mut message = make_message();
         message.task_id = Some("t-push-stored".into());
         message.context_id = Some("c-push-stored".into());
+        seed_task(&handler, "t-push-stored", "c-push-stored").await;
         let response = handler
             .send_message(
                 &params,
@@ -1856,5 +3437,370 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler_with_push_configs();
         assert_eq!(handler.capabilities.push_notifications, Some(true));
+    }
+
+    // §13.3 (#203): a capability the card does not declare is not served.
+
+    fn caps(streaming: Option<bool>, push: Option<bool>) -> AgentCapabilities {
+        AgentCapabilities {
+            streaming,
+            push_notifications: push,
+            extensions: None,
+            extended_agent_card: None,
+        }
+    }
+
+    fn send_request() -> SendMessageRequest {
+        SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("hi")]),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        }
+    }
+
+    fn push_config(task_id: &str) -> TaskPushNotificationConfig {
+        TaskPushNotificationConfig {
+            task_id: task_id.into(),
+            url: "https://example.com/callback".into(),
+            id: Some("cfg-1".into()),
+            token: None,
+            authentication: None,
+            tenant: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_refused_when_the_card_declares_it_absent() {
+        let handler = make_handler().with_capabilities(caps(Some(false), None));
+        let params = ServiceParams::new();
+
+        // The Ok arm is a BoxStream, which is not Debug, so match rather
+        // than unwrap_err().
+        match handler
+            .send_streaming_message(&params, send_request())
+            .await
+        {
+            Err(error) => assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION),
+            Ok(_) => panic!("streaming must be refused when the card declares it absent"),
+        }
+
+        match handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: "t1".into(),
+                    tenant: None,
+                },
+            )
+            .await
+        {
+            Err(error) => assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION),
+            Ok(_) => panic!("subscribe must be refused when the card declares it absent"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_push_refused_when_the_card_declares_it_absent() {
+        // A store *is* configured; the card declaring `false` is what refuses.
+        // Before #203 this combination served push regardless.
+        let handler = make_handler_with_push_configs().with_capabilities(caps(None, Some(false)));
+        let params = ServiceParams::new();
+
+        let error = handler
+            .create_push_config(&params, push_config("t1"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::PUSH_NOTIFICATION_NOT_SUPPORTED);
+
+        let error = handler
+            .list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: None,
+                    page_token: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::PUSH_NOTIFICATION_NOT_SUPPORTED);
+    }
+
+    /// The regression guard. `AgentCapabilities::default()` leaves every field
+    /// `None`, and most embedders never call `with_capabilities`; if `None`
+    /// started meaning "refuse", all of them would break at once.
+    #[tokio::test]
+    async fn test_undeclared_capabilities_stay_permissive() {
+        let handler = make_handler_with_push_configs();
+        let params = ServiceParams::new();
+
+        assert!(
+            handler
+                .send_streaming_message(&params, send_request())
+                .await
+                .is_ok(),
+            "an undeclared capability must not be treated as refused"
+        );
+        assert!(
+            handler
+                .create_push_config(&params, push_config("t1"))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Supplying a store defaults the capability to `true` but must not
+    /// override an explicit `false`, so the outcome does not depend on which
+    /// builder method was called last.
+    #[tokio::test]
+    async fn test_builder_order_does_not_change_the_declared_capability() {
+        let params = ServiceParams::new();
+
+        for handler in [
+            make_handler()
+                .with_capabilities(caps(None, Some(false)))
+                .with_push_config_store(InMemoryPushConfigStore::new()),
+            make_handler()
+                .with_push_config_store(InMemoryPushConfigStore::new())
+                .with_capabilities(caps(None, Some(false))),
+        ] {
+            let error = handler
+                .create_push_config(&params, push_config("t1"))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, error_code::PUSH_NOTIFICATION_NOT_SUPPORTED);
+        }
+    }
+
+    /// `with_push_notifications` defaults the capability the same way as
+    /// `with_push_config_store`, and likewise must not override an explicit
+    /// `false`. It had no unit test before #203 — only an example — so the
+    /// two builders could have drifted apart unnoticed.
+    #[tokio::test]
+    async fn test_with_push_notifications_defaults_the_capability() {
+        let params = ServiceParams::new();
+
+        let handler = make_handler().with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(None),
+        );
+        assert_eq!(handler.capabilities.push_notifications, Some(true));
+        assert!(
+            handler
+                .create_push_config(&params, push_config("t1"))
+                .await
+                .is_ok()
+        );
+
+        let handler = make_handler()
+            .with_capabilities(caps(None, Some(false)))
+            .with_push_notifications(
+                InMemoryPushConfigStore::new(),
+                crate::HttpPushSender::new(None),
+            );
+        assert_eq!(handler.capabilities.push_notifications, Some(false));
+        let error = handler
+            .create_push_config(&params, push_config("t1"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::PUSH_NOTIFICATION_NOT_SUPPORTED);
+    }
+
+    /// A store that was never supplied still reports the same code — that is
+    /// the deployment state, distinct from the card's declaration.
+    #[tokio::test]
+    async fn test_missing_store_still_reports_push_unsupported() {
+        let handler = make_handler();
+        let error = handler
+            .create_push_config(&ServiceParams::new(), push_config("t1"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::PUSH_NOTIFICATION_NOT_SUPPORTED);
+    }
+
+    /// Reported in #161 against a different crate (`a2a-protocol-server`),
+    /// but worth pinning here: two tasks sharing a `contextId` must each
+    /// carry only their own artifacts. The task store is keyed by task id,
+    /// so there is no path by which a context could aggregate them — this
+    /// test exists so that stays true.
+    #[tokio::test]
+    async fn test_artifacts_do_not_aggregate_across_tasks_in_one_context() {
+        let handler = make_handler();
+        let params = ServiceParams::new();
+        let context_id = "ctx-shared";
+
+        for (task_id, artifact_id) in [("t-first", "a-1"), ("t-second", "a-2")] {
+            handler
+                .task_store
+                .create(Task {
+                    id: task_id.into(),
+                    context_id: context_id.into(),
+                    status: TaskStatus {
+                        state: TaskState::Working,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: None,
+                    metadata: None,
+                })
+                .await
+                .unwrap();
+
+            apply_event_to_task(
+                handler.task_store.as_ref(),
+                None,
+                &StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    task_id: task_id.into(),
+                    context_id: context_id.into(),
+                    artifact: Artifact {
+                        artifact_id: artifact_id.into(),
+                        name: None,
+                        description: None,
+                        parts: vec![Part::text("payload")],
+                        metadata: None,
+                        extensions: None,
+                    },
+                    append: None,
+                    last_chunk: None,
+                    metadata: None,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        for (task_id, expected) in [("t-first", "a-1"), ("t-second", "a-2")] {
+            let task = handler
+                .get_task(
+                    &params,
+                    GetTaskRequest {
+                        id: task_id.into(),
+                        history_length: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let ids: Vec<&str> = task
+                .artifacts
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|a| a.artifact_id.as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![expected],
+                "{task_id} must carry only its own artifact"
+            );
+        }
+    }
+    // §12.4 / §10.1 (#204): the extended Agent Card.
+
+    fn extended_card(name: &str) -> AgentCard {
+        AgentCard {
+            name: name.into(),
+            description: "extended".into(),
+            version: "1.0".into(),
+            supported_interfaces: vec![],
+            capabilities: AgentCapabilities::default(),
+            default_input_modes: vec![],
+            default_output_modes: vec![],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: None,
+            signatures: None,
+        }
+    }
+
+    fn extended_request() -> GetExtendedAgentCardRequest {
+        GetExtendedAgentCardRequest { tenant: None }
+    }
+
+    #[tokio::test]
+    async fn test_extended_agent_card_is_served_when_configured() {
+        let handler = make_handler().with_extended_agent_card(extended_card("secret skills"));
+        let card = handler
+            .get_extended_agent_card(&ServiceParams::new(), extended_request())
+            .await
+            .unwrap();
+        assert_eq!(card.name, "secret skills");
+    }
+
+    /// Configuring a card also declares the capability, so serving one and
+    /// advertising it are not two things to remember.
+    #[tokio::test]
+    async fn test_configuring_an_extended_card_declares_the_capability() {
+        let handler = make_handler().with_extended_agent_card(extended_card("x"));
+        assert_eq!(handler.capabilities.extended_agent_card, Some(true));
+    }
+
+    /// A2A gives this condition its own code. Before #204 it reported
+    /// `UNSUPPORTED_OPERATION`, which says the agent does not do extended
+    /// cards at all rather than that this deployment has not configured one.
+    #[tokio::test]
+    async fn test_unconfigured_extended_card_reports_its_own_code() {
+        let handler = make_handler().with_capabilities(AgentCapabilities {
+            streaming: None,
+            push_notifications: None,
+            extensions: None,
+            extended_agent_card: Some(true),
+        });
+        let error = handler
+            .get_extended_agent_card(&ServiceParams::new(), extended_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::EXTENDED_CARD_NOT_CONFIGURED);
+        assert_ne!(error.code, error_code::UNSUPPORTED_OPERATION);
+    }
+
+    /// The capability gate from #203 runs first: a card declaring
+    /// `extendedAgentCard: false` refuses before the configured/unconfigured
+    /// distinction is even reached.
+    #[tokio::test]
+    async fn test_capability_gate_precedes_the_not_configured_check() {
+        let handler = make_handler()
+            .with_extended_agent_card(extended_card("x"))
+            .with_capabilities(AgentCapabilities {
+                streaming: None,
+                push_notifications: None,
+                extensions: None,
+                extended_agent_card: Some(false),
+            });
+        let error = handler
+            .get_extended_agent_card(&ServiceParams::new(), extended_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+    }
+
+    /// §12.4 fetches the extended card under a security scheme, so a
+    /// resolver can vary what it reveals by caller.
+    #[tokio::test]
+    async fn test_resolver_sees_the_caller_params() {
+        let handler = make_handler().with_extended_agent_card_resolver(|params: &ServiceParams| {
+            let privileged = params.contains_key("x-privileged");
+            Ok(extended_card(if privileged { "full" } else { "limited" }))
+        });
+
+        let card = handler
+            .get_extended_agent_card(&ServiceParams::new(), extended_request())
+            .await
+            .unwrap();
+        assert_eq!(card.name, "limited");
+
+        let mut params = ServiceParams::new();
+        params.insert("x-privileged".into(), vec!["yes".into()]);
+        let card = handler
+            .get_extended_agent_card(&params, extended_request())
+            .await
+            .unwrap();
+        assert_eq!(card.name, "full");
     }
 }

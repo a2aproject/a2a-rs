@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 use std::collections::HashMap;
 
@@ -123,6 +124,17 @@ impl A2AError {
         A2AError::new(error_code::UNSUPPORTED_OPERATION, msg)
     }
 
+    /// The agent supports an extended card but this deployment has not
+    /// configured one. Distinct from [`Self::unsupported_operation`], which
+    /// says the agent does not offer extended cards at all — a client can
+    /// act on the difference, so A2A gives it its own code.
+    pub fn extended_card_not_configured() -> Self {
+        A2AError::new(
+            error_code::EXTENDED_CARD_NOT_CONFIGURED,
+            "extended agent card not configured",
+        )
+    }
+
     pub fn content_type_not_supported() -> Self {
         A2AError::new(
             error_code::CONTENT_TYPE_NOT_SUPPORTED,
@@ -173,6 +185,12 @@ impl A2AError {
             error_code::UNSUPPORTED_OPERATION => 400,
             error_code::CONTENT_TYPE_NOT_SUPPORTED => 400,
             error_code::VERSION_NOT_SUPPORTED => 400,
+            // These two were absent and fell through to 500, contradicting
+            // `rest_grpc_status`, which already classes both as
+            // FAILED_PRECONDITION. A caller asking for something this
+            // deployment does not offer is not a server fault.
+            error_code::EXTENDED_CARD_NOT_CONFIGURED => 400,
+            error_code::EXTENSION_SUPPORT_REQUIRED => 400,
             error_code::PARSE_ERROR => 400,
             error_code::INVALID_REQUEST => 400,
             error_code::METHOD_NOT_FOUND => 501,
@@ -312,6 +330,33 @@ mod tests {
         assert_eq!(
             A2AError::method_not_found("missing").http_status_code(),
             501
+        );
+    }
+
+    /// Both of these previously fell through to 500, which contradicted
+    /// `rest_grpc_status` in a2a-server — that already classed them as
+    /// FAILED_PRECONDITION. Asking for something a deployment does not
+    /// offer is a client-side condition, not a server fault.
+    #[test]
+    fn test_precondition_codes_are_client_errors_not_server_faults() {
+        assert_eq!(
+            A2AError::extended_card_not_configured().http_status_code(),
+            400
+        );
+        assert_eq!(
+            A2AError::new(error_code::EXTENSION_SUPPORT_REQUIRED, "needs ext").http_status_code(),
+            400
+        );
+    }
+
+    #[test]
+    fn test_extended_card_not_configured_carries_its_own_code() {
+        let error = A2AError::extended_card_not_configured();
+        assert_eq!(error.code, error_code::EXTENDED_CARD_NOT_CONFIGURED);
+        assert_ne!(error.code, error_code::UNSUPPORTED_OPERATION);
+        assert_eq!(
+            error_reason(error.code),
+            "EXTENDED_AGENT_CARD_NOT_CONFIGURED"
         );
     }
 

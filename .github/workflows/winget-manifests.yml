@@ -1,4 +1,5 @@
 # Copyright AGNTCY Contributors (https://github.com/agntcy)
+# Copyright A2A Contributors (https://github.com/a2aproject)
 # SPDX-License-Identifier: Apache-2.0
 
 name: Publish WinGet Manifests
@@ -22,6 +23,10 @@ on:
         required: true
         type: string
 
+# Least privilege by default; jobs that need more raise it themselves.
+permissions:
+  contents: read
+
 jobs:
   render-winget-manifests:
     runs-on: ubuntu-latest
@@ -36,12 +41,12 @@ jobs:
       RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Render WinGet manifests
         id: render
@@ -54,7 +59,7 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - name: Upload WinGet manifest artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: winget-manifests-${{ steps.render.outputs.package_version }}
           path: dist/winget/manifests
@@ -66,7 +71,7 @@ jobs:
       contents: read
     steps:
       - name: Download rendered manifests
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: winget-manifests-${{ needs.render-winget-manifests.outputs.package_version }}
           path: manifests
@@ -121,7 +126,7 @@ jobs:
       APP_AUTH_CONFIGURED: ${{ secrets.PROJECT_APP_ID != '' && secrets.PROJECT_APP_KEY != '' }}
     steps:
       - name: Download rendered manifests
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: winget-manifests-${{ needs.render-winget-manifests.outputs.package_version }}
           path: dist/winget/manifests
@@ -129,7 +134,7 @@ jobs:
       - name: Authenticate with GitHub App Bot
         if: env.APP_AUTH_CONFIGURED == 'true'
         id: app-token
-        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.PROJECT_APP_ID }}
           private-key: ${{ secrets.PROJECT_APP_KEY }}
@@ -173,7 +178,9 @@ jobs:
           rm -rf /tmp/winget-pkgs
           GH_TOKEN="$WINGET_PKGS_TOKEN" gh repo clone "$fork_owner/winget-pkgs" /tmp/winget-pkgs -- --depth 1
 
-          branch="automation/winget-a2acli-$PACKAGE_VERSION"
+          # Derived from the identifier so a future rename lands in one place.
+          package_slug="${PACKAGE_IDENTIFIER#*.}"
+          branch="automation/winget-$package_slug-$PACKAGE_VERSION"
 
           cd /tmp/winget-pkgs
           if git remote get-url upstream >/dev/null 2>&1; then
@@ -202,7 +209,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "release: add WinGet manifest for a2acli v$PACKAGE_VERSION"
+          git commit -m "release: add WinGet manifest for $PACKAGE_IDENTIFIER v$PACKAGE_VERSION"
           git push --force --set-upstream origin "$branch"
 
           pr_number=$(GH_TOKEN="$WINGET_PKGS_TOKEN" gh pr list --repo microsoft/winget-pkgs --head "$fork_owner:$branch" --base master --state open --json number --jq 'first(.[].number) // ""' 2>/dev/null || true)

@@ -1,9 +1,10 @@
 # Copyright AGNTCY Contributors (https://github.com/agntcy)
+# Copyright A2A Contributors (https://github.com/a2aproject)
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
 name = "a2a-client-lf"
-version = "0.2.3"
+version = "0.2.5"
 description = "A2A v1 async client with protocol binding factory"
 readme = "README.md"
 edition.workspace = true
@@ -33,11 +34,17 @@ pin-project-lite = { workspace = true }
 rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 rcgen = { workspace = true }
+reqwest = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 # By default we will use aws-lc-rs as crypto provider.
 default = ["rustls-tls"]
+
+# Exposes framing internals to fuzz/. Never enable in a dependent.
+fuzzing = []
 
 rustls-tls = [
     "reqwest/rustls",

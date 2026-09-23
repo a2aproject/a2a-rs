@@ -1,6 +1,6 @@
 [package]
 name = "a2a-server-lf"
-version = "0.4.3"
+version = "0.4.4"
 description = "A2A v1 async server framework"
 readme = "README.md"
 edition.workspace = true
@@ -49,6 +49,8 @@ rustls-no-provider = [
     "dep:rustls",
     "axum-server/tls-rustls-no-provider"
 ]
+
+fuzzing = []
 
 [dev-dependencies]
 http-body-util = "0.1"

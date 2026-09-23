@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 use std::fmt;
 
@@ -40,12 +41,20 @@ pub trait ProtoJsonPayload: Sized {
 
     fn to_proto(value: &Self) -> Self::Proto;
     fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError>;
+
+    /// Adjusts the emitted JSON after the generic proto3-JSON conversion. A
+    /// no-op for every type except where the wire mapping needs a field
+    /// always present that proto3's own JSON convention omits when it's
+    /// left at its default.
+    fn normalize_json(_value: &mut Value) {}
 }
 
 pub fn to_value<T: ProtoJsonPayload>(value: &T) -> Result<Value, ProtoJsonPayloadError> {
     let proto = T::to_proto(value);
     let protojson: T::ProtoJson = transcode_message(&proto)?;
-    serde_json::to_value(protojson).map_err(ProtoJsonPayloadError::Json)
+    let mut json = serde_json::to_value(protojson).map_err(ProtoJsonPayloadError::Json)?;
+    T::normalize_json(&mut json);
+    Ok(json)
 }
 
 pub fn from_value<T: ProtoJsonPayload>(value: Value) -> Result<T, ProtoJsonPayloadError> {
@@ -181,13 +190,28 @@ impl_protojson_payload!(
     crate::pbconv::to_proto_task,
     crate::pbconv::from_proto_task
 );
-impl_protojson_payload!(
-    ListTasksResponse,
-    crate::proto::ListTasksResponse,
-    crate::protojson::ListTasksResponse,
-    crate::pbconv::to_proto_list_tasks_response,
-    crate::pbconv::from_proto_list_tasks_response
-);
+impl ProtoJsonPayload for ListTasksResponse {
+    type Proto = crate::proto::ListTasksResponse;
+    type ProtoJson = crate::protojson::ListTasksResponse;
+
+    fn to_proto(value: &Self) -> Self::Proto {
+        crate::pbconv::to_proto_list_tasks_response(value)
+    }
+
+    fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
+        Ok(crate::pbconv::from_proto_list_tasks_response(value))
+    }
+
+    /// REQ-TASK-LIST-002: `nextPageToken` must always be present, even on
+    /// the last page, but the generated serializer follows proto3-JSON's
+    /// own convention of omitting a string left at its default ("").
+    fn normalize_json(value: &mut Value) {
+        if let Value::Object(map) = value {
+            map.entry("nextPageToken")
+                .or_insert_with(|| Value::String(String::new()));
+        }
+    }
+}
 impl_protojson_payload!(
     ListTaskPushNotificationConfigsResponse,
     crate::proto::ListTaskPushNotificationConfigsResponse,
@@ -216,3 +240,52 @@ impl_protojson_payload_optional!(
     crate::pbconv::to_proto_stream_response,
     crate::pbconv::from_proto_stream_response
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REQ-TASK-LIST-002: the field must survive even when it's the
+    /// proto3 default, which the generated serializer would otherwise omit.
+    #[test]
+    fn test_list_tasks_response_always_includes_next_page_token() {
+        let response = ListTasksResponse {
+            tasks: vec![],
+            next_page_token: String::new(),
+            page_size: 0,
+            total_size: 0,
+        };
+        let json = to_value(&response).unwrap();
+        assert_eq!(
+            json.get("nextPageToken"),
+            Some(&Value::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn test_list_tasks_response_keeps_a_non_empty_next_page_token() {
+        let response = ListTasksResponse {
+            tasks: vec![],
+            next_page_token: "page-2".to_string(),
+            page_size: 0,
+            total_size: 0,
+        };
+        let json = to_value(&response).unwrap();
+        assert_eq!(
+            json.get("nextPageToken"),
+            Some(&Value::String("page-2".to_string()))
+        );
+    }
+
+    /// `serde_json::to_value` on a struct always yields `Value::Object`, so
+    /// `to_value` never reaches the non-object case in practice -- but
+    /// `normalize_json` is a public trait method, not an internal that gets
+    /// to lean on that invariant, so its behavior on the rest of `Value` is
+    /// still part of its contract and worth pinning directly.
+    #[test]
+    fn test_list_tasks_response_normalize_json_ignores_a_non_object_value() {
+        let mut not_an_object = Value::Null;
+        ListTasksResponse::normalize_json(&mut not_an_object);
+        assert_eq!(not_an_object, Value::Null);
+    }
+}
