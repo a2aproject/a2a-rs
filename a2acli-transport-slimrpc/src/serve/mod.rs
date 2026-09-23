@@ -2,30 +2,18 @@
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::{self, BufRead};
-use std::net::SocketAddr;
-use std::sync::Arc;
-
 use a2a::*;
-use a2a_client::Transport;
 use a2a_client::transport::ServiceParams;
-use a2a_grpc::GrpcHandler;
-use a2a_pb::proto::a2a_service_server::A2aServiceServer;
-use a2a_server::RequestHandler;
-use a2a_slimrpc::{SlimRpcTransport, parse_slimrpc_target};
-use async_trait::async_trait;
-use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use slim_config::auth::identity::{IdentityProviderConfig, IdentityVerifierConfig};
 use slim_config::client::ClientConfig;
 use slim_datapath::api::ProtoName;
-use slim_service::service::{Service, ServiceBuilder};
-use tonic::transport::server::TcpIncoming;
-use tonic_tls::rustls::TlsIncoming;
-use uuid::Uuid;
 
 use crate::error::PluginError;
-use crate::tls::generate_loopback_tls;
+
+mod connect;
+
+pub use connect::run;
 
 const TOKEN_HEADER: &str = "a2a-plugin-token";
 
@@ -87,21 +75,6 @@ fn write_handshake(hs: &Handshake) -> Result<(), PluginError> {
     Ok(())
 }
 
-// ── Transport → RequestHandler adapter ────────────────────────────────────────
-
-/// Adapts SlimRpcTransport (a client Transport) into a server RequestHandler,
-/// forwarding all calls while enforcing the per-launch plugin token.
-struct TransportHandler {
-    transport: SlimRpcTransport,
-    token: String,
-}
-
-impl TransportHandler {
-    fn new(transport: SlimRpcTransport, token: String) -> Self {
-        Self { transport, token }
-    }
-}
-
 /// Rejects a call unless it carries exactly one `a2a-plugin-token` header
 /// matching `token`. Free function (not a method) so it's testable without
 /// constructing a `TransportHandler`, which needs a live SLIM connection.
@@ -128,128 +101,6 @@ fn forward_params(params: &ServiceParams) -> ServiceParams {
     fwd
 }
 
-#[async_trait]
-impl RequestHandler for TransportHandler {
-    async fn send_message(
-        &self,
-        params: &ServiceParams,
-        req: SendMessageRequest,
-    ) -> Result<SendMessageResponse, A2AError> {
-        check_token(&self.token, params)?;
-        self.transport
-            .send_message(&forward_params(params), &req)
-            .await
-    }
-
-    async fn send_streaming_message(
-        &self,
-        params: &ServiceParams,
-        req: SendMessageRequest,
-    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        check_token(&self.token, params)?;
-        self.transport
-            .send_streaming_message(&forward_params(params), &req)
-            .await
-    }
-
-    async fn get_task(
-        &self,
-        params: &ServiceParams,
-        req: GetTaskRequest,
-    ) -> Result<Task, A2AError> {
-        check_token(&self.token, params)?;
-        self.transport.get_task(&forward_params(params), &req).await
-    }
-
-    async fn list_tasks(
-        &self,
-        params: &ServiceParams,
-        req: ListTasksRequest,
-    ) -> Result<ListTasksResponse, A2AError> {
-        check_token(&self.token, params)?;
-        self.transport
-            .list_tasks(&forward_params(params), &req)
-            .await
-    }
-
-    async fn cancel_task(
-        &self,
-        params: &ServiceParams,
-        req: CancelTaskRequest,
-    ) -> Result<Task, A2AError> {
-        check_token(&self.token, params)?;
-        self.transport
-            .cancel_task(&forward_params(params), &req)
-            .await
-    }
-
-    async fn subscribe_to_task(
-        &self,
-        params: &ServiceParams,
-        req: SubscribeToTaskRequest,
-    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        check_token(&self.token, params)?;
-        self.transport
-            .subscribe_to_task(&forward_params(params), &req)
-            .await
-    }
-
-    async fn create_push_config(
-        &self,
-        params: &ServiceParams,
-        req: TaskPushNotificationConfig,
-    ) -> Result<TaskPushNotificationConfig, A2AError> {
-        check_token(&self.token, params)?;
-        self.transport
-            .create_push_config(&forward_params(params), &req)
-            .await
-    }
-
-    async fn get_push_config(
-        &self,
-        params: &ServiceParams,
-        req: GetTaskPushNotificationConfigRequest,
-    ) -> Result<TaskPushNotificationConfig, A2AError> {
-        check_token(&self.token, params)?;
-        self.transport
-            .get_push_config(&forward_params(params), &req)
-            .await
-    }
-
-    async fn list_push_configs(
-        &self,
-        params: &ServiceParams,
-        req: ListTaskPushNotificationConfigsRequest,
-    ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        check_token(&self.token, params)?;
-        self.transport
-            .list_push_configs(&forward_params(params), &req)
-            .await
-    }
-
-    async fn delete_push_config(
-        &self,
-        params: &ServiceParams,
-        req: DeleteTaskPushNotificationConfigRequest,
-    ) -> Result<(), A2AError> {
-        check_token(&self.token, params)?;
-        self.transport
-            .delete_push_config(&forward_params(params), &req)
-            .await
-    }
-
-    async fn get_extended_agent_card(
-        &self,
-        params: &ServiceParams,
-        req: GetExtendedAgentCardRequest,
-    ) -> Result<AgentCard, A2AError> {
-        check_token(&self.token, params)?;
-        self.transport
-            .get_extended_agent_card(&forward_params(params), &req)
-            .await
-    }
-}
-
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 /// Parse an app name of the form "org/namespace/agent" into a SLIM `ProtoName`.
@@ -267,7 +118,7 @@ fn parse_proto_name(name: &str) -> Result<ProtoName, PluginError> {
     }
 }
 
-// ── Serve entry point ──────────────────────────────────────────────────────────
+// ── Config loading ─────────────────────────────────────────────────────────────
 
 /// Reads and parses the plugin config at `path`. Split out from `run` so the
 /// file-read and YAML-parse failure paths are testable with a tempfile,
@@ -281,107 +132,6 @@ fn load_config(path: &str) -> Result<PluginConfig, PluginError> {
         path: path.to_string(),
         source: e,
     })
-}
-
-pub async fn run(endpoint: &str) -> Result<(), PluginError> {
-    // 1. Load config
-    let config_path =
-        std::env::var("A2A_SLIMRPC_PLUGIN_CONFIG").map_err(|_| PluginError::ConfigEnvMissing)?;
-    let config = load_config(&config_path)?;
-
-    // 2. Parse SLIMRPC remote target
-    let remote = parse_slimrpc_target(endpoint)
-        .map_err(|e| PluginError::InvalidEndpoint(format!("{endpoint}: {}", e.message)))?;
-
-    // 3. Build auth provider + verifier from app config
-    let provider = config.app.identity_provider.build_auth_provider()?;
-    let verifier = config.app.identity_verifier.build_auth_verifier()?;
-
-    // 4. Build SLIM Service + connect to gateway
-    let kind = ServiceBuilder::kind();
-    let id = slim_config::component::id::ID::new_with_name(kind, &config.app.name)
-        .map_err(|e| PluginError::Slim(format!("invalid service ID: {e}")))?;
-    let service = Service::new(id);
-
-    let conn_id = service
-        .connect(&config.client)
-        .await
-        .map_err(|e| PluginError::Slim(format!("SLIM gateway connect failed: {e}")))?;
-
-    // 5. Build SlimApp + transport
-    // Parse the app name (org/namespace/agent) into SLIM's ProtoName components.
-    let app_name = parse_proto_name(&config.app.name)?;
-    let (slim_app, _notifications) = service
-        .create_app(&app_name, provider, verifier)
-        .map_err(|e| PluginError::Slim(format!("create_app failed: {e}")))?;
-    let slim_app = Arc::new(slim_app);
-
-    let transport = SlimRpcTransport::new_with_connection(slim_app, remote, Some(conn_id));
-
-    // 6. Generate per-launch token + TLS cert
-    let token = Uuid::new_v4().to_string();
-    let tls = generate_loopback_tls()?;
-
-    // 7. Bind loopback TCP + wrap in TLS
-    // Bind on :0 to get a random port, then record the assigned address.
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
-    let std_listener = std::net::TcpListener::bind(addr).map_err(PluginError::Bind)?;
-    let local_addr = std_listener.local_addr().map_err(PluginError::Bind)?;
-    std_listener
-        .set_nonblocking(true)
-        .map_err(PluginError::Bind)?;
-    let tokio_listener =
-        tokio::net::TcpListener::from_std(std_listener).map_err(PluginError::Bind)?;
-
-    let tcp_incoming = TcpIncoming::from(tokio_listener);
-    let tls_incoming = TlsIncoming::new(tcp_incoming, tls.server_config);
-
-    // 8. Build gRPC service
-    let handler = Arc::new(TransportHandler::new(transport, token.clone()));
-    let grpc_service = A2aServiceServer::new(GrpcHandler::new(handler));
-
-    // 9. Print handshake
-    let hs = Handshake {
-        success: true,
-        error: None,
-        endpoint: Some(EndpointPayload {
-            address: local_addr.to_string(),
-            binding: TRANSPORT_PROTOCOL_GRPC,
-            protocol: VERSION,
-            token,
-            cert_pem: tls.cert_pem,
-        }),
-    };
-    write_handshake(&hs)?;
-
-    // 10. Serve until stdin closes (CLI parent exit signal)
-    let serve_fut = tonic::transport::Server::builder()
-        .add_service(grpc_service)
-        .serve_with_incoming(tls_incoming);
-
-    tokio::select! {
-        result = serve_fut => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "gRPC proxy server exited with error");
-            }
-        }
-        _ = wait_stdin_close() => {
-            tracing::debug!("stdin closed, shutting down");
-        }
-    }
-
-    Ok(())
-}
-
-async fn wait_stdin_close() {
-    tokio::task::spawn_blocking(|| {
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        let mut buf = Vec::new();
-        let _ = reader.read_until(0, &mut buf);
-    })
-    .await
-    .ok();
 }
 
 #[cfg(test)]
