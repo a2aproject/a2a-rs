@@ -39,7 +39,7 @@ impl TaskStore for InMemoryTaskStore {
     async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
         let mut store = self.tasks.write().await;
         if store.contains_key(&task.id) {
-            return Err(A2AError::internal("task already exists"));
+            return Err(crate::sanitized_internal_error("task already exists"));
         }
         let id = task.id.clone();
         store.insert(id, StoredEntry { task, version: 1 });

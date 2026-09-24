@@ -471,6 +471,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_error_response_boundary_does_not_rewrite_internal_errors() {
+        // The boundary no longer sanitizes: an INTERNAL_ERROR keeps its
+        // message, since the boundary cannot tell an executor's own failure
+        // report from a server fault. Sanitization happens at the raise site
+        // via `sanitized_internal_error`.
+        let resp = error_response(JsonRpcId::Number(1), A2AError::internal("boom details"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let error = rpc_resp.error.unwrap();
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert_eq!(error.message, "boom details");
+
+        // Non-internal errors keep their message (client-validation feedback).
+        let resp = error_response(JsonRpcId::Number(1), A2AError::task_not_found("t1"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rpc_resp.error.unwrap().message, "task not found: t1");
+    }
+
+    #[tokio::test]
     async fn test_empty_method() {
         let app = make_app();
         let resp = post_jsonrpc(app, "", Value::Null).await;
