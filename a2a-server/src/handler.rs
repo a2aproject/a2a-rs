@@ -3804,3 +3804,43 @@ mod tests {
         assert_eq!(card.name, "full");
     }
 }
+
+#[cfg(test)]
+mod lag_coverage_tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn test_subscription_lag_is_reported_as_a_sanitized_internal_error() {
+        // A subscriber that falls behind the active execution gets a generic
+        // INTERNAL_ERROR rather than the broadcast internals, and the stream
+        // terminates instead of spinning on a lost buffer.
+        let (sender, receiver) = broadcast::channel(1);
+
+        for sequence in 0..4 {
+            let _ = sender.send(ExecutionEvent {
+                sequence,
+                result: Ok(StreamResponse::Message(a2a::Message {
+                    message_id: "lag-probe".to_string(),
+                    role: a2a::Role::Agent,
+                    parts: Vec::new(),
+                    context_id: None,
+                    task_id: None,
+                    metadata: None,
+                    extensions: None,
+                    reference_task_ids: None,
+                })),
+            });
+        }
+
+        let mut stream = subscription_stream(receiver, None, 0);
+        let item = stream.next().await.expect("lagged item");
+
+        let error = item.expect_err("lag must surface as an error");
+        assert_eq!(error.code, a2a::error_code::INTERNAL_ERROR);
+        assert_eq!(error.message, "Internal error");
+
+        // `done` is set on lag, so the stream ends rather than repeating.
+        assert!(stream.next().await.is_none());
+    }
+}

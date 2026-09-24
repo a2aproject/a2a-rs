@@ -404,8 +404,8 @@ fn protojson_json_response<T: ProtoJsonPayload>(value: &T) -> axum::response::Re
     }
 }
 
-fn protojson_stream(
-    stream: BoxStream<'static, Result<StreamResponse, A2AError>>,
+fn protojson_stream<T: ProtoJsonPayload + 'static>(
+    stream: BoxStream<'static, Result<T, A2AError>>,
 ) -> BoxStream<'static, Result<Value, A2AError>> {
     Box::pin(stream.map(|item| {
         item.and_then(|value| {
@@ -802,6 +802,72 @@ mod tests {
         // Non-internal errors keep their message (client-validation feedback).
         let resp = rest_error_response(A2AError::task_not_found("t1"));
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A `ProtoJsonPayload` whose proto and ProtoJSON types disagree, so the
+    /// transcode step in `protojson_conv::to_value` always fails.
+    struct UnserializablePayload;
+
+    impl protojson_conv::ProtoJsonPayload for UnserializablePayload {
+        type Proto = a2a_pb::proto::Task;
+        type ProtoJson = a2a_pb::protojson::Task;
+
+        fn to_proto(_value: &Self) -> Self::Proto {
+            // An out-of-range enum discriminant survives encoding but fails
+            // prost's decode in the transcode step.
+            a2a_pb::proto::Task {
+                status: Some(a2a_pb::proto::TaskStatus {
+                    state: 9999,
+                    message: None,
+                    timestamp: None,
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn try_from_proto(
+            _value: &Self::Proto,
+        ) -> Result<Self, a2a_pb::protojson_conv::ProtoJsonPayloadError> {
+            Ok(Self)
+        }
+    }
+
+    #[test]
+    fn test_unserializable_payload_double_round_trips() {
+        // Keeps the fixture's decode side exercised; the fault lives in
+        // `to_proto`, so `to_value` fails while the type stays constructible.
+        let proto = <UnserializablePayload as protojson_conv::ProtoJsonPayload>::to_proto(
+            &UnserializablePayload,
+        );
+        assert!(
+            <UnserializablePayload as protojson_conv::ProtoJsonPayload>::try_from_proto(&proto)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serialization_fault_is_sanitized_at_the_raise_site() {
+        // A server-side ProtoJSON fault must not leak serializer internals,
+        // so the raise site substitutes the generic message while logging the
+        // real cause.
+        let resp = protojson_json_response(&UnserializablePayload);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["message"], "Internal error");
+    }
+
+    #[tokio::test]
+    async fn test_stream_serialization_fault_is_sanitized_at_the_raise_site() {
+        // Same fault on the streaming path: the executor-facing stream yields
+        // a sanitized INTERNAL_ERROR rather than the serializer detail.
+        let stream: BoxStream<'static, Result<UnserializablePayload, A2AError>> =
+            Box::pin(futures::stream::iter(vec![Ok(UnserializablePayload)]));
+        let mut mapped = protojson_stream(stream);
+        let item = mapped.next().await.expect("one item");
+        let err = item.expect_err("transcode must fail");
+        assert_eq!(err.code, a2a::error_code::INTERNAL_ERROR);
+        assert_eq!(err.message, "Internal error");
     }
 
     #[tokio::test]
