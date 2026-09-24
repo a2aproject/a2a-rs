@@ -82,14 +82,21 @@ jobs:
 
             trailers=$(git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$sha")
 
-            # Case-insensitive: a capitalisation difference is not a
-            # missing sign-off. merge_group tests GitHub's squash commit,
-            # whose author name comes from the PR author's profile and need
-            # not match the trailer, so match on the address there.
+            # merge_group tests GitHub's synthetic squash commit, whose
+            # author identity comes from the PR opener's GitHub account --
+            # not from any contributor's own git config, and with no
+            # guaranteed relationship to it (e.g. a personal commit email
+            # that was never added to that account). Every real commit in
+            # this range already had to pass this same check, author-vs-
+            # trailer match included, on the pull_request trigger before
+            # the PR could be enqueued at all, so merge_group only needs to
+            # confirm a Signed-off-by trailer survived the squash, not
+            # re-match an identity GitHub itself assigned.
             if [ "$EVENT_NAME" = "merge_group" ]; then
-              author_email=$(git log -1 --format='%ae' "$sha")
-              matched=$(printf '%s\n' "$trailers" | grep -qiF "<$author_email>" && echo yes || echo no)
+              matched=$([ -n "$trailers" ] && echo yes || echo no)
             else
+              # Case-insensitive: a capitalisation difference is not a
+              # missing sign-off.
               matched=$(printf '%s\n' "$trailers" | grep -qiFx "$author" && echo yes || echo no)
             fi
 
