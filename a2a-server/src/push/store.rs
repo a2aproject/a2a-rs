@@ -102,7 +102,16 @@ impl PushConfigStore for InMemoryPushConfigStore {
             .get(task_id)
             .and_then(|configs| configs.get(config_id))
             .cloned()
-            .ok_or_else(A2AError::push_notification_not_supported)
+            // Spec §3.1.8: a config that does not exist is reported as
+            // TaskNotFoundError, not PushNotificationNotSupportedError --
+            // the latter means the agent refuses the whole feature, which
+            // is not the case here since a store is configured at all.
+            .ok_or_else(|| {
+                A2AError::new(
+                    error_code::TASK_NOT_FOUND,
+                    format!("push notification config not found: {config_id}"),
+                )
+            })
     }
 
     async fn list(&self, task_id: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
@@ -185,7 +194,20 @@ mod tests {
     async fn test_get_not_found() {
         let store = InMemoryPushConfigStore::new();
         let result = store.get("t0", "nonexistent").await;
-        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, error_code::TASK_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_config_on_existing_task_is_task_not_found() {
+        let store = InMemoryPushConfigStore::new();
+        let config = store
+            .save(make_config("t1", "https://example.com/hook"))
+            .await
+            .unwrap();
+        assert_ne!(config.id.as_deref(), Some("nonexistent"));
+
+        let result = store.get("t1", "nonexistent").await;
+        assert_eq!(result.unwrap_err().code, error_code::TASK_NOT_FOUND);
     }
 
     #[tokio::test]
