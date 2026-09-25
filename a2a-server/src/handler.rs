@@ -728,7 +728,17 @@ impl DefaultRequestHandler {
                 .unwrap_or_else(new_context_id),
         };
 
-        let task = if let Some(existing) = stored.clone() {
+        let task = if let Some(mut existing) = stored.clone() {
+            // A continuation turn's own incoming message was never otherwise
+            // recorded anywhere: the executor only sees it via `ctx.message`
+            // for deciding this turn's behavior, and `apply_event_to_task`
+            // only ever merges status/artifact deltas onto the snapshot
+            // started here, never anything content-derived. Append it so
+            // `history` actually accumulates across turns.
+            existing
+                .history
+                .get_or_insert_with(Vec::new)
+                .push(req.message.clone());
             existing
         } else {
             let task = Task {
@@ -826,6 +836,13 @@ impl RequestHandler for DefaultRequestHandler {
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
         self.authorize(params, req.message.task_id.as_deref())?;
+        // ACTS CORE-HIST-003: configuration.historyLength governs this
+        // response's own inline task the same way it governs a later
+        // GetTask, so it has to be applied here too, not just there.
+        let history_length = req
+            .configuration
+            .as_ref()
+            .and_then(|configuration| configuration.history_length);
         let (task_id, mut stream) = self.start_execution(params, req.clone(), true).await?;
         let mut last_event = None;
 
@@ -833,9 +850,9 @@ impl RequestHandler for DefaultRequestHandler {
             let event = item?;
 
             if let Some(interrupt_task_id) = should_interrupt_non_streaming(&req, &event) {
-                return Ok(SendMessageResponse::Task(
-                    self.load_task(&interrupt_task_id).await?,
-                ));
+                let mut task = self.load_task(&interrupt_task_id).await?;
+                apply_history_length(&mut task, history_length);
+                return Ok(SendMessageResponse::Task(task));
             }
 
             match event {
@@ -847,15 +864,26 @@ impl RequestHandler for DefaultRequestHandler {
         }
 
         match last_event {
-            Some(StreamResponse::Task(task)) => Ok(SendMessageResponse::Task(task)),
-            Some(StreamResponse::StatusUpdate(update)) => Ok(SendMessageResponse::Task(
-                self.load_task(&update.task_id).await?,
-            )),
-            Some(StreamResponse::ArtifactUpdate(update)) => Ok(SendMessageResponse::Task(
-                self.load_task(&update.task_id).await?,
-            )),
+            Some(StreamResponse::Task(mut task)) => {
+                apply_history_length(&mut task, history_length);
+                Ok(SendMessageResponse::Task(task))
+            }
+            Some(StreamResponse::StatusUpdate(update)) => {
+                let mut task = self.load_task(&update.task_id).await?;
+                apply_history_length(&mut task, history_length);
+                Ok(SendMessageResponse::Task(task))
+            }
+            Some(StreamResponse::ArtifactUpdate(update)) => {
+                let mut task = self.load_task(&update.task_id).await?;
+                apply_history_length(&mut task, history_length);
+                Ok(SendMessageResponse::Task(task))
+            }
             Some(StreamResponse::Message(message)) => Ok(SendMessageResponse::Message(message)),
-            None => Ok(SendMessageResponse::Task(self.load_task(&task_id).await?)),
+            None => {
+                let mut task = self.load_task(&task_id).await?;
+                apply_history_length(&mut task, history_length);
+                Ok(SendMessageResponse::Task(task))
+            }
         }
     }
 
@@ -1298,6 +1326,60 @@ mod tests {
                     None
                 },
             ))
+        }
+
+        fn cancel(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let task = Task {
+                id: ctx.task_id.clone(),
+                context_id: ctx.context_id.clone(),
+                status: TaskStatus {
+                    state: TaskState::Canceled,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            };
+            Box::pin(stream::once(async move { Ok(StreamResponse::Task(task)) }))
+        }
+    }
+
+    /// Mirrors itk's own `tck-multi-turn` ACTS behavior: only ever emits a
+    /// `StatusUpdate`, never a full `Task`, so a test against it exercises
+    /// exactly the path a real executor that never touches `history` relies
+    /// on the server to handle.
+    struct MultiTurnExecutor;
+
+    impl crate::AgentExecutor for MultiTurnExecutor {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let done = ctx
+                .message
+                .as_ref()
+                .and_then(Message::text)
+                .is_some_and(|text| text.trim().eq_ignore_ascii_case("done"));
+            let state = if done {
+                TaskState::Completed
+            } else {
+                TaskState::InputRequired
+            };
+            let update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: ctx.task_id.clone(),
+                context_id: ctx.context_id.clone(),
+                status: TaskStatus {
+                    state,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            });
+            Box::pin(stream::once(async move { Ok(update) }))
         }
 
         fn cancel(
@@ -2201,6 +2283,99 @@ mod tests {
             .send_message(&ServiceParams::new(), send_req(Some("t-ok"), Some("c-ok")))
             .await
             .expect("a matching pair must be accepted");
+    }
+
+    #[tokio::test]
+    async fn test_send_message_accumulates_history_across_turns() {
+        // ACTS CORE-HIST-005/006: a multi-turn conversation's history must
+        // include every turn's message, not just the one that created the
+        // task. MultiTurnExecutor only ever emits a StatusUpdate, so this
+        // exercises prepare_task_for_execution's continuation path exactly
+        // as a real executor (which never touches history itself) does.
+        install_crypto_provider();
+        let handler = DefaultRequestHandler::new(MultiTurnExecutor, InMemoryTaskStore::new());
+
+        let mut turn1 = make_message();
+        turn1.parts = vec![Part::text("turn one")];
+        let resp1 = handler
+            .send_message(
+                &ServiceParams::new(),
+                SendMessageRequest {
+                    message: turn1,
+                    configuration: None,
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        let task_id = match resp1 {
+            SendMessageResponse::Task(t) => t.id,
+            SendMessageResponse::Message(_) => panic!("expected a task"),
+        };
+
+        for text in ["turn two", "done"] {
+            let mut turn = make_message();
+            turn.task_id = Some(task_id.clone());
+            turn.parts = vec![Part::text(text)];
+            handler
+                .send_message(
+                    &ServiceParams::new(),
+                    SendMessageRequest {
+                        message: turn,
+                        configuration: None,
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let task = handler.task_store.get(&task_id).await.unwrap().unwrap();
+        let history = task.history.expect("history must accumulate across turns");
+        let texts: Vec<_> = history.iter().map(|m| m.text()).collect();
+        assert_eq!(
+            texts,
+            vec![Some("turn one"), Some("turn two"), Some("done")]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_message_applies_configuration_history_length_to_its_own_response() {
+        // ACTS CORE-HIST-003: configuration.historyLength must govern
+        // SendMessage's own inline task the same way history_length governs
+        // a later GetTask, rather than always including the just-sent
+        // message regardless of what was asked for.
+        install_crypto_provider();
+        let handler = DefaultRequestHandler::new(MultiTurnExecutor, InMemoryTaskStore::new());
+        let mut message = make_message();
+        message.parts = vec![Part::text("done")];
+        let resp = handler
+            .send_message(
+                &ServiceParams::new(),
+                SendMessageRequest {
+                    message,
+                    configuration: Some(SendMessageConfiguration {
+                        accepted_output_modes: None,
+                        task_push_notification_config: None,
+                        history_length: Some(0),
+                        return_immediately: None,
+                    }),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        let task = match resp {
+            SendMessageResponse::Task(t) => t,
+            SendMessageResponse::Message(_) => panic!("expected a task"),
+        };
+        assert!(
+            task.history.is_none_or(|h| h.is_empty()),
+            "historyLength=0 must clear history on SendMessage's own response"
+        );
     }
 
     #[tokio::test]

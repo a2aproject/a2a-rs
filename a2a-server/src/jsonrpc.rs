@@ -298,13 +298,16 @@ fn parse_major_version(value: &str) -> Option<u32> {
 }
 
 /// §3.6.2: reject a request whose `A2A-Version` header names an
-/// unsupported major version. An absent header is left alone -- §3.6.1
-/// only requires *sending* it, and this server has one version to speak
-/// regardless.
+/// unsupported major version. §3.6.1/§3.6.2 both require an absent header
+/// to be interpreted as "0.3", not as "whatever this interface happens to
+/// serve" -- so it's rejected here exactly like any other unsupported
+/// version, rather than silently processed as this build's version.
 fn check_a2a_version(params: &ServiceParams) -> Result<(), A2AError> {
-    let Some(requested) = params.get("a2a-version").and_then(|v| v.first()) else {
-        return Ok(());
-    };
+    let requested = params
+        .get("a2a-version")
+        .and_then(|v| v.first())
+        .map(String::as_str)
+        .unwrap_or("0.3");
     match parse_major_version(requested) {
         Some(SUPPORTED_MAJOR_VERSION) => Ok(()),
         _ => Err(A2AError::version_not_supported(requested)),
@@ -397,6 +400,10 @@ mod tests {
             .uri("/")
             .method("POST")
             .header("content-type", "application/json")
+            // A supported version, so tests using this helper for something
+            // other than version negotiation itself aren't confounded by
+            // §3.6.2's now-enforced absent-header rejection.
+            .header("a2a-version", "1.0")
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -755,6 +762,7 @@ mod tests {
             .method("POST")
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
+            .header("a2a-version", "1.0")
             .body(Body::from(serde_json::to_string(&rpc).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -790,6 +798,7 @@ mod tests {
             .header("content-type", "application/json")
             .header("authorization", "Bearer jsonrpc-token")
             .header("x-tenant-id", "acme")
+            .header("a2a-version", "1.0")
             .body(Body::from(serde_json::to_string(&rpc).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -832,19 +841,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_a2a_version_is_accepted() {
-        let resp = post_jsonrpc(
-            make_app(),
+    async fn test_missing_a2a_version_is_rejected() {
+        // §3.6.1/§3.6.2: an absent A2A-Version header MUST be interpreted
+        // as "0.3", not as this interface's own version -- so this server,
+        // which only speaks 1.0, rejects it the same as any other
+        // unsupported version. No a2a-version header at all, unlike
+        // `post_jsonrpc`, which sets one so other tests aren't confounded
+        // by this same check.
+        let app = make_app();
+        let rpc = JsonRpcRequest::new(
+            JsonRpcId::Number(1),
             methods::SEND_MESSAGE,
-            serde_json::json!({
+            Some(serde_json::json!({
                 "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
-            }),
-        )
-        .await;
-        assert!(
-            resp.error.is_none(),
-            "expected success, got {:?}",
-            resp.error
+            })),
+        );
+        let req = Request::builder()
+            .uri("/")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let parsed: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed.error.expect("expected an error").code,
+            error_code::VERSION_NOT_SUPPORTED
         );
     }
 
@@ -899,6 +923,7 @@ mod tests {
             .header("accept", "text/event-stream")
             .header("authorization", "Bearer jsonrpc-streaming-token")
             .header("x-tenant-id", "acme")
+            .header("a2a-version", "1.0")
             .body(Body::from(serde_json::to_string(&rpc).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -968,6 +993,7 @@ mod tests {
                 .method("POST")
                 .header("content-type", "application/json")
                 .header("authorization", &token)
+                .header("a2a-version", "1.0")
                 .body(Body::from(serde_json::to_string(&rpc).unwrap()))
                 .unwrap();
             let resp = app.oneshot(req).await.unwrap();
@@ -990,6 +1016,7 @@ mod tests {
             .method("POST")
             .header("content-type", "application/json")
             .header("authorization", "Bearer subscribe-token")
+            .header("a2a-version", "1.0")
             .body(Body::from(serde_json::to_string(&rpc).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();

@@ -8,7 +8,7 @@ use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
 use chrono::{DateTime, Utc};
@@ -397,11 +397,25 @@ async fn handle_get_extended_agent_card<H: RequestHandler>(
 
 fn protojson_json_response<T: ProtoJsonPayload>(value: &T) -> axum::response::Response {
     match protojson_conv::to_value(value) {
-        Ok(payload) => Json(payload).into_response(),
+        Ok(payload) => with_content_type(Json(payload).into_response(), "application/a2a+json"),
         Err(e) => rest_error_response(crate::sanitized_internal_error(format!(
             "failed to serialize ProtoJSON payload: {e}"
         ))),
     }
+}
+
+/// Spec §9 (REST binding): every worked example response carries a
+/// `Content-Type` naming the A2A media type (`application/a2a+json` for a
+/// success body, `application/problem+json` for an error), not axum's
+/// default `application/json`.
+fn with_content_type(
+    mut response: axum::response::Response,
+    content_type: &'static str,
+) -> axum::response::Response {
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
 }
 
 fn protojson_stream<T: ProtoJsonPayload + 'static>(
@@ -488,7 +502,10 @@ fn rest_error_response(err: A2AError) -> axum::response::Response {
         },
     };
 
-    (status, Json(body)).into_response()
+    with_content_type(
+        (status, Json(body)).into_response(),
+        "application/problem+json",
+    )
 }
 
 fn rest_grpc_status(code: i32) -> &'static str {
@@ -606,6 +623,51 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_response_content_type_is_a2a_json() {
+        // ACTS REST-CT-001, spec §9: a REST success response's Content-Type
+        // is application/a2a+json, not axum's default application/json.
+        let app = make_app();
+        let body = serde_json::json!({
+            "message": {
+                "messageId": "m1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hello"}]
+            }
+        });
+        let req = Request::builder()
+            .uri(REST_SEND_MESSAGE_PATH)
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/a2a+json"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rest_error_response_content_type_is_problem_json() {
+        // Spec §9: an error response's Content-Type is
+        // application/problem+json, distinct from a success response's.
+        let resp = rest_error_response(A2AError::task_not_found("missing"));
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/problem+json"
+        );
     }
 
     #[tokio::test]

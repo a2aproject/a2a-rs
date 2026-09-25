@@ -74,6 +74,14 @@ async fn handle_agent_card<P: AgentCardProducer>(
         resp_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
     }
 
+    // Spec §8.6.1: Agent Card responses SHOULD carry a Cache-Control
+    // max-age and an ETag derived from the card's version, since the card
+    // changes far less often than clients may fetch it.
+    resp_headers.insert(header::CACHE_CONTROL, "max-age=300".parse().unwrap());
+    if let Ok(etag) = format!("\"{}\"", card.version).parse() {
+        resp_headers.insert(header::ETAG, etag);
+    }
+
     (StatusCode::OK, resp_headers, Json(card))
 }
 
@@ -168,6 +176,35 @@ mod tests {
                 .to_str()
                 .unwrap(),
             "true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_card_router_sets_cache_control_and_etag() {
+        // ACTS CARD-CACHE-001, spec §8.6.1: the response must carry a
+        // Cache-Control or ETag header; this crate provides both.
+        let card = test_card();
+        let producer = Arc::new(StaticAgentCard::new(card));
+        let app = agent_card_router(producer);
+
+        let req = Request::builder()
+            .uri("/.well-known/agent-card.json")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get("cache-control")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("max-age")
+        );
+        assert_eq!(
+            resp.headers().get("etag").unwrap().to_str().unwrap(),
+            "\"1.0\""
         );
     }
 }
