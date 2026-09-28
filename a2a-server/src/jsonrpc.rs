@@ -585,6 +585,51 @@ mod tests {
         assert_eq!(error.code, error_code::INVALID_PARAMS);
     }
 
+    /// A2A §9.5: a `params` payload that fails to decode is
+    /// `InvalidParamsError` (-32602) for *every* method, not just
+    /// `message/send`. Each arm decodes its own request type, so guard the
+    /// whole table rather than a single representative method.
+    #[tokio::test]
+    async fn test_invalid_params_is_reported_for_every_method() {
+        // Each payload is a well-formed JSON object whose one recognized
+        // field has the wrong type, so decoding fails before the handler.
+        let cases = [
+            (methods::GET_TASK, serde_json::json!({ "id": 123 })),
+            (
+                methods::LIST_TASKS,
+                serde_json::json!({ "pageSize": "not-a-number" }),
+            ),
+            (methods::CANCEL_TASK, serde_json::json!({ "id": 123 })),
+            (
+                methods::CREATE_PUSH_CONFIG,
+                serde_json::json!({ "taskId": 123 }),
+            ),
+            (
+                methods::GET_PUSH_CONFIG,
+                serde_json::json!({ "taskId": 123 }),
+            ),
+            (
+                methods::LIST_PUSH_CONFIGS,
+                serde_json::json!({ "taskId": 123 }),
+            ),
+            (
+                methods::DELETE_PUSH_CONFIG,
+                serde_json::json!({ "taskId": 123 }),
+            ),
+            (
+                methods::GET_EXTENDED_AGENT_CARD,
+                serde_json::json!({ "tenant": 123 }),
+            ),
+        ];
+        for (method, params) in cases {
+            let resp = post_jsonrpc(make_app(), method, params).await;
+            let error = resp
+                .error
+                .unwrap_or_else(|| panic!("{method}: expected an error, got {:?}", resp.result));
+            assert_eq!(error.code, error_code::INVALID_PARAMS, "method {method}");
+        }
+    }
+
     /// Spec §5.7: unrecognized fields in request params are ignored for
     /// forward compatibility instead of being rejected.
     #[tokio::test]
@@ -751,27 +796,36 @@ mod tests {
     }
 
     /// A params-decode failure on the streaming binding must carry the same
-    /// code as the unary binding: `InvalidParamsError` (-32602).
+    /// code as the unary binding: `InvalidParamsError` (-32602), for both
+    /// streaming methods.
     #[tokio::test]
     async fn test_streaming_invalid_params_use_invalid_params_error_code() {
-        let app = make_app();
-        let rpc = JsonRpcRequest::new(
-            JsonRpcId::Number(1),
-            methods::SEND_STREAMING_MESSAGE,
-            Some(serde_json::json!({"message": "not-an-object"})),
-        );
-        let req = Request::builder()
-            .uri("/")
-            .method("POST")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&rpc).unwrap()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let parsed: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
-        let error = parsed.error.expect("expected an error");
-        assert_eq!(error.code, error_code::INVALID_PARAMS);
+        let cases = [
+            (
+                methods::SEND_STREAMING_MESSAGE,
+                serde_json::json!({"message": "not-an-object"}),
+            ),
+            (methods::SUBSCRIBE_TO_TASK, serde_json::json!({"id": 123})),
+        ];
+        for (method, params) in cases {
+            let app = make_app();
+            let rpc = JsonRpcRequest::new(JsonRpcId::Number(1), method, Some(params));
+            let req = Request::builder()
+                .uri("/")
+                .method("POST")
+                .header("content-type", "application/json")
+                // A supported version, so this test exercises params decoding
+                // rather than §3.6.2's absent-header rejection.
+                .header("a2a-version", "1.0")
+                .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let parsed: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+            let error = parsed.error.expect("expected an error");
+            assert_eq!(error.code, error_code::INVALID_PARAMS, "method {method}");
+        }
     }
 
     #[tokio::test]
