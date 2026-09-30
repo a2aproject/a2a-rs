@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.5.0...a2a-server-lf-v0.5.1) - 2026-09-30
+
+### Other
+
+- updated the following local packages: a2a-lf, a2a-pb
+
 ## [0.5.0](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.4.4...a2a-server-lf-v0.5.0) - 2026-09-30
 
 ### Added
