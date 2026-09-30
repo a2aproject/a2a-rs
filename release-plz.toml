@@ -8,6 +8,20 @@ publish_no_verify = true
 git_release_enable = false
 
 [[package]]
+# cargo-semver-checks builds the previously-published version from scratch to
+# diff its public API, and that build picks whatever mls-rs-core is newest
+# right now, not what agntcy-slim-mls was actually built against when
+# published. The two are semver-incompatible, so the old version's trait
+# impls stop satisfying the newer copy's traits and the baseline build fails
+# outright -- unrelated to any actual API change in this crate. See #314.
+name = "a2a-slimrpc"
+semver_check = false
+
+[[package]]
+name = "a2acli-transport-slimrpc"
+semver_check = false
+
+[[package]]
 name = "a2a-cli"
 git_release_enable = true
 # Owns the root CHANGELOG.md and folds in every other crate's commits, so the
