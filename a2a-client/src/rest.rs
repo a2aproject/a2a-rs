@@ -253,10 +253,7 @@ fn parse_rest_error(status: reqwest::StatusCode, body: &str) -> A2AError {
 }
 
 fn should_retry_subscribe_with_legacy_path(err: &A2AError) -> bool {
-    if matches!(
-        err.code,
-        error_code::METHOD_NOT_FOUND | error_code::UNSUPPORTED_OPERATION
-    ) {
+    if matches!(err.code, error_code::METHOD_NOT_FOUND) {
         return true;
     }
 
@@ -774,7 +771,7 @@ mod tests {
             details: None,
         }));
 
-        assert!(should_retry_subscribe_with_legacy_path(&A2AError {
+        assert!(!should_retry_subscribe_with_legacy_path(&A2AError {
             code: error_code::UNSUPPORTED_OPERATION,
             message: "unsupported".to_string(),
             details: None,
