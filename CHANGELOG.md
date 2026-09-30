@@ -14,6 +14,12 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.3.0...a2a-cli-v0.3.1) - 2026-09-30
+
+### Fixed
+
+- *(a2a)* stop AgentInterface's derived Arbitrary from breaking round-trip ([#318](https://github.com/a2aproject/a2a-rs/pull/318))
+
 ## [0.3.0](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.2.1...a2a-cli-v0.3.0) - 2026-09-30
 
 ### Added

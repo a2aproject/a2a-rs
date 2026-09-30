@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/a2aproject/a2a-rs/compare/a2a-lf-v0.4.0...a2a-lf-v0.4.1) - 2026-09-30
+
+### Fixed
+
+- *(a2a)* stop AgentInterface's derived Arbitrary from breaking round-trip ([#318](https://github.com/a2aproject/a2a-rs/pull/318))
+
 ## [0.4.0](https://github.com/a2aproject/a2a-rs/compare/a2a-lf-v0.3.1...a2a-lf-v0.4.0) - 2026-09-30
 
 ### Added
