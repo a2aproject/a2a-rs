@@ -105,6 +105,19 @@ impl TaskStore for InMemoryTaskStore {
                         return false;
                     }
                 }
+                // A task without a status timestamp cannot satisfy an
+                // "after" filter. Keep this predicate in the store so the
+                // result count and pagination are based on the filtered set.
+                if let Some(after) = req.status_timestamp_after {
+                    if entry
+                        .task
+                        .status
+                        .timestamp
+                        .is_none_or(|timestamp| timestamp <= after)
+                    {
+                        return false;
+                    }
+                }
                 true
             })
             .map(|e| e.task.clone())
@@ -359,6 +372,51 @@ mod tests {
         let resp = store.list(&req).await.unwrap();
         assert_eq!(resp.tasks.len(), 1);
         assert_eq!(resp.tasks[0].id, "t2");
+    }
+
+    #[tokio::test]
+    async fn test_list_filter_by_status_timestamp_after() {
+        let store = InMemoryTaskStore::new();
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let mut old = make_task("old", "c1", TaskState::Completed);
+        old.status.timestamp = Some(cutoff - chrono::Duration::seconds(1));
+        store.create(old).await.unwrap();
+
+        let mut recent = make_task("recent", "c1", TaskState::Completed);
+        recent.status.timestamp = Some(cutoff + chrono::Duration::seconds(1));
+        store.create(recent).await.unwrap();
+
+        // Missing timestamps do not satisfy an "after" filter.
+        store
+            .create(make_task("missing", "c1", TaskState::Completed))
+            .await
+            .unwrap();
+
+        let resp = store
+            .list(&ListTasksRequest {
+                context_id: None,
+                status: None,
+                page_size: None,
+                page_token: None,
+                history_length: None,
+                status_timestamp_after: Some(cutoff),
+                include_artifacts: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.total_size, 1);
+        assert_eq!(
+            resp.tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            ["recent"]
+        );
     }
 
     #[tokio::test]
