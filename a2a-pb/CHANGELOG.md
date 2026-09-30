@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/a2aproject/a2a-rs/compare/a2a-pb-v0.2.1...a2a-pb-v0.3.0) - 2026-09-30
+
+### Fixed
+
+- *(a2a-pb)* normalize protojson timestamps to Z, not +00:00 ([#299](https://github.com/a2aproject/a2a-rs/pull/299))
+- *(a2a-pb)* [**breaking**] reject out-of-range timestamps in to_proto_timestamp ([#261](https://github.com/a2aproject/a2a-rs/pull/261)) ([#266](https://github.com/a2aproject/a2a-rs/pull/266))
+- *(a2a-pb)* ListTasksResponse always includes nextPageToken ([#283](https://github.com/a2aproject/a2a-rs/pull/283))
+
+### Other
+
+- add the A2A Contributors copyright line to every header ([#260](https://github.com/a2aproject/a2a-rs/pull/260))
+
 ## [0.2.1](https://github.com/a2aproject/a2a-rs/compare/a2a-pb-v0.2.0...a2a-pb-v0.2.1) - 2026-09-14
 
 ### Fixed
