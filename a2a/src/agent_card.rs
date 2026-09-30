@@ -138,12 +138,31 @@ where
 
 /// A URL + protocol binding combination for reaching the agent.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct AgentInterface {
     pub url: String,
     pub protocol_binding: TransportProtocol,
     pub protocol_version: ProtocolVersion,
     pub tenant: Option<String>,
+}
+
+// A derived `Arbitrary` would fill `url` independently of `protocol_binding`,
+// producing combinations `new()` never does (e.g. a `grpc` binding paired
+// with an un-normalized `http://` URL) -- valid per the type but not
+// round-trip-stable, since `Serialize`/`Deserialize` always normalize.
+// Route through the same normalization instead, so a fuzz-generated value
+// is exactly as a real caller's `new()` would have built it.
+#[cfg(feature = "fuzzing")]
+impl<'a> arbitrary::Arbitrary<'a> for AgentInterface {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let url = String::arbitrary(u)?;
+        let protocol_binding = TransportProtocol::arbitrary(u)?;
+        Ok(AgentInterface {
+            url: normalize_agent_interface_url(url, &protocol_binding),
+            protocol_binding,
+            protocol_version: ProtocolVersion::arbitrary(u)?,
+            tenant: Option::<String>::arbitrary(u)?,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -631,6 +650,44 @@ mod tests {
         assert_eq!(back.url, "localhost:50051");
         assert_eq!(back.protocol_binding, TRANSPORT_PROTOCOL_GRPC);
         assert_eq!(back.tenant.as_deref(), Some("tenant-a"));
+    }
+
+    // `agent_card_roundtrip`'s fuzz oracle assumes any arbitrary-generated
+    // AgentCard is serde-round-trip-identical; a derived Arbitrary broke that
+    // for exactly the state above (grpc binding + un-normalized http:// url),
+    // since it fills fields independently of `new()`. Hitting that exact
+    // combination by chance is astronomically unlikely (protocol_binding has
+    // to land on the literal string "grpc"), so this drives `arbitrary`
+    // directly with a byte sequence hand-derived from arbitrary 1.4's own
+    // length-then-content encoding (see arbitrary_byte_size/arbitrary_str in
+    // its `Unstructured`) to force exactly that combination, rather than
+    // relying on a fixed seed or many random ones to stumble onto it.
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn test_agent_interface_arbitrary_never_produces_unnormalized_grpc_url() {
+        use arbitrary::{Arbitrary, Unstructured};
+
+        #[rustfmt::skip]
+        let bytes: [u8; 14] = [
+            b'h', b't', b't', b'p', b':', b'/', b'/', b'x', // url content: "http://x"
+            b'g', b'r', b'p', b'c',                          // protocol_binding: "grpc"
+            4, 8, // trailing length bytes, consumed back-to-front: proto=4, url=8
+        ];
+        let mut u = Unstructured::new(&bytes);
+        let iface = AgentInterface::arbitrary(&mut u).unwrap();
+        assert!(
+            iface
+                .protocol_binding
+                .eq_ignore_ascii_case(TRANSPORT_PROTOCOL_GRPC)
+        );
+        assert_eq!(
+            iface.url, "x",
+            "arbitrary() must normalize the seed's http:// prefix away, same as new() would"
+        );
+
+        let json = serde_json::to_string(&iface).unwrap();
+        let back: AgentInterface = serde_json::from_str(&json).unwrap();
+        assert_eq!(iface, back, "did not round-trip: {json}");
     }
 
     #[test]
