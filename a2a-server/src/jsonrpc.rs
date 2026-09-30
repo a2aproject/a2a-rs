@@ -128,7 +128,7 @@ async fn handle_unary_request<H: RequestHandler>(
                 .send_message(params, req)
                 .await
                 .and_then(|r| protojson_value(&r)),
-            Err(e) => Err(parse_error(e)),
+            Err(e) => Err(invalid_params(e)),
         },
         methods::GET_TASK => match protojson_conv::from_value::<GetTaskRequest>(raw_params) {
             Ok(req) => state
@@ -136,7 +136,7 @@ async fn handle_unary_request<H: RequestHandler>(
                 .get_task(params, req)
                 .await
                 .and_then(|r| protojson_value(&r)),
-            Err(e) => Err(parse_error(e)),
+            Err(e) => Err(invalid_params(e)),
         },
         methods::LIST_TASKS => match protojson_conv::from_value::<ListTasksRequest>(raw_params) {
             Ok(req) => state
@@ -144,7 +144,7 @@ async fn handle_unary_request<H: RequestHandler>(
                 .list_tasks(params, req)
                 .await
                 .and_then(|r| protojson_value(&r)),
-            Err(e) => Err(parse_error(e)),
+            Err(e) => Err(invalid_params(e)),
         },
         methods::CANCEL_TASK => match protojson_conv::from_value::<CancelTaskRequest>(raw_params) {
             Ok(req) => state
@@ -152,7 +152,7 @@ async fn handle_unary_request<H: RequestHandler>(
                 .cancel_task(params, req)
                 .await
                 .and_then(|r| protojson_value(&r)),
-            Err(e) => Err(parse_error(e)),
+            Err(e) => Err(invalid_params(e)),
         },
         methods::CREATE_PUSH_CONFIG => match parse_create_push_config_request(raw_params) {
             Ok(req) => state
@@ -160,7 +160,7 @@ async fn handle_unary_request<H: RequestHandler>(
                 .create_push_config(params, req)
                 .await
                 .and_then(|r| protojson_value(&r)),
-            Err(e) => Err(parse_error(e)),
+            Err(e) => Err(invalid_params(e)),
         },
         methods::GET_PUSH_CONFIG => {
             match protojson_conv::from_value::<GetTaskPushNotificationConfigRequest>(raw_params) {
@@ -169,7 +169,7 @@ async fn handle_unary_request<H: RequestHandler>(
                     .get_push_config(params, req)
                     .await
                     .and_then(|r| protojson_value(&r)),
-                Err(e) => Err(parse_error(e)),
+                Err(e) => Err(invalid_params(e)),
             }
         }
         methods::LIST_PUSH_CONFIGS => {
@@ -179,7 +179,7 @@ async fn handle_unary_request<H: RequestHandler>(
                     .list_push_configs(params, req)
                     .await
                     .and_then(|r| protojson_value(&r)),
-                Err(e) => Err(parse_error(e)),
+                Err(e) => Err(invalid_params(e)),
             }
         }
         methods::DELETE_PUSH_CONFIG => {
@@ -190,7 +190,7 @@ async fn handle_unary_request<H: RequestHandler>(
                     .delete_push_config(params, req)
                     .await
                     .map(|_| Value::Null),
-                Err(e) => Err(parse_error(e)),
+                Err(e) => Err(invalid_params(e)),
             }
         }
         methods::GET_EXTENDED_AGENT_CARD => {
@@ -200,7 +200,7 @@ async fn handle_unary_request<H: RequestHandler>(
                     .get_extended_agent_card(params, req)
                     .await
                     .and_then(|r| protojson_value(&r)),
-                Err(e) => Err(parse_error(e)),
+                Err(e) => Err(invalid_params(e)),
             }
         }
         "" => Err(A2AError::invalid_request("method is required")),
@@ -233,7 +233,7 @@ async fn handle_streaming_request<H: RequestHandler>(
                     }
                     Err(e) => error_response(id, e),
                 },
-                Err(e) => error_response(id, parse_error(e)),
+                Err(e) => error_response(id, invalid_params(e)),
             }
         }
         methods::SUBSCRIBE_TO_TASK => {
@@ -244,7 +244,7 @@ async fn handle_streaming_request<H: RequestHandler>(
                     }
                     Err(e) => error_response(id, e),
                 },
-                Err(e) => error_response(id, parse_error(e)),
+                Err(e) => error_response(id, invalid_params(e)),
             }
         }
         _ => error_response(id, A2AError::method_not_found(&request.method)),
@@ -279,12 +279,12 @@ fn parse_create_push_config_request(
     protojson_conv::from_value::<TaskPushNotificationConfig>(raw_params).map_err(|e| e.to_string())
 }
 
-fn parse_error(e: impl std::fmt::Display) -> A2AError {
-    A2AError {
-        code: error_code::PARSE_ERROR,
-        message: format!("invalid params: {e}"),
-        details: None,
-    }
+/// A2A §9.5: `params` that fail schema validation are
+/// `InvalidParamsError` (-32602). `PARSE_ERROR` (-32700) is reserved for a
+/// body that is not valid JSON, which `malformed_request_response` handles
+/// before this point.
+fn invalid_params(e: impl std::fmt::Display) -> A2AError {
+    A2AError::invalid_params(format!("invalid params: {e}"))
 }
 
 /// The major version this build implements (§3.6.2). Minor is accepted
@@ -570,6 +570,10 @@ mod tests {
         assert_eq!(rpc_resp.id, JsonRpcId::Null, "id cannot be recovered");
     }
 
+    /// A2A §3.3.2 / §9.5: parameters that fail to decode are
+    /// `InvalidParamsError` (-32602). `JSONParseError` (-32700) is reserved
+    /// for a body that is not valid JSON at all, which
+    /// `test_invalid_json_syntax_is_parse_error_not_a_400` covers.
     #[tokio::test]
     async fn test_invalid_params() {
         let app = make_app();
@@ -577,8 +581,53 @@ mod tests {
         // is not invalid params; it is ignored per spec §5.7.
         let params = serde_json::json!({"message": "not-an-object"});
         let resp = post_jsonrpc(app, methods::SEND_MESSAGE, params).await;
-        assert!(resp.error.is_some());
-        assert_eq!(resp.error.unwrap().code, error_code::PARSE_ERROR);
+        let error = resp.error.expect("expected an error");
+        assert_eq!(error.code, error_code::INVALID_PARAMS);
+    }
+
+    /// A2A §9.5: a `params` payload that fails to decode is
+    /// `InvalidParamsError` (-32602) for *every* method, not just
+    /// `message/send`. Each arm decodes its own request type, so guard the
+    /// whole table rather than a single representative method.
+    #[tokio::test]
+    async fn test_invalid_params_is_reported_for_every_method() {
+        // Each payload is a well-formed JSON object whose one recognized
+        // field has the wrong type, so decoding fails before the handler.
+        let cases = [
+            (methods::GET_TASK, serde_json::json!({ "id": 123 })),
+            (
+                methods::LIST_TASKS,
+                serde_json::json!({ "pageSize": "not-a-number" }),
+            ),
+            (methods::CANCEL_TASK, serde_json::json!({ "id": 123 })),
+            (
+                methods::CREATE_PUSH_CONFIG,
+                serde_json::json!({ "taskId": 123 }),
+            ),
+            (
+                methods::GET_PUSH_CONFIG,
+                serde_json::json!({ "taskId": 123 }),
+            ),
+            (
+                methods::LIST_PUSH_CONFIGS,
+                serde_json::json!({ "taskId": 123 }),
+            ),
+            (
+                methods::DELETE_PUSH_CONFIG,
+                serde_json::json!({ "taskId": 123 }),
+            ),
+            (
+                methods::GET_EXTENDED_AGENT_CARD,
+                serde_json::json!({ "tenant": 123 }),
+            ),
+        ];
+        for (method, params) in cases {
+            let resp = post_jsonrpc(make_app(), method, params).await;
+            let error = resp
+                .error
+                .unwrap_or_else(|| panic!("{method}: expected an error, got {:?}", resp.result));
+            assert_eq!(error.code, error_code::INVALID_PARAMS, "method {method}");
+        }
     }
 
     /// Spec §5.7: unrecognized fields in request params are ignored for
@@ -744,6 +793,39 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // Subscription may fail (task not found), but routing should work
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A params-decode failure on the streaming binding must carry the same
+    /// code as the unary binding: `InvalidParamsError` (-32602), for both
+    /// streaming methods.
+    #[tokio::test]
+    async fn test_streaming_invalid_params_use_invalid_params_error_code() {
+        let cases = [
+            (
+                methods::SEND_STREAMING_MESSAGE,
+                serde_json::json!({"message": "not-an-object"}),
+            ),
+            (methods::SUBSCRIBE_TO_TASK, serde_json::json!({"id": 123})),
+        ];
+        for (method, params) in cases {
+            let app = make_app();
+            let rpc = JsonRpcRequest::new(JsonRpcId::Number(1), method, Some(params));
+            let req = Request::builder()
+                .uri("/")
+                .method("POST")
+                .header("content-type", "application/json")
+                // A supported version, so this test exercises params decoding
+                // rather than §3.6.2's absent-header rejection.
+                .header("a2a-version", "1.0")
+                .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let parsed: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+            let error = parsed.error.expect("expected an error");
+            assert_eq!(error.code, error_code::INVALID_PARAMS, "method {method}");
+        }
     }
 
     #[tokio::test]
