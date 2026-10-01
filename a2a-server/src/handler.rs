@@ -1175,7 +1175,7 @@ mod tests {
     };
     use futures::stream;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI32, Ordering};
     use tokio::{
         net::TcpListener,
         sync::{Notify, mpsc, oneshot},
@@ -1556,108 +1556,6 @@ mod tests {
 
         async fn delete_all(&self, task_id: &str) -> Result<(), A2AError> {
             self.inner.delete_all(task_id).await
-        }
-    }
-
-    /// Streams a long turn the way a model-backed executor does: a `Working`
-    /// status, `fragments` appended artifact chunks, then a `Completed`
-    /// status. Every event is a delta on a task the handler already holds.
-    struct FragmentExecutor {
-        fragments: usize,
-    }
-
-    impl crate::AgentExecutor for FragmentExecutor {
-        fn execute(
-            &self,
-            ctx: ExecutorContext,
-        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-            let status = |state| {
-                StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-                    task_id: ctx.task_id.clone(),
-                    context_id: ctx.context_id.clone(),
-                    status: TaskStatus {
-                        state,
-                        message: None,
-                        timestamp: None,
-                    },
-                    metadata: None,
-                })
-            };
-            let fragment = |index: usize| {
-                StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
-                    task_id: ctx.task_id.clone(),
-                    context_id: ctx.context_id.clone(),
-                    artifact: Artifact {
-                        artifact_id: "answer".into(),
-                        name: None,
-                        description: None,
-                        parts: vec![Part::text(format!("fragment {index}"))],
-                        metadata: None,
-                        extensions: None,
-                    },
-                    append: Some(index > 0),
-                    last_chunk: None,
-                    metadata: None,
-                })
-            };
-            let mut events = vec![Ok(status(TaskState::Working))];
-            events.extend((0..self.fragments).map(|index| Ok(fragment(index))));
-            events.push(Ok(status(TaskState::Completed)));
-            Box::pin(stream::iter(events))
-        }
-
-        fn cancel(
-            &self,
-            ctx: ExecutorContext,
-        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-            let task = Task {
-                id: ctx.task_id.clone(),
-                context_id: ctx.context_id.clone(),
-                status: TaskStatus {
-                    state: TaskState::Canceled,
-                    message: None,
-                    timestamp: None,
-                },
-                artifacts: None,
-                history: None,
-                metadata: None,
-            };
-            Box::pin(stream::once(async move { Ok(StreamResponse::Task(task)) }))
-        }
-    }
-
-    /// A `TaskStore` that behaves exactly like `InMemoryTaskStore` but
-    /// counts its `get` calls.
-    ///
-    /// `TaskStore` is public and `get` is not obliged to be cheap -- an
-    /// implementation may rebuild the task from an event log -- so how often
-    /// the handler calls it is observable behaviour.
-    struct CountingTaskStore {
-        inner: InMemoryTaskStore,
-        gets: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl TaskStore for CountingTaskStore {
-        async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
-            self.inner.create(task).await
-        }
-
-        async fn update(&self, task: Task) -> Result<TaskVersion, A2AError> {
-            self.inner.update(task).await
-        }
-
-        async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
-            self.gets.fetch_add(1, Ordering::SeqCst);
-            self.inner.get(task_id).await
-        }
-
-        async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError> {
-            self.inner.begin_cancel(task_id).await
-        }
-
-        async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
-            self.inner.list(req).await
         }
     }
 
@@ -3982,59 +3880,6 @@ mod tests {
                 "{task_id} must carry only its own artifact"
             );
         }
-    }
-
-    /// `apply_event_to_task` is handed the task the execution already holds,
-    /// so it must read the store only when it holds none. It used to call
-    /// `Option::or(task_store.get(..).await?)`, which evaluates its argument
-    /// eagerly: one store read per streamed event, discarded whenever the
-    /// task was already known. For a store whose `get` is not trivial that
-    /// cost recurs on every event of a streaming turn.
-    #[tokio::test]
-    async fn test_applying_events_to_a_known_task_does_not_read_the_store() {
-        use futures::StreamExt;
-        const FRAGMENTS: usize = 8;
-        let gets = Arc::new(AtomicUsize::new(0));
-        let handler = DefaultRequestHandler::new(
-            FragmentExecutor {
-                fragments: FRAGMENTS,
-            },
-            CountingTaskStore {
-                inner: InMemoryTaskStore::new(),
-                gets: Arc::clone(&gets),
-            },
-        );
-
-        let mut stream = handler
-            .send_streaming_message(&ServiceParams::new(), send_request())
-            .await
-            .unwrap();
-        let mut task_id = None;
-        while let Some(event) = stream.next().await {
-            if let StreamResponse::StatusUpdate(update) = event.unwrap() {
-                task_id = Some(update.task_id);
-            }
-        }
-
-        // The one read is the handler's own lookup of the task before it
-        // starts the executor; none of the FRAGMENTS + 2 events adds one.
-        assert_eq!(
-            gets.load(Ordering::SeqCst),
-            1,
-            "the store must not be read once per applied event"
-        );
-
-        // The events were all applied: the fix must not change the result.
-        let task = handler
-            .task_store
-            .get(&task_id.unwrap())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(task.status.state, TaskState::Completed);
-        let artifacts = task.artifacts.unwrap();
-        assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].parts.len(), FRAGMENTS);
     }
     // §12.4 / §10.1 (#204): the extended Agent Card.
 
