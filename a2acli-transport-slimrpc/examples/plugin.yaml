@@ -1,0 +1,15 @@
+# Local demonstration only: replace these credentials for your deployment.
+client:
+  endpoint: "http://127.0.0.1:46357"
+  tls:
+    insecure: true
+app:
+  name: "org/demo/cli"
+  identity_provider:
+    type: shared_secret
+    id: "demo-client"
+    data: "my_shared_secret_for_testing_purposes_only"
+  identity_verifier:
+    type: shared_secret
+    id: "demo-client"
+    data: "my_shared_secret_for_testing_purposes_only"
