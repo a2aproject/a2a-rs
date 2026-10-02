@@ -257,16 +257,24 @@ async fn apply_event_to_task(
     match event {
         StreamResponse::Task(task) => save_task(task_store, task.clone()).await.map(Some),
         StreamResponse::StatusUpdate(update) => {
-            let mut task = current_task
-                .or(task_store.get(&update.task_id).await?)
-                .ok_or_else(|| A2AError::task_not_found(&update.task_id))?;
+            let mut task = match current_task {
+                Some(task) => task,
+                None => task_store
+                    .get(&update.task_id)
+                    .await?
+                    .ok_or_else(|| A2AError::task_not_found(&update.task_id))?,
+            };
             task.status = update.status.clone();
             save_task(task_store, task).await.map(Some)
         }
         StreamResponse::ArtifactUpdate(update) => {
-            let mut task = current_task
-                .or(task_store.get(&update.task_id).await?)
-                .ok_or_else(|| A2AError::task_not_found(&update.task_id))?;
+            let mut task = match current_task {
+                Some(task) => task,
+                None => task_store
+                    .get(&update.task_id)
+                    .await?
+                    .ok_or_else(|| A2AError::task_not_found(&update.task_id))?,
+            };
             let artifacts = task.artifacts.get_or_insert_with(Vec::new);
             let existing = artifacts
                 .iter_mut()
