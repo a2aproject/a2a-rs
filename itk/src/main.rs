@@ -652,12 +652,12 @@ impl ItkHandler {
         let advertises_extended = card.capabilities.extended_agent_card.unwrap_or(false);
         let advertises_push = card.capabilities.push_notifications.unwrap_or(false);
 
-        // `with_capabilities` is inert in this SDK — the field is stored and
-        // never read — so advertising `pushNotifications: false` would not on
-        // its own make the agent refuse push. Withholding the store does: the
-        // handler answers `push_notification_not_supported` when it is unset,
-        // which is what the ACTS reduced pass is checking for.
+        // The handler enforces what the card declares (§13.3), so the reduced
+        // pass's `streaming: false` / `pushNotifications: false` make it refuse
+        // those operations. Withholding the push store still matters: it is
+        // what leaves nothing to save configs into when push is not advertised.
         let mut inner = DefaultRequestHandler::new(ItkExecutor, InMemoryTaskStore::new())
+            .with_capabilities(card.capabilities.clone())
             .with_default_input_modes(card.default_input_modes.clone());
         if advertises_push {
             // The ITK/interop harness's own webhook receiver runs on
