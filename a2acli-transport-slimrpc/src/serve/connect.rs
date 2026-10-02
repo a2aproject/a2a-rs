@@ -13,6 +13,7 @@
 //! serve loop -- has no fake-able seam and is instead exercised end-to-end
 //! via the itk/csit integration suites.
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -221,6 +222,34 @@ fn failure_handshake(err: &PluginError) -> Handshake {
     }
 }
 
+/// Derive a component label without changing the application's routing name.
+/// Component names accept only lowercase ASCII letters, digits and hyphens.
+fn service_component_name(app_name: &str) -> Result<String, PluginError> {
+    let mut name = String::from("name-");
+    for byte in app_name.bytes() {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+            name.push(char::from(byte));
+        } else {
+            // Escape the delimiter too, so literal hyphens cannot alias '/'.
+            write!(name, "-{byte:02x}").expect("writing to a String cannot fail");
+        }
+
+        if name.len() > 1024 {
+            // Avoid rejecting long routing names or silently truncating them.
+            // Reuse SLIM's existing routing hashes, with a separate prefix
+            // from the reversible encoding above. This adds no dependency.
+            let encoded = parse_proto_name(app_name)?
+                .name
+                .expect("parse_proto_name constructs encoded name components");
+            return Ok(format!(
+                "hash-{:016x}-{:016x}-{:016x}",
+                encoded.component_0, encoded.component_1, encoded.component_2
+            ));
+        }
+    }
+    Ok(name)
+}
+
 /// The bulk of `run`, taking an already-loaded config directly. Split out so
 /// tests can exercise it without touching the process-global
 /// `A2A_SLIMRPC_PLUGIN_CONFIG` env var (see `load_config`'s own doc comment).
@@ -235,7 +264,10 @@ async fn run_with_config(endpoint: &str, config: PluginConfig) -> Result<(), Plu
 
     // 4. Build SLIM Service + connect to gateway
     let kind = ServiceBuilder::kind();
-    let id = slim_config::component::id::ID::new_with_name(kind, &config.app.name)
+    // Derive the local component label from app.name; the original name is
+    // still passed unchanged to create_app below for network routing.
+    let component_name = service_component_name(&config.app.name)?;
+    let id = slim_config::component::id::ID::new_with_name(kind, &component_name)
         .map_err(|e| PluginError::Slim(format!("invalid service ID: {e}")))?;
     let service = Service::new(id);
 
@@ -251,6 +283,13 @@ async fn run_with_config(endpoint: &str, config: PluginConfig) -> Result<(), Plu
         .create_app(&app_name, provider, verifier)
         .map_err(|e| PluginError::Slim(format!("create_app failed: {e}")))?;
     let slim_app = Arc::new(slim_app);
+
+    // create_app subscribes locally. Propagate the client name to the gateway
+    // so the remote agent can route session handshake replies back to us.
+    slim_app
+        .subscribe(&app_name, Some(conn_id))
+        .await
+        .map_err(|e| PluginError::Slim(format!("subscribe failed: {e}")))?;
 
     let transport = SlimRpcTransport::new_with_connection(slim_app, remote, Some(conn_id));
 
@@ -740,11 +779,79 @@ mod tests {
     // string parsing, and connecting to a closed local port fails immediately
     // with "connection refused" rather than needing a real peer.
 
+    #[test]
+    fn test_service_component_name_accepts_configured_routing_names() {
+        assert_eq!(
+            service_component_name("org/demo/cli").unwrap(),
+            "name-org-2fdemo-2fcli"
+        );
+
+        for app_name in ["org/demo/cli", "Org/demo/my-agent_1", "org/demo/café"] {
+            let component_name = service_component_name(app_name).unwrap();
+            let id = slim_config::component::id::ID::new_with_name(
+                ServiceBuilder::kind(),
+                &component_name,
+            );
+            assert!(
+                id.is_ok(),
+                "component label rejected for {app_name}: {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_service_component_name_keeps_distinct_names_distinct() {
+        for (first, second) in [
+            ("org/demo-a/cli", "org-demo/a/cli"),
+            ("org/demo/cli", "org/demo/CLI"),
+            ("org/demo/cli-1", "org/demo/cli_1"),
+            ("org/demo/café", "org/demo/cafÉ"),
+        ] {
+            assert_ne!(
+                service_component_name(first).unwrap(),
+                service_component_name(second).unwrap(),
+                "component labels must distinguish {first} from {second}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_service_component_name_handles_long_names_without_truncation() {
+        let at_limit = format!("org/demo/{}", "a".repeat(1006));
+        let at_limit = service_component_name(&at_limit).unwrap();
+        assert_eq!(at_limit.len(), 1024);
+        assert!(at_limit.starts_with("name-"));
+
+        let over_limit = format!("org/demo/{}", "a".repeat(1007));
+        let much_longer = format!("org/demo/{}", "a".repeat(10_000));
+        for app_name in [over_limit, much_longer] {
+            let name = service_component_name(&app_name).unwrap();
+            assert!(name.starts_with("hash-"));
+            assert_eq!(name.len(), 55);
+            assert_eq!(name, service_component_name(&app_name).unwrap());
+            assert!(
+                slim_config::component::id::ID::new_with_name(ServiceBuilder::kind(), &name)
+                    .is_ok()
+            );
+            assert_ne!(
+                name,
+                service_component_name(&format!("{app_name}b")).unwrap(),
+                "the component label must account for the end of a long name"
+            );
+        }
+    }
+
     fn minimal_config_yaml(client_endpoint: &str) -> String {
         format!(
             r#"
 client:
   endpoint: "{client_endpoint}"
+  tls:
+    insecure: true
+  backoff:
+    type: fixed_interval
+    interval: 1ms
+    max_attempts: 0
 app:
   name: "org/namespace/agent"
   identity_provider:
@@ -784,10 +891,17 @@ app:
     async fn test_run_with_config_reports_a_connect_failure_for_an_unreachable_gateway() {
         let port = closed_local_port();
         let config = minimal_config(&format!("http://127.0.0.1:{port}"));
-        let err = run_with_config("org/namespace/agent", config)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, PluginError::Slim(_)));
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_with_config("org/namespace/agent", config),
+        )
+        .await
+        .expect("the closed gateway port should fail promptly")
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::Slim(message) if message.starts_with("SLIM gateway connect failed:")),
+            "a valid app identity must reach the gateway connection attempt: {err}"
+        );
     }
 
     #[tokio::test]
