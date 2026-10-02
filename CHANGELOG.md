@@ -14,6 +14,12 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.3.1...a2a-cli-v0.3.2) - 2026-09-30
+
+### Fixed
+
+- honor task list timestamps and terminal subscribe errors ([#320](https://github.com/a2aproject/a2a-rs/pull/320))
+
 ## [0.3.1](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.3.0...a2a-cli-v0.3.1) - 2026-09-30
 
 ### Fixed
