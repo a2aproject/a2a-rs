@@ -238,6 +238,7 @@ def render_default_locale_manifest(
         f"Publisher: {PUBLISHER}\n"
         f"PublisherUrl: https://github.com/a2aproject\n"
         f"PublisherSupportUrl: {repository_url}/issues\n"
+        f"PrivacyUrl: {repository_url}/blob/main/a2acli/PRIVACY.md\n"
         f"Author: AGNTCY Contributors\n"
         f"PackageName: {PACKAGE_NAME}\n"
         f"PackageUrl: {repository_url}\n"
