@@ -51,41 +51,62 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+  # Decides what to distribute from the repository's own state -- the CLI
+  # manifest's version, and whether its GitHub release already carries
+  # binaries -- rather than from release-plz's outputs. release-crates fails
+  # as a whole when any one crate cannot be published, and its outputs are
+  # not set then, which used to stop a CLI release that had already been cut
+  # from ever getting binaries, a Homebrew formula or WinGet manifests.
   resolve-a2acli-release:
     name: Resolve a2acli release
     needs: release-crates
-    if: ${{ needs.release-crates.outputs.releases_created == 'true' && contains(needs.release-crates.outputs.releases, '"package_name":"a2a-cli"') }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Resolve CLI release tag
         id: release
         shell: bash
         env:
-          RELEASES: ${{ needs.release-crates.outputs.releases }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          release_tag=$(python3 - <<'PY'
-          import json
-          import os
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("a2acli/Cargo.toml", "rb"))["package"]["version"])')
+          tag="a2a-cli-v${version}"
 
-          releases = json.loads(os.environ["RELEASES"])
-          for release in releases:
-              if release["package_name"] == "a2a-cli":
-                  print(release["tag"])
-                  break
-          else:
-              raise SystemExit("a2a-cli release not found in release-plz outputs")
-          PY
-          )
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          # An empty tag means nothing to distribute, and skips every job below.
+          if ! archives=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+              --jq '[.assets[].name | select(endswith(".sha256"))] | length' 2>/tmp/gh_err); then
+            if grep -q "HTTP 404" /tmp/gh_err; then
+              echo "No GitHub release for ${tag} yet; nothing to distribute."
+              echo "release_tag=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat /tmp/gh_err >&2
+            exit 1
+          fi
+
+          if [ "$archives" -gt 0 ]; then
+            echo "${tag} already has binaries; nothing to distribute."
+            echo "release_tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "${tag} has no binaries yet; distributing."
+          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
 
   release-a2acli-binaries:
     name: Release a2acli binaries (${{ matrix.name }})
-    needs:
-      - release-crates
-      - resolve-a2acli-release
-    if: ${{ needs.release-crates.outputs.releases_created == 'true' && contains(needs.release-crates.outputs.releases, '"package_name":"a2a-cli"') }}
+    needs: resolve-a2acli-release
+    if: ${{ !cancelled() && needs.resolve-a2acli-release.outputs.release_tag != '' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write      # gh release upload
@@ -111,8 +132,12 @@ jobs:
             runner: windows-2025
             target: x86_64-pc-windows-msvc
     steps:
+      # The tag, not the branch head: this can now run after main has moved
+      # on, and must not ship newer code under an older version's name.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.resolve-a2acli-release.outputs.release_tag }}
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -205,10 +230,9 @@ jobs:
   release-a2acli-winget:
     name: Publish a2acli WinGet manifests
     needs:
-      - release-crates
       - resolve-a2acli-release
       - release-a2acli-binaries
-    if: ${{ needs.release-crates.outputs.releases_created == 'true' && contains(needs.release-crates.outputs.releases, '"package_name":"a2a-cli"') }}
+    if: ${{ !cancelled() && needs.resolve-a2acli-release.outputs.release_tag != '' && needs.release-a2acli-binaries.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -227,10 +251,9 @@ jobs:
   release-a2acli-homebrew:
     name: Publish a2acli Homebrew formula
     needs:
-      - release-crates
       - resolve-a2acli-release
       - release-a2acli-binaries
-    if: ${{ needs.release-crates.outputs.releases_created == 'true' && contains(needs.release-crates.outputs.releases, '"package_name":"a2a-cli"') }}
+    if: ${{ !cancelled() && needs.resolve-a2acli-release.outputs.release_tag != '' && needs.release-a2acli-binaries.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       actions: write
