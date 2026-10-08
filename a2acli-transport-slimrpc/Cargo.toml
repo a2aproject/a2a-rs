@@ -1,6 +1,6 @@
 [package]
 name = "a2acli-transport-slimrpc"
-version = "0.1.0"
+version = "0.1.1"
 description = "SLIMRPC transport plugin for a2a-cli — implements the pluggable transport contract"
 edition.workspace = true
 license.workspace = true

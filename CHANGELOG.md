@@ -14,6 +14,17 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.3.1...a2a-cli-v0.3.2) - 2026-10-08
+
+### Fixed
+
+- honor task list timestamps and terminal subscribe errors ([#320](https://github.com/a2aproject/a2a-rs/pull/320))
+- *(a2a-server)* read the task store only when the task is unknown ([#323](https://github.com/a2aproject/a2a-rs/pull/323))
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.3.1](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.3.0...a2a-cli-v0.3.1) - 2026-09-30
 
 ### Fixed
