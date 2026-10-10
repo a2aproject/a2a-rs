@@ -44,6 +44,7 @@ pub struct AgentCard {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_security_requirements",
         deserialize_with = "deserialize_optional_security_requirements"
     )]
     pub security_requirements: Option<Vec<SecurityRequirement>>,
@@ -75,6 +76,41 @@ where
             .collect()
     })
     .transpose()
+}
+
+fn serialize_optional_security_requirements<S>(
+    requirements: &Option<Vec<SecurityRequirement>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match requirements {
+        Some(requirements) => requirements
+            .iter()
+            .map(|requirement| {
+                let schemes = requirement
+                    .iter()
+                    .map(|(scheme, scopes)| {
+                        (scheme.as_str(), SerializedSecurityScopes { list: scopes })
+                    })
+                    .collect();
+                SerializedSecurityRequirement { schemes }
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+#[derive(Serialize)]
+struct SerializedSecurityRequirement<'a> {
+    schemes: HashMap<&'a str, SerializedSecurityScopes<'a>>,
+}
+
+#[derive(Serialize)]
+struct SerializedSecurityScopes<'a> {
+    list: &'a [String],
 }
 
 fn parse_security_requirement_value<E>(value: Value) -> Result<SecurityRequirement, E>
@@ -313,6 +349,7 @@ pub struct AgentSkill {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_security_requirements",
         deserialize_with = "deserialize_optional_security_requirements"
     )]
     pub security_requirements: Option<Vec<SecurityRequirement>>,
@@ -895,9 +932,39 @@ mod tests {
             ]),
             signatures: None,
         };
-        let json = serde_json::to_string(&card).unwrap();
-        let back: AgentCard = serde_json::from_str(&json).unwrap();
+        let value = serde_json::to_value(&card).unwrap();
+        assert_eq!(
+            value["securityRequirements"],
+            serde_json::json!([{"schemes": {"bearer": {"list": []}}}])
+        );
+        let back: AgentCard = serde_json::from_value(value).unwrap();
         assert_eq!(card, back);
+    }
+
+    #[test]
+    fn test_agent_skill_serializes_security_requirements() {
+        let skill = AgentSkill {
+            id: "secure-skill".to_string(),
+            name: "Secure skill".to_string(),
+            description: "Requires bearer authorization".to_string(),
+            tags: vec![],
+            examples: None,
+            input_modes: None,
+            output_modes: None,
+            security_requirements: Some(vec![
+                [("bearer".to_string(), vec!["read".to_string()])]
+                    .into_iter()
+                    .collect(),
+            ]),
+        };
+
+        let value = serde_json::to_value(&skill).unwrap();
+        assert_eq!(
+            value["securityRequirements"],
+            serde_json::json!([{"schemes": {"bearer": {"list": ["read"]}}}])
+        );
+        let back: AgentSkill = serde_json::from_value(value).unwrap();
+        assert_eq!(skill, back);
     }
 
     #[test]
