@@ -186,13 +186,14 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-auth"
-version = "0.16.3"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c607b195f194b2b461265dbf9ca94e663ab17375e424a975fb946f99d481deaf"
+checksum = "0d9fc15c29c173ed696b2fc4fae62cd76d20fa3ee26fdc8009ac9985facb1e76"
 dependencies = [
  "agntcy-slim-version",
  "aws-lc-rs",
  "base64 0.23.1",
+ "bs58",
  "cel",
  "cfg-if",
  "display-error-chain",
@@ -235,9 +236,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-config"
-version = "0.16.5"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1559dafe78067d99789f883ec59e135adc50c915f431eda242ced7522118f4c"
+checksum = "c46776ec3aed0806cc6d82fb0bedb520f70a3bb394068aa566e466c9fcf09b6e"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-version",
@@ -293,9 +294,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-controller"
-version = "0.13.4"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "487704737fbd48581243bc8aab0a05b624bf8a3b970e1bbd3e45897e97cf97a6"
+checksum = "78b11b9d4ba5d3aa2ab9ca0901421f360176c413e867f015a4192660b083379b"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-config",
@@ -326,9 +327,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-datapath"
-version = "0.19.2"
+version = "0.19.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82679131b75b500d431607b7b748add20745705ac5b16a770c732ab970546922"
+checksum = "6d719d221928a7fc1a374d48abcbfc84cd8841e930aab642c8c173888005e313"
 dependencies = [
  "agntcy-slim-config",
  "agntcy-slim-proto",
@@ -372,9 +373,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-mls"
-version = "0.4.2"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eecf253ed2632f3e50125d6b42d97ac413e33add2de56d774b234a21ef6416d2"
+checksum = "94645f31abea3873323fcdde4a542919b28f33a6eb555a5bcad3cde0e036923c"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-persistence",
@@ -414,9 +415,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-proto"
-version = "0.6.5"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd3601098d679a24f4a42f0e39be44f8e74092d8d8ce927140feb59d866d11ab"
+checksum = "a2b4f391a77eade7158aaa2675c2edd3b18557eabd53ae1c7064fbfe2bb7008d"
 dependencies = [
  "agntcy-slim-config",
  "agntcy-slim-version",
@@ -434,9 +435,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-rpc"
-version = "3.0.1"
+version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11b2cf634e9258256a2c4ba81da391fa73a4d436e235b0028f6f1f4d3b572d7e"
+checksum = "fb6378ab6a7fb0b4b1bc2b5cfb8d4270968fb226970bc824a6b1b5bcbc5025bd"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-datapath",
@@ -458,9 +459,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-service"
-version = "0.13.2"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77b4533ed4c2741292a95d12391282fd5060c01f6394fe9440c06f567a63cb5f"
+checksum = "3b7ab213a3ceeec8e2f7f30d32cfbe9de2573e486d616d4428d5e4ac8d056c57"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-config",
@@ -486,9 +487,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-session"
-version = "0.7.14"
+version = "0.7.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad5eaef69bc7f759850b19062a3983a08fd0aef1b82e96b9fd42752ad78d7a1f"
+checksum = "273e20e35543b491243aa0642a215ede724947713d4a2f6f849cab9313d09d7e"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-datapath",
@@ -520,9 +521,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-signal"
-version = "0.1.28"
+version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b6c2f290b1d6704bc2e9dacbfa3fef87a149cfdee06394f234922c275e1978a"
+checksum = "c89df691170e036ce6d23effdfa963d52c63c227976f35f0657898801ef529b4"
 dependencies = [
  "agntcy-slim-version",
  "tokio",
@@ -531,9 +532,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-tracing"
-version = "0.4.24"
+version = "0.4.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2ccb5205bbd19e489eeecea1036f3bb05db88afaa69fd9824c9e3bd60066bc1"
+checksum = "a3440c491748850c93234d671bbb78faa6700e7a0eb7dae169606452b6803bc1"
 dependencies = [
  "agntcy-slim-config",
  "agntcy-slim-version",
@@ -556,9 +557,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-version"
-version = "3.0.1"
+version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b16e1cfe46f65fb3d90befe9970d9ac0458b82984cf89721581c7db89ac5b8b"
+checksum = "551897a1af4ad897f7c02b253236bf8de7f5ef8f917105ffb20199c460c787b6"
 
 [[package]]
 name = "ahash"
@@ -634,7 +635,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -645,7 +646,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1050,6 +1051,15 @@ name = "borrow-or-share"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
+
+[[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "bstr"
@@ -1759,7 +1769,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3341,7 +3351,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3515,9 +3525,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry"
-version = "0.32.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
+checksum = "8c1f1a6ac9c875a4941e4c7c085b61e8f4daa326de03b4701768c3491a6ad9ee"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -3529,9 +3539,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-http"
-version = "0.32.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5683015d09e2df236ef005b17f6f196f0d5f6313c4fa43a7b6a53b52776e4331"
+checksum = "302249bd8ee804789faaa7b5b2cbf79bc61cb864714079c644e3828af5b7e811"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3542,11 +3552,12 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-otlp"
-version = "0.32.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
+checksum = "0756af24841e367128ef31c831999937b8b5c5197d47914590d8f4e2e88c2e1a"
 dependencies = [
  "http",
+ "httpdate",
  "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-proto",
@@ -3561,9 +3572,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-proto"
-version = "0.32.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
+checksum = "d576f5dddc3299341bcd85a04be17b2564844c0c9563214f02d85f2524d1afae"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
@@ -3574,15 +3585,15 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.32.1"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c913ac17a6c451661ee255f4625d143e51647ae78ebd969b75e41c4442f4fe47"
+checksum = "7a3cf639fefd3e852869114f9925b578da6dd8e99281a2089bb0e773ead46962"
 
 [[package]]
 name = "opentelemetry-stdout"
-version = "0.32.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1b1c6a247d79091f0062a5f4bd058589525cf987a8d4c169440d9c1be72f0ad"
+checksum = "2afbc6661934787ce79bef1e35d0ffe9d62e945f07f664dc1283ce83292b908a"
 dependencies = [
  "chrono",
  "opentelemetry",
@@ -3591,9 +3602,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry_sdk"
-version = "0.32.1"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
+checksum = "372a912db2974d1990207006fd0e3aa0ef3fd4ad3be43c65cfaadf2206866061"
 dependencies = [
  "futures-channel",
  "futures-executor",
@@ -4506,7 +4517,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4573,7 +4584,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4960,7 +4971,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5138,7 +5149,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5570,9 +5581,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-opentelemetry"
-version = "0.33.0"
+version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adbc64cba7137545b8044cb1fe9814f7aacf3c6b5f9b45be8bb5db538befdb26"
+checksum = "0a904802a1b902f43638b677ff2a650847e3b4404101b6c586d648e8c1e3e8fe"
 dependencies = [
  "js-sys",
  "opentelemetry",
@@ -6062,7 +6073,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -26,8 +26,12 @@ Accepted forms are:
 ```toml
 [dependencies]
 a2a = { package = "a2a-lf", version = "0.2" }
-a2a-slimrpc = { package = "a2a-slimrpc", version = "0.1" }
+a2a-slimrpc = { package = "a2a-slimrpc", version = "0.3" }
 ```
+
+Built on the SLIM 3.2 release line (`agntcy-slim-rpc` 3.2, `agntcy-slim-auth` and
+`agntcy-slim-config` 0.17). `SlimApp` and the `slim_rpc` types in the public API
+come from those crates, so depend on the same versions.
 
 ## Workspace
 
