@@ -20,3 +20,5 @@ fuzz/corpus/
 fuzz/artifacts/
 fuzz/coverage/
 fuzz/target/
+# Derived from the root Cargo.lock; see `just fuzz-lock`.
+fuzz/Cargo.lock

@@ -67,6 +67,10 @@ example:
 clean:
     cargo clean
 
+# fuzz/ has no lockfile of its own; derive it from the root one
+fuzz-lock:
+    cp Cargo.lock fuzz/Cargo.lock
+
 # Verify copyright headers on all Rust source files
 check-headers:
     #!/usr/bin/env bash
