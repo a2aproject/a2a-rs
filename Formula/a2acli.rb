@@ -4,19 +4,19 @@
 class A2acli < Formula
   desc "Standalone A2A CLI client"
   homepage "https://github.com/a2aproject/a2a-rs"
-  version "0.4.1"
+  version "0.4.2"
   license "Apache-2.0"
   depends_on :macos
 
   on_macos do
     on_arm do
       url "https://github.com/a2aproject/a2a-rs/releases/download/a2a-cli-v#{version}/a2acli-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "7dbab1897ecbe2e0049d5a334fff225407ee9060f76df67c89833e83aef657d1"
+      sha256 "a770f9408973af7fda936dd73400bff05dd2508ad6705363d5842eafe2833703"
     end
 
     on_intel do
       url "https://github.com/a2aproject/a2a-rs/releases/download/a2a-cli-v#{version}/a2acli-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "46358fa84ba27e9c994e630be7f5bd5132de1c1a127dd9556789f16bc049d3c4"
+      sha256 "20fa35fd21a9cec49d48311145e5f5f324875f5a2eb42911ce4737c33c00a089"
     end
   end
 
