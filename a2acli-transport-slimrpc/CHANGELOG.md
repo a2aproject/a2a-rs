@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/a2aproject/a2a-rs/compare/a2acli-transport-slimrpc-v0.1.2...a2acli-transport-slimrpc-v0.1.3) - 2026-10-12
+
+### Other
+
+- updated the following local packages: a2a-slimrpc
+
 ## [0.1.2](https://github.com/a2aproject/a2a-rs/compare/a2acli-transport-slimrpc-v0.1.1...a2acli-transport-slimrpc-v0.1.2) - 2026-10-12
 
 ### Other

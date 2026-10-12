@@ -1,6 +1,6 @@
 [package]
 name = "a2a-slimrpc"
-version = "0.3.1"
+version = "0.3.2"
 description = "A2A v1 SLIMRPC protocol binding for client and server"
 readme = "README.md"
 edition.workspace = true
