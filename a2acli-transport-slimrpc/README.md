@@ -36,9 +36,23 @@ brew trust a2aproject/a2a-rs
 brew install a2a-transport-slimrpc
 ```
 
-**Linux and Windows** — download the archive for your platform from the
+**Windows** — PowerShell installer, no administrator rights needed:
+
+```powershell
+irm https://raw.githubusercontent.com/a2aproject/a2a-rs/main/scripts/install-slimrpc-plugin.ps1 | iex
+```
+
+It downloads the latest release archive, checks its SHA-256, installs
+`a2a-transport-slimrpc.exe` to `%LOCALAPPDATA%\Programs\a2a-transport-slimrpc`
+and adds that directory to your user `PATH`; open a new terminal afterwards.
+Set `A2A_SLIMRPC_PLUGIN_VERSION` to pin a version or
+`A2A_SLIMRPC_PLUGIN_INSTALL_DIR` to change the directory. Read the
+[script](../scripts/install-slimrpc-plugin.ps1) first if you prefer, or download
+the `.zip` from the releases page and put the executable on `PATH` yourself.
+
+**Linux** — download the archive from the
 [releases page](https://github.com/a2aproject/a2a-rs/releases) and put the
-`a2a-transport-slimrpc` executable on `PATH`. For example, on Linux x86_64:
+`a2a-transport-slimrpc` executable on `PATH`. For example, on x86_64:
 
 ```sh
 version=<version>

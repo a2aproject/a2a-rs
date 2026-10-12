@@ -13,6 +13,7 @@ on:
       - 'a2acli-transport-slimrpc/**'
       - 'scripts/package_a2acli_release.py'
       - 'scripts/resolve_a2acli_release_metadata.py'
+      - 'scripts/install-slimrpc-plugin.ps1'
       - '.github/workflows/plugin-release-check.yml'
       - '.github/workflows/release-upload-binaries.yml'
 
@@ -99,6 +100,41 @@ jobs:
             --version "${{ steps.metadata.outputs.version }}" \
             --output-dir dist \
             --github-output "$GITHUB_OUTPUT"
+
+      - name: Install with the Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ARCHIVE_PATH: ${{ steps.package.outputs.archive_path }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          # Serve the archive the way a GitHub release would, then run the
+          # installer against it in Windows PowerShell 5.1 and PowerShell 7,
+          # the way users run it: piped to Invoke-Expression.
+          $site = Join-Path $env:RUNNER_TEMP 'site'
+          $releaseDir = Join-Path $site "a2acli-transport-slimrpc-v$env:VERSION"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          Copy-Item "$env:ARCHIVE_PATH*" $releaseDir
+          $server = Start-Process python -NoNewWindow -PassThru -ArgumentList '-m', 'http.server', '8765', '--bind', '127.0.0.1', '--directory', $site
+          try {
+            for ($i = 0; $i -lt 20; $i++) {
+              try { Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8765/' | Out-Null; break } catch { Start-Sleep -Milliseconds 500 }
+            }
+            $env:A2A_SLIMRPC_PLUGIN_VERSION = $env:VERSION
+            $env:A2A_SLIMRPC_PLUGIN_RELEASE_DOWNLOAD_BASE_URL = 'http://127.0.0.1:8765'
+            foreach ($shellName in 'powershell', 'pwsh', 'pwsh') {
+              $dir = Join-Path $env:RUNNER_TEMP "install-$shellName"
+              $env:A2A_SLIMRPC_PLUGIN_INSTALL_DIR = $dir
+              & $shellName -NoProfile -Command 'Get-Content -Raw scripts/install-slimrpc-plugin.ps1 | Invoke-Expression'
+              if ($LASTEXITCODE -ne 0) { throw "$shellName installer exited with $LASTEXITCODE" }
+              $exe = Join-Path $dir 'a2a-transport-slimrpc.exe'
+              if (-not (& $exe info | Select-String -Quiet slimrpc)) { throw "$exe did not report slimrpc" }
+              $onPath = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_.TrimEnd('\') -ieq $dir })
+              if ($onPath.Count -ne 1) { throw "$dir appears $($onPath.Count) times on the user PATH, expected 1" }
+            }
+          } finally {
+            Stop-Process -Id $server.Id -Force
+          }
 
       - name: Upload the archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
