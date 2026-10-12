@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.3.0...a2a-slimrpc-v0.3.1) - 2026-10-12
+
+### Fixed
+
+- *(deps)* build on SLIM 3.3 ([#342](https://github.com/a2aproject/a2a-rs/pull/342))
+
 ## [0.3.0](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.2.11...a2a-slimrpc-v0.3.0) - 2026-10-11
 
 ### Fixed

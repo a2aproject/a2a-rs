@@ -14,6 +14,16 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.4.0...a2a-cli-v0.4.1) - 2026-10-12
+
+### Fixed
+
+- *(deps)* build on SLIM 3.3 ([#342](https://github.com/a2aproject/a2a-rs/pull/342))
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.4.0](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.3.1...a2a-cli-v0.4.0) - 2026-10-11
 
 ### Fixed

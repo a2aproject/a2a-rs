@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/a2aproject/a2a-rs/compare/a2acli-transport-slimrpc-v0.1.1...a2acli-transport-slimrpc-v0.1.2) - 2026-10-12
+
+### Other
+
+- *(release)* ship prebuilt a2a-transport-slimrpc binaries and a Homebrew formula ([#344](https://github.com/a2aproject/a2a-rs/pull/344))
+- *(slimrpc)* document CLI setup with the existing Go echo agent ([#311](https://github.com/a2aproject/a2a-rs/pull/311))
+- fix CLI startup and gateway reply routing ([#312](https://github.com/a2aproject/a2a-rs/pull/312))
+
 ## [0.1.1](https://github.com/a2aproject/a2a-rs/compare/a2acli-transport-slimrpc-v0.1.0...a2acli-transport-slimrpc-v0.1.1) - 2026-10-11
 
 ### Other
