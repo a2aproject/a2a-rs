@@ -21,13 +21,18 @@ DEFAULT_README = ROOT / "README.md"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Package a built a2acli binary into a release archive."
+        description="Package a built binary into a release archive."
     )
     parser.add_argument(
         "--binary",
         type=Path,
         required=True,
-        help="Path to the built a2acli binary.",
+        help="Path to the built binary.",
+    )
+    parser.add_argument(
+        "--name",
+        default="a2acli",
+        help="Binary and archive name (default: a2acli).",
     )
     parser.add_argument(
         "--target",
@@ -37,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--version",
         required=True,
-        help="CLI version used in the release archive name.",
+        help="Version used in the release archive name.",
     )
     parser.add_argument(
         "--output-dir",
@@ -106,7 +111,7 @@ def main() -> None:
         if not support_path.is_file():
             raise SystemExit(f"expected support file at {support_path}")
 
-    archive_stem = f"a2acli-v{args.version}-{args.target}"
+    archive_stem = f"{args.name}-v{args.version}-{args.target}"
     output_dir = args.output_dir.resolve()
     staging_dir = output_dir / archive_stem
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -115,7 +120,7 @@ def main() -> None:
         shutil.rmtree(staging_dir)
     staging_dir.mkdir()
 
-    binary_name = "a2acli.exe" if args.target.endswith("windows-msvc") else "a2acli"
+    binary_name = f"{args.name}.exe" if args.target.endswith("windows-msvc") else args.name
     shutil.copy2(binary, staging_dir / binary_name)
     shutil.copy2(args.license, staging_dir / args.license.name)
     shutil.copy2(args.readme, staging_dir / args.readme.name)

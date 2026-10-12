@@ -1,0 +1,108 @@
+# Copyright AGNTCY Contributors (https://github.com/agntcy)
+# Copyright A2A Contributors (https://github.com/a2aproject)
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build slimrpc plugin release artifacts
+
+# The plugin's release builds only run at release time, so a change that breaks
+# one of the five targets would otherwise surface there. This builds, packages
+# and runs the plugin on each target, only for changes that can affect it.
+on:
+  pull_request:
+    paths:
+      - 'a2acli-transport-slimrpc/**'
+      - 'scripts/package_a2acli_release.py'
+      - 'scripts/resolve_a2acli_release_metadata.py'
+      - '.github/workflows/plugin-release-check.yml'
+      - '.github/workflows/release-upload-binaries.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege; nothing here writes.
+permissions:
+  contents: read
+
+jobs:
+  build-plugin-release-artifacts:
+    name: Plugin ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macOS arm64
+            runner: macos-26
+            target: aarch64-apple-darwin
+          - name: macOS x86_64
+            runner: macos-26-intel
+            target: x86_64-apple-darwin
+          - name: Windows x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          target: ${{ matrix.target }}
+          # No cache: the repo sits at GitHub's cache cap, and a release build
+          # of this crate would evict more useful entries.
+          cache: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
+
+      - name: Resolve release metadata
+        id: metadata
+        shell: bash
+        run: |
+          python scripts/resolve_a2acli_release_metadata.py \
+            --event-name "${{ github.event_name }}" \
+            --release-tag "" \
+            --package a2acli-transport-slimrpc \
+            --target "${{ matrix.target }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Build the plugin
+        run: cargo build -p ${{ steps.metadata.outputs.cargo_package }} --release --locked --target ${{ matrix.target }}
+
+      - name: Run the plugin
+        # Every runner is native to its target, so the binary can run. `info`
+        # needs no configuration or gateway.
+        shell: bash
+        run: |
+          out=$("${{ steps.metadata.outputs.binary_path }}" info)
+          echo "$out"
+          echo "$out" | grep -q slimrpc
+
+      - name: Package release archive
+        id: package
+        shell: bash
+        run: |
+          python scripts/package_a2acli_release.py \
+            --binary "${{ steps.metadata.outputs.binary_path }}" \
+            --name "${{ steps.metadata.outputs.archive_name }}" \
+            --readme "${{ steps.metadata.outputs.readme_path }}" \
+            --target "${{ matrix.target }}" \
+            --version "${{ steps.metadata.outputs.version }}" \
+            --output-dir dist \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload the archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: slimrpc-plugin-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive_path }}
+          retention-days: 7

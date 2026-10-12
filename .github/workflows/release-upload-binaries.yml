@@ -2,13 +2,22 @@
 # Copyright A2A Contributors (https://github.com/a2aproject)
 # SPDX-License-Identifier: Apache-2.0
 
-name: Upload a2acli Release Binaries
+name: Upload Release Binaries
 
+# Builds, signs and attests the binaries of whichever crate the tag names:
+# a2a-cli-v* or a2acli-transport-slimrpc-v*. Callable from release-rust.yml and
+# by hand, to recover a release that never got its binaries.
 on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Release tag to upload binaries for"
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to upload binaries for (e.g. a2a-cli-v0.1.6)"
+        description: "Release tag to upload binaries for (e.g. a2a-cli-v0.1.6 or a2acli-transport-slimrpc-v0.1.2)"
         required: true
         type: string
 
@@ -17,8 +26,8 @@ permissions:
   contents: read
 
 jobs:
-  upload-a2acli-binaries:
-    name: Upload a2acli binaries (${{ matrix.name }})
+  upload-binaries:
+    name: Upload binaries (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write      # gh release upload
@@ -74,8 +83,8 @@ jobs:
             --target "${{ matrix.target }}" \
             --github-output "$GITHUB_OUTPUT"
 
-      - name: Build a2acli
-        run: cargo build -p a2a-cli --release --locked --target ${{ matrix.target }}
+      - name: Build ${{ steps.metadata.outputs.cargo_package }}
+        run: cargo build -p ${{ steps.metadata.outputs.cargo_package }} --release --locked --target ${{ matrix.target }}
 
       - name: Package release archive
         id: package
@@ -83,6 +92,8 @@ jobs:
         run: |
           python scripts/package_a2acli_release.py \
             --binary "${{ steps.metadata.outputs.binary_path }}" \
+            --name "${{ steps.metadata.outputs.archive_name }}" \
+            --readme "${{ steps.metadata.outputs.readme_path }}" \
             --target "${{ matrix.target }}" \
             --version "${{ steps.metadata.outputs.version }}" \
             --output-dir dist \

@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: CLI release tag to render into Formula/a2acli.rb (e.g. a2a-cli-v0.1.5)
+        description: Release tag to render a formula for (e.g. a2a-cli-v0.1.5 or a2acli-transport-slimrpc-v0.1.2)
         required: true
         type: string
 
@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   refresh-homebrew-formula:
-    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'a2a-cli-v') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'a2a-cli-v') || startsWith(github.event.release.tag_name, 'a2acli-transport-slimrpc-v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -52,20 +52,29 @@ jobs:
           case "$tag" in
             a2a-cli-v*)
               version="${tag#a2a-cli-v}"
+              name="a2acli"
+              ;;
+            a2acli-transport-slimrpc-v*)
+              version="${tag#a2acli-transport-slimrpc-v}"
+              name="a2a-transport-slimrpc"
               ;;
             *)
-              echo "::error::expected an a2a-cli-v* tag, got $tag"
+              echo "::error::expected an a2a-cli-v* or a2acli-transport-slimrpc-v* tag, got $tag"
               exit 1
               ;;
           esac
 
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "name=$name"
+            echo "formula=Formula/$name.rb"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Render Homebrew formula
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python scripts/render_homebrew_formula.py --tag "${{ steps.release.outputs.tag }}" --output Formula/a2acli.rb
+        run: python scripts/render_homebrew_formula.py --tag "${{ steps.release.outputs.tag }}" --output "${{ steps.release.outputs.formula }}"
 
       - name: Authenticate with GitHub App Bot
         if: env.APP_AUTH_CONFIGURED == 'true'
@@ -90,17 +99,19 @@ jobs:
           GIT_AUTHOR_NAME: ${{ steps.app-token.outputs.app-slug != '' && format('{0}[bot]', steps.app-token.outputs.app-slug) || 'github-actions[bot]' }}
           GIT_AUTHOR_EMAIL: ${{ steps.app-user.outputs.user_id != '' && format('{0}+{1}[bot]@users.noreply.github.com', steps.app-user.outputs.user_id, steps.app-token.outputs.app-slug) || '41898282+github-actions[bot]@users.noreply.github.com' }}
         run: |
-          if git diff --quiet -- Formula/a2acli.rb; then
+          # `git diff` ignores untracked files, so it would call a brand-new
+          # formula "up to date"; status reports both new and modified files.
+          if [ -z "$(git status --porcelain -- "${{ steps.release.outputs.formula }}")" ]; then
             echo "Formula already up to date for ${{ steps.release.outputs.tag }}"
             exit 0
           fi
 
-          branch="automation/homebrew-a2acli-${{ steps.release.outputs.version }}"
+          branch="automation/homebrew-${{ steps.release.outputs.name }}-${{ steps.release.outputs.version }}"
           git config user.name "$GIT_AUTHOR_NAME"
           git config user.email "$GIT_AUTHOR_EMAIL"
           git checkout -B "$branch"
-          git add Formula/a2acli.rb
-          git commit -m "release: update Homebrew formula for a2acli v${{ steps.release.outputs.version }}"
+          git add "${{ steps.release.outputs.formula }}"
+          git commit -m "release: update Homebrew formula for ${{ steps.release.outputs.name }} v${{ steps.release.outputs.version }}"
           git push --force --set-upstream origin "$branch"
 
           pr_number=$(gh pr list --repo a2aproject/a2a-rs --head "$branch" --base main --state open --json number --jq 'first(.[].number) // ""')
@@ -110,15 +121,15 @@ jobs:
           fi
 
           cat > /tmp/homebrew-formula-pr-body.md <<EOF
-          Update Formula/a2acli.rb for ${{ steps.release.outputs.tag }}.
+          Update ${{ steps.release.outputs.formula }} for ${{ steps.release.outputs.tag }}.
 
-          - refreshes the source tarball SHA256
-          - keeps the Homebrew install path aligned with the latest CLI release
+          - refreshes the release archive SHA256
+          - keeps the Homebrew install path aligned with the latest release
           EOF
 
           gh pr create \
             --repo a2aproject/a2a-rs \
             --base main \
             --head "$branch" \
-            --title "release: update Homebrew formula for a2acli v${{ steps.release.outputs.version }}" \
+            --title "release: update Homebrew formula for ${{ steps.release.outputs.name }} v${{ steps.release.outputs.version }}" \
             --body-file /tmp/homebrew-formula-pr-body.md
