@@ -46,7 +46,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: "3.14"
+          python-version: "3.15"
 
       - name: Render WinGet manifests
         id: render
@@ -59,7 +59,7 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - name: Upload WinGet manifest artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: winget-manifests-${{ steps.render.outputs.package_version }}
           path: dist/winget/manifests
@@ -71,7 +71,7 @@ jobs:
       contents: read
     steps:
       - name: Download rendered manifests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: winget-manifests-${{ needs.render-winget-manifests.outputs.package_version }}
           path: manifests
@@ -126,7 +126,7 @@ jobs:
       APP_AUTH_CONFIGURED: ${{ secrets.PROJECT_APP_ID != '' && secrets.PROJECT_APP_KEY != '' }}
     steps:
       - name: Download rendered manifests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: winget-manifests-${{ needs.render-winget-manifests.outputs.package_version }}
           path: dist/winget/manifests
