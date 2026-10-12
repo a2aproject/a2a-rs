@@ -31,6 +31,7 @@ The workspace supports:
 | `a2a-pb` | Protobuf schema, generated types, ProtoJSON-capable generated types, and native <-> protobuf conversion helpers |
 | `a2a-grpc` | gRPC client and server bindings built on `tonic` |
 | `a2a-slimrpc` | SLIMRPC client and server bindings built on `slim_bindings` |
+| [`a2acli-transport-slimrpc`](a2acli-transport-slimrpc/README.md) | SLIMRPC transport plugin for the Go `a2a-cli`, built as `a2a-transport-slimrpc` |
 | `a2acli` | Standalone A2A client CLI, published as `a2a-cli`, for inspecting agent cards, sending messages, managing tasks, and handling push configs |
 | `examples/helloworld` | Minimal runnable example agent |
 
@@ -41,7 +42,7 @@ The workspace supports:
 | JSON-RPC | `a2a-client` | `a2a-server` |
 | HTTP+JSON / REST | `a2a-client` | `a2a-server` |
 | gRPC | `a2a-grpc` | `a2a-grpc` |
-| SLIMRPC | `a2a-slimrpc` | `a2a-slimrpc` |
+| SLIMRPC | `a2a-slimrpc`; Go `a2a-cli` via [`a2acli-transport-slimrpc`](a2acli-transport-slimrpc/README.md) | `a2a-slimrpc` |
 
 The gRPC support uses the schema in `a2a-pb/proto/a2a.proto`. The REST and
 JSON-RPC bindings are intended to stay wire-compatible with other A2A SDKs,
@@ -189,6 +190,7 @@ Typical usage is:
 - `a2a-grpc/`: tonic-based bindings
 - `a2a-slimrpc/`: SLIMRPC bindings
 - `a2acli/`: standalone A2A client CLI and published binary package
+- `a2acli-transport-slimrpc/`: SLIMRPC plugin for the Go `a2a-cli`, with a local gateway and echo-agent example
 - `examples/helloworld/`: runnable sample agent
 
 ## Contributing
