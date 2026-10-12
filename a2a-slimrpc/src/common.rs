@@ -33,10 +33,36 @@ pub const A2A_COLLABORATIVE_CHANNEL_SERVICE: &str =
     "experimental.slimrpc.collaborative_channel.v1.CollaborativeChannelService";
 pub const METHOD_COLLABORATE: &str = "Collaborate";
 
-/// `Message.metadata` key the SLIMRPC layer populates with the sender's SLIM name
-/// on every inbound `Collaborate` message, per the collaborative channel spec's
-/// message-attribution requirement.
+/// Key for the sender's SLIM name.
+///
+/// - On every inbound `Collaborate` message, the SLIMRPC layer sets it in
+///   `Message.metadata`, per the collaborative channel spec's
+///   message-attribution requirement.
+/// - On every request a [`SlimRpcHandler`](crate::SlimRpcHandler) serves, it is
+///   a reserved service-params key holding the caller's SLIM name as the
+///   session reports it. Caller-supplied values are dropped. The name is the
+///   one the caller claimed when it set up the session; for authorization, use
+///   [`SLIM_PEER_SUBJECT_METADATA_KEY`], which is verified.
 pub const SLIM_SRC_METADATA_KEY: &str = "slim-src";
+
+/// Reserved service-params key holding the verified subject (`sub`) of the
+/// caller's identity token, e.g. a `did:key` or a SPIFFE ID. Set only when the
+/// session uses MLS, which is what verifies it; absent otherwise.
+/// Caller-supplied values are dropped.
+pub const SLIM_PEER_SUBJECT_METADATA_KEY: &str = "slim-peer-subject";
+
+/// Reserved service-params key holding the verified issuer (`iss`) of the
+/// caller's identity token. Set only when the session uses MLS and the token
+/// has an issuer. Caller-supplied values are dropped.
+pub const SLIM_PEER_ISSUER_METADATA_KEY: &str = "slim-peer-issuer";
+
+/// Service-params keys that carry the caller identity. Only the SLIMRPC layer
+/// sets them, from the session; request metadata can't.
+const RESERVED_IDENTITY_KEYS: [&str; 3] = [
+    SLIM_SRC_METADATA_KEY,
+    SLIM_PEER_SUBJECT_METADATA_KEY,
+    SLIM_PEER_ISSUER_METADATA_KEY,
+];
 
 pub fn encode_proto_message<T>(message: &T) -> Vec<u8>
 where
@@ -80,13 +106,66 @@ pub fn service_params_to_metadata_opt(
     }
 }
 
+/// The caller identity a server handler sees, taken from the session rather
+/// than from request metadata.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CallerIdentity {
+    pub slim_src: Option<String>,
+    pub peer_subject: Option<String>,
+    pub peer_issuer: Option<String>,
+}
+
+impl CallerIdentity {
+    pub fn from_context(context: &Context) -> Self {
+        // In a handler, the session's destination is the caller. A context
+        // built without a session has an empty name, which isn't forwarded.
+        let caller = context.session().destination();
+        let (org, namespace, app) = caller.str_components();
+        let slim_src = (!(org.is_empty() && namespace.is_empty() && app.is_empty()))
+            .then(|| caller.to_string());
+        Self {
+            slim_src,
+            peer_subject: context.peer_subject(),
+            peer_issuer: context.peer_issuer(),
+        }
+    }
+}
+
+/// Build the service params a server handler sees: the request metadata minus
+/// internal keys and caller-supplied reserved identity keys, plus the caller
+/// identity from the session under those reserved keys.
 pub fn context_to_service_params(context: &Context) -> ServiceParamsMap {
-    context
-        .metadata()
+    to_service_params(context.metadata(), CallerIdentity::from_context(context))
+}
+
+fn to_service_params(
+    metadata: HashMap<String, String>,
+    identity: CallerIdentity,
+) -> ServiceParamsMap {
+    let mut params: ServiceParamsMap = metadata
         .into_iter()
-        .filter(|(key, _)| !is_internal_metadata_key(key))
+        .filter(|(key, _)| !is_internal_metadata_key(key) && !is_reserved_identity_key(key))
         .map(|(key, value)| (key, vec![value]))
-        .collect()
+        .collect();
+    let identity_params = [
+        (SLIM_SRC_METADATA_KEY, identity.slim_src),
+        (SLIM_PEER_SUBJECT_METADATA_KEY, identity.peer_subject),
+        (SLIM_PEER_ISSUER_METADATA_KEY, identity.peer_issuer),
+    ];
+    for (key, value) in identity_params {
+        if let Some(value) = value {
+            params.insert(key.to_string(), vec![value]);
+        }
+    }
+    params
+}
+
+fn is_reserved_identity_key(key: &str) -> bool {
+    // Metadata keys are header-like, so a differently-cased copy must not slip
+    // past a handler that normalizes case.
+    RESERVED_IDENTITY_KEYS
+        .iter()
+        .any(|reserved| key.eq_ignore_ascii_case(reserved))
 }
 
 fn is_internal_metadata_key(key: &str) -> bool {
@@ -149,6 +228,97 @@ mod tests {
         assert!(!params.contains_key("rpc-id"));
         assert!(!params.contains_key("service"));
         assert!(!params.contains_key("method"));
+    }
+
+    #[test]
+    fn test_context_to_service_params_strips_spoofed_identity_keys() {
+        let context =
+            Context::for_rpc(None, None).with_message_metadata(std::collections::HashMap::from([
+                (
+                    SLIM_SRC_METADATA_KEY.to_string(),
+                    "org/evil/app".to_string(),
+                ),
+                ("Slim-Src".to_string(), "org/evil/app".to_string()),
+                (
+                    SLIM_PEER_SUBJECT_METADATA_KEY.to_string(),
+                    "did:key:spoofed".to_string(),
+                ),
+                (
+                    "SLIM-PEER-ISSUER".to_string(),
+                    "https://evil.example".to_string(),
+                ),
+                ("x-user".to_string(), "value".to_string()),
+            ]));
+
+        // A context without a session carries no caller identity, so nothing
+        // may come back under the reserved keys, in any case.
+        let params = context_to_service_params(&context);
+        assert_eq!(params.get("x-user"), Some(&vec!["value".to_string()]));
+        assert!(
+            params.keys().all(|key| !is_reserved_identity_key(key)),
+            "reserved keys leaked: {params:?}"
+        );
+    }
+
+    #[test]
+    fn test_to_service_params_populates_identity() {
+        let metadata = HashMap::from([
+            (
+                SLIM_SRC_METADATA_KEY.to_string(),
+                "org/evil/app".to_string(),
+            ),
+            (
+                SLIM_PEER_SUBJECT_METADATA_KEY.to_string(),
+                "did:key:spoofed".to_string(),
+            ),
+            ("x-user".to_string(), "value".to_string()),
+        ]);
+        let identity = CallerIdentity {
+            slim_src: Some("org/ns/caller/42".to_string()),
+            peer_subject: Some("did:key:z6Mk".to_string()),
+            peer_issuer: Some("https://issuer.example".to_string()),
+        };
+
+        let params = to_service_params(metadata, identity);
+        assert_eq!(
+            params.get(SLIM_SRC_METADATA_KEY),
+            Some(&vec!["org/ns/caller/42".to_string()])
+        );
+        assert_eq!(
+            params.get(SLIM_PEER_SUBJECT_METADATA_KEY),
+            Some(&vec!["did:key:z6Mk".to_string()])
+        );
+        assert_eq!(
+            params.get(SLIM_PEER_ISSUER_METADATA_KEY),
+            Some(&vec!["https://issuer.example".to_string()])
+        );
+        assert_eq!(params.get("x-user"), Some(&vec!["value".to_string()]));
+    }
+
+    #[test]
+    fn test_to_service_params_omits_unset_identity() {
+        let metadata = HashMap::from([(
+            SLIM_PEER_ISSUER_METADATA_KEY.to_string(),
+            "https://evil.example".to_string(),
+        )]);
+        let identity = CallerIdentity {
+            slim_src: Some("org/ns/caller/42".to_string()),
+            peer_subject: Some("shared-secret-id".to_string()),
+            peer_issuer: None,
+        };
+
+        let params = to_service_params(metadata, identity);
+        assert!(params.contains_key(SLIM_SRC_METADATA_KEY));
+        assert!(params.contains_key(SLIM_PEER_SUBJECT_METADATA_KEY));
+        assert!(!params.contains_key(SLIM_PEER_ISSUER_METADATA_KEY));
+    }
+
+    #[test]
+    fn test_caller_identity_from_context_without_session() {
+        assert_eq!(
+            CallerIdentity::from_context(&Context::for_rpc(None, None)),
+            CallerIdentity::default()
+        );
     }
 
     #[test]

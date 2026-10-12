@@ -9,8 +9,10 @@ use a2a::*;
 use a2a_client::Transport;
 use a2a_client::transport::{ServiceParams, TransportFactory};
 use a2a_server::RequestHandler;
-use a2a_slimrpc::SlimApp;
-use a2a_slimrpc::{SlimRpcHandler, SlimRpcTransport, SlimRpcTransportFactory};
+use a2a_slimrpc::{
+    SLIM_PEER_ISSUER_METADATA_KEY, SLIM_PEER_SUBJECT_METADATA_KEY, SLIM_SRC_METADATA_KEY, SlimApp,
+    SlimRpcHandler, SlimRpcTransport, SlimRpcTransportFactory,
+};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
@@ -208,6 +210,26 @@ impl RequestHandler for TestHandler {
             && params.get("x-trace") != Some(&vec!["alpha, beta".to_string()])
         {
             return Err(A2AError::invalid_params("missing x-trace metadata"));
+        }
+
+        if req.message.task_id.as_deref() == Some("identity-required") {
+            // The caller's identity comes from the session: its SLIM name and
+            // the verified subject of its shared-secret token (id plus a
+            // per-instance suffix), never the spoofed values it sent.
+            let single = |key: &str| match params.get(key).map(Vec::as_slice) {
+                Some([value]) => Some(value.clone()),
+                _ => None,
+            };
+            let slim_src = single(SLIM_SRC_METADATA_KEY).unwrap_or_default();
+            let subject = single(SLIM_PEER_SUBJECT_METADATA_KEY).unwrap_or_default();
+            if !slim_src.starts_with(&format!("{}-direct/", self.target))
+                || !subject.starts_with("test-provider-client")
+                || params.contains_key(SLIM_PEER_ISSUER_METADATA_KEY)
+            {
+                return Err(A2AError::invalid_params(format!(
+                    "unexpected caller identity: {params:?}"
+                )));
+            }
         }
 
         if req.message.task_id.as_deref() == Some("message-response") {
@@ -408,6 +430,26 @@ async fn slimrpc_transport_end_to_end() {
 
     let send_resp = transport
         .send_message(&params, &send_message_request("metadata-required"))
+        .await
+        .unwrap();
+    assert!(matches!(send_resp, SendMessageResponse::Task(_)));
+
+    let spoofed = ServiceParams::from([
+        (
+            SLIM_SRC_METADATA_KEY.to_string(),
+            vec!["org/evil/app".to_string()],
+        ),
+        (
+            SLIM_PEER_SUBJECT_METADATA_KEY.to_string(),
+            vec!["did:key:spoofed".to_string()],
+        ),
+        (
+            SLIM_PEER_ISSUER_METADATA_KEY.to_string(),
+            vec!["https://evil.example".to_string()],
+        ),
+    ]);
+    let send_resp = transport
+        .send_message(&spoofed, &send_message_request("identity-required"))
         .await
         .unwrap();
     assert!(matches!(send_resp, SendMessageResponse::Task(_)));
