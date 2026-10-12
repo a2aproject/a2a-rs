@@ -14,6 +14,12 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.4.1...a2a-cli-v0.4.2) - 2026-10-12
+
+### Added
+
+- *(slimrpc)* pass the verified caller identity to the RequestHandler ([#349](https://github.com/a2aproject/a2a-rs/pull/349))
+
 ## [0.4.1](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.4.0...a2a-cli-v0.4.1) - 2026-10-12
 
 ### Fixed

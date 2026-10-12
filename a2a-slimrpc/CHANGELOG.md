@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.3.1...a2a-slimrpc-v0.3.2) - 2026-10-12
+
+### Added
+
+- *(slimrpc)* pass the verified caller identity to the RequestHandler ([#349](https://github.com/a2aproject/a2a-rs/pull/349))
+
 ## [0.3.1](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.3.0...a2a-slimrpc-v0.3.1) - 2026-10-12
 
 ### Fixed
