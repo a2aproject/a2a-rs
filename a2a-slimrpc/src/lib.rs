@@ -7,7 +7,9 @@ pub mod errors;
 pub mod server;
 
 pub use client::{SlimApp, SlimRpcTransport, SlimRpcTransportFactory, parse_slimrpc_target};
-pub use common::SLIM_SRC_METADATA_KEY;
+pub use common::{
+    SLIM_PEER_ISSUER_METADATA_KEY, SLIM_PEER_SUBJECT_METADATA_KEY, SLIM_SRC_METADATA_KEY,
+};
 pub use server::{SlimRpcHandler, register_collaborate};
 
 // Wire internals reached by the fuzz target in fuzz/ — see #238. Thin

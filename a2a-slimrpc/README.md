@@ -21,6 +21,34 @@ Accepted forms are:
 - `slim://org/namespace/app`
 - `slimrpc://org/namespace/app`
 
+## Caller Identity
+
+`SlimRpcHandler` passes the caller's identity to the `RequestHandler` in the
+service params, under reserved keys that only the SLIMRPC layer sets. Values
+a caller sends under these keys, in any letter case, are dropped.
+
+| Key | Constant | Value |
+| --- | --- | --- |
+| `slim-src` | `SLIM_SRC_METADATA_KEY` | The caller's SLIM name, as the session reports it (`org/namespace/app/id`). |
+| `slim-peer-subject` | `SLIM_PEER_SUBJECT_METADATA_KEY` | The verified subject (`sub`) of the caller's identity token, such as a `did:key` or a SPIFFE ID. |
+| `slim-peer-issuer` | `SLIM_PEER_ISSUER_METADATA_KEY` | The verified issuer (`iss`) of that token, when it has one. |
+
+The peer keys are set only when the session uses MLS (the SLIMRPC default),
+since MLS is what verifies the token. `slim-src` is the name the caller
+claimed when it set up the session, so authorize on `slim-peer-subject` (and
+`slim-peer-issuer`), and treat a request without it as unauthenticated:
+
+```rust
+use a2a_slimrpc::SLIM_PEER_SUBJECT_METADATA_KEY;
+
+fn caller_subject(params: &ServiceParams) -> Option<&str> {
+    params
+        .get(SLIM_PEER_SUBJECT_METADATA_KEY)
+        .and_then(|values| values.first())
+        .map(String::as_str)
+}
+```
+
 ## Install
 
 ```toml
