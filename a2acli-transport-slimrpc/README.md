@@ -21,6 +21,59 @@ certificate, and a per-launch authentication token. It forwards A2A calls to
 the target agent and stops when the CLI closes its stdin. The local token is
 checked by the proxy and removed before forwarding requests upstream.
 
+## Install A Prebuilt Binary
+
+Each GitHub release tagged `a2acli-transport-slimrpc-v<version>` carries signed
+archives for macOS (arm64, x86_64), Linux (x86_64, arm64) and Windows (x86_64).
+You also need the [Go CLI](https://github.com/a2aproject/a2a-cli#installation)
+(`a2a`), which is what discovers and launches the plugin.
+
+**macOS** — [Homebrew](https://brew.sh):
+
+```sh
+brew tap a2aproject/a2a-rs https://github.com/a2aproject/a2a-rs
+brew trust a2aproject/a2a-rs
+brew install a2a-transport-slimrpc
+```
+
+**Windows** — PowerShell installer, no administrator rights needed:
+
+```powershell
+irm https://raw.githubusercontent.com/a2aproject/a2a-rs/main/scripts/install-slimrpc-plugin.ps1 | iex
+```
+
+It downloads the latest release archive, checks its SHA-256, installs
+`a2a-transport-slimrpc.exe` to `%LOCALAPPDATA%\Programs\a2a-transport-slimrpc`
+and adds that directory to your user `PATH`; open a new terminal afterwards.
+Set `A2A_SLIMRPC_PLUGIN_VERSION` to pin a version or
+`A2A_SLIMRPC_PLUGIN_INSTALL_DIR` to change the directory. Read the
+[script](../scripts/install-slimrpc-plugin.ps1) first if you prefer, or download
+the `.zip` from the releases page and put the executable on `PATH` yourself.
+
+**Linux** — download the archive from the
+[releases page](https://github.com/a2aproject/a2a-rs/releases) and put the
+`a2a-transport-slimrpc` executable on `PATH`. For example, on x86_64:
+
+```sh
+version=<version>
+target=x86_64-unknown-linux-gnu
+archive="a2a-transport-slimrpc-v${version}-${target}"
+curl -fsSLO "https://github.com/a2aproject/a2a-rs/releases/download/a2acli-transport-slimrpc-v${version}/${archive}.tar.gz"
+tar -xzf "${archive}.tar.gz"
+install -m 0755 "${archive}/a2a-transport-slimrpc" ~/.local/bin/
+```
+
+Check that the Go CLI finds it:
+
+```sh
+a2a transport list
+```
+
+The list should include `slimrpc`. To verify a download, use the signature and
+provenance commands in [Verifying a download](../a2acli/README.md#verifying-a-download)
+with the plugin's archive name. Then continue with [Configuration](#configuration).
+Building from source is covered next.
+
 ## Build And Discover
 
 Install a current stable Rust toolchain and the

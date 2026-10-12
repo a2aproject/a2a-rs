@@ -269,6 +269,88 @@ jobs:
             --ref "${{ github.ref_name }}" \
             -f tag="$RELEASE_TAG"
 
+  # The SLIMRPC plugin for the Go a2a CLI ships on its own tag and version, so
+  # it is resolved separately. It gets binaries and a Homebrew formula but no
+  # WinGet package, which would be a new package to maintain.
+  resolve-plugin-release:
+    name: Resolve slimrpc plugin release
+    needs: release-crates
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve plugin release tag
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("a2acli-transport-slimrpc/Cargo.toml", "rb"))["package"]["version"])')
+          tag="a2acli-transport-slimrpc-v${version}"
+
+          # An empty tag means nothing to distribute, and skips every job below.
+          if ! archives=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+              --jq '[.assets[].name | select(endswith(".sha256"))] | length' 2>/tmp/gh_err); then
+            if grep -q "HTTP 404" /tmp/gh_err; then
+              echo "No GitHub release for ${tag} yet; nothing to distribute."
+              echo "release_tag=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat /tmp/gh_err >&2
+            exit 1
+          fi
+
+          if [ "$archives" -gt 0 ]; then
+            echo "${tag} already has binaries; nothing to distribute."
+            echo "release_tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "${tag} has no binaries yet; distributing."
+          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
+
+  release-plugin-binaries:
+    name: Release slimrpc plugin binaries
+    needs: resolve-plugin-release
+    if: ${{ !cancelled() && needs.resolve-plugin-release.outputs.release_tag != '' }}
+    permissions:
+      contents: write      # gh release upload
+      id-token: write      # cosign keyless signing + provenance, via OIDC
+      attestations: write  # actions/attest-build-provenance
+    uses: ./.github/workflows/release-upload-binaries.yml
+    with:
+      release_tag: ${{ needs.resolve-plugin-release.outputs.release_tag }}
+
+  release-plugin-homebrew:
+    name: Publish slimrpc plugin Homebrew formula
+    needs:
+      - resolve-plugin-release
+      - release-plugin-binaries
+    if: ${{ !cancelled() && needs.resolve-plugin-release.outputs.release_tag != '' && needs.release-plugin-binaries.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      RELEASE_TAG: ${{ needs.resolve-plugin-release.outputs.release_tag }}
+    steps:
+      - name: Trigger Homebrew formula workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run homebrew-formula.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}" \
+            -f tag="$RELEASE_TAG"
+
   release-crates-pr:
     name: Release crates - PR
     runs-on: ubuntu-latest

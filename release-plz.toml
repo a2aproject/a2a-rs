@@ -20,6 +20,10 @@ semver_check = false
 [[package]]
 name = "a2acli-transport-slimrpc"
 semver_check = false
+# The GitHub release carries the plugin's prebuilt binaries (release-rust.yml).
+# Not "latest": that label stays on the CLI release.
+git_release_enable = true
+git_release_latest = false
 
 [[package]]
 name = "a2a-cli"
