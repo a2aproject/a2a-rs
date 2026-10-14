@@ -14,6 +14,12 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.4.2...a2a-cli-v0.4.3) - 2026-10-14
+
+### Fixed
+
+- *(deps)* build on SLIM 3.4.1 ([#353](https://github.com/a2aproject/a2a-rs/pull/353))
+
 ## [0.4.2](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.4.1...a2a-cli-v0.4.2) - 2026-10-12
 
 ### Added

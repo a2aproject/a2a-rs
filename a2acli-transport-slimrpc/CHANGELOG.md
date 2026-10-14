@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/a2aproject/a2a-rs/compare/a2acli-transport-slimrpc-v0.1.3...a2acli-transport-slimrpc-v0.1.4) - 2026-10-14
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.1.3](https://github.com/a2aproject/a2a-rs/compare/a2acli-transport-slimrpc-v0.1.2...a2acli-transport-slimrpc-v0.1.3) - 2026-10-12
 
 ### Other
