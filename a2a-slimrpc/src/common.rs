@@ -47,8 +47,9 @@ pub const SLIM_SRC_METADATA_KEY: &str = "slim-src";
 
 /// Reserved service-params key holding the verified subject (`sub`) of the
 /// caller's identity token, e.g. a `did:key` or a SPIFFE ID. Set only when the
-/// session uses MLS, which is what verifies it; absent otherwise.
-/// Caller-supplied values are dropped.
+/// session uses MLS, which is what verifies it; absent otherwise. In a group
+/// session it is the member that sent the request, not the one that set the
+/// session up. Caller-supplied values are dropped.
 pub const SLIM_PEER_SUBJECT_METADATA_KEY: &str = "slim-peer-subject";
 
 /// Reserved service-params key holding the verified issuer (`iss`) of the
@@ -232,8 +233,13 @@ mod tests {
 
     #[test]
     fn test_context_to_service_params_strips_spoofed_identity_keys() {
-        let context =
-            Context::for_rpc(None, None).with_message_metadata(std::collections::HashMap::from([
+        // Plain request metadata, which is all a caller controls. Not
+        // `with_message_metadata`: since slim-rpc 3.4 that is where the
+        // session layer's MLS-stamped sender enters (see the next test), and
+        // the session layer strips a caller's own value before it gets there.
+        let context = Context::for_rpc(
+            None,
+            Some(std::collections::HashMap::from([
                 (
                     SLIM_SRC_METADATA_KEY.to_string(),
                     "org/evil/app".to_string(),
@@ -248,7 +254,8 @@ mod tests {
                     "https://evil.example".to_string(),
                 ),
                 ("x-user".to_string(), "value".to_string()),
-            ]));
+            ])),
+        );
 
         // A context without a session carries no caller identity, so nothing
         // may come back under the reserved keys, in any case.
@@ -258,6 +265,28 @@ mod tests {
             params.keys().all(|key| !is_reserved_identity_key(key)),
             "reserved keys leaked: {params:?}"
         );
+    }
+
+    #[test]
+    fn test_context_to_service_params_forwards_the_mls_sender_subject() {
+        // slim-rpc 3.4 reads the subject its session layer stamps from the MLS
+        // sender into the message metadata, so a handler sees who sent this
+        // request. It reaches the handler exactly once, under the reserved key.
+        let context =
+            Context::for_rpc(None, None).with_message_metadata(std::collections::HashMap::from([
+                (
+                    SLIM_PEER_SUBJECT_METADATA_KEY.to_string(),
+                    "did:key:z6Mk".to_string(),
+                ),
+                ("x-user".to_string(), "value".to_string()),
+            ]));
+
+        let params = context_to_service_params(&context);
+        assert_eq!(
+            params.get(SLIM_PEER_SUBJECT_METADATA_KEY),
+            Some(&vec!["did:key:z6Mk".to_string()])
+        );
+        assert_eq!(params.get("x-user"), Some(&vec!["value".to_string()]));
     }
 
     #[test]
