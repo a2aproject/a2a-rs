@@ -5,13 +5,16 @@ use std::collections::HashMap;
 
 use a2a::A2AError;
 use prost::Message;
-use slim_rpc::{Context, DEADLINE_KEY, RpcError, STATUS_CODE_KEY};
+use slim_rpc::{Context, DEADLINE_KEY, RPC_DIR_KEY, RpcError, STATUS_CODE_KEY};
 
 pub type ServiceParamsMap = HashMap<String, Vec<String>>;
 
 const RPC_ID_KEY: &str = "rpc-id";
 const SERVICE_KEY: &str = "service";
 const METHOD_KEY: &str = "method";
+/// Signature the SLIM session layer (3.4+) puts on every message it sends.
+/// slim-session keeps its own constant crate-private.
+const PAYLOAD_SIG_KEY: &str = "slim-payload-sig";
 
 pub const A2A_SLIMRPC_SERVICE: &str = "lf.a2a.v1.A2AService";
 pub const METHOD_SEND_MESSAGE: &str = "SendMessage";
@@ -172,8 +175,8 @@ fn is_reserved_identity_key(key: &str) -> bool {
 fn is_internal_metadata_key(key: &str) -> bool {
     matches!(
         key,
-        DEADLINE_KEY | STATUS_CODE_KEY | RPC_ID_KEY | SERVICE_KEY | METHOD_KEY
-    )
+        DEADLINE_KEY | STATUS_CODE_KEY | RPC_ID_KEY | SERVICE_KEY | METHOD_KEY | RPC_DIR_KEY
+    ) || key.eq_ignore_ascii_case(PAYLOAD_SIG_KEY)
 }
 
 #[cfg(test)]
@@ -219,6 +222,9 @@ mod tests {
                 ("rpc-id".to_string(), "abc".to_string()),
                 ("service".to_string(), "svc".to_string()),
                 ("method".to_string(), "m".to_string()),
+                (RPC_DIR_KEY.to_string(), "req".to_string()),
+                ("slim-payload-sig".to_string(), "MEQCIF".to_string()),
+                ("Slim-Payload-Sig".to_string(), "MEQCIF".to_string()),
                 ("x-user".to_string(), "value".to_string()),
             ]));
 
@@ -229,6 +235,9 @@ mod tests {
         assert!(!params.contains_key("rpc-id"));
         assert!(!params.contains_key("service"));
         assert!(!params.contains_key("method"));
+        assert!(!params.contains_key(RPC_DIR_KEY));
+        assert!(!params.contains_key("slim-payload-sig"));
+        assert!(!params.contains_key("Slim-Payload-Sig"));
     }
 
     #[test]
