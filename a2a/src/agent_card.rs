@@ -109,16 +109,18 @@ where
         let scopes = match scopes_value {
             Value::Array(_) => serde_json::from_value::<Vec<String>>(scopes_value)
                 .map_err(|e| E::custom(format!("invalid security scopes for {scheme}: {e}")))?,
-            Value::Object(mut wrapped) => {
-                let Some(list) = wrapped.remove("list") else {
+            Value::Object(mut wrapped) => match wrapped.remove("list") {
+                Some(list) => serde_json::from_value::<Vec<String>>(list).map_err(|e| {
+                    E::custom(format!("invalid wrapped security scopes for {scheme}: {e}"))
+                })?,
+                // ProtoJSON omits an empty StringList, so {} is the same as {"list": []}.
+                None if wrapped.is_empty() => Vec::new(),
+                None => {
                     return Err(E::custom(format!(
                         "invalid wrapped security scopes for {scheme}"
                     )));
-                };
-                serde_json::from_value::<Vec<String>>(list).map_err(|e| {
-                    E::custom(format!("invalid wrapped security scopes for {scheme}: {e}"))
-                })?
-            }
+                }
+            },
             _ => {
                 return Err(E::custom(format!(
                     "security scopes for {scheme} must be a list"
@@ -989,5 +991,77 @@ mod tests {
         let requirements = card.security_requirements.unwrap();
         assert_eq!(requirements.len(), 1);
         assert_eq!(requirements[0].get("bearer_token"), Some(&Vec::new()));
+    }
+
+    #[test]
+    fn test_agent_card_deserializes_omitted_empty_security_scope_list() {
+        let card: AgentCard = serde_json::from_str(
+            r#"{
+                "name": "Spec Agent",
+                "description": "A test agent",
+                "version": "1.0.0",
+                "supportedInterfaces": [
+                    {
+                        "url": "https://example.com/spec",
+                        "protocolBinding": "JSONRPC",
+                        "protocolVersion": "1.0"
+                    }
+                ],
+                "capabilities": {
+                    "streaming": true
+                },
+                "defaultInputModes": ["text/plain"],
+                "defaultOutputModes": ["text/plain"],
+                "skills": [],
+                "securityRequirements": [
+                    {
+                        "schemes": {
+                            "bearerAuth": {}
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let requirements = card.security_requirements.unwrap();
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].get("bearerAuth"), Some(&Vec::new()));
+    }
+
+    #[test]
+    fn test_agent_card_rejects_security_scope_wrapper_without_list() {
+        let err = serde_json::from_str::<AgentCard>(
+            r#"{
+                "name": "Spec Agent",
+                "description": "A test agent",
+                "version": "1.0.0",
+                "supportedInterfaces": [
+                    {
+                        "url": "https://example.com/spec",
+                        "protocolBinding": "JSONRPC",
+                        "protocolVersion": "1.0"
+                    }
+                ],
+                "capabilities": {},
+                "defaultInputModes": ["text/plain"],
+                "defaultOutputModes": ["text/plain"],
+                "skills": [],
+                "securityRequirements": [
+                    {
+                        "schemes": {
+                            "bearerAuth": { "scopes": ["read"] }
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("invalid wrapped security scopes for bearerAuth"),
+            "{err}"
+        );
     }
 }
