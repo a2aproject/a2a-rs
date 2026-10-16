@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/a2aproject/a2a-rs/compare/a2acli-transport-slimrpc-v0.1.5...a2acli-transport-slimrpc-v0.1.6) - 2026-10-16
+
+### Other
+
+- *(slimrpc)* document the Windows plugin install in full ([#365](https://github.com/a2aproject/a2a-rs/pull/365))
+
 ## [0.1.5](https://github.com/a2aproject/a2a-rs/compare/a2acli-transport-slimrpc-v0.1.4...a2acli-transport-slimrpc-v0.1.5) - 2026-10-16
 
 ### Other
