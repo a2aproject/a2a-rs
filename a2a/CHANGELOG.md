@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/a2aproject/a2a-rs/compare/a2a-lf-v0.4.1...a2a-lf-v0.4.2) - 2026-10-16
+
+### Fixed
+
+- *(a2a)* accept an omitted empty security scope list ([#332](https://github.com/a2aproject/a2a-rs/pull/332))
+
+### Other
+
+- serialize security requirements in v1.0 shape ([#359](https://github.com/a2aproject/a2a-rs/pull/359))
+
 ## [0.4.1](https://github.com/a2aproject/a2a-rs/compare/a2a-lf-v0.4.0...a2a-lf-v0.4.1) - 2026-09-30
 
 ### Fixed

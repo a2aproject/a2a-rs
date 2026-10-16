@@ -14,6 +14,18 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.4.3...a2a-cli-v0.4.4) - 2026-10-16
+
+### Fixed
+
+- *(a2a)* accept an omitted empty security scope list ([#332](https://github.com/a2aproject/a2a-rs/pull/332))
+- *(slimrpc)* keep slim-payload-sig and slimrpc-dir out of service params ([#358](https://github.com/a2aproject/a2a-rs/pull/358))
+
+### Other
+
+- update Cargo.lock dependencies
+- serialize security requirements in v1.0 shape ([#359](https://github.com/a2aproject/a2a-rs/pull/359))
+
 ## [0.4.3](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.4.2...a2a-cli-v0.4.3) - 2026-10-14
 
 ### Fixed
