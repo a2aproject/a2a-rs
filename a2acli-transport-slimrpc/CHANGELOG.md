@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/a2aproject/a2a-rs/compare/a2acli-transport-slimrpc-v0.1.6...a2acli-transport-slimrpc-v0.1.7) - 2026-10-16
+
+### Other
+
+- *(slimrpc)* add a quick start for the Go CLI and the plugin together ([#367](https://github.com/a2aproject/a2a-rs/pull/367))
+
 ## [0.1.6](https://github.com/a2aproject/a2a-rs/compare/a2acli-transport-slimrpc-v0.1.5...a2acli-transport-slimrpc-v0.1.6) - 2026-10-16
 
 ### Other
