@@ -36,19 +36,34 @@ brew trust a2aproject/a2a-rs
 brew install a2a-transport-slimrpc
 ```
 
-**Windows** — PowerShell installer, no administrator rights needed:
+**Windows** — in PowerShell (not Command Prompt), no administrator rights needed:
 
 ```powershell
 irm https://raw.githubusercontent.com/a2aproject/a2a-rs/main/scripts/install-slimrpc-plugin.ps1 | iex
 ```
 
-It downloads the latest release archive, checks its SHA-256, installs
-`a2a-transport-slimrpc.exe` to `%LOCALAPPDATA%\Programs\a2a-transport-slimrpc`
-and adds that directory to your user `PATH`; open a new terminal afterwards.
-Set `A2A_SLIMRPC_PLUGIN_VERSION` to pin a version or
-`A2A_SLIMRPC_PLUGIN_INSTALL_DIR` to change the directory. Read the
-[script](../scripts/install-slimrpc-plugin.ps1) first if you prefer, or download
-the `.zip` from the releases page and put the executable on `PATH` yourself.
+It installs the latest release: it downloads the archive, checks its SHA-256,
+puts `a2a-transport-slimrpc.exe` in
+`%LOCALAPPDATA%\Programs\a2a-transport-slimrpc` and adds that folder to your
+user `PATH`. Open a new terminal afterwards, since a `PATH` change only reaches
+new ones, and check the install:
+
+```powershell
+a2a-transport-slimrpc info
+```
+
+It should print JSON containing `"name":"slimrpc"`. Set
+`$env:A2A_SLIMRPC_PLUGIN_VERSION = '<version>'` before the install command to pin
+a version, or `$env:A2A_SLIMRPC_PLUGIN_INSTALL_DIR` to change the directory. The
+Windows build is x86_64 only. Read the
+[script](../scripts/install-slimrpc-plugin.ps1) first if you would rather not
+pipe it into a shell.
+
+Without the script, download
+`a2a-transport-slimrpc-v<version>-x86_64-pc-windows-msvc.zip` and its `.sha256`
+file from the release page, compare `(Get-FileHash <zip>).Hash` with the
+`.sha256` file, unzip, and copy `a2a-transport-slimrpc.exe` to a folder on your
+`PATH`.
 
 **Linux** — download the archive from the
 [releases page](https://github.com/a2aproject/a2a-rs/releases) and put the
