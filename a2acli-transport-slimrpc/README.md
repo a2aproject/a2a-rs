@@ -21,12 +21,50 @@ certificate, and a per-launch authentication token. It forwards A2A calls to
 the target agent and stops when the CLI closes its stdin. The local token is
 checked by the proxy and removed before forwarding requests upstream.
 
+## Install The Go CLI And The Plugin
+
+The plugin only works with the [Go CLI](https://github.com/a2aproject/a2a-cli)
+(`a2a`), which discovers it on `PATH` and launches it. Install both, then check
+that the CLI lists `slimrpc`.
+
+**macOS** — [Homebrew](https://brew.sh):
+
+```sh
+brew tap a2aproject/a2a-cli https://github.com/a2aproject/a2a-cli
+brew install a2a
+brew tap a2aproject/a2a-rs https://github.com/a2aproject/a2a-rs
+brew trust a2aproject/a2a-rs
+brew install a2a-transport-slimrpc
+```
+
+**Windows** — in PowerShell, no administrator rights needed:
+
+```powershell
+winget install a2aproject.a2acli
+irm https://raw.githubusercontent.com/a2aproject/a2a-rs/main/scripts/install-slimrpc-plugin.ps1 | iex
+```
+
+**Linux** — install the Go CLI with Homebrew or a prebuilt binary, as its
+[installation instructions](https://github.com/a2aproject/a2a-cli#installation)
+describe, then install the plugin from its archive as shown
+[below](#install-a-prebuilt-binary).
+
+Open a new terminal afterwards, since a `PATH` change only reaches new ones, and
+run:
+
+```sh
+a2a transport list
+```
+
+The list should include `slimrpc`. Then continue with
+[Configuration](#configuration).
+
 ## Install A Prebuilt Binary
 
 Each GitHub release tagged `a2acli-transport-slimrpc-v<version>` carries signed
 archives for macOS (arm64, x86_64), Linux (x86_64, arm64) and Windows (x86_64).
-You also need the [Go CLI](https://github.com/a2aproject/a2a-cli#installation)
-(`a2a`), which is what discovers and launches the plugin.
+The Go CLI (`a2a`) must already be installed; it is what discovers and launches
+the plugin. The sections below install the plugin on its own.
 
 **macOS** — [Homebrew](https://brew.sh):
 
