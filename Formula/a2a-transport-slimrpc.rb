@@ -4,19 +4,19 @@
 class A2aTransportSlimrpc < Formula
   desc "SLIMRPC transport plugin for the Go A2A CLI"
   homepage "https://github.com/a2aproject/a2a-rs"
-  version "0.1.4"
+  version "0.1.6"
   license "Apache-2.0"
   depends_on :macos
 
   on_macos do
     on_arm do
       url "https://github.com/a2aproject/a2a-rs/releases/download/a2acli-transport-slimrpc-v#{version}/a2a-transport-slimrpc-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "5f12c1b371927d4647e7665039c21db26fda7a417f1fd76d734f287b75b0d252"
+      sha256 "26ab271f97fc6ef694f365fd629160e1cc399f5a1e670720baf957c26aa36718"
     end
 
     on_intel do
       url "https://github.com/a2aproject/a2a-rs/releases/download/a2acli-transport-slimrpc-v#{version}/a2a-transport-slimrpc-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "09787dc0d09f17095c12a3f1ccf27aad75706f6b636ca83902aa4d08638efab7"
+      sha256 "7d7549e4b4da58968e66a49f1d8c44c7ff1d6b3148da8038b5de0b647e8280bc"
     end
   end
 
