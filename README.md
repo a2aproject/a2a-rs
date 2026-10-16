@@ -137,6 +137,46 @@ winget install a2aproject.a2acli-rs
 cargo install a2a-cli
 ```
 
+## Installing The SLIMRPC Transport Plugin
+
+`a2a-transport-slimrpc` is the SLIMRPC transport plugin for the
+[Go A2A CLI](https://github.com/a2aproject/a2a-cli) (`a2a`). The CLI finds it on
+your `PATH` and launches it, so the plugin is installed separately from the CLI.
+Prebuilt binaries are available for macOS (arm64, x86_64), Linux (x86_64, arm64)
+and Windows (x86_64).
+
+**Windows** — in PowerShell (not Command Prompt), no administrator rights needed:
+
+```powershell
+irm https://raw.githubusercontent.com/a2aproject/a2a-rs/main/scripts/install-slimrpc-plugin.ps1 | iex
+```
+
+The script installs the latest release. It downloads the Windows archive, checks
+its SHA-256, copies `a2a-transport-slimrpc.exe` to
+`%LOCALAPPDATA%\Programs\a2a-transport-slimrpc` and adds that folder to your
+user `PATH`. Open a new terminal afterwards, since a `PATH` change only reaches
+new ones, and check it:
+
+```powershell
+a2a-transport-slimrpc info
+```
+
+It should print JSON containing `"name":"slimrpc"`. If the Go CLI is installed,
+`a2a transport list` should now list `slimrpc`. Set
+`$env:A2A_SLIMRPC_PLUGIN_VERSION = '<version>'` before the install command to pin
+a version, or `$env:A2A_SLIMRPC_PLUGIN_INSTALL_DIR` to change the folder.
+
+To install without the script, download
+`a2a-transport-slimrpc-v<version>-x86_64-pc-windows-msvc.zip` and its `.sha256`
+file from the plugin's release page (releases are tagged
+`a2acli-transport-slimrpc-v<version>`), compare `(Get-FileHash <zip>).Hash` with
+the `.sha256` file, unzip, and copy `a2a-transport-slimrpc.exe` to a folder on
+your `PATH`.
+
+**macOS and Linux** — see the
+[plugin README](a2acli-transport-slimrpc/README.md#install-a-prebuilt-binary):
+Homebrew on macOS, a release archive on Linux.
+
 ## Running The A2A CLI
 
 The workspace includes a standalone CLI client built on `a2a-client`. It
