@@ -186,9 +186,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-auth"
-version = "0.17.7"
+version = "0.17.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34bc9893113a29506c407f7381f87f2041fd7b06ff64d60edeec53b8ecf3dc16"
+checksum = "cc580f8418fdac156ff79664f37df527df9d399a71e60b8986cf9480ee1c71f8"
 dependencies = [
  "agntcy-slim-version",
  "aws-lc-rs",
@@ -236,9 +236,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-config"
-version = "0.17.7"
+version = "0.17.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f9c6a0d1444960e3dc9d0c09dc9014d9a3780ad7757395ff8aa2b723fe567ee"
+checksum = "b884d225aa6445acf4060fabce199ab29e0671aadc21604cd6c3952672e9d602"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-version",
@@ -294,9 +294,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-controller"
-version = "0.13.14"
+version = "0.13.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83fb0cc864920065403c132437fb9dc23846d99006842b90f9d238bfdeb01205"
+checksum = "f21ae939a30928b1432d1878b84ae16b8e0cdb86c70a21a40ae9d6c897ac7680"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-config",
@@ -327,9 +327,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-datapath"
-version = "0.19.12"
+version = "0.19.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8891e747587604fb8bf13fb3c988e0a94f6267b4aabb580f37fbd56eed7bb1b"
+checksum = "b7da50f9a8567558fabd13f636365a7b0386875ecd166ece9a6e04289fac866a"
 dependencies = [
  "agntcy-slim-config",
  "agntcy-slim-proto",
@@ -373,9 +373,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-mls"
-version = "0.4.11"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff50ca960b9f0c3e7dcff308880cdd0add74552e880eab9d15432c20f5809f59"
+checksum = "5b5ea1f94a79f0b53f4a4887bafaf12efb7b0d4fa8f50700f6f8437ab690ea99"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-persistence",
@@ -415,9 +415,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-proto"
-version = "0.8.5"
+version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ceb00a1a632d12bcbe28059529793292b33f58bcf949646677670c485a25fbe"
+checksum = "0e0911132f12e19d7f062320fd2f14face0b801131635aede774d4a3971ffb55"
 dependencies = [
  "agntcy-slim-config",
  "agntcy-slim-version",
@@ -435,9 +435,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-rpc"
-version = "3.4.3"
+version = "3.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eda32bc835dc8f5af4412b9730d60a353df087a26a1a5df03fc977599800becd"
+checksum = "a8efd27d8be6db183a1262177839ce222f398e50126c9e923cc7b2884cb8eb28"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-datapath",
@@ -459,9 +459,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-service"
-version = "0.13.12"
+version = "0.13.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c6e0a1daa03d7448b6e7aa874b2195c76633c6e4162d92e6c6fe12563a81c75"
+checksum = "e84f2d01f8bbf75107f152db7b5cfc1d9129e5c567c0b3bfd47fa3335d9af7ff"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-config",
@@ -486,9 +486,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-session"
-version = "0.7.24"
+version = "0.7.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebf8a820e961c6b04b40193dfeeb4b2b59d7da26cd2314f3b0666be379e43848"
+checksum = "d4ff80d7ca2d6561acff531fb809b2eba6d8ddc07927bd51c8bb50289f15be0d"
 dependencies = [
  "agntcy-slim-auth",
  "agntcy-slim-datapath",
@@ -520,9 +520,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-signal"
-version = "0.1.37"
+version = "0.1.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c380a4432d7735f4cbe4d9181d8c3bebb500c718f4754e9f44791a0b29608675"
+checksum = "7a79c77cc3b28a0a464c8b9114f5597dd03bb6c07094e551c4b245b18772486f"
 dependencies = [
  "agntcy-slim-version",
  "tokio",
@@ -531,9 +531,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-tracing"
-version = "0.4.33"
+version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96b0d72404204ad9edb99d5fc4953935e71a394722a664e31fff67ab7b0cd063"
+checksum = "2bd63183c60cea11dfe9901a7999b64b9f35498cabb607d36ddc8c5813c04261"
 dependencies = [
  "agntcy-slim-config",
  "agntcy-slim-version",
@@ -556,9 +556,9 @@ dependencies = [
 
 [[package]]
 name = "agntcy-slim-version"
-version = "3.4.3"
+version = "3.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1194d96e0501decf220da46a49c8b1c0707d967d6c1547376a4ef2266d85217d"
+checksum = "15516273c06157e3e9e56b0d11c3dadbd1e2904826ebfcb05810cf6570f0a9c6"
 
 [[package]]
 name = "ahash"
