@@ -41,7 +41,7 @@ a2a-client = { package = "a2a-client-lf", path = "a2a-client", version = "0.2.9"
 a2a-server = { package = "a2a-server-lf", path = "a2a-server", version = "0.5.3", default-features = false }
 a2a-pb = { package = "a2a-pb", path = "a2a-pb", version = "0.3.2" }
 a2a-grpc = { package = "a2a-grpc", path = "a2a-grpc", version = "0.3.11", default-features = false }
-a2a-slimrpc = { package = "a2a-slimrpc", path = "a2a-slimrpc", version = "0.3.4" }
+a2a-slimrpc = { package = "a2a-slimrpc", path = "a2a-slimrpc", version = "0.3.5" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
