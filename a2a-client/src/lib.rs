@@ -39,6 +39,16 @@ pub use transport::{ServiceParams, Transport, TransportFactory};
 #[cfg(any(feature = "rustls-tls", feature = "rustls-no-provider"))]
 pub use rustls;
 
+use std::time::Duration;
+
+/// Default connect timeout applied to HTTP clients built by this crate.
+///
+/// Without a connect timeout, a connection attempt to an unresponsive peer
+/// (e.g. a blackholed host) can hang indefinitely. This bounds the TCP/TLS
+/// handshake phase only; it does not limit how long a streamed response may
+/// take to complete.
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Build a `reqwest::Client` whose TLS layer matches this crate's feature
 /// selection, optionally adding extra root certificates from a PEM bundle.
 pub fn default_reqwest_client(
@@ -61,6 +71,7 @@ pub fn default_reqwest_client(
     };
 
     builder
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
         .build()
         .map_err(|e| a2a::A2AError::internal(format!("failed to build HTTP client: {e}")))
 }
