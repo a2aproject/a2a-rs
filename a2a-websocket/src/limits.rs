@@ -1,3 +1,6 @@
+// Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
+// SPDX-License-Identifier: Apache-2.0
 //! Connection and stream limits (spec Section 13.5).
 //!
 //! Two caps, both asked for by Section 13.5: how many connections one
