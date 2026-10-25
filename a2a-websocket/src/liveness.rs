@@ -1,3 +1,6 @@
+// Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
+// SPDX-License-Identifier: Apache-2.0
 //! Connection liveness: keep-alive pings and idle timeouts (spec Section 2.4).
 //!
 //! Answering a ping is handled by the WebSocket layer itself. This module covers

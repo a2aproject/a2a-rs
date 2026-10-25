@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 //! End-to-end tests for the A2A WebSocket binding. These tests boot a real
 //! Axum server using `websocket_router(...)`, connect a real
@@ -311,7 +312,13 @@ async fn end_to_end_streaming_message_yields_all_events_then_terminates() {
 
 #[tokio::test]
 async fn end_to_end_dropping_stream_emits_cancel_stream_to_server() {
-    let (url, shutdown) = start_server(StreamingExecutor { events: 100 }).await;
+    // Paced so the stream is still running when it is dropped, without
+    // bursting past the server's execution buffer.
+    let (url, shutdown) = start_server(SlowStreamingExecutor {
+        events: 100,
+        gap: Duration::from_millis(5),
+    })
+    .await;
     let transport = WebSocketTransport::connect(&url).await.unwrap();
 
     {

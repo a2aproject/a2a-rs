@@ -1,4 +1,5 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 //! End-to-end tests for the `wss://` (TLS) transport path. These tests boot a
 //! real TLS-terminating server (rustls + `ring`, self-signed via `rcgen`),
