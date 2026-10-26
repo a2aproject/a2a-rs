@@ -101,11 +101,9 @@ impl Transport for GrpcTransport {
             .send_streaming_message(grpc_req)
             .await
             .map_err(|s| status_to_a2a_error(&s))?;
-        let stream = response.into_inner().map(|item| match item {
-            Ok(proto_sr) => pbconv::from_proto_stream_response(&proto_sr)
-                .ok_or_else(|| A2AError::internal("empty StreamResponse payload")),
-            Err(s) => Err(status_to_a2a_error(&s)),
-        });
+        let stream = response
+            .into_inner()
+            .filter_map(|item| std::future::ready(decode_stream_item(item)));
         Ok(Box::pin(stream))
     }
 
@@ -166,11 +164,9 @@ impl Transport for GrpcTransport {
             .subscribe_to_task(grpc_req)
             .await
             .map_err(|s| status_to_a2a_error(&s))?;
-        let stream = response.into_inner().map(|item| match item {
-            Ok(proto_sr) => pbconv::from_proto_stream_response(&proto_sr)
-                .ok_or_else(|| A2AError::internal("empty StreamResponse payload")),
-            Err(s) => Err(status_to_a2a_error(&s)),
-        });
+        let stream = response
+            .into_inner()
+            .filter_map(|item| std::future::ready(decode_stream_item(item)));
         Ok(Box::pin(stream))
     }
 
@@ -342,6 +338,18 @@ impl TransportFactory for GrpcTransportFactory {
 
         let transport = GrpcTransport::connect(&iface.url).await?;
         Ok(Box::new(transport))
+    }
+}
+
+/// Decodes one item of a server stream. A payload kind this client does not
+/// know decodes to `None` and is skipped, as the spec requires of stream
+/// readers.
+fn decode_stream_item(
+    item: Result<a2a_pb::proto::StreamResponse, tonic::Status>,
+) -> Option<Result<StreamResponse, A2AError>> {
+    match item {
+        Ok(proto_sr) => pbconv::from_proto_stream_response(&proto_sr).map(Ok),
+        Err(status) => Some(Err(status_to_a2a_error(&status))),
     }
 }
 
@@ -530,5 +538,34 @@ mod tests {
             let result = f.create(&card, &iface).await;
             assert!(result.is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_decode_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_stream_payload_is_skipped() {
+        let unknown = a2a_pb::proto::StreamResponse { payload: None };
+        assert!(decode_stream_item(Ok(unknown)).is_none());
+    }
+
+    #[test]
+    fn known_stream_payload_is_decoded() {
+        let known = pbconv::to_proto_stream_response(&StreamResponse::Message(a2a::Message::new(
+            a2a::Role::Agent,
+            vec![a2a::Part::text("hi")],
+        )));
+        assert!(matches!(
+            decode_stream_item(Ok(known)),
+            Some(Ok(StreamResponse::Message(_)))
+        ));
+    }
+
+    #[test]
+    fn stream_status_error_is_reported() {
+        let item = decode_stream_item(Err(tonic::Status::internal("boom")));
+        assert!(matches!(item, Some(Err(_))));
     }
 }

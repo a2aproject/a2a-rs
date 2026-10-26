@@ -199,6 +199,20 @@ pub(crate) fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+/// Turns a decoded `StreamResponse` into a stream item. A payload kind this
+/// client does not recognise (e.g. one added by a later minor version) is
+/// skipped rather than reported, as the spec requires of stream readers.
+fn decode_stream_event(
+    decoded: Result<StreamResponse, protojson_conv::ProtoJsonPayloadError>,
+    context: &str,
+) -> Option<Result<StreamResponse, A2AError>> {
+    match decoded {
+        Ok(event) => Some(Ok(event)),
+        Err(protojson_conv::ProtoJsonPayloadError::MissingPayload(_)) => None,
+        Err(error) => Some(Err(A2AError::internal(format!("{context}: {error}")))),
+    }
+}
+
 /// Interpret whatever is left in the buffer when the byte stream ends.
 ///
 /// Anything not terminated by an SSE event boundary would otherwise be
@@ -247,12 +261,10 @@ pub(crate) fn parse_stream_tail(
             return Some(Err(parse_jsonrpc_error(error)));
         }
         if let Some(result) = response.result {
-            return Some(match protojson_conv::from_value::<StreamResponse>(result) {
-                Ok(event) => Ok(event),
-                Err(error) => Err(A2AError::internal(format!(
-                    "failed to parse JSON-RPC result at end of stream: {error}"
-                ))),
-            });
+            return decode_stream_event(
+                protojson_conv::from_value::<StreamResponse>(result),
+                "failed to parse JSON-RPC result at end of stream",
+            );
         }
     }
 
@@ -368,20 +380,20 @@ fn parse_sse_stream(
                     return Some(Err(parse_jsonrpc_error(err)));
                 }
                 if let Some(result) = rpc_resp.result {
-                    match protojson_conv::from_value::<StreamResponse>(result) {
-                        Ok(sr) => Some(Ok(sr)),
-                        Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
-                    }
+                    decode_stream_event(
+                        protojson_conv::from_value::<StreamResponse>(result),
+                        "SSE parse error",
+                    )
                 } else {
                     None
                 }
             }
             Err(_) => {
                 // Fallback: parse directly as StreamResponse
-                match protojson_conv::from_str::<StreamResponse>(&data) {
-                    Ok(sr) => Some(Ok(sr)),
-                    Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
-                }
+                decode_stream_event(
+                    protojson_conv::from_str::<StreamResponse>(&data),
+                    "SSE parse error",
+                )
             }
         }
     })
@@ -412,10 +424,10 @@ pub(crate) fn parse_sse_stream_rest(
             return None;
         }
 
-        match protojson_conv::from_str::<StreamResponse>(&data) {
-            Ok(sr) => Some(Ok(sr)),
-            Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
-        }
+        decode_stream_event(
+            protojson_conv::from_str::<StreamResponse>(&data),
+            "SSE parse error",
+        )
     })
 }
 
@@ -810,6 +822,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_parse_sse_stream_rest_skips_unknown_payload() {
+        let known = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "t1".into(),
+            context_id: "c1".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        let known = serde_json::to_string(&protojson_conv::to_value(&known).unwrap()).unwrap();
+        let sse_text = format!(
+            "data: {{\"somethingFromALaterVersion\":{{\"taskId\":\"t1\"}}}}\n\ndata: {known}\n\n"
+        );
+
+        let mut parsed = parse_sse_stream_rest(byte_stream(vec![sse_text]));
+        let item = parsed.next().await.unwrap().unwrap();
+        assert!(matches!(item, StreamResponse::StatusUpdate(_)));
+        assert!(parsed.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_sse_stream_jsonrpc_skips_unknown_payload() {
+        let unknown = JsonRpcResponse::success(
+            JsonRpcId::Number(1),
+            serde_json::json!({"somethingFromALaterVersion": {"taskId": "t1"}}),
+        );
+        let sse_text = format!("data: {}\n\n", serde_json::to_string(&unknown).unwrap());
+
+        let mut parsed = parse_sse_stream(byte_stream(vec![sse_text]));
+        assert!(parsed.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_parse_sse_stream_rest_parse_error() {
         let sse_text = "data: not-valid-json\n\n".to_string();
         let stream = byte_stream(vec![sse_text]);
@@ -1090,10 +1137,11 @@ mod tests {
         );
     }
 
-    /// JSON-RPC envelope whose `result` is not a valid `StreamResponse`
-    /// must surface a parse error instead of silently dropping the event.
+    /// JSON-RPC envelope whose `result` carries only a payload kind this
+    /// client does not know is skipped: later minor versions may add payload
+    /// kinds, and stream readers MUST ignore the ones they do not recognise.
     #[tokio::test]
-    async fn test_parse_sse_stream_invalid_protojson_result_surfaces_error() {
+    async fn test_parse_sse_stream_unrecognised_result_is_skipped() {
         let rpc_resp = JsonRpcResponse::success(
             JsonRpcId::Number(1),
             serde_json::json!({"not_a_stream_response_field": 42}),
@@ -1102,28 +1150,24 @@ mod tests {
         let sse_text = format!("data: {data}\n\n");
         let stream = byte_stream(vec![sse_text]);
         let items: Vec<_> = parse_sse_stream(stream).collect().await;
-        assert_eq!(items.len(), 1, "expected one error item, got {items:?}");
-        let err = items.into_iter().next().unwrap().expect_err("should error");
         assert!(
-            err.to_string().contains("parse error"),
-            "error should mention parse error: {err}",
+            items.is_empty(),
+            "expected the event to be skipped: {items:?}"
         );
     }
 
-    /// Direct `StreamResponse` JSON (JSON-RPC fallback path) that fails
-    /// protojson conversion must surface a parse error.
+    /// Direct `StreamResponse` JSON (JSON-RPC fallback path) carrying only an
+    /// unrecognised payload kind is skipped too.
     #[tokio::test]
-    async fn test_parse_sse_stream_direct_invalid_protojson_surfaces_error() {
-        // Not a JSON-RPC envelope (missing `jsonrpc`/`id`) and not a valid
+    async fn test_parse_sse_stream_direct_unrecognised_payload_is_skipped() {
+        // Not a JSON-RPC envelope (missing `jsonrpc`/`id`) and not a known
         // StreamResponse — exercises the `Err(_)` fallback branch.
         let sse_text = "data: {\"foo\":\"bar\"}\n\n".to_string();
         let stream = byte_stream(vec![sse_text]);
         let items: Vec<_> = parse_sse_stream(stream).collect().await;
-        assert_eq!(items.len(), 1, "expected one error item, got {items:?}");
-        let err = items.into_iter().next().unwrap().expect_err("should error");
         assert!(
-            err.to_string().contains("parse error"),
-            "error should mention parse error: {err}",
+            items.is_empty(),
+            "expected the event to be skipped: {items:?}"
         );
     }
 
@@ -1949,10 +1993,10 @@ mod tests {
         }
     }
 
-    /// A tail envelope whose `result` is well-formed JSON but not a
-    /// `StreamResponse` is reported, not silently dropped.
+    /// A tail envelope whose `result` carries only an unrecognised payload
+    /// kind is skipped like any other unknown event.
     #[tokio::test]
-    async fn test_stream_tail_reports_an_unconvertible_envelope_result() {
+    async fn test_stream_tail_skips_an_unrecognised_envelope_result() {
         let body = serde_json::to_string(&JsonRpcResponse::success(
             JsonRpcId::Number(1),
             serde_json::json!({"notAStreamResponse": true}),
@@ -1961,9 +2005,10 @@ mod tests {
 
         let items: Vec<_> = parse_sse_stream(byte_stream(vec![body])).collect().await;
 
-        assert_eq!(items.len(), 1, "expected one item, got {items:?}");
-        let error = items.into_iter().next().unwrap().unwrap_err();
-        assert!(error.message.contains("end of stream"), "{}", error.message);
+        assert!(
+            items.is_empty(),
+            "expected the event to be skipped: {items:?}"
+        );
     }
 
     /// An envelope with neither result nor error is not a usable event, so
