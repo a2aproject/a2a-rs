@@ -32,7 +32,15 @@ fuzz_target!(|data: &[u8]| {
     let parse_event = |_text: &str| None;
     let tail = parse_stream_tail(data, &parse_event);
     if let Ok(text) = std::str::from_utf8(data) {
-        if !text.trim().is_empty() && !text.lines().any(|l| l.starts_with("data:")) {
+        // A well-formed JSON-RPC success whose result carries only an event
+        // kind this client does not know is skipped on purpose (stream readers
+        // MUST ignore unrecognised payloads); everything else must surface.
+        let skipped_on_purpose = serde_json::from_str::<serde_json::Value>(text.trim())
+            .is_ok_and(|v| v.get("result").is_some() && v.get("error").is_none());
+        if !text.trim().is_empty()
+            && !text.lines().any(|l| l.starts_with("data:"))
+            && !skipped_on_purpose
+        {
             assert!(
                 tail.is_some(),
                 "non-empty tail silently dropped: {text:?}"
