@@ -199,16 +199,27 @@ pub(crate) fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// Turns a decoded `StreamResponse` into a stream item. A payload kind this
-/// client does not recognise (e.g. one added by a later minor version) is
-/// skipped rather than reported, as the spec requires of stream readers.
-fn decode_stream_event(
-    decoded: Result<StreamResponse, protojson_conv::ProtoJsonPayloadError>,
+/// Turns a decoded JSON `StreamResponse` into a stream item. A payload kind
+/// this client does not recognise (e.g. one added by a later minor version) is
+/// skipped rather than reported, as the spec requires of stream readers. An
+/// event with no payload at all (`{}`) is not an unknown kind but a malformed
+/// event, and is reported.
+fn decode_stream_value(
+    value: serde_json::Value,
     context: &str,
 ) -> Option<Result<StreamResponse, A2AError>> {
-    match decoded {
+    let empty = value.as_object().is_some_and(serde_json::Map::is_empty);
+    match protojson_conv::from_value::<StreamResponse>(value) {
         Ok(event) => Some(Ok(event)),
-        Err(protojson_conv::ProtoJsonPayloadError::MissingPayload(_)) => None,
+        Err(protojson_conv::ProtoJsonPayloadError::MissingPayload(_)) if !empty => None,
+        Err(error) => Some(Err(A2AError::internal(format!("{context}: {error}")))),
+    }
+}
+
+/// [`decode_stream_value`] for the text of an event.
+fn decode_stream_text(data: &str, context: &str) -> Option<Result<StreamResponse, A2AError>> {
+    match serde_json::from_str::<serde_json::Value>(data) {
+        Ok(value) => decode_stream_value(value, context),
         Err(error) => Some(Err(A2AError::internal(format!("{context}: {error}")))),
     }
 }
@@ -261,10 +272,7 @@ pub(crate) fn parse_stream_tail(
             return Some(Err(parse_jsonrpc_error(error)));
         }
         if let Some(result) = response.result {
-            return decode_stream_event(
-                protojson_conv::from_value::<StreamResponse>(result),
-                "failed to parse JSON-RPC result at end of stream",
-            );
+            return decode_stream_value(result, "failed to parse JSON-RPC result at end of stream");
         }
     }
 
@@ -380,20 +388,14 @@ fn parse_sse_stream(
                     return Some(Err(parse_jsonrpc_error(err)));
                 }
                 if let Some(result) = rpc_resp.result {
-                    decode_stream_event(
-                        protojson_conv::from_value::<StreamResponse>(result),
-                        "SSE parse error",
-                    )
+                    decode_stream_value(result, "SSE parse error")
                 } else {
                     None
                 }
             }
             Err(_) => {
                 // Fallback: parse directly as StreamResponse
-                decode_stream_event(
-                    protojson_conv::from_str::<StreamResponse>(&data),
-                    "SSE parse error",
-                )
+                decode_stream_text(&data, "SSE parse error")
             }
         }
     })
@@ -424,10 +426,7 @@ pub(crate) fn parse_sse_stream_rest(
             return None;
         }
 
-        decode_stream_event(
-            protojson_conv::from_str::<StreamResponse>(&data),
-            "SSE parse error",
-        )
+        decode_stream_text(&data, "SSE parse error")
     })
 }
 
@@ -854,6 +853,26 @@ mod tests {
 
         let mut parsed = parse_sse_stream(byte_stream(vec![sse_text]));
         assert!(parsed.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_sse_stream_rest_reports_an_event_with_no_payload() {
+        // `{}` is not a payload kind this client does not know: it is malformed.
+        let mut parsed = parse_sse_stream_rest(byte_stream(vec!["data: {}\n\n".to_string()]));
+        let error = parsed.next().await.unwrap().unwrap_err();
+        assert!(
+            error.message.contains("SSE parse error"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_sse_stream_jsonrpc_reports_a_result_with_no_payload() {
+        let empty = JsonRpcResponse::success(JsonRpcId::Number(1), serde_json::json!({}));
+        let sse_text = format!("data: {}\n\n", serde_json::to_string(&empty).unwrap());
+        let mut parsed = parse_sse_stream(byte_stream(vec![sse_text]));
+        assert!(parsed.next().await.unwrap().is_err());
     }
 
     #[tokio::test]
