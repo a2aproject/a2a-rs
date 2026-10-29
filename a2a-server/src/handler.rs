@@ -23,6 +23,7 @@ struct ExecutionEvent {
 struct ActiveExecutionState {
     sequence: u64,
     snapshot_task: Option<Task>,
+    running: bool,
 }
 
 struct ActiveExecution {
@@ -31,13 +32,14 @@ struct ActiveExecution {
 }
 
 impl ActiveExecution {
-    fn new(task: Task) -> Arc<Self> {
+    fn new(task: Task, running: bool) -> Arc<Self> {
         let (sender, _) = broadcast::channel(EXECUTION_BUFFER_CAPACITY);
         Arc::new(Self {
             sender,
             state: RwLock::new(ActiveExecutionState {
                 sequence: 0,
                 snapshot_task: Some(task),
+                running,
             }),
         })
     }
@@ -96,14 +98,20 @@ struct ExecutionManager {
 impl ExecutionManager {
     async fn start(&self, task: Task) -> Result<Arc<ActiveExecution>, A2AError> {
         let mut executions = self.executions.write().await;
-        if executions.contains_key(&task.id) {
-            return Err(A2AError::invalid_request(format!(
-                "task execution is already in progress: {}",
-                task.id
-            )));
+        if let Some(active) = executions.get(&task.id) {
+            let mut state = active.state.write().await;
+            if state.running {
+                return Err(A2AError::invalid_request(format!(
+                    "task execution is already in progress: {}",
+                    task.id
+                )));
+            }
+            state.running = true;
+            state.snapshot_task = Some(task);
+            return Ok(active.clone());
         }
 
-        let active = ActiveExecution::new(task.clone());
+        let active = ActiveExecution::new(task.clone(), true);
         executions.insert(task.id.clone(), active.clone());
         Ok(active)
     }
@@ -122,13 +130,33 @@ impl ExecutionManager {
         Some((receiver, snapshot_task, sequence))
     }
 
+    async fn subscribe_stored_task(
+        &self,
+        task: Task,
+    ) -> (broadcast::Receiver<ExecutionEvent>, Option<Task>, u64) {
+        let mut executions = self.executions.write().await;
+        let active = executions
+            .entry(task.id.clone())
+            .or_insert_with(|| ActiveExecution::new(task, false))
+            .clone();
+        active.resubscribe().await
+    }
+
     async fn finish(&self, task_id: &str, active: &Arc<ActiveExecution>) {
         let mut executions = self.executions.write().await;
-        let should_remove = executions
+        let is_current = executions
             .get(task_id)
             .is_some_and(|current| Arc::ptr_eq(current, active));
-        if should_remove {
-            executions.remove(task_id);
+        if is_current {
+            let mut state = active.state.write().await;
+            state.running = false;
+            if state
+                .snapshot_task
+                .as_ref()
+                .is_some_and(|task| task.status.state.is_terminal())
+            {
+                executions.remove(task_id);
+            }
         }
     }
 }
@@ -1069,6 +1097,9 @@ impl RequestHandler for DefaultRequestHandler {
                     req.id
                 )));
             }
+            let (receiver, snapshot_task, sequence) =
+                self.execution_manager.subscribe_stored_task(task).await;
+            return Ok(subscription_stream(receiver, snapshot_task, sequence));
         }
         Err(A2AError::task_not_found(&req.id))
     }
