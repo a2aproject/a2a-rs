@@ -32,7 +32,10 @@ pub mod fuzz_support {
 pub mod tls;
 
 pub use agent_card::{AgentCardProducer, StaticAgentCard, WELL_KNOWN_AGENT_CARD_PATH};
-pub use executor::{AgentExecutor, ClientInput, ClientInputSender, ClientInputs, ExecutorContext};
+pub use executor::{
+    Agent, AgentExecutor, ClientInput, ClientInputSender, ClientInputs, ExecutorContext,
+    NewMessage, Start,
+};
 pub use handler::{
     DefaultRequestHandler, ExtendedAgentCardResolver, LiveResponse, RequestAuthorizer,
     RequestHandler,
