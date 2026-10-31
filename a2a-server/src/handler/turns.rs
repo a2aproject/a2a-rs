@@ -193,3 +193,181 @@ pub(super) async fn reject_inputs(
             .await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn a_busy_handoff_returns_input_with_its_caller_identity_intact() {
+        let runtime = make_handler();
+        let task = task_with_history("busy-handoff", "context", 0);
+        let (active, _inputs, writer) = runtime.execution_manager.reserve(&task.id).await.unwrap();
+        active.set_snapshot(task.clone()).await;
+        let mut input = crate::ClientInput::new(make_message(), 7);
+        input.user = Some(crate::User::authenticated("alice"));
+        input.tenant = Some("tenant-a".into());
+        input.metadata = Some(std::collections::HashMap::from([(
+            "trace".into(),
+            serde_json::json!(42),
+        )]));
+        let returned = start_next_turn(
+            &runtime,
+            &task.id,
+            task.clone(),
+            vec![input.clone()],
+            writer,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].message, input.message);
+        assert_eq!(returned[0].user, input.user);
+        assert_eq!(returned[0].metadata, input.metadata);
+        assert_eq!(returned[0].tenant, input.tenant);
+        assert!(runtime.execution_manager.get(&task.id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn rejected_pending_push_configuration_does_not_replace_existing_endpoints() {
+        let runtime = make_handler_with_push_configs();
+        let config = |id: usize| TaskPushNotificationConfig {
+            task_id: "configured".into(),
+            id: Some(id.to_string()),
+            url: "https://example.com/push".into(),
+            token: None,
+            authentication: None,
+            tenant: None,
+            protocol_version: Some("1.1".into()),
+        };
+        let store = runtime.push_config_store.as_ref().unwrap();
+        for id in 0..50 {
+            store.save(config(id)).await.unwrap();
+        }
+        let active = ActiveExecution::new(None);
+        *active.pending_push.lock().unwrap() = Some(config(50));
+        save_pending_push_config(&active, &runtime).await;
+        assert!(active.pending_push.lock().unwrap().is_none());
+        assert_eq!(store.list("configured").await.unwrap().len(), 50);
+        assert!(store.get("configured", "50").await.is_err());
+        save_pending_push_config(&active, &runtime).await;
+        assert_eq!(store.list("configured").await.unwrap().len(), 50);
+    }
+
+    #[tokio::test]
+    async fn artifact_only_unread_input_has_no_empty_message_reference() {
+        let active = ActiveExecution::new(None);
+        let mut events = active.subscribe();
+        let mut message = make_message();
+        message.message_id.clear();
+        reject_inputs(&active, "task", vec![crate::ClientInput::new(message, 3)]).await;
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event.kind, EventKind::LiveOnly(None)));
+        let StreamResponse::Error(error) = event.result.unwrap() else {
+            panic!("expected a rejection")
+        };
+        assert_eq!(error.task_id, "task");
+        assert_eq!(error.code, "UNAVAILABLE");
+        assert_eq!(error.reference_id, None);
+    }
+    struct CaptureTurn(
+        tokio::sync::mpsc::UnboundedSender<(crate::ExecutorContext, Vec<crate::ClientInput>)>,
+    );
+
+    impl crate::AgentExecutor for CaptureTurn {
+        fn execute(
+            &self,
+            mut context: crate::ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let queued = std::iter::from_fn(|| context.inputs.try_recv()).collect();
+            let mut task = context.stored_task.clone().unwrap();
+            task.status.state = TaskState::Completed;
+            self.0
+                .send((context, queued))
+                .unwrap_or_else(|_| panic!("observer dropped"));
+            Box::pin(stream::once(async move { Ok(StreamResponse::Task(task)) }))
+        }
+        fn cancel(
+            &self,
+            context: crate::ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            crate::AgentExecutor::cancel(&EchoExecutor, context)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handoff_preserves_the_trigger_and_queues_remaining_inputs_in_order() {
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = DefaultRequestHandler::new(CaptureTurn(sent), InMemoryTaskStore::new());
+        let mut task = task_with_history("next-turn", "context", 0);
+        task.status.state = TaskState::Working;
+        runtime.task_store.create(task.clone()).await.unwrap();
+        let inputs: Vec<_> = ["first", "second", "third"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut message = make_message();
+                message.message_id = id.into();
+                let mut input = crate::ClientInput::new(message, index as i64 + 1);
+                input.user = Some(crate::User::authenticated("alice"));
+                input.tenant = Some("tenant-a".into());
+                input.metadata = Some(std::collections::HashMap::from([(
+                    "trace".into(),
+                    serde_json::json!(id),
+                )]));
+                input
+            })
+            .collect();
+        let writer = runtime
+            .execution_manager
+            .writer_for(&task.id)
+            .lock_owned()
+            .await;
+        assert!(
+            start_next_turn(&runtime, &task.id, task.clone(), inputs.clone(), writer)
+                .await
+                .is_ok()
+        );
+        let (context, queued) = timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.message, Some(inputs[0].message.clone()));
+        assert_eq!(context.metadata, inputs[0].metadata);
+        assert_eq!(context.user, inputs[0].user);
+        assert_eq!(context.tenant, inputs[0].tenant);
+        assert_eq!(
+            queued
+                .iter()
+                .map(|input| input.message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "third"]
+        );
+        assert_eq!(
+            queued
+                .iter()
+                .map(|input| input.generation)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        timeout(Duration::from_secs(1), async {
+            while runtime.execution_manager.get(&task.id).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime
+                .task_store
+                .get(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .state,
+            TaskState::Completed
+        );
+    }
+}

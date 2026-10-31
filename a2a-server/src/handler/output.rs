@@ -123,3 +123,21 @@ impl Notification {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runner_panic_is_reported_and_a_disconnected_consumer_stops_delivery() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let sink = DeliverySink::Stream(sender);
+        sink.report_panic().await;
+        let error = receiver.recv().await.unwrap().unwrap_err();
+        assert_eq!(error.code, a2a::error_code::INTERNAL_ERROR);
+        assert_eq!(error.message, "the response runner failed");
+        drop(receiver);
+        sink.closed().await;
+        assert!(!sink.send(DeliveryEvent::from(Err(error))).await);
+    }
+}
