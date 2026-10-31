@@ -550,12 +550,12 @@ async fn routed_http_messages_authorize_once_with_their_own_credentials() {
         .await;
     assert!(matches!(result, Err(error) if error.message == "caller denied"));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
-    let LiveResponse::Ack(task) = handler
-        .send_live_request(&alice, send("finish", Some(&task_id)))
-        .await
-        .unwrap()
+    let StreamRequestPayload::SendMessage(request) = send("finish", Some(&task_id)).payload else {
+        unreachable!()
+    };
+    let SendMessageResponse::Task(task) = handler.send_message(&alice, request).await.unwrap()
     else {
-        panic!("expected an acknowledgement");
+        panic!("expected a task")
     };
     assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert!(
@@ -1831,5 +1831,361 @@ async fn a_panic_while_handling_a_call_never_loses_or_hangs_the_calls_queued_beh
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SendMessage and SendStreamingMessage to a task that is working
+// ---------------------------------------------------------------------------
+
+fn message_request(text: &str, task_id: &str) -> SendMessageRequest {
+    match send(text, Some(task_id)).payload {
+        StreamRequestPayload::SendMessage(request) => request,
+        _ => unreachable!(),
+    }
+}
+
+/// Starts a task that waits for input, holding the stream that started it.
+async fn working_task(handler: &DefaultRequestHandler, p: &ServiceParams) -> (String, Downlink) {
+    let mut stream = match send("start", None).payload {
+        StreamRequestPayload::SendMessage(request) => {
+            handler.send_streaming_message(p, request).await.unwrap()
+        }
+        _ => unreachable!(),
+    };
+    let task_id = task_of(next(&mut stream).await).id;
+    assert_eq!(state_text(&next(&mut stream).await).1, "working");
+    (task_id, stream)
+}
+
+#[tokio::test]
+async fn a_streaming_message_to_a_working_task_reaches_the_agent() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let (task_id, mut first) = working_task(&handler, &p).await;
+
+    let mut second = handler
+        .send_streaming_message(&p, message_request("hello", &task_id))
+        .await
+        .unwrap();
+    // The opening task already holds the message: it is not announced again.
+    let opening = task_of(next(&mut second).await);
+    assert_eq!(opening.id, task_id);
+    assert_eq!(applied(&opening, "hello"), 1);
+    assert_eq!(state_text(&next(&mut second).await).1, "got: hello");
+    // The stream that started the turn hears it too.
+    assert!(matches!(
+        next(&mut first).await,
+        StreamResponse::MessageUpdate(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_blocking_message_to_a_working_task_waits_for_the_turn_it_joined() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let (task_id, _first) = working_task(&handler, &p).await;
+
+    let call = {
+        let handler = handler.clone();
+        let p = p.clone();
+        let request = message_request("finish", &task_id);
+        tokio::spawn(async move { handler.send_message(&p, request).await })
+    };
+    let response = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("the call returns when the turn ends")
+        .unwrap()
+        .unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("a task is returned");
+    };
+    assert_eq!(task.status.state, TaskState::Completed);
+    assert_eq!(applied(&task, "finish"), 1);
+}
+
+#[tokio::test]
+async fn a_message_to_a_working_task_can_return_at_once() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let (task_id, _first) = working_task(&handler, &p).await;
+
+    let mut request = message_request("hello", &task_id);
+    request.configuration = Some(SendMessageConfiguration {
+        accepted_output_modes: None,
+        task_push_notification_config: None,
+        history_length: None,
+        timeline_length: None,
+        return_immediately: Some(true),
+        if_generation_match: None,
+    });
+    let response = tokio::time::timeout(Duration::from_secs(5), handler.send_message(&p, request))
+        .await
+        .expect("returns at once")
+        .unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("a task is returned");
+    };
+    assert_eq!(task.status.state, TaskState::Working);
+    assert_eq!(applied(&task, "hello"), 1);
+}
+
+#[tokio::test]
+async fn a_call_that_returns_at_once_does_not_wait_for_an_agent_that_ignores_input() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let mut stream = match send("lazy", None).payload {
+        StreamRequestPayload::SendMessage(request) => {
+            handler.send_streaming_message(&p, request).await.unwrap()
+        }
+        _ => unreachable!(),
+    };
+    let task_id = task_of(next(&mut stream).await).id;
+    assert_eq!(state_text(&next(&mut stream).await).1, "lazy");
+
+    let mut request = message_request("hello", &task_id);
+    request.configuration = Some(SendMessageConfiguration {
+        accepted_output_modes: None,
+        task_push_notification_config: None,
+        history_length: None,
+        timeline_length: None,
+        return_immediately: Some(true),
+        if_generation_match: None,
+    });
+    let response = tokio::time::timeout(Duration::from_secs(2), handler.send_message(&p, request))
+        .await
+        .expect("returns at once")
+        .unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("a task is returned");
+    };
+    assert_eq!(applied(&task, "hello"), 1);
+}
+
+#[tokio::test]
+async fn a_blocking_call_returns_when_the_turn_it_joined_asks_for_input() {
+    let (handler, _) = handler(true);
+    let p = params("1.1");
+    let mut stream = match send("chat", None).payload {
+        StreamRequestPayload::SendMessage(request) => {
+            handler.send_streaming_message(&p, request).await.unwrap()
+        }
+        _ => unreachable!(),
+    };
+    let task_id = task_of(next(&mut stream).await).id;
+    assert_eq!(state_text(&next(&mut stream).await).1, "working");
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        handler.send_message(&p, message_request("hello", &task_id)),
+    )
+    .await
+    .expect("returns at the interrupted state, though the turn goes on")
+    .unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("a task is returned");
+    };
+    assert_eq!(task.status.state, TaskState::InputRequired);
+    assert_eq!(applied(&task, "hello"), 1);
+}
+
+/// A webhook that takes the connection and never answers.
+async fn silent_webhook() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            held.push(socket);
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn a_receiver_that_never_answers_does_not_hold_up_the_messages_of_a_working_task() {
+    let url = silent_webhook().await;
+    let handler = Arc::new(
+        DefaultRequestHandler::new(
+            LiveAgent {
+                takes_input: true,
+                release: Arc::new(Notify::new()),
+            },
+            InMemoryTaskStore::new(),
+        )
+        .with_capabilities(AgentCapabilities {
+            streaming: Some(true),
+            push_notifications: Some(true),
+            ..AgentCapabilities::default()
+        })
+        .with_push_notifications(
+            a2a_server::InMemoryPushConfigStore::new(),
+            a2a_server::HttpPushSender::new(Some(a2a_server::HttpPushSenderConfig {
+                validate_urls: false,
+                ..Default::default()
+            })),
+        ),
+    );
+    let p = params("1.1");
+    let (task_id, _first) = working_task(&handler, &p).await;
+
+    let mut request = message_request("one", &task_id);
+    request.configuration = Some(SendMessageConfiguration {
+        accepted_output_modes: None,
+        task_push_notification_config: Some(TaskPushNotificationConfig {
+            url,
+            id: Some("silent".into()),
+            task_id: String::new(),
+            token: None,
+            authentication: None,
+            tenant: None,
+            protocol_version: None,
+        }),
+        history_length: None,
+        timeline_length: None,
+        return_immediately: Some(true),
+        if_generation_match: None,
+    });
+    let first = tokio::time::timeout(Duration::from_secs(2), handler.send_message(&p, request))
+        .await
+        .expect("the call does not wait for the webhook");
+    first.unwrap();
+    let mut second = tokio::time::timeout(
+        Duration::from_secs(2),
+        handler.send_streaming_message(&p, message_request("two", &task_id)),
+    )
+    .await
+    .expect("nor does the next one")
+    .unwrap();
+    // The call that took the message answered at once, with the task holding it.
+    assert_eq!(applied(&task_of(next(&mut second).await), "two"), 1);
+}
+
+/// A message that reaches a task as an executor fails is never refused for a
+/// closed input queue: the queue is closed together with the execution being
+/// deregistered, under the writer a delivery decides under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn messages_racing_an_executor_that_fails_are_never_refused_for_a_closed_queue() {
+    for round in 0..60 {
+        let (handler, release) = handler(true);
+        let p = params("1.1");
+        let mut stream = match send("lazy-err", None).payload {
+            StreamRequestPayload::SendMessage(request) => {
+                handler.send_streaming_message(&p, request).await.unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let task_id = task_of(next(&mut stream).await).id;
+        assert_eq!(state_text(&next(&mut stream).await).1, "lazy");
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let senders: Vec<_> = (0..4)
+            .map(|i| {
+                let (handler, p, task_id, stop) =
+                    (handler.clone(), p.clone(), task_id.clone(), stop.clone());
+                tokio::spawn(async move {
+                    let mut n = 0;
+                    let mut refused = Vec::new();
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        n += 1;
+                        let mut request = message_request(&format!("s{i}-{n}"), &task_id);
+                        request.configuration = Some(SendMessageConfiguration {
+                            accepted_output_modes: None,
+                            task_push_notification_config: None,
+                            history_length: None,
+                            timeline_length: None,
+                            return_immediately: Some(true),
+                            if_generation_match: None,
+                        });
+                        if let Err(error) = handler.send_message(&p, request).await {
+                            refused.push(error.message);
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    refused
+                })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        // The executor fails while the senders are at it.
+        release.notify_one();
+        while tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the stream ends")
+            .is_some()
+        {}
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        for sender in senders {
+            for message in sender.await.unwrap() {
+                assert!(
+                    !message.contains("no longer taking input") && !message.contains("closed"),
+                    "round {round}: refused for a closed queue: {message}"
+                );
+            }
+        }
+    }
+}
+
+/// A client that answers INPUT_REQUIRED the moment it sees it reaches a turn
+/// that has asked for input but not yet returned. Its answer is not swallowed:
+/// the turn that follows handles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_answer_sent_as_the_turn_asks_for_input_is_handled_by_a_turn() {
+    for round in 0..30 {
+        let (handler, _) = handler(true);
+        let p = params("1.1");
+        let mut stream = match send("ask-slow", None).payload {
+            StreamRequestPayload::SendMessage(request) => {
+                handler.send_streaming_message(&p, request).await.unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let task_id = task_of(next(&mut stream).await).id;
+        loop {
+            if let StreamResponse::StatusUpdate(update) = next(&mut stream).await {
+                if update.status.state == TaskState::InputRequired {
+                    break;
+                }
+            }
+        }
+        // "quick" completes the task, which only a turn that ran can do.
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            handler.send_message(&p, message_request("quick", &task_id)),
+        )
+        .await
+        .expect("no hang")
+        .expect("accepted");
+        let SendMessageResponse::Task(task) = reply else {
+            panic!("a task is returned");
+        };
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stored = handler
+                    .get_task(
+                        &p,
+                        GetTaskRequest {
+                            id: task_id.clone(),
+                            history_length: None,
+                            tenant: None,
+                            timeline_length: None,
+                            current_generation: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                if stored.status.state == TaskState::Completed {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "round {round}: the answer was recorded ({:?}) but no turn handled it",
+            task.status.state
+        );
     }
 }
