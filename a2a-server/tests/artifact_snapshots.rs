@@ -124,6 +124,14 @@ async fn snapshot(updates: Vec<Update>, streaming: bool) -> Result<Task, A2AErro
             }
         }
         let initial_task = initial_task.unwrap();
+        // Each update is one mutation: the server numbers them consecutively
+        // from the generation of the snapshot the stream opened with.
+        let mut next = initial_task.generation;
+        for update in &mut live_updates {
+            next += 1;
+            assert_eq!(update.generation, next, "streaming={streaming}");
+            update.generation = 0;
+        }
         let expected_updates: Vec<_> = updates
             .iter()
             .enumerate()
@@ -186,7 +194,14 @@ async fn assert_snapshot(updates: Vec<Update>, expected: Vec<Artifact>) {
                 .await
                 .unwrap()
                 .unwrap();
-        assert_eq!(task.artifacts.unwrap(), expected, "streaming={streaming}");
+        // The generations the server stamps are covered by their own tests;
+        // this one is about the merged content.
+        let mut artifacts = task.artifacts.unwrap();
+        for artifact in &mut artifacts {
+            artifact.start_generation = None;
+            artifact.end_generation = None;
+        }
+        assert_eq!(artifacts, expected, "streaming={streaming}");
     }
 }
 
