@@ -13,10 +13,9 @@ This crate is published as `a2a-pb` and imported in Rust as `a2a_pb`.
 
 ## Install
 
-```toml
-[dependencies]
-a2a = { package = "a2a-lf", version = "0.2" }
-a2a-pb = { package = "a2a-pb", version = "0.1" }
+```sh
+cargo add a2a-lf --rename a2a
+cargo add a2a-pb
 ```
 
 ## Workspace

@@ -18,10 +18,9 @@ before connecting so agent cards emitted by other SDKs remain usable.
 
 ## Install
 
-```toml
-[dependencies]
-a2a = { package = "a2a-lf", version = "0.2" }
-a2a-grpc = { package = "a2a-grpc", version = "0.1" }
+```sh
+cargo add a2a-lf --rename a2a
+cargo add a2a-grpc
 ```
 
 ## Workspace
