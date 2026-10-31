@@ -400,4 +400,68 @@ mod tests {
             });
         }
     }
+
+    #[tokio::test]
+    async fn try_recv_drains_closed_inputs_but_revocation_withholds_them() {
+        let (sender, mut inputs) = ClientInputs::channel(2);
+        assert!(inputs.try_recv().is_none());
+        sender.try_send(input("buffered")).unwrap();
+        assert!(
+            !format!("{inputs:?}").contains("buffered"),
+            "debug output must not reveal buffered input"
+        );
+        sender.close();
+        assert_eq!(inputs.try_recv().unwrap().message.message_id, "buffered");
+        assert!(inputs.try_recv().is_none());
+
+        let (sender, mut inputs) = ClientInputs::channel(1);
+        sender.try_send(input("handed-off")).unwrap();
+        sender.revoke();
+        assert!(inputs.try_recv().is_none());
+        assert!(inputs.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn recv_skips_receipts_already_reclaimed_for_a_later_turn() {
+        let (sender, mut inputs) = ClientInputs::channel(2);
+        let first = QueuedInput::new(input("handed-off"));
+        assert!(first.clone().reclaim().is_some());
+        sender.sender.try_send(first).unwrap();
+        sender.try_send(input("still-unread")).unwrap();
+        assert_eq!(
+            inputs.recv().await.unwrap().message.message_id,
+            "still-unread"
+        );
+        drop(sender);
+        assert!(inputs.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_receiver_returns_the_original_unsent_input() {
+        let (sender, inputs) = ClientInputs::channel(1);
+        drop(inputs);
+        let mut original = input("retry-me");
+        original.tenant = Some("tenant-a".into());
+        original.metadata = Some(HashMap::from([("trace".into(), Value::from("original"))]));
+        let returned = sender.try_send(original.clone()).unwrap_err();
+        assert_eq!(returned.message, original.message);
+        assert_eq!(returned.generation, original.generation);
+        assert_eq!(returned.tenant, original.tenant);
+        assert_eq!(returned.metadata, original.metadata);
+    }
+
+    #[tokio::test]
+    async fn revocation_wakes_a_receiver_owned_by_a_worker() {
+        let (sender, mut inputs) = ClientInputs::channel(1);
+        let worker = tokio::spawn(async move { inputs.recv().await });
+        tokio::task::yield_now().await;
+        sender.revoke();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+    }
 }

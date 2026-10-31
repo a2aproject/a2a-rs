@@ -184,6 +184,7 @@ pub(super) fn records_message(task: &Task, request: &StreamRequest) -> bool {
             |entry| matches!(&entry.content, TimelineContent::Message(m) if &m.message_id == id),
         )
 }
+
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
@@ -203,5 +204,33 @@ mod coverage_tests {
         let reply = StreamResponse::Message(make_message());
         assert_eq!(should_interrupt_non_streaming(&request, &reply), None);
         assert_eq!(task_id_for_event(&reply), None);
+    }
+
+    #[test]
+    fn live_rejections_preserve_codes_and_omit_empty_reference_ids() {
+        for (error, expected) in [
+            (A2AError::invalid_params("bad input"), "INVALID_ARGUMENT"),
+            (A2AError::task_not_found("gone"), "NOT_FOUND"),
+            (A2AError::internal("store unavailable"), "INTERNAL_ERROR"),
+        ] {
+            let StreamResponse::Error(rejection) =
+                Rejection::from(error.clone()).into_stream_error("task", Some(String::new()))
+            else {
+                panic!("expected stream error")
+            };
+            assert_eq!(rejection.code, expected);
+            assert_eq!(rejection.message, error.message);
+            assert_eq!(rejection.reference_id, None);
+            let returned = Rejection::from(error.clone()).into_error();
+            assert_eq!(returned.code, error.code);
+            assert_eq!(returned.message, error.message);
+        }
+        assert_eq!(
+            Rejection::Declined("busy".into()).into_error().code,
+            error_code::UNSUPPORTED_OPERATION
+        );
+        let refusal = unary_refusal(Rejection::Declined("full".into()), &send_req(None, None));
+        assert_eq!(refusal.code, error_code::INVALID_REQUEST);
+        assert!(refusal.message.contains("full"));
     }
 }

@@ -282,3 +282,172 @@ pub(super) async fn drive_execution_guarded(
     release_execution(&manager, &active, &task_id).await;
     changes.notify(&task_id);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::test_support::*;
+
+    async fn registered(
+        runtime: &ExecutionRuntime,
+        task: Task,
+    ) -> (Arc<ActiveExecution>, ExecutorContext) {
+        let (active, inputs, writer) = runtime.execution_manager.reserve(&task.id).await.unwrap();
+        active.set_snapshot(task.clone()).await;
+        drop(writer);
+        let context = ExecutorContext::new(task.id.clone(), task.context_id.clone(), inputs)
+            .with_stored_task(task);
+        (active, context)
+    }
+
+    #[tokio::test]
+    async fn a_failed_terminal_save_releases_the_execution_without_overwriting_cancellation() {
+        let runtime = make_handler();
+        let mut task = task_with_history("save-fails", "context", 0);
+        task.status.state = TaskState::Canceled;
+        runtime.task_store.create(task.clone()).await.unwrap();
+        task.status.state = TaskState::Working;
+        let (active, context) = registered(&runtime, task.clone()).await;
+        let mut events = active.subscribe();
+        timeout(
+            Duration::from_secs(1),
+            drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            events.recv().await.unwrap().result.unwrap_err().code,
+            error_code::INVALID_REQUEST
+        );
+        assert!(runtime.execution_manager.get(&task.id).await.is_none());
+        assert!(active.inputs_drained.is_cancelled());
+        assert_eq!(
+            runtime
+                .task_store
+                .get(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .state,
+            TaskState::Canceled
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_state_and_cancellation_take_precedence_over_push_failure() {
+        for canceled in [false, true] {
+            let runtime = make_handler();
+            let mut task = task_with_history("already-stopped", "context", 0);
+            task.status.state = if canceled {
+                TaskState::Working
+            } else {
+                TaskState::Canceled
+            };
+            let (active, context) = registered(&runtime, task.clone()).await;
+            active
+                .push_failure
+                .send_replace(Some(A2AError::internal("late delivery failure")));
+            if canceled {
+                active.inputs.revoke();
+            }
+            assert!(matches!(
+                poll_executor(&runtime, &task.id, &active, context).await,
+                TurnEnd::Stopped
+            ));
+            assert!(active.snapshot().await.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn late_executor_output_cannot_overwrite_a_terminal_snapshot() {
+        let (runtime, release) = make_resumable_handler();
+        let mut task = task_with_history("late-output", "context", 0);
+        task.status.state = TaskState::Submitted;
+        runtime.task_store.create(task.clone()).await.unwrap();
+        let (active, context) = registered(&runtime, task.clone()).await;
+        let mut events = active.subscribe();
+        let runner = tokio::spawn({
+            let runtime = runtime.clone();
+            let active = active.clone();
+            let task_id = task.id.clone();
+            async move { poll_executor(&runtime, &task_id, &active, context).await }
+        });
+        events.recv().await.unwrap().result.unwrap();
+        let canceled = runtime.task_store.begin_cancel(&task.id).await.unwrap();
+        active.set_snapshot(canceled).await;
+        release.notify_one();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), runner)
+                .await
+                .unwrap()
+                .unwrap(),
+            TurnEnd::Stopped
+        ));
+        assert_eq!(
+            runtime
+                .task_store
+                .get(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .state,
+            TaskState::Canceled
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "late completion must not be published"
+        );
+    }
+
+    struct Panics;
+    impl crate::AgentExecutor for Panics {
+        fn execute(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            panic!("executor panicked before returning its stream");
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            Box::pin(stream::empty())
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_to_persist_a_panic_still_notifies_and_releases_subscribers() {
+        let runtime = DefaultRequestHandler::new(Panics, InMemoryTaskStore::new());
+        let mut task = task_with_history("panic-save-fails", "context", 0);
+        task.status.state = TaskState::Canceled;
+        runtime.task_store.create(task.clone()).await.unwrap();
+        task.status.state = TaskState::Working;
+        let (active, context) = registered(&runtime, task.clone()).await;
+        let mut events = active.subscribe();
+        timeout(
+            Duration::from_secs(1),
+            drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            events.recv().await.unwrap().result.unwrap_err().code,
+            error_code::INVALID_REQUEST
+        );
+        assert!(active.inputs_drained.is_cancelled());
+        assert!(runtime.execution_manager.get(&task.id).await.is_none());
+        assert_eq!(
+            runtime
+                .task_store
+                .get(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .state,
+            TaskState::Canceled
+        );
+    }
+}
