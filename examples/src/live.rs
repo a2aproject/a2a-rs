@@ -29,6 +29,10 @@ impl AgentExecutor for LiveEchoExecutor {
                     _ => (TaskState::Working, format!("Echo: {text}")),
                 };
                 let keep_running = state == TaskState::Working;
+                eprintln!(
+                    "task_id={} execution_id={} state={state:?}",
+                    ctx.task_id, ctx.execution_id,
+                );
                 yield Ok(status(&ctx.task_id, &ctx.context_id, state, &reply));
                 if !keep_running {
                     return;
@@ -45,6 +49,10 @@ impl AgentExecutor for LiveEchoExecutor {
 
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         Box::pin(futures::stream::once(async move {
+            eprintln!(
+                "task_id={} execution_id={} state=Canceled",
+                ctx.task_id, ctx.execution_id,
+            );
             Ok(status(
                 &ctx.task_id,
                 &ctx.context_id,

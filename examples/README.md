@@ -47,6 +47,11 @@ The live client runs the same conversation over all three bindings:
    starts this invocation is in `ctx.message`; further input is in `ctx.inputs`.
 5. `finish` produces `Completed`, closing the downlink.
 
+The server prints `task_id`, `execution_id`, and `state` for each status update.
+The execution ID stays the same through `start`, `hello`, and `pause`, then
+changes for `resumed` and stays the same through `finish`. The task ID stays
+the same throughout the conversation.
+
 `live.events` carries task updates for every binding. HTTP sends subsequent input
 as individual requests and returns task receipts; gRPC writes input on the duplex
 stream. The executor and conversation code are shared across these bindings.
