@@ -1570,13 +1570,11 @@ mod tests {
             id: "task-1".into(),
             tenant: None,
         };
-        let error = match transport
+        let error = transport
             .subscribe_to_task(&ServiceParams::new(), &req)
             .await
-        {
-            Err(e) => e,
-            Ok(_) => panic!("expected error, got a stream"),
-        };
+            .err()
+            .expect("expected error, got a stream");
 
         assert_eq!(error.message, "HTTP 401 Unauthorized: ");
     }
