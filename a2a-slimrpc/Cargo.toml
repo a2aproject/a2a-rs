@@ -27,6 +27,7 @@ slim_datapath = { workspace = true }
 slim_auth = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 
 [features]
 fuzzing = []

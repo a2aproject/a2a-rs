@@ -311,6 +311,14 @@ pub struct MessageCommand {
     #[arg(long)]
     pub history_length: Option<i32>,
 
+    /// Ask the server to include up to this many timeline entries in task responses.
+    #[arg(long)]
+    pub timeline_length: Option<i32>,
+
+    /// Reject the message unless the task is at this generation (optimistic concurrency).
+    #[arg(long)]
+    pub if_generation_match: Option<i64>,
+
     /// Accepted output mode, for example text/plain or application/json.
     #[arg(long = "accept-output")]
     pub accepted_output_modes: Vec<String>,
@@ -332,6 +340,14 @@ pub struct TaskLookupCommand {
     /// Ask the server to include up to this many history items.
     #[arg(long)]
     pub history_length: Option<i32>,
+
+    /// Ask the server to include up to this many timeline entries.
+    #[arg(long)]
+    pub timeline_length: Option<i32>,
+
+    /// Hold the request until the task's generation exceeds this value.
+    #[arg(long)]
+    pub current_generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -355,6 +371,10 @@ pub struct ListTasksCommand {
     /// Ask the server to include up to this many history items per task.
     #[arg(long)]
     pub history_length: Option<i32>,
+
+    /// Ask the server to include up to this many timeline entries per task.
+    #[arg(long)]
+    pub timeline_length: Option<i32>,
 
     /// Ask the server to include artifacts in the listed tasks.
     #[arg(long)]
@@ -1158,8 +1178,8 @@ async fn run_task_command(
             let ResolvedClient { client, tenant, .. } = resolve_client(cli, matches).await?;
             let result = client
                 .get_task(&GetTaskRequest {
-                    current_generation: None,
-                    timeline_length: None,
+                    current_generation: command.current_generation,
+                    timeline_length: command.timeline_length,
                     id: command.id.clone(),
                     history_length: command.history_length,
                     tenant: tenant.clone(),
@@ -1188,7 +1208,7 @@ async fn run_task_command(
             let ResolvedClient { client, tenant, .. } = resolve_client(cli, matches).await?;
             let result = client
                 .list_tasks(&ListTasksRequest {
-                    timeline_length: None,
+                    timeline_length: command.timeline_length,
                     context_id: command.context_id.clone(),
                     status: command.status.map(TaskState::from),
                     page_size: command.page_size,
@@ -1478,12 +1498,14 @@ fn build_send_message_request(
     message.task_id = command.task_id.clone();
 
     let configuration = if command.history_length.is_some()
+        || command.timeline_length.is_some()
+        || command.if_generation_match.is_some()
         || !command.accepted_output_modes.is_empty()
         || command.return_immediately
     {
         Some(SendMessageConfiguration {
-            if_generation_match: None,
-            timeline_length: None,
+            if_generation_match: command.if_generation_match,
+            timeline_length: command.timeline_length,
             accepted_output_modes: (!command.accepted_output_modes.is_empty())
                 .then_some(command.accepted_output_modes.clone()),
             task_push_notification_config: None,
@@ -3061,6 +3083,34 @@ async fn consume_stream<T: a2a_client::Transport, V: Serialize + TextRender + Ta
     }
 }
 
+/// Whether the first event after a reconnect only restates the state the
+/// connection had reached before the cut. Only a snapshot reconciles: a
+/// resumed stream carries none, so its first event is a real update even when
+/// it reports the state reached before the cut.
+fn is_unchanged_reconciliation(
+    first_event: bool,
+    value: &StreamResponse,
+    state: Option<&TaskState>,
+    state_before_this_attempt: Option<&TaskState>,
+) -> bool {
+    first_event
+        && matches!(value, StreamResponse::Task(_))
+        && state.is_some()
+        && state == state_before_this_attempt
+}
+
+/// The task generation a `StreamResponse` reports; zero when it carries none
+/// (a message, or a peer that predates generations).
+fn stream_response_generation(value: &StreamResponse) -> i64 {
+    match value {
+        StreamResponse::Task(task) => task.generation,
+        StreamResponse::StatusUpdate(event) => event.generation,
+        StreamResponse::ArtifactUpdate(event) => event.generation,
+        StreamResponse::MessageUpdate(event) => event.generation,
+        _ => 0,
+    }
+}
+
 /// The task state a `StreamResponse` carries, if any.
 fn stream_response_state(value: &StreamResponse) -> Option<TaskState> {
     match value {
@@ -3084,6 +3134,7 @@ async fn subscribe_with_resumption<T: a2a_client::Transport>(
 ) -> Result<(), CliError> {
     let deadline = tokio::time::Instant::now() + cli.timeout;
     let mut last_state: Option<TaskState> = None;
+    let mut last_generation: i64 = 0;
     let mut attempt: u32 = 0;
 
     loop {
@@ -3097,9 +3148,14 @@ async fn subscribe_with_resumption<T: a2a_client::Transport>(
                     if let Some(state) = &state {
                         last_state = Some(state.clone());
                     }
+                    last_generation = last_generation.max(stream_response_generation(&value));
 
-                    let is_unchanged_reconciliation =
-                        first_event && state.is_some() && state == state_before_this_attempt;
+                    let is_unchanged_reconciliation = is_unchanged_reconciliation(
+                        first_event,
+                        &value,
+                        state.as_ref(),
+                        state_before_this_attempt.as_ref(),
+                    );
                     first_event = false;
                     if is_unchanged_reconciliation {
                         continue;
@@ -3143,7 +3199,10 @@ async fn subscribe_with_resumption<T: a2a_client::Transport>(
 
             match client
                 .subscribe_to_task(&SubscribeToTaskRequest {
-                    last_seen_generation: None,
+                    // A server that tracks generations then resumes from what
+                    // this client already printed; one that does not sends a
+                    // snapshot, which the reconciliation above handles.
+                    last_seen_generation: (last_generation > 0).then_some(last_generation),
                     id: task_id.clone(),
                     tenant: tenant.clone(),
                 })
@@ -3747,6 +3806,85 @@ mod tests {
     }
 
     #[test]
+    fn test_only_a_snapshot_is_suppressed_as_an_unchanged_reconciliation() {
+        let working = TaskState::Working;
+        let task = StreamResponse::Task(Task {
+            id: "t".into(),
+            context_id: "c".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            timeline: None,
+            metadata: None,
+            generation: 0,
+        });
+        let update = StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+            task_id: "t".into(),
+            context_id: "c".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+            generation: 4,
+        });
+
+        assert!(is_unchanged_reconciliation(
+            true,
+            &task,
+            Some(&working),
+            Some(&working)
+        ));
+        // After resuming without a snapshot the first event is a real update.
+        assert!(!is_unchanged_reconciliation(
+            true,
+            &update,
+            Some(&working),
+            Some(&working)
+        ));
+        // Past the first event nothing is suppressed.
+        assert!(!is_unchanged_reconciliation(
+            false,
+            &task,
+            Some(&working),
+            Some(&working)
+        ));
+        // A snapshot that moved on is printed.
+        assert!(!is_unchanged_reconciliation(
+            true,
+            &task,
+            Some(&working),
+            Some(&TaskState::Submitted)
+        ));
+    }
+
+    #[test]
+    fn test_stream_response_generation_reads_the_event_generation() {
+        let status = |generation| {
+            StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+                task_id: "t".into(),
+                context_id: "c".into(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+                generation,
+            })
+        };
+        assert_eq!(stream_response_generation(&status(5)), 5);
+        assert_eq!(stream_response_generation(&status(0)), 0);
+        let message = StreamResponse::Message(Message::new(Role::Agent, vec![]));
+        assert_eq!(stream_response_generation(&message), 0);
+    }
+
+    #[test]
     fn test_build_send_message_request_populates_optional_fields() {
         let request = build_send_message_request(
             &MessageCommand {
@@ -3758,6 +3896,8 @@ mod tests {
                 context_id: Some("ctx-1".to_string()),
                 task_id: Some("task-1".to_string()),
                 history_length: Some(4),
+                timeline_length: Some(3),
+                if_generation_match: Some(7),
                 accepted_output_modes: vec!["text/plain".to_string()],
                 return_immediately: true,
                 stream: false,
@@ -3781,6 +3921,20 @@ mod tests {
             request
                 .configuration
                 .as_ref()
+                .and_then(|config| config.timeline_length),
+            Some(3)
+        );
+        assert_eq!(
+            request
+                .configuration
+                .as_ref()
+                .and_then(|config| config.if_generation_match),
+            Some(7)
+        );
+        assert_eq!(
+            request
+                .configuration
+                .as_ref()
                 .and_then(|config| config.return_immediately),
             Some(true)
         );
@@ -3798,6 +3952,8 @@ mod tests {
                 context_id: None,
                 task_id: None,
                 history_length: None,
+                timeline_length: None,
+                if_generation_match: None,
                 accepted_output_modes: Vec::new(),
                 return_immediately: false,
                 stream: false,
@@ -5507,8 +5663,8 @@ mod tests {
     }
 
     /// Absent a flag, negotiate down to the highest version both sides
-    /// declare — `supported` is a parameter precisely so this branch is
-    /// exercisable while this build's own VERSION is still 1.0.
+    /// declare — `supported` is a parameter so this branch is exercisable
+    /// whatever this build's own VERSION is.
     #[test]
     fn test_negotiate_a2a_version_takes_the_highest_shared_1x() {
         // Agent declares less than we support: follow it down, and say so.
