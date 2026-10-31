@@ -16,7 +16,7 @@ use futures::{StreamExt, stream::BoxStream};
 use serde_json::Value;
 
 use crate::handler::RequestHandler;
-use crate::middleware::{ServiceParams, extract_service_params};
+use crate::middleware::{ServiceParams, check_a2a_version, extract_service_params};
 use crate::sse;
 
 /// Shared state for the JSON-RPC handler.
@@ -285,33 +285,6 @@ fn parse_create_push_config_request(
 /// before this point.
 fn invalid_params(e: impl std::fmt::Display) -> A2AError {
     A2AError::invalid_params(format!("invalid params: {e}"))
-}
-
-/// The major version this build implements (§3.6.2). Minor is accepted
-/// unconditionally since nothing here branches on it.
-const SUPPORTED_MAJOR_VERSION: u32 = 1;
-
-/// Mirrors a2acli's own `parse_protocol_version`: tolerant of a bare major,
-/// extra trailing components, and surrounding whitespace.
-fn parse_major_version(value: &str) -> Option<u32> {
-    value.trim().split('.').next()?.parse().ok()
-}
-
-/// §3.6.2: reject a request whose `A2A-Version` header names an
-/// unsupported major version. §3.6.1/§3.6.2 both require an absent header
-/// to be interpreted as "0.3", not as "whatever this interface happens to
-/// serve" -- so it's rejected here exactly like any other unsupported
-/// version, rather than silently processed as this build's version.
-fn check_a2a_version(params: &ServiceParams) -> Result<(), A2AError> {
-    let requested = params
-        .get("a2a-version")
-        .and_then(|v| v.first())
-        .map(String::as_str)
-        .unwrap_or("0.3");
-    match parse_major_version(requested) {
-        Some(SUPPORTED_MAJOR_VERSION) => Ok(()),
-        _ => Err(A2AError::version_not_supported(requested)),
-    }
 }
 
 #[cfg(test)]

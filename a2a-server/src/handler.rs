@@ -3,15 +3,25 @@
 // SPDX-License-Identifier: Apache-2.0
 use a2a::*;
 use async_trait::async_trait;
-use futures::{StreamExt, stream::BoxStream};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{RwLock, broadcast};
+use futures::{
+    StreamExt,
+    stream::{self, BoxStream},
+};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
+use tokio::sync::{RwLock, broadcast, oneshot};
 
 use crate::middleware::ServiceParams;
 use crate::pagination::resolve_page_size;
 use crate::task_store::apply_history_length;
 
 const EXECUTION_BUFFER_CAPACITY: usize = 32;
+
+/// What a subscription attaches to: the events to come, the task as of the
+/// last event already published, and that event's sequence.
+type Resubscription = (broadcast::Receiver<ExecutionEvent>, Option<Task>, u64);
 
 #[derive(Clone)]
 struct ExecutionEvent {
@@ -46,7 +56,7 @@ impl ActiveExecution {
         self.sender.subscribe()
     }
 
-    async fn resubscribe(&self) -> (broadcast::Receiver<ExecutionEvent>, Option<Task>, u64) {
+    async fn resubscribe(&self) -> Resubscription {
         let receiver = self.sender.subscribe();
         let state = self.state.read().await;
         (receiver, state.snapshot_task.clone(), state.sequence)
@@ -91,9 +101,17 @@ impl ActiveExecution {
 #[derive(Default)]
 struct ExecutionManager {
     executions: RwLock<HashMap<TaskId, Arc<ActiveExecution>>>,
+    /// Subscriptions to tasks with no registered execution, which `start`
+    /// attaches to the next one. Taken under `executions` by `start` and
+    /// `subscribe`, alone by `Waiter::drop`, never across an await.
+    waiting: Mutex<HashMap<TaskId, Vec<oneshot::Sender<Resubscription>>>>,
 }
 
 impl ExecutionManager {
+    fn waiting(&self) -> MutexGuard<'_, HashMap<TaskId, Vec<oneshot::Sender<Resubscription>>>> {
+        self.waiting.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     async fn start(&self, task: Task) -> Result<Arc<ActiveExecution>, A2AError> {
         let mut executions = self.executions.write().await;
         if executions.contains_key(&task.id) {
@@ -105,6 +123,11 @@ impl ExecutionManager {
 
         let active = ActiveExecution::new(task.clone());
         executions.insert(task.id.clone(), active.clone());
+        // Subscribed before the executor runs, so they miss none of its events.
+        let waiting = self.waiting().remove(&task.id).unwrap_or_default();
+        for waiter in waiting {
+            let _ = waiter.send((active.subscribe(), Some(task.clone()), 0));
+        }
         Ok(active)
     }
 
@@ -113,13 +136,30 @@ impl ExecutionManager {
         executions.get(task_id).cloned()
     }
 
-    async fn resubscribe(
-        &self,
-        task_id: &str,
-    ) -> Option<(broadcast::Receiver<ExecutionEvent>, Option<Task>, u64)> {
-        let active = self.get(task_id).await?;
-        let (receiver, snapshot_task, sequence) = active.resubscribe().await;
-        Some((receiver, snapshot_task, sequence))
+    /// Subscribes to the task's registered execution or, when there is none,
+    /// to the next one `start` registers. Decided under the registry lock, so
+    /// an execution registering meanwhile is either found here or finds the
+    /// waiter.
+    async fn subscribe(self: &Arc<Self>, task_id: &str) -> Waiter {
+        let (sender, receiver) = oneshot::channel();
+        let executions = self.executions.read().await;
+        match executions.get(task_id) {
+            Some(active) => {
+                let _ = sender.send(active.resubscribe().await);
+            }
+            None => {
+                self.waiting()
+                    .entry(task_id.to_owned())
+                    .or_default()
+                    .push(sender);
+            }
+        }
+        drop(executions);
+        Waiter {
+            manager: Arc::clone(self),
+            task_id: task_id.to_owned(),
+            attached: Some(receiver),
+        }
     }
 
     async fn finish(&self, task_id: &str, active: &Arc<ActiveExecution>) {
@@ -129,6 +169,48 @@ impl ExecutionManager {
             .is_some_and(|current| Arc::ptr_eq(current, active));
         if should_remove {
             executions.remove(task_id);
+        }
+    }
+}
+
+/// A subscription that `ExecutionManager::start` attaches to the task's next
+/// execution. Dropped first, it leaves nothing behind in the registry.
+struct Waiter {
+    manager: Arc<ExecutionManager>,
+    task_id: TaskId,
+    attached: Option<oneshot::Receiver<Resubscription>>,
+}
+
+impl Waiter {
+    /// The execution attached so far, if any.
+    fn attached(&mut self) -> Option<Resubscription> {
+        self.attached.as_mut()?.try_recv().ok()
+    }
+
+    /// The events of the execution once attached; none if the handler goes
+    /// away first.
+    fn into_stream(mut self) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        stream::once(async move { self.attached.as_mut()?.await.ok() })
+            .flat_map(|attached| match attached {
+                Some((receiver, snapshot_task, sequence)) => {
+                    subscription_stream(receiver, snapshot_task, sequence)
+                }
+                None => stream::empty().boxed(),
+            })
+            .boxed()
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        // Closing the receiver is what marks this waiter's own sender closed.
+        self.attached = None;
+        let mut waiting = self.manager.waiting();
+        if let Some(waiters) = waiting.get_mut(&self.task_id) {
+            waiters.retain(|waiter| !waiter.is_closed());
+            if waiters.is_empty() {
+                waiting.remove(&self.task_id);
+            }
         }
     }
 }
@@ -1052,9 +1134,10 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.authorize(params, Some(&req.id))?;
         self.require_streaming()?;
-        if let Some((receiver, snapshot_task, sequence)) =
-            self.execution_manager.resubscribe(&req.id).await
-        {
+        // Registered before the store is read: an execution that starts from
+        // here on attaches this subscription itself, so nothing is missed.
+        let mut waiter = self.execution_manager.subscribe(&req.id).await;
+        if let Some((receiver, snapshot_task, sequence)) = waiter.attached() {
             return Ok(subscription_stream(receiver, snapshot_task, sequence));
         }
 
@@ -1062,15 +1145,26 @@ impl RequestHandler for DefaultRequestHandler {
         // execution is cleaned up, so it doesn't by itself mean the task
         // never existed -- check the store to tell the two apart before
         // reporting TaskNotFoundError.
-        if let Some(task) = self.task_store.get(&req.id).await? {
-            if task.status.state.is_terminal() {
-                return Err(A2AError::unsupported_operation(format!(
-                    "task {} has already reached a terminal state",
-                    req.id
-                )));
-            }
+        let task = self.load_task(&req.id).await?;
+        // An execution that started while the store was read may have moved
+        // the task on already; the waiter has everything it published.
+        if let Some((receiver, snapshot_task, sequence)) = waiter.attached() {
+            return Ok(subscription_stream(receiver, snapshot_task, sequence));
         }
-        Err(A2AError::task_not_found(&req.id))
+        if task.status.state.is_terminal() {
+            return Err(A2AError::unsupported_operation(format!(
+                "task {} has already reached a terminal state",
+                req.id
+            )));
+        }
+
+        // The task is between turns, in an interrupted state; §3.1.6 allows
+        // subscribing to any non-terminal task. The stream opens with the
+        // task as stored, then follows the execution the next message starts
+        // to its end, as a resubscription would (TCK STREAM-SUB-002).
+        Ok(stream::once(async move { Ok(StreamResponse::Task(task)) })
+            .chain(waiter.into_stream())
+            .boxed())
     }
 
     async fn create_push_config(
@@ -1559,6 +1653,39 @@ mod tests {
         }
     }
 
+    /// Asks for input on the task's first turn and completes on the next.
+    struct InputRequiredExecutor;
+
+    impl crate::AgentExecutor for InputRequiredExecutor {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let state = match ctx.stored_task.as_ref().map(|task| &task.status.state) {
+                Some(TaskState::InputRequired) => TaskState::Completed,
+                _ => TaskState::InputRequired,
+            };
+            let update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: ctx.task_id,
+                context_id: ctx.context_id,
+                status: TaskStatus {
+                    state,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            });
+            Box::pin(stream::once(async move { Ok(update) }))
+        }
+
+        fn cancel(
+            &self,
+            _ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            Box::pin(stream::empty())
+        }
+    }
+
     /// Pre-create a task so a message may legitimately reference it: A2A
     /// §3.4.2 forbids client-provided taskIds for *creating* tasks.
     async fn seed_task(handler: &DefaultRequestHandler, task_id: &str, context_id: &str) {
@@ -1613,6 +1740,33 @@ mod tests {
             ),
             release,
         )
+    }
+
+    fn make_input_required_handler() -> DefaultRequestHandler {
+        DefaultRequestHandler::new(InputRequiredExecutor, InMemoryTaskStore::new())
+    }
+
+    /// A task whose first turn ended asking for input: stored, but with no
+    /// execution registered any more.
+    async fn task_awaiting_input(handler: &DefaultRequestHandler) -> Task {
+        let response = handler
+            .send_message(
+                &ServiceParams::new(),
+                SendMessageRequest {
+                    message: make_message(),
+                    configuration: None,
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        let SendMessageResponse::Task(task) = response else {
+            panic!("expected a task");
+        };
+        assert_eq!(task.status.state, TaskState::InputRequired);
+        assert!(handler.execution_manager.get(&task.id).await.is_none());
+        task
     }
 
     fn make_message() -> Message {
@@ -2872,7 +3026,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_subscribe_requires_active_execution() {
+    async fn test_subscribe_to_an_unknown_task_is_not_found() {
         let handler = make_handler();
         let params = ServiceParams::new();
         let req = SubscribeToTaskRequest {
@@ -2884,6 +3038,7 @@ mod tests {
             Ok(_) => panic!("expected subscribe_to_task to fail"),
             Err(error) => assert_eq!(error.code, error_code::TASK_NOT_FOUND),
         }
+        assert!(handler.execution_manager.waiting().is_empty());
     }
 
     #[tokio::test]
@@ -2918,6 +3073,124 @@ mod tests {
             Ok(_) => panic!("expected subscribe_to_task to fail"),
             Err(error) => assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION),
         }
+        assert!(handler.execution_manager.waiting().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_a_task_awaiting_input_opens_with_the_stored_task() {
+        let handler = make_input_required_handler();
+        let params = ServiceParams::new();
+        let task = task_awaiting_input(&handler).await;
+        let stored = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: task.id.clone(),
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.status.state, TaskState::InputRequired);
+
+        let mut subscription = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: task.id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        match subscription.next().await.unwrap().unwrap() {
+            StreamResponse::Task(first) => assert_eq!(first, stored),
+            other => panic!("expected the stored task first, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subscriptions_to_a_task_awaiting_input_follow_its_next_turn() {
+        let handler = make_input_required_handler();
+        let params = ServiceParams::new();
+        let task = task_awaiting_input(&handler).await;
+        let subscribe = || SubscribeToTaskRequest {
+            id: task.id.clone(),
+            tenant: None,
+        };
+        let first = handler
+            .subscribe_to_task(&params, subscribe())
+            .await
+            .unwrap();
+        let second = handler
+            .subscribe_to_task(&params, subscribe())
+            .await
+            .unwrap();
+
+        // The whole next turn runs before either stream is polled: what it
+        // publishes must still reach both.
+        let mut follow_up = make_message();
+        follow_up.task_id = Some(task.id.clone());
+        let response = handler
+            .send_message(
+                &params,
+                SendMessageRequest {
+                    message: follow_up,
+                    configuration: None,
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            SendMessageResponse::Task(task) if task.status.state == TaskState::Completed
+        ));
+
+        let states = |events: Vec<Result<StreamResponse, A2AError>>| {
+            events
+                .into_iter()
+                .map(|event| match event.unwrap() {
+                    StreamResponse::Task(task) => task.status.state,
+                    StreamResponse::StatusUpdate(update) => update.status.state,
+                    other => panic!("unexpected event {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        // The stored task, the task as the turn found it, then the turn.
+        let expected = [
+            TaskState::InputRequired,
+            TaskState::InputRequired,
+            TaskState::Completed,
+        ];
+        assert_eq!(states(first.collect().await), expected);
+        assert_eq!(states(second.collect().await), expected);
+
+        // Over: a new subscription is refused as for any finished task.
+        let result = handler.subscribe_to_task(&params, subscribe()).await;
+        assert!(matches!(result, Err(error) if error.code == error_code::UNSUPPORTED_OPERATION));
+    }
+
+    #[tokio::test]
+    async fn test_a_dropped_subscription_to_a_task_awaiting_input_unregisters() {
+        let handler = make_input_required_handler();
+        let params = ServiceParams::new();
+        let task = task_awaiting_input(&handler).await;
+        let subscription = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: task.id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(handler.execution_manager.waiting().len(), 1);
+        drop(subscription);
+        assert!(handler.execution_manager.waiting().is_empty());
     }
 
     #[tokio::test]

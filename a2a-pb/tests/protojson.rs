@@ -313,3 +313,26 @@ fn stream_response_protojson_roundtrip_serializes_oneof_payloads() {
     let roundtrip: StreamResponse = serde_json::from_value(json).unwrap();
     assert_eq!(response, roundtrip);
 }
+
+/// `google.protobuf.Value` carries every number as a double, so an integer in
+/// a data part has to come back out as an integer, not as `3600.0`.
+#[test]
+fn integers_in_data_parts_stay_integers() {
+    let request: a2a::SendMessageRequest = a2a_pb::protojson_conv::from_value(json!({
+        "message": {
+            "messageId": "msg-1",
+            "role": "ROLE_USER",
+            "parts": [{"data": {"sinceSeconds": 3600, "ratio": 0.5}}]
+        }
+    }))
+    .unwrap();
+
+    let a2a::PartContent::Data(data) = &request.message.parts[0].content else {
+        panic!("expected a data part");
+    };
+    assert_eq!(
+        serde_json::from_value::<u32>(data["sinceSeconds"].clone()).unwrap(),
+        3600
+    );
+    assert_eq!(data["ratio"], json!(0.5));
+}
