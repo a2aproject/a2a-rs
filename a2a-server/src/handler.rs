@@ -274,6 +274,15 @@ impl DefaultRequestHandler {
         }
     }
 
+    /// A handler for an [`Agent`](crate::Agent), which decides for each message
+    /// whether a task exists.
+    pub fn from_agent(agent: impl crate::Agent, task_store: impl crate::TaskStore) -> Self {
+        Self::new(
+            crate::executor::AgentExecutorAdapter(Arc::new(agent)),
+            task_store,
+        )
+    }
+
     /// Bounds how long a `GetTask` carrying `currentGeneration` is held open
     /// when the task does not advance. The request then returns the current
     /// state, which the spec allows.
@@ -610,11 +619,7 @@ impl DefaultRequestHandler {
                     .into());
                 }
                 Some(_) => {}
-                None => {
-                    if let Some(message) = &mut request.message {
-                        message.task_id = Some(bound.to_string());
-                    }
-                }
+                None => request.message.task_id = Some(bound.to_string()),
             }
         }
         if let Some(mut authorized) = authorized {
@@ -644,14 +649,10 @@ impl DefaultRequestHandler {
         let request = &message.request;
         self.validate_artifact_updates(request)?;
         if !is_artifact_only(request) {
-            let message = request
-                .message
-                .as_ref()
-                .ok_or_else(|| A2AError::invalid_params("message is required"))?;
-            self.validate_content_types(message)?;
-            if message.message_id.is_empty()
-                || message.parts.is_empty()
-                || message.role != Role::User
+            self.validate_content_types(&request.message)?;
+            if request.message.message_id.is_empty()
+                || request.message.parts.is_empty()
+                || request.message.role != Role::User
             {
                 return Err(A2AError::invalid_params(
                     "client messages require a messageId, user role and at least one part",
@@ -786,8 +787,7 @@ impl DefaultRequestHandler {
                 message.user.clone(),
                 params,
                 message.response_id,
-            )
-            .ok_or_else(|| A2AError::invalid_params("message is required"))?;
+            );
             permit.send(active.track_input(input).await);
         }
         drop(writer);
@@ -944,13 +944,7 @@ impl DefaultRequestHandler {
         // and client-provided ids for *creating* tasks are not supported. Only
         // an absent taskId may mint a new one.
         let stored = self.task_store.get(task_id).await?;
-        if stored.is_none()
-            && (req
-                .message
-                .as_ref()
-                .is_some_and(|message| message.task_id.is_some())
-                || artifact_only)
-        {
+        if stored.is_none() && (req.message.task_id.is_some() || artifact_only) {
             return Err(A2AError::task_not_found(task_id));
         }
         if let Some(task) = &stored {
@@ -961,8 +955,8 @@ impl DefaultRequestHandler {
             .map(|task| task.context_id.clone())
             .unwrap_or_else(|| {
                 req.message
-                    .as_ref()
-                    .and_then(|message| message.context_id.clone())
+                    .context_id
+                    .clone()
                     .unwrap_or_else(new_context_id)
             });
 
@@ -1007,8 +1001,10 @@ impl DefaultRequestHandler {
         } = message;
         let params = &params;
         let include_task_snapshot_in_context = mode == StartMode::Blocking;
-        // This layer stores new tasks before starting the executor. Deferred
-        // creation is enabled by the later lazy-task layer.
+        // A new task is created by the executor: only a live exchange, which is
+        // bound to its task from the first request, creates it up front.
+        let lazy = mode != StartMode::Bidi;
+        let artifact_only = is_artifact_only(&req);
         let task_id = request_task_id(&req).unwrap_or_else(new_task_id);
 
         // Claim the task before reading it: from here until the execution
@@ -1029,13 +1025,23 @@ impl DefaultRequestHandler {
             // wait for it instead of racing it.
             let prepared = async {
                 let prepared = self.prepare_task_for_execution(&req, &task_id).await?;
-                self.save_request_push_config(params, &task_id, &req)
-                    .await?;
+                if lazy && !prepared.1 {
+                    // For a task that may never exist, the configuration waits
+                    // for the executor to create it.
+                    let config = self.request_push_config(params, &task_id, &req)?;
+                    *active
+                        .pending_push
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+                } else {
+                    self.save_request_push_config(params, &task_id, &req)
+                        .await?;
+                }
                 // All admission checks and configuration saves precede the
                 // input commit. The owned preparation then starts its executor.
                 if prepared.1 {
                     self.task_store.update(prepared.0.clone()).await?;
-                } else {
+                } else if !lazy {
                     self.task_store.create(prepared.0.clone()).await?;
                 }
                 Ok::<_, A2AError>(prepared)
@@ -1044,6 +1050,11 @@ impl DefaultRequestHandler {
             match prepared {
                 Ok(prepared) => {
                     active.set_snapshot(prepared.0.clone()).await;
+                    if lazy && !prepared.1 {
+                        active
+                            .uncreated
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     prepared
                 }
                 Err(error) => {
@@ -1057,12 +1068,14 @@ impl DefaultRequestHandler {
         self.execution_manager
             .pushes
             .attach(self, &task_id, &active.events);
-        // Existing subscribers and webhooks observe persisted client input
-        // through the same publication path as executor output. The new
-        // response subscribes below and announces its input via its opening
-        // snapshot (or recorded follow-up), avoiding duplicate generations.
-        for event in &input_events {
-            active.publish(Ok(event), None).await;
+        if existed || !lazy {
+            // Existing subscribers and webhooks observe persisted client input
+            // through the same publication path as executor output. The new
+            // response subscribes below and announces its input via its opening
+            // snapshot (or recorded follow-up), avoiding duplicate generations.
+            for event in &input_events {
+                active.publish(Ok(event), None).await;
+            }
         }
         self.changes.notify(&task_id);
         // The task input queue is owned by the server and already exists
@@ -1089,7 +1102,7 @@ impl DefaultRequestHandler {
         tokio::spawn(async move {
             let exec_ctx = crate::ExecutorContext {
                 execution_id: active_execution.execution_id.clone(),
-                message: req.message,
+                message: (!artifact_only).then_some(req.message),
                 task_id: execution_task_id.clone(),
                 // The task as it stands once the request is applied. A task this
                 // request created is withheld unless the caller asked for it
@@ -1959,7 +1972,7 @@ mod tests {
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
 
-                    message: Some(make_message()),
+                    message: make_message(),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -1990,7 +2003,7 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
         let mut req = send_req(None, None);
-        req.message.as_mut().unwrap().parts = vec![
+        req.message.parts = vec![
             Part::data(serde_json::json!({"value": "unsupported"}))
                 .with_media_type("application/x-unsupported-type-12345"),
         ];
@@ -2006,8 +2019,7 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
         let mut req = send_req(None, None);
-        req.message.as_mut().unwrap().parts =
-            vec![Part::text("hello").with_media_type("text/plain")];
+        req.message.parts = vec![Part::text("hello").with_media_type("text/plain")];
         handler
             .send_message(&ServiceParams::new(), req)
             .await
@@ -2019,7 +2031,7 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler();
         let mut req = send_req(None, None);
-        req.message.as_mut().unwrap().parts = vec![
+        req.message.parts = vec![
             Part::data(serde_json::json!({"value": "x"})).with_media_type("application/x-anything"),
         ];
         handler
@@ -2045,7 +2057,7 @@ mod tests {
                     &params,
                     SendMessageRequest {
                         artifact_updates: Vec::new(),
-                        message: Some(make_message()),
+                        message: make_message(),
                         configuration: None,
                         metadata: None,
                         tenant: None,
@@ -2509,7 +2521,7 @@ mod tests {
         let params = ServiceParams::new();
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: Some(make_message()),
+            message: make_message(),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -2572,7 +2584,7 @@ mod tests {
                 &params,
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message: Some(message),
+                    message,
                     configuration: Some(SendMessageConfiguration {
                         if_generation_match: None,
                         timeline_length: None,
@@ -3133,7 +3145,7 @@ mod tests {
                 .is_err()
         );
         let mut follow_up = send_req(Some(&opening.id), None);
-        follow_up.message.as_mut().unwrap().parts = vec![Part::text("done")];
+        follow_up.message.parts = vec![Part::text("done")];
         handler.send_message(&params, follow_up).await.unwrap();
         loop {
             let event = tokio::time::timeout(Duration::from_secs(2), events.next())
@@ -3154,7 +3166,7 @@ mod tests {
         let params = ServiceParams::new();
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: Some(make_message()),
+            message: make_message(),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -3284,7 +3296,7 @@ mod tests {
                 &ServiceParams::new(),
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message: Some(turn1),
+                    message: turn1,
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -3306,7 +3318,7 @@ mod tests {
                     &ServiceParams::new(),
                     SendMessageRequest {
                         artifact_updates: Vec::new(),
-                        message: Some(turn),
+                        message: turn,
                         configuration: None,
                         metadata: None,
                         tenant: None,
@@ -3344,7 +3356,7 @@ mod tests {
                 &ServiceParams::new(),
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message: Some(message),
+                    message,
                     configuration: Some(SendMessageConfiguration {
                         if_generation_match: None,
                         timeline_length: None,
@@ -3423,7 +3435,7 @@ mod tests {
         seed_task(&handler, "t1", "c1").await;
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: Some(msg),
+            message: msg,
             configuration: None,
             metadata: None,
             tenant: None,
@@ -3795,7 +3807,7 @@ mod tests {
         let (handler, _release) = make_resumable_handler();
         seed_task(&handler, "active-cancel", "context").await;
         let mut request = send_req(Some("active-cancel"), Some("context"));
-        request.message.as_mut().unwrap().parts = vec![Part::text("wait")];
+        request.message.parts = vec![Part::text("wait")];
         let mut events = handler
             .send_streaming_message(&ServiceParams::new(), request)
             .await
@@ -4256,7 +4268,8 @@ mod tests {
         let active = handler.execution_manager.get(&task.id).await.unwrap();
         let capacity = active.inputs.sender.capacity();
         let mut request = send_req(None, None);
-        request.message = None;
+        request.message = Message::new(Role::Unspecified, Vec::new());
+        request.message.message_id.clear();
         request.artifact_updates = vec![TaskArtifactUpdateEvent {
             task_id: task.id.clone(),
             context_id: task.context_id.clone(),
@@ -4555,7 +4568,7 @@ mod tests {
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
 
-                    message: Some(follow_up),
+                    message: follow_up,
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -4961,7 +4974,7 @@ mod upstream_regressions {
         );
         let params = ServiceParams::new();
         let ask = SendMessageRequest {
-            message: Some(Message::new(Role::User, vec![Part::text("ask")])),
+            message: Message::new(Role::User, vec![Part::text("ask")]),
             ..send_request()
         };
         handler.send_message(&params, ask).await.unwrap();
@@ -4986,10 +4999,10 @@ mod upstream_regressions {
             .id
             .clone();
         let answer = SendMessageRequest {
-            message: Some(Message {
+            message: Message {
                 task_id: Some(task_id.clone()),
                 ..Message::new(Role::User, vec![Part::text("main.rs")])
-            }),
+            },
             ..send_request()
         };
         handler.send_message(&params, answer).await.unwrap();
@@ -5063,7 +5076,7 @@ mod upstream_regressions {
         async fn turn(handler: &DefaultRequestHandler, streaming: bool, message: Message) {
             let params = ServiceParams::new();
             let request = SendMessageRequest {
-                message: Some(message),
+                message,
                 ..send_request()
             };
             if streaming {

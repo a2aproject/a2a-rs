@@ -16,7 +16,8 @@ This crate is published as `a2a-server-lf` and imported in Rust as `a2a_server`.
 `ctx.execution_id` is a server-generated identifier for one execution. It stays
 the same while that execution reads queued inputs and changes when the same
 task starts another execution, including unread-input handoff. Capture it
-alongside `ctx.task_id` when spawning workers or recording traces. Cancellation receives the
+alongside `ctx.task_id` when spawning workers or recording traces. Typed
+`Agent::start` receives the same ID in `NewMessage`; cancellation receives the
 active execution's ID, or a fresh ID when no execution is active. This ID is SDK
 context and is not added to protocol task objects or events.
 
