@@ -335,10 +335,14 @@ async fn spawn_grpc_server() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 async fn spawn_default_handler_grpc_server() -> (String, tokio::task::JoinHandle<()>) {
-    let handler = Arc::new(DefaultRequestHandler::new(
-        StoredTaskExecutor,
-        InMemoryTaskStore::new(),
-    ));
+    let handler = Arc::new(
+        DefaultRequestHandler::new(StoredTaskExecutor, InMemoryTaskStore::new()).with_capabilities(
+            a2a::AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            },
+        ),
+    );
     let service = A2aServiceServer::new(GrpcHandler::new(handler));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -375,6 +379,10 @@ fn send_message_request() -> SendMessageRequest {
         metadata: None,
         tenant: None,
     }
+}
+
+fn versioned_params() -> ServiceParams {
+    ServiceParams::from([("a2a-version".to_string(), vec!["1.1".to_string()])])
 }
 
 #[tokio::test]

@@ -377,13 +377,18 @@ async fn spawn_push_http_server() -> (String, tokio::task::JoinHandle<()>) {
         store.create(task).await.unwrap();
     }
     let handler = Arc::new(
-        DefaultRequestHandler::new(PushTransportExecutor, store).with_push_notifications(
-            InMemoryPushConfigStore::new(),
-            HttpPushSender::new(Some(HttpPushSenderConfig {
-                validate_urls: false,
+        DefaultRequestHandler::new(PushTransportExecutor, store)
+            .with_capabilities(a2a::AgentCapabilities {
+                streaming: Some(true),
                 ..Default::default()
-            })),
-        ),
+            })
+            .with_push_notifications(
+                InMemoryPushConfigStore::new(),
+                HttpPushSender::new(Some(HttpPushSenderConfig {
+                    validate_urls: false,
+                    ..Default::default()
+                })),
+            ),
     );
     let app = Router::new()
         .nest("/rest", rest_router(handler.clone()))
@@ -448,12 +453,15 @@ async fn recv_push(receiver: &mut mpsc::UnboundedReceiver<CapturedPush>) -> Capt
         .unwrap()
 }
 
-/// A2A-Version header a real client sends (§3.6.1); every binding rejects
-/// a request without one (§3.6.2).
+/// The A2A-Version header a real 1.1 client sends.
 fn versioned_params() -> ServiceParams {
     let mut params = ServiceParams::new();
     params.insert(SVC_PARAM_VERSION.to_string(), vec![VERSION.to_string()]);
     params
+}
+
+fn jsonrpc_service_params() -> ServiceParams {
+    versioned_params()
 }
 
 fn send_message_request() -> SendMessageRequest {

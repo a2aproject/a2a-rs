@@ -258,7 +258,8 @@ async fn caller_context_survives_unread_handoff_and_remaining_queued_inputs() {
 
 #[tokio::test]
 async fn unary_streaming_and_live_inputs_carry_their_own_trusted_context() {
-    for mode in ["live"] {
+    {
+        let mode = "live";
         let (handler, mut receiver, _) = handler();
         let (id, _owner) = start(&handler, &params("alice", Some("a")), "start").await;
         let initial_execution = caller(seen(&mut receiver).await, "alice", "start", true);
@@ -421,7 +422,8 @@ async fn unread_input_rejection_is_private_to_the_exchange_that_accepted_it() {
 
 #[tokio::test]
 async fn native_live_rejections_stay_private_and_unary_rejections_are_not_broadcast() {
-    for native_input in [true] {
+    {
+        let native_input = true;
         let (handler, _receiver, release) = handler();
         let a = params("alice", Some("a"));
         let (id, mut owner) = start(&handler, &a, "hold-finish").await;
