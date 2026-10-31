@@ -1804,6 +1804,7 @@ dependencies = [
  "a2a-lf",
  "a2a-pb",
  "a2a-server-lf",
+ "async-stream",
  "async-trait",
  "axum",
  "chrono",

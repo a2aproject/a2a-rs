@@ -371,13 +371,18 @@ async fn spawn_push_http_server() -> (String, tokio::task::JoinHandle<()>) {
         store.create(task).await.unwrap();
     }
     let handler = Arc::new(
-        DefaultRequestHandler::new(PushTransportExecutor, store).with_push_notifications(
-            InMemoryPushConfigStore::new(),
-            HttpPushSender::new(Some(HttpPushSenderConfig {
-                validate_urls: false,
+        DefaultRequestHandler::new(PushTransportExecutor, store)
+            .with_capabilities(a2a::AgentCapabilities {
+                streaming: Some(true),
                 ..Default::default()
-            })),
-        ),
+            })
+            .with_push_notifications(
+                InMemoryPushConfigStore::new(),
+                HttpPushSender::new(Some(HttpPushSenderConfig {
+                    validate_urls: false,
+                    ..Default::default()
+                })),
+            ),
     );
     let app = Router::new()
         .nest("/rest", rest_router(handler.clone()))
@@ -442,12 +447,15 @@ async fn recv_push(receiver: &mut mpsc::UnboundedReceiver<CapturedPush>) -> Capt
         .unwrap()
 }
 
-/// A2A-Version header a real client sends. Only JSON-RPC checks it
-/// (§3.6.2); the REST tests use bare `ServiceParams::new()`.
-fn jsonrpc_service_params() -> ServiceParams {
+/// The A2A-Version header a real 1.1 client sends.
+fn versioned_params() -> ServiceParams {
     let mut params = ServiceParams::new();
     params.insert(SVC_PARAM_VERSION.to_string(), vec![VERSION.to_string()]);
     params
+}
+
+fn jsonrpc_service_params() -> ServiceParams {
+    versioned_params()
 }
 
 fn send_message_request() -> SendMessageRequest {
@@ -466,13 +474,13 @@ async fn rest_transport_end_to_end() {
     let transport = RestTransport::new(Client::new(), format!("{base_url}/rest"));
 
     let send_resp = transport
-        .send_message(&ServiceParams::new(), &send_message_request())
+        .send_message(&versioned_params(), &send_message_request())
         .await;
     assert!(matches!(send_resp.unwrap(), SendMessageResponse::Task(_)));
 
     let task = transport
         .get_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &GetTaskRequest {
                 current_generation: None,
                 timeline_length: None,
@@ -487,7 +495,7 @@ async fn rest_transport_end_to_end() {
 
     let not_found = transport
         .get_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &GetTaskRequest {
                 current_generation: None,
                 timeline_length: None,
@@ -502,7 +510,7 @@ async fn rest_transport_end_to_end() {
 
     let list = transport
         .list_tasks(
-            &ServiceParams::new(),
+            &versioned_params(),
             &ListTasksRequest {
                 timeline_length: None,
                 context_id: Some("ctx-1".to_string()),
@@ -521,7 +529,7 @@ async fn rest_transport_end_to_end() {
 
     let canceled = transport
         .cancel_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &CancelTaskRequest {
                 id: "task-1".to_string(),
                 metadata: None,
@@ -534,7 +542,7 @@ async fn rest_transport_end_to_end() {
 
     let cancel_missing = transport
         .cancel_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &CancelTaskRequest {
                 id: "missing".to_string(),
                 metadata: None,
@@ -547,7 +555,7 @@ async fn rest_transport_end_to_end() {
 
     let subscribed = transport
         .subscribe_to_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &SubscribeToTaskRequest {
                 last_seen_generation: None,
                 id: "task-1".to_string(),
@@ -560,14 +568,14 @@ async fn rest_transport_end_to_end() {
     assert_eq!(events.len(), 1);
 
     let created = transport
-        .create_push_config(&ServiceParams::new(), &sample_push_config("cfg-1"))
+        .create_push_config(&versioned_params(), &sample_push_config("cfg-1"))
         .await
         .unwrap();
     assert_eq!(created.task_id, "task-1");
 
     let created_missing = transport
         .create_push_config(
-            &ServiceParams::new(),
+            &versioned_params(),
             &TaskPushNotificationConfig {
                 task_id: "missing".to_string(),
                 ..sample_push_config("cfg-1")
@@ -579,7 +587,7 @@ async fn rest_transport_end_to_end() {
 
     let fetched = transport
         .get_push_config(
-            &ServiceParams::new(),
+            &versioned_params(),
             &GetTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "cfg-1".to_string(),
@@ -592,7 +600,7 @@ async fn rest_transport_end_to_end() {
 
     let fetched_missing = transport
         .get_push_config(
-            &ServiceParams::new(),
+            &versioned_params(),
             &GetTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "missing".to_string(),
@@ -605,7 +613,7 @@ async fn rest_transport_end_to_end() {
 
     let configs = transport
         .list_push_configs(
-            &ServiceParams::new(),
+            &versioned_params(),
             &ListTaskPushNotificationConfigsRequest {
                 task_id: "task-1".to_string(),
                 page_size: Some(5),
@@ -619,7 +627,7 @@ async fn rest_transport_end_to_end() {
 
     transport
         .delete_push_config(
-            &ServiceParams::new(),
+            &versioned_params(),
             &DeleteTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "cfg-1".to_string(),
@@ -631,7 +639,7 @@ async fn rest_transport_end_to_end() {
 
     let delete_missing = transport
         .delete_push_config(
-            &ServiceParams::new(),
+            &versioned_params(),
             &DeleteTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "missing".to_string(),
@@ -866,7 +874,7 @@ async fn rest_transport_push_delivery_end_to_end() {
 
     transport
         .create_push_config(
-            &ServiceParams::new(),
+            &versioned_params(),
             &TaskPushNotificationConfig {
                 protocol_version: None,
                 task_id: "task-rest-push".to_string(),
@@ -888,7 +896,7 @@ async fn rest_transport_push_delivery_end_to_end() {
     request.message.context_id = Some("ctx-rest-push".to_string());
 
     let response = transport
-        .send_message(&ServiceParams::new(), &request)
+        .send_message(&versioned_params(), &request)
         .await
         .unwrap();
     assert!(matches!(response, SendMessageResponse::Task(_)));

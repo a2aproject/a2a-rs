@@ -7,9 +7,10 @@ use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::IntoResponse,
+    middleware::Next,
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream::BoxStream};
@@ -17,13 +18,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::handler::RequestHandler;
-use crate::middleware::{ServiceParams, extract_service_params};
+use crate::handler::{LiveResponse, RequestHandler};
+use crate::middleware::{ServiceParams, check_a2a_version, extract_service_params};
 use crate::sse;
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
 const REST_SEND_MESSAGE_LEGACY_PATH: &str = "/message/send";
 const REST_STREAM_MESSAGE_PATH: &str = "/message:stream";
+const REST_LIVE_MESSAGE_PATH: &str = "/message:live";
 const REST_STREAM_MESSAGE_LEGACY_PATH: &str = "/message/stream";
 const REST_EXTENDED_AGENT_CARD_PATH: &str = "/extendedAgentCard";
 const REST_EXTENDED_AGENT_CARD_LEGACY_PATH: &str = "/agent-card/extended";
@@ -78,6 +80,10 @@ pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
             axum::routing::post(handle_stream_message::<H>),
         )
         .route(
+            REST_LIVE_MESSAGE_PATH,
+            axum::routing::post(handle_live_message::<H>),
+        )
+        .route(
             "/tasks/{id}",
             axum::routing::get(handle_get_task_or_subscribe::<H>)
                 .post(handle_post_task_action::<H>),
@@ -119,7 +125,16 @@ pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
         .layer(axum::extract::DefaultBodyLimit::max(
             crate::jsonrpc::MAX_REQUEST_BODY_BYTES,
         ))
+        .layer(axum::middleware::from_fn(validate_protocol_version))
         .with_state(state)
+}
+
+async fn validate_protocol_version(request: Request, next: Next) -> Response {
+    let params = extract_service_params(request.headers());
+    match check_a2a_version(&params) {
+        Ok(()) => next.run(request).await,
+        Err(error) => rest_error_response(error),
+    }
 }
 
 async fn handle_send_message<H: RequestHandler>(
@@ -150,6 +165,28 @@ async fn handle_stream_message<H: RequestHandler>(
     let params = extract_service_params(&headers);
     match state.handler.send_streaming_message(&params, req).await {
         Ok(stream) => sse::sse_from_stream(protojson_stream(stream)).into_response(),
+        Err(e) => rest_error_response(e),
+    }
+}
+
+/// `POST /message:live`: the call that opens a live exchange is its downlink
+/// (an event stream); a later call for the same task is input to it and gets
+/// the task as it stands.
+async fn handle_live_message<H: RequestHandler>(
+    State(state): State<RestState<H>>,
+    headers: HeaderMap,
+    Json(raw_req): Json<Value>,
+) -> impl IntoResponse {
+    let req = match protojson_conv::from_value::<StreamRequest>(raw_req) {
+        Ok(req) => req,
+        Err(e) => return rest_payload_error_response(e),
+    };
+    let params = extract_service_params(&headers);
+    match state.handler.send_live_request(&params, req).await {
+        Ok(LiveResponse::Stream(stream)) => {
+            sse::sse_from_stream(protojson_stream(stream)).into_response()
+        }
+        Ok(LiveResponse::Ack(task)) => protojson_json_response(&*task),
         Err(e) => rest_error_response(e),
     }
 }
@@ -624,10 +661,15 @@ mod tests {
         }
     }
 
+    /// The REST test requests model a client that has negotiated A2A 1.1.
+    fn versioned_request() -> axum::http::request::Builder {
+        Request::builder().header("a2a-version", "1.1")
+    }
+
     fn make_app() -> axum::Router {
         let handler = Arc::new(
             DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new()).with_capabilities(
-                AgentCapabilities {
+                a2a::AgentCapabilities {
                     streaming: Some(true),
                     ..Default::default()
                 },
@@ -643,6 +685,10 @@ mod tests {
                 EchoExecutor,
                 crate::test_util::seeded_task_store("t1").await,
             )
+            .with_capabilities(a2a::AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            })
             .with_push_config_store(InMemoryPushConfigStore::new()),
         );
         rest_router(handler)
@@ -658,7 +704,7 @@ mod tests {
                 "parts": [{"text": "hello"}]
             }
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri(REST_SEND_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -666,6 +712,32 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_protocol_version_is_required_and_supported_versions_are_accepted() {
+        let app = rest_router(Arc::new(
+            DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new()).with_capabilities(
+                a2a::AgentCapabilities {
+                    streaming: Some(true),
+                    ..Default::default()
+                },
+            ),
+        ));
+        let request = |version: Option<&str>| {
+            let mut builder = Request::builder().uri("/tasks").method("GET");
+            if let Some(version) = version {
+                builder = builder.header("a2a-version", version);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+
+        let missing = app.clone().oneshot(request(None)).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let unsupported = app.clone().oneshot(request(Some("2.0"))).await.unwrap();
+        assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+        let supported = app.oneshot(request(Some("1.0"))).await.unwrap();
+        assert_eq!(supported.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -680,7 +752,7 @@ mod tests {
                 "parts": [{"text": "hello"}]
             }
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri(REST_SEND_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -723,7 +795,7 @@ mod tests {
                 "parts": [{"text": "hello"}]
             }
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri(REST_SEND_MESSAGE_LEGACY_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -736,7 +808,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_task_not_found() {
         let app = make_app();
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/nonexistent")
             .method("GET")
             .body(Body::empty())
@@ -748,7 +820,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_tasks_empty() {
         let app = make_app();
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks")
             .method("GET")
             .body(Body::empty())
@@ -765,7 +837,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_task_not_found() {
         let app = make_app();
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/nonexistent:cancel")
             .method("POST")
             .header("content-type", "application/json")
@@ -781,7 +853,7 @@ mod tests {
         let body = serde_json::json!({
             "url": "http://example.com/callback"
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("POST")
             .header("content-type", "application/json")
@@ -798,7 +870,7 @@ mod tests {
             "id": "cfg1",
             "url": "http://example.com/callback"
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("POST")
             .header("content-type", "application/json")
@@ -821,7 +893,7 @@ mod tests {
             "id": "cfg1",
             "url": "http://example.com/callback"
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("POST")
             .header("content-type", "application/json")
@@ -843,7 +915,7 @@ mod tests {
             "taskId": "other-task",
             "url": "http://example.com/callback"
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("POST")
             .header("content-type", "application/json")
@@ -856,7 +928,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_extended_agent_card() {
         let app = make_app();
-        let req = Request::builder()
+        let req = versioned_request()
             .uri(REST_EXTENDED_AGENT_CARD_PATH)
             .method("GET")
             .body(Body::empty())
@@ -1045,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_to_task_not_found() {
         let app = make_app();
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/nonexistent:subscribe")
             .method("GET")
             .body(Body::empty())
@@ -1064,7 +1136,7 @@ mod tests {
                 "parts": [{"text": "hello"}]
             }
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri(REST_STREAM_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -1078,7 +1150,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_push_config_not_found() {
         let app = make_app();
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs/cfg1")
             .method("GET")
             .body(Body::empty())
@@ -1091,7 +1163,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_push_configs() {
         let app = make_push_app().await;
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("GET")
             .body(Body::empty())
@@ -1107,7 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_push_config() {
         let app = make_app();
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs/cfg1")
             .method("DELETE")
             .body(Body::empty())
@@ -1123,7 +1195,7 @@ mod tests {
             "id": "cfg1",
             "url": "http://example.com/callback"
         });
-        let create_req = Request::builder()
+        let create_req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("POST")
             .header("content-type", "application/json")
@@ -1132,7 +1204,7 @@ mod tests {
         let create_resp = app.clone().oneshot(create_req).await.unwrap();
         assert_eq!(create_resp.status(), StatusCode::OK);
 
-        let delete_req = Request::builder()
+        let delete_req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs/cfg1")
             .method("DELETE")
             .body(Body::empty())
@@ -1140,7 +1212,7 @@ mod tests {
         let delete_resp = app.clone().oneshot(delete_req).await.unwrap();
         assert_eq!(delete_resp.status(), StatusCode::OK);
 
-        let list_req = Request::builder()
+        let list_req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("GET")
             .body(Body::empty())
@@ -1156,7 +1228,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_tasks_with_query_params() {
         let app = make_app();
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks?contextId=c1&pageSize=5&pageToken=&historyLength=3&includeArtifacts=true&statusTimestampAfter=2025-01-01T00:00:00Z")
             .method("GET")
             .body(Body::empty())
@@ -1168,7 +1240,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_tasks_invalid_status_returns_bad_request() {
         let app = make_app();
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks?status=invalid")
             .method("GET")
             .body(Body::empty())
@@ -1192,7 +1264,7 @@ mod tests {
                 "parts": [{"text": "hi"}]
             }
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri(REST_SEND_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -1223,7 +1295,7 @@ mod tests {
                 "parts": [{"text": "hi"}]
             }
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri(REST_STREAM_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -1247,7 +1319,7 @@ mod tests {
     async fn test_get_task_propagates_headers_as_service_params() {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/some-id")
             .method("GET")
             .header("authorization", "Bearer get-task-token")
@@ -1268,7 +1340,7 @@ mod tests {
     async fn test_list_tasks_propagates_headers_as_service_params() {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks")
             .method("GET")
             .header("authorization", "Bearer list-tasks-token")
@@ -1287,7 +1359,7 @@ mod tests {
     async fn test_cancel_task_propagates_headers_as_service_params() {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/some-id:cancel")
             .method("POST")
             .header("authorization", "Bearer cancel-token")
@@ -1307,7 +1379,7 @@ mod tests {
         // /tasks/{id}/cancel routes through handle_cancel_task_legacy.
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/some-id/cancel")
             .method("POST")
             .header("authorization", "Bearer cancel-legacy-token")
@@ -1330,7 +1402,7 @@ mod tests {
             "id": "cfg1",
             "url": "http://example.com/callback"
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("POST")
             .header("content-type", "application/json")
@@ -1350,7 +1422,7 @@ mod tests {
     async fn test_list_push_configs_propagates_headers_as_service_params() {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("GET")
             .header("authorization", "Bearer push-list-token")
@@ -1369,7 +1441,7 @@ mod tests {
     async fn test_get_push_config_propagates_headers_as_service_params() {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs/cfg1")
             .method("GET")
             .header("authorization", "Bearer push-get-token")
@@ -1388,7 +1460,7 @@ mod tests {
     async fn test_delete_push_config_propagates_headers_as_service_params() {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/t1/pushNotificationConfigs/cfg1")
             .method("DELETE")
             .header("authorization", "Bearer push-delete-token")
@@ -1407,7 +1479,7 @@ mod tests {
     async fn test_get_extended_agent_card_propagates_headers_as_service_params() {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
-        let req = Request::builder()
+        let req = versioned_request()
             .uri(REST_EXTENDED_AGENT_CARD_PATH)
             .method("GET")
             .header("authorization", "Bearer card-token")
@@ -1426,7 +1498,7 @@ mod tests {
     async fn test_subscribe_to_task_propagates_headers_as_service_params() {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/some-id:subscribe")
             .method("GET")
             .header("authorization", "Bearer subscribe-token")
@@ -1447,7 +1519,7 @@ mod tests {
         // /tasks/{id}/subscribe routes through handle_subscribe_to_task_legacy.
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
-        let req = Request::builder()
+        let req = versioned_request()
             .uri("/tasks/some-id/subscribe")
             .method("GET")
             .header("authorization", "Bearer subscribe-legacy-token")
@@ -1475,7 +1547,7 @@ mod tests {
                 "parts": [{"text": "hello"}]
             }
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri(REST_SEND_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -1488,7 +1560,7 @@ mod tests {
         let task_id = send_resp["task"]["id"].as_str().unwrap();
 
         let app = make_app();
-        let req = Request::builder()
+        let req = versioned_request()
             .uri(format!("/tasks/{}?historyLength=5", task_id))
             .method("GET")
             .body(Body::empty())
@@ -1504,7 +1576,7 @@ mod tests {
         let body = serde_json::json!({
             "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hello"}]}
         });
-        let req = Request::builder()
+        let req = versioned_request()
             .uri(REST_SEND_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -1518,7 +1590,7 @@ mod tests {
         assert!(sent["task"]["timeline"].as_array().unwrap().len() > 1);
 
         let get = |query: &str| {
-            Request::builder()
+            versioned_request()
                 .uri(format!("/tasks/{task_id}{query}"))
                 .method("GET")
                 .body(Body::empty())
@@ -1549,7 +1621,7 @@ mod tests {
     async fn test_request_body_over_the_limit_is_rejected() {
         let app = make_app();
         let oversized = Body::from("x".repeat(crate::jsonrpc::MAX_REQUEST_BODY_BYTES + 1));
-        let req = Request::builder()
+        let req = versioned_request()
             .uri(REST_SEND_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")

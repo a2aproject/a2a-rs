@@ -319,10 +319,14 @@ async fn spawn_grpc_server() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 async fn spawn_default_handler_grpc_server() -> (String, tokio::task::JoinHandle<()>) {
-    let handler = Arc::new(DefaultRequestHandler::new(
-        StoredTaskExecutor,
-        InMemoryTaskStore::new(),
-    ));
+    let handler = Arc::new(
+        DefaultRequestHandler::new(StoredTaskExecutor, InMemoryTaskStore::new()).with_capabilities(
+            a2a::AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            },
+        ),
+    );
     let service = A2aServiceServer::new(GrpcHandler::new(handler));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -355,19 +359,23 @@ fn send_message_request() -> SendMessageRequest {
     }
 }
 
+fn versioned_params() -> ServiceParams {
+    ServiceParams::from([("a2a-version".to_string(), vec!["1.1".to_string()])])
+}
+
 #[tokio::test]
 async fn grpc_transport_end_to_end() {
     let (endpoint, handle) = spawn_grpc_server().await;
     let transport = GrpcTransport::connect(endpoint).await.unwrap();
 
     let send_resp = transport
-        .send_message(&ServiceParams::new(), &send_message_request())
+        .send_message(&versioned_params(), &send_message_request())
         .await;
     assert!(matches!(send_resp.unwrap(), SendMessageResponse::Task(_)));
 
     let task = transport
         .get_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &GetTaskRequest {
                 current_generation: None,
                 timeline_length: None,
@@ -382,7 +390,7 @@ async fn grpc_transport_end_to_end() {
 
     let list = transport
         .list_tasks(
-            &ServiceParams::new(),
+            &versioned_params(),
             &ListTasksRequest {
                 timeline_length: None,
                 context_id: Some("ctx-1".to_string()),
@@ -401,7 +409,7 @@ async fn grpc_transport_end_to_end() {
 
     let canceled = transport
         .cancel_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &CancelTaskRequest {
                 id: "task-1".to_string(),
                 metadata: None,
@@ -413,14 +421,14 @@ async fn grpc_transport_end_to_end() {
     assert_eq!(canceled.status.state, TaskState::Canceled);
 
     let created = transport
-        .create_push_config(&ServiceParams::new(), &sample_push_config("cfg-1"))
+        .create_push_config(&versioned_params(), &sample_push_config("cfg-1"))
         .await
         .unwrap();
     assert_eq!(created.id.as_deref(), Some("cfg-1"));
 
     let fetched = transport
         .get_push_config(
-            &ServiceParams::new(),
+            &versioned_params(),
             &GetTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "cfg-1".to_string(),
@@ -433,7 +441,7 @@ async fn grpc_transport_end_to_end() {
 
     let configs = transport
         .list_push_configs(
-            &ServiceParams::new(),
+            &versioned_params(),
             &ListTaskPushNotificationConfigsRequest {
                 task_id: "task-1".to_string(),
                 page_size: Some(10),
@@ -447,7 +455,7 @@ async fn grpc_transport_end_to_end() {
 
     transport
         .delete_push_config(
-            &ServiceParams::new(),
+            &versioned_params(),
             &DeleteTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "cfg-1".to_string(),
@@ -459,7 +467,7 @@ async fn grpc_transport_end_to_end() {
 
     let card = transport
         .get_extended_agent_card(
-            &ServiceParams::new(),
+            &versioned_params(),
             &GetExtendedAgentCardRequest { tenant: None },
         )
         .await
@@ -476,7 +484,7 @@ async fn grpc_transport_streaming_and_error_paths() {
     let transport = GrpcTransport::connect(endpoint.clone()).await.unwrap();
 
     let stream = transport
-        .send_streaming_message(&ServiceParams::new(), &send_message_request())
+        .send_streaming_message(&versioned_params(), &send_message_request())
         .await
         .unwrap();
     let events: Vec<_> = stream.collect().await;
@@ -488,7 +496,7 @@ async fn grpc_transport_streaming_and_error_paths() {
 
     let subscribe_stream = transport
         .subscribe_to_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &SubscribeToTaskRequest {
                 last_seen_generation: None,
                 id: "task-1".to_string(),
@@ -502,7 +510,7 @@ async fn grpc_transport_streaming_and_error_paths() {
 
     let err = transport
         .get_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &GetTaskRequest {
                 current_generation: None,
                 timeline_length: None,
@@ -517,7 +525,7 @@ async fn grpc_transport_streaming_and_error_paths() {
 
     let err = transport
         .delete_push_config(
-            &ServiceParams::new(),
+            &versioned_params(),
             &DeleteTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "missing".to_string(),
@@ -550,7 +558,7 @@ async fn grpc_transport_accepts_bare_host_port_endpoints() {
     let transport = GrpcTransport::connect(bare_endpoint.clone()).await.unwrap();
     let task = transport
         .get_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &GetTaskRequest {
                 current_generation: None,
                 timeline_length: None,
@@ -572,7 +580,7 @@ async fn grpc_transport_accepts_bare_host_port_endpoints() {
         .await
         .unwrap();
     let response = transport
-        .send_message(&ServiceParams::new(), &send_message_request())
+        .send_message(&versioned_params(), &send_message_request())
         .await
         .unwrap();
     assert!(matches!(response, SendMessageResponse::Task(_)));
@@ -588,7 +596,7 @@ async fn grpc_transport_treats_zero_page_size_as_unset() {
 
     let sent = transport
         .send_message(
-            &ServiceParams::new(),
+            &versioned_params(),
             &SendMessageRequest {
                 artifact_updates: Vec::new(),
                 message: Message::new(Role::User, vec![Part::text("hello")]),
@@ -607,7 +615,7 @@ async fn grpc_transport_treats_zero_page_size_as_unset() {
 
     let listed = transport
         .list_tasks(
-            &ServiceParams::new(),
+            &versioned_params(),
             &ListTasksRequest {
                 timeline_length: None,
                 context_id: Some(task.context_id.clone()),
