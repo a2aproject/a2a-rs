@@ -888,4 +888,22 @@ mod tests {
             vec![Some("caller-chosen".to_string()), None]
         );
     }
+    #[tokio::test]
+    async fn legacy_transports_reject_live_openings_explicitly() {
+        let client = make_client().with_tenant("tenant-a");
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        let error = client
+            .send_live_message(&request)
+            .await
+            .err()
+            .expect("legacy transport must refuse live input");
+        assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+    }
 }

@@ -575,4 +575,33 @@ mod stream_decode_tests {
         let item = decode_stream_item(Err(A2AError::internal("boom")));
         assert!(matches!(item, Some(Err(_))));
     }
+    #[tokio::test]
+    async fn live_uplink_preserves_routing_and_reports_a_closed_exchange() {
+        use a2a_client::LiveUplink;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let uplink = SlimLiveUplink { sender };
+        let request = StreamRequest {
+            tenant: Some("tenant-a".into()),
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: Some("tenant-a".into()),
+                last_seen_generation: Some(i64::MAX),
+            }),
+        };
+        assert!(matches!(
+            uplink.send(request.clone()).await.unwrap(),
+            a2a_client::LiveAck::Sent
+        ));
+        let wire = receiver.recv().await.unwrap();
+        let wire =
+            decode_proto_response::<a2a_pb::proto::StreamRequest>(wire, "StreamRequest").unwrap();
+        assert_eq!(pbconv::from_proto_stream_request(&wire), request);
+        drop(receiver);
+        let error = uplink
+            .send(request)
+            .await
+            .err()
+            .expect("closed uplink must reject the request");
+        assert_eq!(error.code, error_code::INVALID_REQUEST);
+    }
 }

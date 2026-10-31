@@ -91,7 +91,13 @@ impl LiveSender {
                 _ => {}
             }
         }
-        self.uplink.send(request).await
+        let mut acknowledgement = self.uplink.send(request).await?;
+        if let (Some(tenant), LiveAck::Reopened(connection)) = (&self.tenant, &mut acknowledgement)
+        {
+            // A replacement downlink must retain the interface's routing tenant.
+            connection.sender = connection.sender.clone().with_tenant(tenant.clone());
+        }
+        Ok(acknowledgement)
     }
 
     /// Sends `message` to the task the exchange is bound to.

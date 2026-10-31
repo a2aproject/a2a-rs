@@ -972,4 +972,137 @@ mod tests {
         let transport = f.create(&card, &iface).await.unwrap();
         transport.destroy().await.unwrap();
     }
+    #[tokio::test]
+    async fn live_http_receipts_reopen_streams_and_preserve_exchange_and_tenant() {
+        use crate::{A2AClient, LiveAck};
+        for (rpc, streaming_opening) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let task = json!({"id":"task", "contextId":"context", "generation":"4",
+                    "status":{"state":"TASK_STATE_WORKING"}})
+                .to_string();
+                let sse = format!("data: {{\"task\":{task}}}\n\n");
+                let mut exchange = None;
+                for step in 0..4 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut raw = read_http_request(&mut socket).await;
+                    let boundary = raw.find("\r\n\r\n").unwrap() + 4;
+                    let length = raw[..boundary]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    while raw.len() < boundary + length {
+                        let mut bytes = [0; 1024];
+                        let read = socket.read(&mut bytes).await.unwrap();
+                        assert!(read > 0);
+                        raw.push_str(std::str::from_utf8(&bytes[..read]).unwrap());
+                    }
+                    assert!(raw.starts_with(if rpc {
+                        "POST /rpc HTTP/1.1"
+                    } else {
+                        "POST /message:live HTTP/1.1"
+                    }));
+                    let routing = raw[..boundary]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case(SDK_LIVE_EXCHANGE_HEADER)
+                                .then(|| value.trim().to_owned())
+                        })
+                        .unwrap();
+                    match &exchange {
+                        None => exchange = Some(routing),
+                        Some(expected) => assert_eq!(&routing, expected),
+                    }
+                    let envelope: Value = serde_json::from_str(&raw[boundary..]).unwrap();
+                    let body = if rpc {
+                        assert_eq!(envelope["method"], "SendLiveMessage");
+                        &envelope["params"]
+                    } else {
+                        &envelope
+                    };
+                    assert_eq!(body["tenant"], "tenant-a");
+                    let payload = if step == 2 || (step == 0 && streaming_opening) {
+                        "subscribe"
+                    } else {
+                        "sendMessage"
+                    };
+                    assert_eq!(body[payload]["tenant"], "tenant-a");
+                    let streamed = step == 2 || (step == 0 && streaming_opening);
+                    let rpc_json = json!({"jsonrpc":"2.0", "id":envelope["id"], "result":serde_json::from_str::<Value>(&task).unwrap()}).to_string();
+                    let rpc_sse = format!(
+                        "data: {}\n\n",
+                        json!({"jsonrpc":"2.0", "id":envelope["id"], "result":{"task":serde_json::from_str::<Value>(&task).unwrap()}})
+                    );
+                    let (kind, body) = match (streamed, rpc) {
+                        (true, false) => ("text/event-stream", &sse),
+                        (true, true) => ("text/event-stream", &rpc_sse),
+                        (false, false) => ("application/json", &task),
+                        (false, true) => ("application/json", &rpc_json),
+                    };
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let transport: Box<dyn Transport> = if rpc {
+                Box::new(crate::jsonrpc::JsonRpcTransport::new(
+                    Client::new(),
+                    format!("http://{address}/rpc"),
+                ))
+            } else {
+                Box::new(RestTransport::new(
+                    Client::new(),
+                    format!("http://{address}"),
+                ))
+            };
+            let client = A2AClient::new(transport).with_tenant("tenant-a");
+            let subscribe = || StreamRequest {
+                tenant: None,
+                payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                    id: "task".into(),
+                    tenant: None,
+                    last_seen_generation: None,
+                }),
+            };
+            let message = Message::new(Role::User, vec![Part::text("input")]);
+            let first = if streaming_opening {
+                subscribe()
+            } else {
+                StreamRequest {
+                    tenant: None,
+                    payload: StreamRequestPayload::SendMessage(SendMessageRequest {
+                        message: message.clone(),
+                        configuration: None,
+                        metadata: None,
+                        tenant: None,
+                        artifact_updates: Vec::new(),
+                    }),
+                }
+            };
+            let mut connection = client.send_live_message(&first).await.unwrap();
+            assert!(
+                matches!(connection.events.next().await.unwrap().unwrap(), StreamResponse::Task(task) if task.generation == 4)
+            );
+            assert!(connection.events.next().await.is_none());
+            assert!(
+                matches!(connection.sender.send_message(message.clone()).await.unwrap(), LiveAck::Task(task) if task.id == "task")
+            );
+            let LiveAck::Reopened(mut renewed) = connection.sender.send(subscribe()).await.unwrap()
+            else {
+                panic!("expected a new downlink")
+            };
+            assert!(
+                matches!(renewed.events.next().await.unwrap().unwrap(), StreamResponse::Task(task) if task.id == "task")
+            );
+            assert!(
+                matches!(renewed.sender.send_message(message).await.unwrap(), LiveAck::Task(task) if task.id == "task")
+            );
+            server.await.unwrap();
+        }
+    }
 }
