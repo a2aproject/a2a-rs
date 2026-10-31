@@ -272,6 +272,15 @@ impl DefaultRequestHandler {
         }
     }
 
+    /// A handler for an [`Agent`](crate::Agent), which decides for each message
+    /// whether a task exists.
+    pub fn from_agent(agent: impl crate::Agent, task_store: impl crate::TaskStore) -> Self {
+        Self::new(
+            crate::executor::AgentExecutorAdapter(Arc::new(agent)),
+            task_store,
+        )
+    }
+
     /// Bounds how long a `GetTask` carrying `currentGeneration` is held open
     /// when the task does not advance. The request then returns the current
     /// state, which the spec allows.
@@ -999,7 +1008,7 @@ impl DefaultRequestHandler {
         let include_task_snapshot_in_context = mode == StartMode::Blocking;
         // A new task is created by the executor: only a live exchange, which is
         // bound to its task from the first request, creates it up front.
-        let lazy = false;
+        let lazy = mode != StartMode::Bidi;
         let artifact_only = is_artifact_only(&req);
         let task_id = request_task_id(&req).unwrap_or_else(new_task_id);
 
