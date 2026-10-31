@@ -15,8 +15,9 @@ use crate::common::{
     A2A_COLLABORATIVE_CHANNEL_SERVICE, A2A_SLIMRPC_SERVICE, METHOD_CANCEL_TASK, METHOD_COLLABORATE,
     METHOD_CREATE_PUSH_CONFIG, METHOD_DELETE_PUSH_CONFIG, METHOD_GET_EXTENDED_AGENT_CARD,
     METHOD_GET_PUSH_CONFIG, METHOD_GET_TASK, METHOD_LIST_PUSH_CONFIGS, METHOD_LIST_TASKS,
-    METHOD_SEND_MESSAGE, METHOD_SEND_STREAMING_MESSAGE, METHOD_SUBSCRIBE_TO_TASK, ServiceParamsMap,
-    context_to_service_params, decode_proto_request, encode_proto_message,
+    METHOD_SEND_LIVE_MESSAGE, METHOD_SEND_MESSAGE, METHOD_SEND_STREAMING_MESSAGE,
+    METHOD_SUBSCRIBE_TO_TASK, ServiceParamsMap, context_to_service_params, decode_proto_request,
+    encode_proto_message,
 };
 use crate::errors::a2a_error_to_rpc_error;
 
@@ -84,6 +85,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
         );
 
         register_unary_stream_subscribe_to_task(server, self.handler.clone());
+        register_stream_stream_send_live_message(server, self.handler.clone());
 
         register_unary_unary::<H, proto::TaskPushNotificationConfig, _, _, _, _>(
             server,
@@ -233,6 +235,7 @@ fn register_unary_unary<H, ReqProto, ReqNative, ResNative, DecodeReq, EncodeRes>
             async move {
                 let proto_request = decode_proto_request::<ReqProto>(request, request_name)?;
                 let params = context_to_service_params(&context);
+                validate_protocol_version(&params)?;
                 let request = decode_req(&proto_request);
                 let response = call(handler, params, request)
                     .await
@@ -259,9 +262,58 @@ where
                     "SendMessageRequest",
                 )?;
                 let params = context_to_service_params(&context);
+                validate_protocol_version(&params)?;
                 let request = pbconv::from_proto_send_message_request(&proto_request);
                 let stream = handler
                     .send_streaming_message(&params, request)
+                    .await
+                    .map_err(|error| a2a_error_to_rpc_error(&error))?;
+
+                Ok(stream.map(map_stream_response))
+            }
+        },
+    );
+}
+
+/// `SendLiveMessage`: the client's requests are the uplink stream, the task's
+/// events the reply stream, for as long as the exchange lasts.
+fn register_stream_stream_send_live_message<H>(server: &slim_rpc::Server, handler: Arc<H>)
+where
+    H: RequestHandler,
+{
+    server.register_stream_stream::<_, Vec<u8>, Vec<u8>, _, _>(
+        A2A_SLIMRPC_SERVICE,
+        METHOD_SEND_LIVE_MESSAGE,
+        move |requests: slim_rpc::DecodedStream<Vec<u8>>, context: slim_rpc::Context| {
+            let handler = handler.clone();
+
+            async move {
+                let params = context_to_service_params(&context);
+                validate_protocol_version(&params)?;
+                // A request that cannot be read ends the uplink, and with it
+                // what the client can still say; the downlink goes on.
+                let uplink = requests
+                    .take_while(|item| futures::future::ready(item.is_ok()))
+                    .map(|item| {
+                        // A request that cannot be decoded is carried on as one
+                        // with no payload this version knows, which the
+                        // exchange refuses with a `StreamError`.
+                        item.ok()
+                            .and_then(|bytes| {
+                                decode_proto_request::<proto::StreamRequest>(bytes, "StreamRequest")
+                                    .ok()
+                            })
+                            .map_or_else(
+                                || a2a::StreamRequest {
+                                    tenant: None,
+                                    payload: a2a::StreamRequestPayload::Unrecognised,
+                                },
+                                |request| pbconv::from_proto_stream_request(&request),
+                            )
+                    })
+                    .boxed();
+                let stream = handler
+                    .send_live_message(&params, uplink)
                     .await
                     .map_err(|error| a2a_error_to_rpc_error(&error))?;
 
@@ -287,6 +339,7 @@ where
                     "SubscribeToTaskRequest",
                 )?;
                 let params = context_to_service_params(&context);
+                validate_protocol_version(&params)?;
                 let request = pbconv::from_proto_subscribe_to_task_request(&proto_request);
                 let stream = handler
                     .subscribe_to_task(&params, request)
@@ -307,9 +360,24 @@ fn map_stream_response(
         .map_err(|error| a2a_error_to_rpc_error(&error))
 }
 
+fn validate_protocol_version(params: &ServiceParamsMap) -> Result<(), slim_rpc::RpcError> {
+    a2a_server::middleware::check_a2a_version(params)
+        .map_err(|error| a2a_error_to_rpc_error(&error))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_slimrpc_protocol_version_validation() {
+        let mut params = ServiceParamsMap::new();
+        assert!(validate_protocol_version(&params).is_err());
+        params.insert("a2a-version".into(), vec!["1.1".into()]);
+        assert!(validate_protocol_version(&params).is_ok());
+        params.insert("a2a-version".into(), vec!["2.0".into()]);
+        assert!(validate_protocol_version(&params).is_err());
+    }
 
     #[test]
     fn test_slimrpc_handler_new() {
@@ -337,10 +405,14 @@ mod tests {
             }
         }
 
-        let handler = Arc::new(DefaultRequestHandler::new(
-            NoopExecutor,
-            InMemoryTaskStore::new(),
-        ));
+        let handler = Arc::new(
+            DefaultRequestHandler::new(NoopExecutor, InMemoryTaskStore::new()).with_capabilities(
+                a2a::AgentCapabilities {
+                    streaming: Some(true),
+                    ..Default::default()
+                },
+            ),
+        );
         let slimrpc_handler = SlimRpcHandler::new(handler);
         let _ = slimrpc_handler;
     }

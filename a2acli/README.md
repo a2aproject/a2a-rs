@@ -221,6 +221,24 @@ rather than printed a second time — under `-o json --stream` the output is
 JSONL a consumer reads incrementally, and a duplicate `Task` line there would
 look like a second, spurious transition.
 
+Against an A2A 1.1 server the reconnect also sends the highest task
+generation it has printed (`lastSeenGeneration`). A server that is still at
+that generation resumes without a snapshot, so nothing is repeated; one that
+is ahead, or that predates generations, opens with the snapshot as above.
+
+### Task generation (A2A 1.1)
+
+A 1.1 server numbers every change to a task (its `generation`) and records the
+conversation in the task's `timeline`. Three flags use them:
+
+- `--timeline-length N` on `send`, `task get` and `task list` limits how many
+  timeline entries come back (`0` omits the timeline).
+- `--if-generation-match N` on `send` rejects the message unless the task is
+  at generation `N`, so two clients cannot overwrite each other's turn. A
+  mismatch fails with `TASK_GENERATION_MISMATCH`.
+- `--current-generation N` on `task get` holds the request until the task's
+  generation exceeds `N` (or the server's long-poll timeout passes).
+
 ### Message parts
 
 A message can carry more than one part, built from repeatable,

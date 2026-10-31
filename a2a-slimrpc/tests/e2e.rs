@@ -30,6 +30,10 @@ const SEND_MESSAGE_METHOD: &str = "SendMessage";
 const SEND_STREAMING_MESSAGE_METHOD: &str = "SendStreamingMessage";
 const SHARED_SECRET: &str = "test-secret-with-sufficient-length-for-hmac-key";
 
+fn versioned_params() -> ServiceParams {
+    ServiceParams::from([("a2a-version".to_string(), vec!["1.1".to_string()])])
+}
+
 fn sample_message(role: Role, text: &str, task_id: &str) -> Message {
     Message {
         message_id: format!("msg-{text}"),
@@ -418,6 +422,113 @@ impl RequestHandler for TestHandler {
     ) -> Result<AgentCard, A2AError> {
         Ok(sample_agent_card(&format!("slimrpc://{}", self.target)))
     }
+
+    /// Opens with a task, then answers every message it is sent until "finish".
+    async fn send_live_message(
+        &self,
+        _params: &ServiceParams,
+        uplink: BoxStream<'static, StreamRequest>,
+    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        let events = stream::once(async {
+            Ok(StreamResponse::Task(sample_task(
+                "live-task",
+                TaskState::Working,
+            )))
+        })
+        .chain(
+            uplink
+                // The first request opened the exchange; the rest are answered.
+                .skip(1)
+                .map(|request| match request.payload {
+                    StreamRequestPayload::SendMessage(message) => {
+                        message.message.text().unwrap_or("").to_string()
+                    }
+                    _ => String::new(),
+                })
+                .take_while(|text| futures::future::ready(text != "finish"))
+                .map(|text| {
+                    Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                        generation: 0,
+                        task_id: "live-task".to_string(),
+                        context_id: "ctx-1".to_string(),
+                        status: TaskStatus {
+                            state: TaskState::Working,
+                            message: Some(Message::new(
+                                Role::Agent,
+                                vec![Part::text(format!("echo: {text}"))],
+                            )),
+                            timestamp: None,
+                        },
+                        metadata: None,
+                    }))
+                }),
+        )
+        .chain(stream::once(async {
+            Ok(StreamResponse::Task(sample_task(
+                "live-task",
+                TaskState::Completed,
+            )))
+        }));
+        Ok(Box::pin(events))
+    }
+}
+
+#[tokio::test]
+async fn slimrpc_carries_a_live_exchange() {
+    let env = TestEnv::new("transport-live").await;
+    let handler = Arc::new(TestHandler {
+        target: env.target(),
+    });
+    SlimRpcHandler::new(handler).register(&env.server);
+    env.start().await;
+    let transport = env.transport("live").await;
+
+    let first = StreamRequest {
+        tenant: None,
+        payload: StreamRequestPayload::SendMessage(send_message_request("start")),
+    };
+    let mut live = transport
+        .send_live_message(&versioned_params(), &first)
+        .await
+        .expect("the exchange opens");
+    let opening = tokio::time::timeout(Duration::from_secs(10), live.events.next())
+        .await
+        .expect("an event arrives")
+        .expect("the stream is open")
+        .expect("no transport error");
+    assert!(matches!(opening, StreamResponse::Task(task) if task.id == "live-task"));
+
+    live.sender
+        .send_message(Message::new(Role::User, vec![Part::text("hello")]))
+        .await
+        .expect("the request is sent");
+    let echoed = tokio::time::timeout(Duration::from_secs(10), live.events.next())
+        .await
+        .expect("an event arrives")
+        .expect("the stream is open")
+        .expect("no transport error");
+    match echoed {
+        StreamResponse::StatusUpdate(update) => assert_eq!(
+            update.status.message.as_ref().and_then(|m| m.text()),
+            Some("echo: hello")
+        ),
+        other => panic!("expected the echo, got {other:?}"),
+    }
+
+    live.sender
+        .send_message(Message::new(Role::User, vec![Part::text("finish")]))
+        .await
+        .expect("the request is sent");
+    let done = tokio::time::timeout(Duration::from_secs(10), live.events.next())
+        .await
+        .expect("an event arrives")
+        .expect("the stream is open")
+        .expect("no transport error");
+    assert!(
+        matches!(&done, StreamResponse::Task(task) if task.status.state == TaskState::Completed),
+        "{done:?}"
+    );
+    env.shutdown().await;
 }
 
 #[tokio::test]
@@ -430,7 +541,7 @@ async fn slimrpc_transport_end_to_end() {
     env.start().await;
 
     let transport = env.transport("direct").await;
-    let mut params = ServiceParams::new();
+    let mut params = versioned_params();
     params.insert(
         "x-trace".to_string(),
         vec!["alpha".to_string(), "beta".to_string()],
@@ -443,6 +554,7 @@ async fn slimrpc_transport_end_to_end() {
     assert!(matches!(send_resp, SendMessageResponse::Task(_)));
 
     let spoofed = ServiceParams::from([
+        ("a2a-version".to_string(), vec!["1.1".to_string()]),
         (
             SLIM_SRC_METADATA_KEY.to_string(),
             vec!["org/evil/app".to_string()],
@@ -464,7 +576,7 @@ async fn slimrpc_transport_end_to_end() {
 
     let send_resp = transport
         .send_message(
-            &ServiceParams::new(),
+            &versioned_params(),
             &send_message_request("message-response"),
         )
         .await
@@ -473,7 +585,7 @@ async fn slimrpc_transport_end_to_end() {
 
     let task = transport
         .get_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &GetTaskRequest {
                 current_generation: None,
                 timeline_length: None,
@@ -488,7 +600,7 @@ async fn slimrpc_transport_end_to_end() {
 
     let list = transport
         .list_tasks(
-            &ServiceParams::new(),
+            &versioned_params(),
             &ListTasksRequest {
                 timeline_length: None,
                 context_id: Some("ctx-1".to_string()),
@@ -507,7 +619,7 @@ async fn slimrpc_transport_end_to_end() {
 
     let canceled = transport
         .cancel_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &CancelTaskRequest {
                 id: "task-1".to_string(),
                 metadata: None,
@@ -519,14 +631,14 @@ async fn slimrpc_transport_end_to_end() {
     assert_eq!(canceled.status.state, TaskState::Canceled);
 
     let created = transport
-        .create_push_config(&ServiceParams::new(), &sample_push_config("cfg-1"))
+        .create_push_config(&versioned_params(), &sample_push_config("cfg-1"))
         .await
         .unwrap();
     assert_eq!(created.id.as_deref(), Some("cfg-1"));
 
     let fetched = transport
         .get_push_config(
-            &ServiceParams::new(),
+            &versioned_params(),
             &GetTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "cfg-1".to_string(),
@@ -539,7 +651,7 @@ async fn slimrpc_transport_end_to_end() {
 
     let configs = transport
         .list_push_configs(
-            &ServiceParams::new(),
+            &versioned_params(),
             &ListTaskPushNotificationConfigsRequest {
                 task_id: "task-1".to_string(),
                 page_size: Some(10),
@@ -553,7 +665,7 @@ async fn slimrpc_transport_end_to_end() {
 
     transport
         .delete_push_config(
-            &ServiceParams::new(),
+            &versioned_params(),
             &DeleteTaskPushNotificationConfigRequest {
                 task_id: "task-1".to_string(),
                 id: "cfg-1".to_string(),
@@ -579,7 +691,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
     let transport = env.transport_from_channel("channel").await;
 
     let stream = transport
-        .send_streaming_message(&ServiceParams::new(), &send_message_request("task-1"))
+        .send_streaming_message(&versioned_params(), &send_message_request("task-1"))
         .await
         .unwrap();
     let events: Vec<_> = stream.collect().await;
@@ -590,7 +702,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
     ));
 
     let stream = transport
-        .send_streaming_message(&ServiceParams::new(), &send_message_request("stream-error"))
+        .send_streaming_message(&versioned_params(), &send_message_request("stream-error"))
         .await
         .unwrap();
     let events: Vec<_> = stream.collect().await;
@@ -602,7 +714,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
 
     let subscribe_stream = transport
         .subscribe_to_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &SubscribeToTaskRequest {
                 last_seen_generation: None,
                 id: "task-1".to_string(),
@@ -617,7 +729,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
     for error in [
         transport
             .get_task(
-                &ServiceParams::new(),
+                &versioned_params(),
                 &GetTaskRequest {
                     current_generation: None,
                     timeline_length: None,
@@ -630,7 +742,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
             .unwrap_err(),
         transport
             .cancel_task(
-                &ServiceParams::new(),
+                &versioned_params(),
                 &CancelTaskRequest {
                     id: "missing".to_string(),
                     metadata: None,
@@ -641,7 +753,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
             .unwrap_err(),
         transport
             .create_push_config(
-                &ServiceParams::new(),
+                &versioned_params(),
                 &TaskPushNotificationConfig {
                     task_id: "missing".to_string(),
                     ..sample_push_config("cfg-1")
@@ -651,7 +763,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
             .unwrap_err(),
         transport
             .get_push_config(
-                &ServiceParams::new(),
+                &versioned_params(),
                 &GetTaskPushNotificationConfigRequest {
                     task_id: "task-1".to_string(),
                     id: "missing".to_string(),
@@ -662,7 +774,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
             .unwrap_err(),
         transport
             .delete_push_config(
-                &ServiceParams::new(),
+                &versioned_params(),
                 &DeleteTaskPushNotificationConfigRequest {
                     task_id: "task-1".to_string(),
                     id: "missing".to_string(),
@@ -677,7 +789,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
 
     let subscribe_stream = transport
         .subscribe_to_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &SubscribeToTaskRequest {
                 last_seen_generation: None,
                 id: "missing".to_string(),
@@ -759,7 +871,7 @@ async fn slimrpc_transport_reports_malformed_payloads() {
 
     let error = transport
         .get_task(
-            &ServiceParams::new(),
+            &versioned_params(),
             &GetTaskRequest {
                 current_generation: None,
                 timeline_length: None,
@@ -774,10 +886,7 @@ async fn slimrpc_transport_reports_malformed_payloads() {
     assert!(error.message.contains("invalid Task payload"));
 
     let error = transport
-        .send_message(
-            &ServiceParams::new(),
-            &send_message_request("empty-response"),
-        )
+        .send_message(&versioned_params(), &send_message_request("empty-response"))
         .await
         .unwrap_err();
     assert_eq!(error.code, error_code::INTERNAL_ERROR);
@@ -787,7 +896,7 @@ async fn slimrpc_transport_reports_malformed_payloads() {
     );
 
     let stream = transport
-        .send_streaming_message(&ServiceParams::new(), &send_message_request("empty-stream"))
+        .send_streaming_message(&versioned_params(), &send_message_request("empty-stream"))
         .await
         .unwrap();
     let events: Vec<_> = stream.collect().await;

@@ -1,0 +1,373 @@
+// Copyright AGNTCY Contributors (https://github.com/agntcy)
+// Copyright A2A Contributors (https://github.com/a2aproject)
+// SPDX-License-Identifier: Apache-2.0
+//! Close execution turns and transfer unread inputs to the next turn.
+
+use super::events::{ActiveExecution, EventKind};
+use super::execution::drive_execution_guarded;
+use super::registry::{ExecutionManager, ExecutionRuntime};
+use super::updates::save_task_with;
+use a2a::*;
+use std::sync::Arc;
+
+/// Ends a turn whose executor has returned, under the task's writer.
+///
+/// An executor that ended without saying anything still has a task: the one
+/// the request prepared. Messages the executor never read, while the task goes
+/// on, are not turned away: they were accepted and recorded, so the next turn
+/// is theirs. It starts here, under the same writer, with the first as its
+/// message and the rest queued. A message is accepted only if some turn will
+/// read it.
+pub(super) async fn end_turn(
+    runtime: &ExecutionRuntime,
+    active: &Arc<ActiveExecution>,
+    task_id: &TaskId,
+) {
+    let writer = Arc::clone(&active.writer).lock_owned().await;
+    if active
+        .uncreated
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        if let Some(task) = active.snapshot().await {
+            match save_task_with(runtime.task_store.as_ref(), task, true).await {
+                Ok(_) => save_pending_push_config(active, runtime).await,
+                Err(error) => {
+                    tracing::warn!(task_id = %task_id, %error, "could not create the task");
+                }
+            }
+        }
+    }
+    let snapshot = active.snapshot().await;
+    let goes_on = snapshot
+        .as_ref()
+        .is_some_and(|task| !task.status.state.is_terminal());
+    let unread = if goes_on {
+        active.drain_inputs().await
+    } else {
+        Vec::new()
+    };
+    let (Some(snapshot), false) = (snapshot, unread.is_empty()) else {
+        release_execution_locked(&runtime.execution_manager, active, task_id).await;
+        return;
+    };
+    runtime.execution_manager.finish(task_id, active).await;
+    if let Err(unread) = start_next_turn(runtime, task_id, snapshot, unread, writer).await {
+        // Nothing could take them over: they are answered, as at any end.
+        reject_inputs(active, task_id, unread).await;
+    }
+}
+
+/// Starts the turn that takes over `unread` messages, under the task's
+/// writer. Gives them back if it cannot.
+async fn start_next_turn(
+    runtime: &ExecutionRuntime,
+    task_id: &TaskId,
+    snapshot: Task,
+    mut unread: Vec<crate::executor::ClientInput>,
+    writer: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<(), Vec<crate::executor::ClientInput>> {
+    let Ok((next, inputs, guard)) = runtime
+        .execution_manager
+        .reserve_held(task_id, writer)
+        .await
+    else {
+        return Err(unread);
+    };
+    next.set_snapshot(snapshot.clone()).await;
+    let first = unread.remove(0);
+    for input in unread {
+        if let Ok(permit) = next.inputs.sender.clone().try_reserve_owned() {
+            permit.send(next.track_input(input).await);
+        }
+    }
+
+    drop(guard);
+    let runtime = runtime.clone();
+    let task_id = task_id.clone();
+    tokio::spawn(async move {
+        let exec_ctx = crate::ExecutorContext {
+            execution_id: next.execution_id.clone(),
+            message: Some(first.message),
+            task_id: task_id.clone(),
+            stored_task: Some(snapshot.clone()),
+            context_id: snapshot.context_id.clone(),
+            metadata: first.metadata,
+            user: first.user,
+            service_params: first.service_params,
+            tenant: first.tenant,
+            inputs,
+            new_task: false,
+        };
+        run_execution(runtime, task_id, next, exec_ctx).await;
+    });
+    Ok(())
+}
+
+/// [`drive_execution_guarded`] as a boxed future: an execution can start the
+/// next one as it ends, which a plain `async fn` cannot prove `Send` for.
+fn run_execution(
+    runtime: ExecutionRuntime,
+    task_id: TaskId,
+    active: Arc<ActiveExecution>,
+    exec_ctx: crate::ExecutorContext,
+) -> futures::future::BoxFuture<'static, ()> {
+    Box::pin(drive_execution_guarded(runtime, task_id, active, exec_ctx))
+}
+
+/// Ends an execution's hold on its task in one step, under the task's writer:
+/// the task-input queue is closed (what the executor never read is answered)
+/// and the execution deregistered together. A message delivered to the task
+/// decides under the same writer, so it finds either a running execution that
+/// is taking input, or none.
+pub(super) async fn release_execution(
+    manager: &ExecutionManager,
+    active: &Arc<ActiveExecution>,
+    task_id: &str,
+) {
+    let _writer = active.writer.lock().await;
+    release_execution_locked(manager, active, task_id).await;
+}
+
+/// [`release_execution`] for a caller that already holds the task's writer.
+/// Every place that closes the queue while the task goes on does so through
+/// this, so a closed queue is never found on a registered execution.
+pub(super) async fn release_execution_locked(
+    manager: &ExecutionManager,
+    active: &Arc<ActiveExecution>,
+    task_id: &str,
+) {
+    reject_unread_inputs_locked(active, task_id).await;
+    manager.finish(task_id, active).await;
+}
+
+/// Saves the push configuration the request that started the execution
+/// carried, now that the task it is for exists.
+pub(super) async fn save_pending_push_config(active: &ActiveExecution, runtime: &ExecutionRuntime) {
+    let pending = active
+        .pending_push
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let (Some(config), Some(store)) = (pending, runtime.push_config_store.as_ref()) {
+        if let Err(error) = store.save(config).await {
+            tracing::warn!(%error, "could not save the push configuration of a new task");
+        }
+    }
+}
+
+/// Closes the task-input queue and tells the exchanges about each
+/// message the executor never read. Those messages were accepted, recorded and
+/// announced; the executor's turn ended without handling them, which the
+/// client that sent one is told by a `StreamError` naming it, rather than by
+/// silence.
+pub(super) async fn reject_unread_inputs(active: &ActiveExecution, task_id: &str) {
+    // Under the writer: no message can be queued once the queue is closed.
+    let _writer = active.writer.lock().await;
+    reject_unread_inputs_locked(active, task_id).await;
+}
+
+/// [`reject_unread_inputs`] for a caller that already holds the task's writer.
+/// Called before a terminal event is published, so the errors come first: a
+/// stream ends on the terminal event and would never see them after it.
+pub(super) async fn reject_unread_inputs_locked(active: &ActiveExecution, task_id: &str) {
+    reject_inputs(active, task_id, active.drain_inputs().await).await;
+}
+
+/// Answers each of `inputs` with a `StreamError` naming it. The caller holds
+/// the task's writer.
+pub(super) async fn reject_inputs(
+    active: &ActiveExecution,
+    task_id: &str,
+    inputs: Vec<crate::executor::ClientInput>,
+) {
+    for input in inputs {
+        let event = StreamResponse::Error(StreamError {
+            task_id: task_id.to_string(),
+            code: "UNAVAILABLE".to_string(),
+            message: "the agent finished its turn before reading this message".to_string(),
+            reference_id: Some(input.message.message_id.clone()).filter(|id| !id.is_empty()),
+            metadata: None,
+        });
+        active
+            .publish_kind(Ok(&event), None, EventKind::LiveOnly(input.response_id))
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn a_busy_handoff_returns_input_with_its_caller_identity_intact() {
+        let runtime = make_handler();
+        let task = task_with_history("busy-handoff", "context", 0);
+        let (active, _inputs, writer) = runtime.execution_manager.reserve(&task.id).await.unwrap();
+        active.set_snapshot(task.clone()).await;
+        let mut input = crate::ClientInput::new(make_message(), 7);
+        input.user = Some(crate::User::authenticated("alice"));
+        input.tenant = Some("tenant-a".into());
+        input.metadata = Some(std::collections::HashMap::from([(
+            "trace".into(),
+            serde_json::json!(42),
+        )]));
+        let returned = start_next_turn(
+            &runtime,
+            &task.id,
+            task.clone(),
+            vec![input.clone()],
+            writer,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].message, input.message);
+        assert_eq!(returned[0].user, input.user);
+        assert_eq!(returned[0].metadata, input.metadata);
+        assert_eq!(returned[0].tenant, input.tenant);
+        assert!(runtime.execution_manager.get(&task.id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn rejected_pending_push_configuration_does_not_replace_existing_endpoints() {
+        let runtime = make_handler_with_push_configs();
+        let config = |id: usize| TaskPushNotificationConfig {
+            task_id: "configured".into(),
+            id: Some(id.to_string()),
+            url: "https://example.com/push".into(),
+            token: None,
+            authentication: None,
+            tenant: None,
+            protocol_version: Some("1.1".into()),
+        };
+        let store = runtime.push_config_store.as_ref().unwrap();
+        for id in 0..50 {
+            store.save(config(id)).await.unwrap();
+        }
+        let active = ActiveExecution::new(None);
+        *active.pending_push.lock().unwrap() = Some(config(50));
+        save_pending_push_config(&active, &runtime).await;
+        assert!(active.pending_push.lock().unwrap().is_none());
+        assert_eq!(store.list("configured").await.unwrap().len(), 50);
+        assert!(store.get("configured", "50").await.is_err());
+        save_pending_push_config(&active, &runtime).await;
+        assert_eq!(store.list("configured").await.unwrap().len(), 50);
+    }
+
+    #[tokio::test]
+    async fn artifact_only_unread_input_has_no_empty_message_reference() {
+        let active = ActiveExecution::new(None);
+        let mut events = active.subscribe();
+        let mut message = make_message();
+        message.message_id.clear();
+        reject_inputs(&active, "task", vec![crate::ClientInput::new(message, 3)]).await;
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event.kind, EventKind::LiveOnly(None)));
+        let StreamResponse::Error(error) = event.result.unwrap() else {
+            panic!("expected a rejection")
+        };
+        assert_eq!(error.task_id, "task");
+        assert_eq!(error.code, "UNAVAILABLE");
+        assert_eq!(error.reference_id, None);
+    }
+    struct CaptureTurn(
+        tokio::sync::mpsc::UnboundedSender<(crate::ExecutorContext, Vec<crate::ClientInput>)>,
+    );
+
+    impl crate::AgentExecutor for CaptureTurn {
+        fn execute(
+            &self,
+            mut context: crate::ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let queued = std::iter::from_fn(|| context.inputs.try_recv()).collect();
+            let mut task = context.stored_task.clone().unwrap();
+            task.status.state = TaskState::Completed;
+            self.0
+                .send((context, queued))
+                .unwrap_or_else(|_| panic!("observer dropped"));
+            Box::pin(stream::once(async move { Ok(StreamResponse::Task(task)) }))
+        }
+        fn cancel(
+            &self,
+            context: crate::ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            crate::AgentExecutor::cancel(&EchoExecutor, context)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handoff_preserves_the_trigger_and_queues_remaining_inputs_in_order() {
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = DefaultRequestHandler::new(CaptureTurn(sent), InMemoryTaskStore::new());
+        let mut task = task_with_history("next-turn", "context", 0);
+        task.status.state = TaskState::Working;
+        runtime.task_store.create(task.clone()).await.unwrap();
+        let inputs: Vec<_> = ["first", "second", "third"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut message = make_message();
+                message.message_id = id.into();
+                let mut input = crate::ClientInput::new(message, index as i64 + 1);
+                input.user = Some(crate::User::authenticated("alice"));
+                input.tenant = Some("tenant-a".into());
+                input.metadata = Some(std::collections::HashMap::from([(
+                    "trace".into(),
+                    serde_json::json!(id),
+                )]));
+                input
+            })
+            .collect();
+        let writer = runtime
+            .execution_manager
+            .writer_for(&task.id)
+            .lock_owned()
+            .await;
+        assert!(
+            start_next_turn(&runtime, &task.id, task.clone(), inputs.clone(), writer)
+                .await
+                .is_ok()
+        );
+        let (context, queued) = timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.message, Some(inputs[0].message.clone()));
+        assert_eq!(context.metadata, inputs[0].metadata);
+        assert_eq!(context.user, inputs[0].user);
+        assert_eq!(context.tenant, inputs[0].tenant);
+        assert_eq!(
+            queued
+                .iter()
+                .map(|input| input.message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "third"]
+        );
+        assert_eq!(
+            queued
+                .iter()
+                .map(|input| input.generation)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        timeout(Duration::from_secs(1), async {
+            while runtime.execution_manager.get(&task.id).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime
+                .task_store
+                .get(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .state,
+            TaskState::Completed
+        );
+    }
+}

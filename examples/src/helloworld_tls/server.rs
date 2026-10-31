@@ -68,15 +68,15 @@ async fn main() {
         .install_default()
         .expect("Failed to install default crypto provider");
 
-    let handler = Arc::new(DefaultRequestHandler::new(
-        EchoExecutor,
-        InMemoryTaskStore::new(),
-    ));
     let agent_card = build_agent_card(vec![
         AgentInterface::new("https://localhost:3443/jsonrpc", TRANSPORT_PROTOCOL_JSONRPC),
         AgentInterface::new("https://localhost:3443/rest", TRANSPORT_PROTOCOL_HTTP_JSON),
         AgentInterface::new("https://localhost:50052", TRANSPORT_PROTOCOL_GRPC),
     ]);
+    let handler = Arc::new(
+        DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+            .with_capabilities(agent_card.capabilities.clone()),
+    );
     let card_producer = Arc::new(StaticAgentCard::new(agent_card));
 
     let app = axum::Router::new()

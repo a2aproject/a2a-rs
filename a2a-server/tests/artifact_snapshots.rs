@@ -102,7 +102,11 @@ async fn snapshot(updates: Vec<Update>, streaming: bool) -> Result<Task, A2AErro
             updates: updates.clone(),
         },
         InMemoryTaskStore::new(),
-    );
+    )
+    .with_capabilities(a2a::AgentCapabilities {
+        streaming: Some(true),
+        ..Default::default()
+    });
     let request = SendMessageRequest {
         artifact_updates: Vec::new(),
         message: Message::new(Role::User, vec![Part::text("hi")]),
@@ -378,7 +382,11 @@ async fn applying_events_to_a_known_task_does_not_read_the_store() {
             inner: InMemoryTaskStore::new(),
             gets: Arc::clone(&gets),
         },
-    );
+    )
+    .with_capabilities(a2a::AgentCapabilities {
+        streaming: Some(true),
+        ..Default::default()
+    });
     let request = SendMessageRequest {
         artifact_updates: Vec::new(),
         message: Message::new(Role::User, vec![Part::text("hi")]),

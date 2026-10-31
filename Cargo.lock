@@ -126,6 +126,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-http 0.7.1",
  "tracing",
@@ -1803,6 +1804,7 @@ dependencies = [
  "a2a-lf",
  "a2a-pb",
  "a2a-server-lf",
+ "async-stream",
  "async-trait",
  "axum",
  "chrono",
@@ -5364,6 +5366,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
