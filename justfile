@@ -61,7 +61,7 @@ coverage-lcov:
 
 # Run the helloworld example
 example:
-    cargo run -p helloworld
+    cargo run -p examples --bin helloworld-server
 
 # Install the docs toolchain into .venv-docs (needs Python 3.11 or newer)
 docs-install:
