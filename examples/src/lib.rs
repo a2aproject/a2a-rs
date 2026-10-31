@@ -39,6 +39,7 @@ impl AgentExecutor for EchoExecutor {
             .unwrap_or(false);
 
         let working = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: task_id.clone(),
             context_id: context_id.clone(),
             status: TaskStatus {
@@ -73,6 +74,8 @@ impl AgentExecutor for EchoExecutor {
             };
 
             let completed = StreamResponse::Task(Task {
+                generation: 0,
+                timeline: None,
                 id: task_id.clone(),
                 context_id: context_id.clone(),
                 status: TaskStatus {
@@ -104,6 +107,7 @@ impl AgentExecutor for EchoExecutor {
 
         Box::pin(stream::once(async {
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id,
                 context_id,
                 status: TaskStatus {
@@ -131,6 +135,7 @@ pub fn build_agent_card(interfaces: Vec<AgentInterface>) -> AgentCard {
             url: "https://github.com/a2aproject/a2a-rs".to_string(),
         }),
         capabilities: AgentCapabilities {
+            user_artifacts: None,
             streaming: Some(true),
             push_notifications: Some(false),
             extensions: None,
@@ -163,6 +168,7 @@ pub fn build_agent_card(interfaces: Vec<AgentInterface>) -> AgentCard {
 
 pub fn req(text: &str) -> SendMessageRequest {
     SendMessageRequest {
+        artifact_updates: Vec::new(),
         message: Message::new(Role::User, vec![Part::text(text)]),
         configuration: None,
         metadata: None,
@@ -172,8 +178,11 @@ pub fn req(text: &str) -> SendMessageRequest {
 
 pub fn wait_req(text: &str) -> SendMessageRequest {
     SendMessageRequest {
+        artifact_updates: Vec::new(),
         message: Message::new(Role::User, vec![Part::text(format!("wait:{text}"))]),
         configuration: Some(SendMessageConfiguration {
+            if_generation_match: None,
+            timeline_length: None,
             return_immediately: Some(true),
             accepted_output_modes: None,
             task_push_notification_config: None,
@@ -273,6 +282,8 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
     // ---- get_task --------------------------------------------------------
     match client
         .get_task(&GetTaskRequest {
+            current_generation: None,
+            timeline_length: None,
             id: task_id.clone(),
             history_length: Some(10),
             tenant: None,
@@ -286,6 +297,7 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
     // ---- list_tasks ------------------------------------------------------
     match client
         .list_tasks(&ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: Some(10),
@@ -322,6 +334,7 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
 
     // ---- send_streaming_message ------------------------------------------
     let stream_req = SendMessageRequest {
+        artifact_updates: Vec::new(),
         message: Message::new(Role::User, vec![Part::text("Stream me!")]),
         configuration: None,
         metadata: None,
@@ -342,6 +355,11 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
                     Ok(StreamResponse::ArtifactUpdate(a)) => {
                         sub_row!(n, "artifact", &a.artifact.artifact_id)
                     }
+                    Ok(StreamResponse::MessageUpdate(m)) => {
+                        sub_row!(n, "message_update", &m.message.message_id)
+                    }
+                    Ok(StreamResponse::Error(e)) => sub_row!(n, "stream_error", &e.code),
+                    Ok(_) => {}
                     Err(e) => eprintln!("  [{n:>2}] ✗  {e}"),
                 }
             }
@@ -355,6 +373,7 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
             let sub_id = t.id;
             match client
                 .subscribe_to_task(&SubscribeToTaskRequest {
+                    last_seen_generation: None,
                     id: sub_id.clone(),
                     tenant: None,
                 })

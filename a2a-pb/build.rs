@@ -83,6 +83,14 @@ const NULL_REPEATED_FIELD_REPLACEMENTS: &[(&str, &str)] = &[
         "history__ = Some(map_.next_value()?);",
         "history__ = Some(map_.next_value::<Option<_>>()?.unwrap_or_default());",
     ),
+    (
+        "timeline__ = Some(map_.next_value()?);",
+        "timeline__ = Some(map_.next_value::<Option<_>>()?.unwrap_or_default());",
+    ),
+    (
+        "artifact_updates__ = Some(map_.next_value()?);",
+        "artifact_updates__ = Some(map_.next_value::<Option<_>>()?.unwrap_or_default());",
+    ),
 ];
 const NULL_MAP_REPLACEMENT: (&str, &str) = (
     "map_.next_value::<std::collections::HashMap<_, _>>()?",

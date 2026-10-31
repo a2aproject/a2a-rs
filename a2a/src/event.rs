@@ -14,11 +14,17 @@ use crate::types::*;
 /// A streaming event. Uses field-presence serialization for wire compatibility.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub enum StreamResponse {
     Task(Task),
     Message(Message),
     StatusUpdate(TaskStatusUpdateEvent),
     ArtifactUpdate(TaskArtifactUpdateEvent),
+    /// A message appended to the task (A2A 1.1).
+    MessageUpdate(TaskMessageUpdateEvent),
+    /// A non-fatal rejection of a single client request on a live stream
+    /// (A2A 1.1).
+    Error(StreamError),
 }
 
 impl Serialize for StreamResponse {
@@ -30,6 +36,8 @@ impl Serialize for StreamResponse {
             StreamResponse::Message(m) => map.serialize_entry("message", m)?,
             StreamResponse::StatusUpdate(s) => map.serialize_entry("statusUpdate", s)?,
             StreamResponse::ArtifactUpdate(a) => map.serialize_entry("artifactUpdate", a)?,
+            StreamResponse::MessageUpdate(m) => map.serialize_entry("messageUpdate", m)?,
+            StreamResponse::Error(e) => map.serialize_entry("error", e)?,
         }
         map.end()
     }
@@ -54,6 +62,14 @@ impl<'de> Deserialize<'de> for StreamResponse {
             Ok(StreamResponse::ArtifactUpdate(
                 serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
             ))
+        } else if let Some(v) = raw.get("messageUpdate") {
+            Ok(StreamResponse::MessageUpdate(
+                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
+            ))
+        } else if let Some(v) = raw.get("error") {
+            Ok(StreamResponse::Error(
+                serde_json::from_value(v.clone()).map_err(serde::de::Error::custom)?,
+            ))
         } else {
             Err(serde::de::Error::custom("unknown StreamResponse variant"))
         }
@@ -76,6 +92,15 @@ pub struct TaskStatusUpdateEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "fuzzing", arbitrary(default))]
     pub metadata: Option<HashMap<String, Value>>,
+
+    /// The task generation after this update. Zero means the peer did not
+    /// report one.
+    #[serde(
+        default,
+        with = "crate::types::int64",
+        skip_serializing_if = "crate::types::is_zero"
+    )]
+    pub generation: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +125,74 @@ pub struct TaskArtifactUpdateEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "fuzzing", arbitrary(default))]
     pub metadata: Option<HashMap<String, Value>>,
+
+    /// The task generation after this update. Zero means the peer did not
+    /// report one.
+    #[serde(
+        default,
+        with = "crate::types::int64",
+        skip_serializing_if = "crate::types::is_zero"
+    )]
+    pub generation: i64,
+}
+
+// ---------------------------------------------------------------------------
+// TaskMessageUpdateEvent
+// ---------------------------------------------------------------------------
+
+/// Event: a message was appended to the task (e.g. client input). Sent only
+/// to clients that announced protocol version 1.1 or later.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
+#[serde(rename_all = "camelCase")]
+pub struct TaskMessageUpdateEvent {
+    pub task_id: TaskId,
+    pub context_id: String,
+    pub message: Message,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "fuzzing", arbitrary(default))]
+    pub metadata: Option<HashMap<String, Value>>,
+
+    /// The task generation after the message was appended.
+    #[serde(
+        default,
+        with = "crate::types::int64",
+        skip_serializing_if = "crate::types::is_zero"
+    )]
+    pub generation: i64,
+}
+
+// ---------------------------------------------------------------------------
+// StreamError
+// ---------------------------------------------------------------------------
+
+/// A non-fatal error reported on a live stream. It rejects a single client
+/// request without terminating the stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
+#[serde(rename_all = "camelCase")]
+pub struct StreamError {
+    /// The task the rejected request applied to, when known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub task_id: TaskId,
+
+    /// A machine-readable identifier, using the same codes as the equivalent
+    /// unary operation (e.g. `INVALID_ARGUMENT`).
+    pub code: String,
+
+    /// A human readable description of why the request was rejected.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+
+    /// The `message_id` of the rejected client message, or the `artifact_id`
+    /// of the rejected artifact update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_id: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "fuzzing", arbitrary(default))]
+    pub metadata: Option<HashMap<String, Value>>,
 }
 
 #[cfg(test)]
@@ -109,6 +202,7 @@ mod tests {
     #[test]
     fn test_stream_response_status_update_serde() {
         let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -129,6 +223,8 @@ mod tests {
     #[test]
     fn test_stream_response_task_serde() {
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -162,9 +258,13 @@ mod tests {
     #[test]
     fn test_stream_response_artifact_update_serde() {
         let event = StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             artifact: Artifact {
+                end_generation: None,
+                role: None,
+                start_generation: None,
                 artifact_id: "a1".into(),
                 name: None,
                 description: None,
@@ -195,6 +295,7 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert("key".to_string(), Value::String("val".to_string()));
         let event = TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -213,9 +314,13 @@ mod tests {
     #[test]
     fn test_task_artifact_update_event_full() {
         let event = TaskArtifactUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             artifact: Artifact {
+                end_generation: None,
+                role: None,
+                start_generation: None,
                 artifact_id: "a1".into(),
                 name: Some("file.txt".into()),
                 description: Some("A file".into()),

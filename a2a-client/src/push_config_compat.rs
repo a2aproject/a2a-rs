@@ -55,6 +55,7 @@ mod tests {
 
     fn sample_task_push_config() -> TaskPushNotificationConfig {
         TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: "t1".into(),
             url: "https://example.invalid/webhook".into(),
             id: Some("cfg1".into()),

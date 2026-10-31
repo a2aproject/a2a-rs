@@ -1,6 +1,8 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+// The 1.1 schema deprecates `history` and `history_length`; the fixtures still cover them.
+#![allow(deprecated)]
 use std::collections::HashMap;
 
 use a2a_pb::protojson::{
@@ -42,6 +44,7 @@ fn struct_value(fields: impl IntoIterator<Item = (&'static str, Value)>) -> Stru
 #[test]
 fn send_message_request_protojson_roundtrip() {
     let request = SendMessageRequest {
+        artifact_updates: Vec::new(),
         tenant: "tenant-1".to_string(),
         message: Some(Message {
             message_id: "msg-1".to_string(),
@@ -59,8 +62,11 @@ fn send_message_request_protojson_roundtrip() {
             reference_task_ids: vec!["task-root".to_string()],
         }),
         configuration: Some(SendMessageConfiguration {
+            if_generation_match: None,
+            timeline_length: None,
             accepted_output_modes: vec!["text/plain".to_string(), "application/json".to_string()],
             task_push_notification_config: Some(TaskPushNotificationConfig {
+                protocol_version: String::new(),
                 tenant: "tenant-1".to_string(),
                 id: "push-1".to_string(),
                 task_id: String::new(),
@@ -100,6 +106,8 @@ fn send_message_request_protojson_roundtrip() {
 #[test]
 fn task_protojson_roundtrip_serializes_protojson_primitives() {
     let task = Task {
+        generation: 0,
+        timeline: Vec::new(),
         id: "task-1".to_string(),
         context_id: "ctx-1".to_string(),
         status: Some(TaskStatus {
@@ -125,6 +133,9 @@ fn task_protojson_roundtrip_serializes_protojson_primitives() {
             }),
         }),
         artifacts: vec![Artifact {
+            end_generation: 0,
+            role: 0,
+            start_generation: 0,
             artifact_id: "artifact-1".to_string(),
             name: "payload".to_string(),
             description: String::new(),
@@ -193,6 +204,7 @@ fn agent_card_protojson_deserializes_null_skills_as_empty() {
         version: "1.2.3".to_string(),
         documentation_url: Some("https://example.com/docs".to_string()),
         capabilities: Some(AgentCapabilities {
+            user_artifacts: None,
             streaming: Some(true),
             push_notifications: Some(false),
             extensions: vec![],
@@ -273,6 +285,7 @@ fn stream_response_protojson_roundtrip_serializes_oneof_payloads() {
     let response = StreamResponse {
         payload: Some(stream_response::Payload::StatusUpdate(
             TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "task-42".to_string(),
                 context_id: "ctx-42".to_string(),
                 status: Some(TaskStatus {

@@ -6,6 +6,10 @@
 //! These functions handle the mapping between the hand-written serde types
 //! in the `a2a` crate and the prost-generated types from `a2a.proto`.
 
+// `history` and `history_length` are deprecated in the 1.1 schema, but servers
+// keep populating them throughout 1.x, so the conversions must still map them.
+#![allow(deprecated)]
+
 use crate::proto;
 use a2a::agent_card::*;
 use a2a::event::*;
@@ -128,6 +132,11 @@ fn empty_to_none(s: &str) -> Option<String> {
     } else {
         Some(s.to_string())
     }
+}
+
+/// Proto3 has no presence for a plain `int64`: zero means unset.
+fn zero_to_none(value: i64) -> Option<i64> {
+    (value != 0).then_some(value)
 }
 
 fn non_positive_to_none(value: Option<i32>) -> Option<i32> {
@@ -291,6 +300,9 @@ pub fn to_proto_artifact(a: &Artifact) -> proto::Artifact {
         parts: a.parts.iter().map(to_proto_part).collect(),
         metadata: opt_metadata_to_proto(&a.metadata),
         extensions: a.extensions.clone().unwrap_or_default(),
+        start_generation: a.start_generation.unwrap_or(0),
+        end_generation: a.end_generation.unwrap_or(0),
+        role: a.role.as_ref().map(to_proto_role).unwrap_or(0),
     }
 }
 
@@ -306,6 +318,9 @@ pub fn from_proto_artifact(a: &proto::Artifact) -> Artifact {
         } else {
             Some(a.extensions.clone())
         },
+        start_generation: zero_to_none(a.start_generation),
+        end_generation: zero_to_none(a.end_generation),
+        role: (a.role != 0).then(|| from_proto_role(a.role)),
     }
 }
 
@@ -328,8 +343,45 @@ pub fn to_proto_task(t: &Task) -> proto::Task {
             .as_ref()
             .map(|h| h.iter().map(to_proto_message).collect())
             .unwrap_or_default(),
+        timeline: t
+            .timeline
+            .as_ref()
+            .map(|entries| entries.iter().map(to_proto_timeline_entry).collect())
+            .unwrap_or_default(),
         metadata: opt_metadata_to_proto(&t.metadata),
+        generation: t.generation,
     }
+}
+
+pub fn to_proto_timeline_entry(e: &TimelineEntry) -> proto::TimelineEntry {
+    let entry = match &e.content {
+        TimelineContent::Message(m) => {
+            Some(proto::timeline_entry::Entry::Message(to_proto_message(m)))
+        }
+        TimelineContent::Status(s) => Some(proto::timeline_entry::Entry::Status(
+            to_proto_task_status(s),
+        )),
+        _ => None,
+    };
+    proto::TimelineEntry {
+        entry,
+        generation: e.generation,
+    }
+}
+
+/// Entries of a kind this version does not know carry no entry and are
+/// dropped.
+pub fn from_proto_timeline_entry(e: &proto::TimelineEntry) -> Option<TimelineEntry> {
+    let content = match e.entry.as_ref()? {
+        proto::timeline_entry::Entry::Message(m) => TimelineContent::Message(from_proto_message(m)),
+        proto::timeline_entry::Entry::Status(s) => {
+            TimelineContent::Status(from_proto_task_status(s))
+        }
+    };
+    Some(TimelineEntry {
+        content,
+        generation: e.generation,
+    })
 }
 
 pub fn from_proto_task(t: &proto::Task) -> Task {
@@ -355,7 +407,20 @@ pub fn from_proto_task(t: &proto::Task) -> Task {
         } else {
             Some(t.history.iter().map(from_proto_message).collect())
         },
+        timeline: {
+            let entries: Vec<_> = t
+                .timeline
+                .iter()
+                .filter_map(from_proto_timeline_entry)
+                .collect();
+            if entries.is_empty() {
+                None
+            } else {
+                Some(entries)
+            }
+        },
         metadata: opt_metadata_from_proto(&t.metadata),
+        generation: t.generation,
     }
 }
 
@@ -391,6 +456,7 @@ pub fn to_proto_task_push_notification_config(
         url: c.url.clone(),
         token: c.token.clone().unwrap_or_default(),
         authentication: c.authentication.as_ref().map(to_proto_authentication_info),
+        protocol_version: c.protocol_version.clone().unwrap_or_default(),
     }
 }
 
@@ -407,6 +473,7 @@ pub fn from_proto_task_push_notification_config(
             .as_ref()
             .map(from_proto_authentication_info),
         tenant: empty_to_none(&c.tenant),
+        protocol_version: empty_to_none(&c.protocol_version),
     }
 }
 
@@ -424,7 +491,9 @@ pub fn to_proto_send_message_configuration(
             .as_ref()
             .map(to_proto_task_push_notification_config),
         history_length: c.history_length,
+        timeline_length: c.timeline_length,
         return_immediately: c.return_immediately.unwrap_or(false),
+        if_generation_match: c.if_generation_match,
     }
 }
 
@@ -442,11 +511,13 @@ pub fn from_proto_send_message_configuration(
             .as_ref()
             .map(from_proto_task_push_notification_config),
         history_length: c.history_length,
+        timeline_length: c.timeline_length,
         return_immediately: if c.return_immediately {
             Some(true)
         } else {
             None
         },
+        if_generation_match: c.if_generation_match,
     }
 }
 
@@ -454,15 +525,36 @@ pub fn from_proto_send_message_configuration(
 // Request types
 // ---------------------------------------------------------------------------
 
+/// A request that carries only `artifactUpdates` has no message on the wire;
+/// natively that is a message with nothing in it: no id, no role, no parts and
+/// no other field. A message with anything set is sent, or that would be lost.
+fn is_absent_message(r: &SendMessageRequest) -> bool {
+    let m = &r.message;
+    !r.artifact_updates.is_empty()
+        && m.role == Role::Unspecified
+        && m.message_id.is_empty()
+        && m.parts.is_empty()
+        && m.task_id.is_none()
+        && m.context_id.is_none()
+        && m.metadata.is_none()
+        && m.extensions.is_none()
+        && m.reference_task_ids.is_none()
+}
+
 pub fn to_proto_send_message_request(r: &SendMessageRequest) -> proto::SendMessageRequest {
     proto::SendMessageRequest {
         tenant: r.tenant.clone().unwrap_or_default(),
-        message: Some(to_proto_message(&r.message)),
+        message: (!is_absent_message(r)).then(|| to_proto_message(&r.message)),
         configuration: r
             .configuration
             .as_ref()
             .map(to_proto_send_message_configuration),
         metadata: opt_metadata_to_proto(&r.metadata),
+        artifact_updates: r
+            .artifact_updates
+            .iter()
+            .map(to_proto_task_artifact_update_event)
+            .collect(),
     }
 }
 
@@ -473,12 +565,24 @@ pub fn from_proto_send_message_request(r: &proto::SendMessageRequest) -> SendMes
             .message
             .as_ref()
             .map(from_proto_message)
-            .unwrap_or_else(|| Message::new(Role::User, vec![])),
+            .unwrap_or_else(|| {
+                // Preserve absence so the handler can reject missing messages
+                // or accept artifact-only updates for an existing task. Never
+                // generate an ID that makes missing required input look valid.
+                let mut message = Message::new(Role::Unspecified, vec![]);
+                message.message_id = String::new();
+                message
+            }),
         configuration: r
             .configuration
             .as_ref()
             .map(from_proto_send_message_configuration),
         metadata: opt_metadata_from_proto(&r.metadata),
+        artifact_updates: r
+            .artifact_updates
+            .iter()
+            .map(from_proto_task_artifact_update_event)
+            .collect(),
     }
 }
 
@@ -487,6 +591,8 @@ pub fn to_proto_get_task_request(r: &GetTaskRequest) -> proto::GetTaskRequest {
         tenant: r.tenant.clone().unwrap_or_default(),
         id: r.id.clone(),
         history_length: r.history_length,
+        timeline_length: r.timeline_length,
+        current_generation: r.current_generation,
     }
 }
 
@@ -495,6 +601,8 @@ pub fn from_proto_get_task_request(r: &proto::GetTaskRequest) -> GetTaskRequest 
         tenant: empty_to_none(&r.tenant),
         id: r.id.clone(),
         history_length: r.history_length,
+        timeline_length: r.timeline_length,
+        current_generation: r.current_generation,
     }
 }
 
@@ -506,6 +614,7 @@ pub fn to_proto_list_tasks_request(r: &ListTasksRequest) -> proto::ListTasksRequ
         page_size: r.page_size,
         page_token: r.page_token.clone().unwrap_or_default(),
         history_length: r.history_length,
+        timeline_length: r.timeline_length,
         status_timestamp_after: r
             .status_timestamp_after
             .as_ref()
@@ -526,6 +635,7 @@ pub fn from_proto_list_tasks_request(r: &proto::ListTasksRequest) -> ListTasksRe
         page_size: non_positive_to_none(r.page_size),
         page_token: empty_to_none(&r.page_token),
         history_length: r.history_length,
+        timeline_length: r.timeline_length,
         status_timestamp_after: r
             .status_timestamp_after
             .as_ref()
@@ -574,6 +684,7 @@ pub fn to_proto_subscribe_to_task_request(
     proto::SubscribeToTaskRequest {
         tenant: r.tenant.clone().unwrap_or_default(),
         id: r.id.clone(),
+        last_seen_generation: r.last_seen_generation,
     }
 }
 
@@ -583,6 +694,7 @@ pub fn from_proto_subscribe_to_task_request(
     SubscribeToTaskRequest {
         tenant: empty_to_none(&r.tenant),
         id: r.id.clone(),
+        last_seen_generation: r.last_seen_generation,
     }
 }
 
@@ -740,6 +852,7 @@ pub fn to_proto_task_status_update_event(
         context_id: e.context_id.clone(),
         status: Some(to_proto_task_status(&e.status)),
         metadata: opt_metadata_to_proto(&e.metadata),
+        generation: e.generation,
     }
 }
 
@@ -759,6 +872,7 @@ pub fn from_proto_task_status_update_event(
                 timestamp: None,
             }),
         metadata: opt_metadata_from_proto(&e.metadata),
+        generation: e.generation,
     }
 }
 
@@ -772,6 +886,7 @@ pub fn to_proto_task_artifact_update_event(
         append: e.append.unwrap_or(false),
         last_chunk: e.last_chunk.unwrap_or(false),
         metadata: opt_metadata_to_proto(&e.metadata),
+        generation: e.generation,
     }
 }
 
@@ -792,10 +907,97 @@ pub fn from_proto_task_artifact_update_event(
                 parts: vec![],
                 metadata: None,
                 extensions: None,
+                start_generation: None,
+                end_generation: None,
+                role: None,
             }),
         append: if e.append { Some(true) } else { None },
         last_chunk: if e.last_chunk { Some(true) } else { None },
         metadata: opt_metadata_from_proto(&e.metadata),
+        generation: e.generation,
+    }
+}
+
+pub fn to_proto_task_message_update_event(
+    e: &TaskMessageUpdateEvent,
+) -> proto::TaskMessageUpdateEvent {
+    proto::TaskMessageUpdateEvent {
+        task_id: e.task_id.clone(),
+        context_id: e.context_id.clone(),
+        message: Some(to_proto_message(&e.message)),
+        metadata: opt_metadata_to_proto(&e.metadata),
+        generation: e.generation,
+    }
+}
+
+pub fn from_proto_task_message_update_event(
+    e: &proto::TaskMessageUpdateEvent,
+) -> TaskMessageUpdateEvent {
+    TaskMessageUpdateEvent {
+        task_id: e.task_id.clone(),
+        context_id: e.context_id.clone(),
+        message: e
+            .message
+            .as_ref()
+            .map(from_proto_message)
+            .unwrap_or_else(|| Message::new(Role::Unspecified, vec![])),
+        metadata: opt_metadata_from_proto(&e.metadata),
+        generation: e.generation,
+    }
+}
+
+pub fn to_proto_stream_error(e: &StreamError) -> proto::StreamError {
+    proto::StreamError {
+        task_id: e.task_id.clone(),
+        code: e.code.clone(),
+        message: e.message.clone(),
+        reference_id: e.reference_id.clone().unwrap_or_default(),
+        metadata: opt_metadata_to_proto(&e.metadata),
+    }
+}
+
+pub fn from_proto_stream_error(e: &proto::StreamError) -> StreamError {
+    StreamError {
+        task_id: e.task_id.clone(),
+        code: e.code.clone(),
+        message: e.message.clone(),
+        reference_id: empty_to_none(&e.reference_id),
+        metadata: opt_metadata_from_proto(&e.metadata),
+    }
+}
+
+pub fn to_proto_stream_request(r: &StreamRequest) -> proto::StreamRequest {
+    let payload = match &r.payload {
+        StreamRequestPayload::SendMessage(m) => Some(proto::stream_request::Payload::SendMessage(
+            to_proto_send_message_request(m),
+        )),
+        StreamRequestPayload::Subscribe(s) => Some(proto::stream_request::Payload::Subscribe(
+            to_proto_subscribe_to_task_request(s),
+        )),
+        StreamRequestPayload::Unrecognised => None,
+        _ => None,
+    };
+    proto::StreamRequest {
+        tenant: r.tenant.clone().unwrap_or_default(),
+        payload,
+    }
+}
+
+/// A request whose payload this version does not understand comes back with
+/// [`StreamRequestPayload::Unrecognised`], so it can be refused rather than lost.
+pub fn from_proto_stream_request(r: &proto::StreamRequest) -> StreamRequest {
+    let payload = match r.payload.as_ref() {
+        Some(proto::stream_request::Payload::SendMessage(m)) => {
+            StreamRequestPayload::SendMessage(from_proto_send_message_request(m))
+        }
+        Some(proto::stream_request::Payload::Subscribe(s)) => {
+            StreamRequestPayload::Subscribe(from_proto_subscribe_to_task_request(s))
+        }
+        None => StreamRequestPayload::Unrecognised,
+    };
+    StreamRequest {
+        tenant: empty_to_none(&r.tenant),
+        payload,
     }
 }
 
@@ -811,6 +1013,13 @@ pub fn to_proto_stream_response(r: &StreamResponse) -> proto::StreamResponse {
         StreamResponse::ArtifactUpdate(a) => Some(proto::stream_response::Payload::ArtifactUpdate(
             to_proto_task_artifact_update_event(a),
         )),
+        StreamResponse::MessageUpdate(m) => Some(proto::stream_response::Payload::MessageUpdate(
+            to_proto_task_message_update_event(m),
+        )),
+        StreamResponse::Error(e) => Some(proto::stream_response::Payload::Error(
+            to_proto_stream_error(e),
+        )),
+        _ => None,
     };
     proto::StreamResponse { payload }
 }
@@ -829,6 +1038,12 @@ pub fn from_proto_stream_response(r: &proto::StreamResponse) -> Option<StreamRes
         Some(proto::stream_response::Payload::ArtifactUpdate(a)) => Some(
             StreamResponse::ArtifactUpdate(from_proto_task_artifact_update_event(a)),
         ),
+        Some(proto::stream_response::Payload::MessageUpdate(m)) => Some(
+            StreamResponse::MessageUpdate(from_proto_task_message_update_event(m)),
+        ),
+        Some(proto::stream_response::Payload::Error(e)) => {
+            Some(StreamResponse::Error(from_proto_stream_error(e)))
+        }
         None => None,
     }
 }
@@ -895,6 +1110,7 @@ pub fn to_proto_agent_capabilities(c: &AgentCapabilities) -> proto::AgentCapabil
             .map(|exts| exts.iter().map(to_proto_agent_extension).collect())
             .unwrap_or_default(),
         extended_agent_card: c.extended_agent_card,
+        user_artifacts: c.user_artifacts,
     }
 }
 
@@ -913,6 +1129,7 @@ pub fn from_proto_agent_capabilities(c: &proto::AgentCapabilities) -> AgentCapab
             )
         },
         extended_agent_card: c.extended_agent_card,
+        user_artifacts: c.user_artifacts,
     }
 }
 
@@ -1384,6 +1601,8 @@ mod tests {
     #[test]
     fn test_task_roundtrip() {
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "task-1".to_string(),
             context_id: "ctx-1".to_string(),
             status: TaskStatus {
@@ -1392,6 +1611,9 @@ mod tests {
                 timestamp: None,
             },
             artifacts: Some(vec![Artifact {
+                end_generation: None,
+                role: None,
+                start_generation: None,
                 artifact_id: "art-1".to_string(),
                 name: Some("result".to_string()),
                 description: None,
@@ -1414,6 +1636,7 @@ mod tests {
     #[test]
     fn test_stream_response_roundtrip() {
         let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".to_string(),
             context_id: "c1".to_string(),
             status: TaskStatus {
@@ -1431,6 +1654,8 @@ mod tests {
     #[test]
     fn test_send_message_response_task_roundtrip() {
         let resp = SendMessageResponse::Task(Task {
+            generation: 0,
+            timeline: None,
             id: "t1".to_string(),
             context_id: "c1".to_string(),
             status: TaskStatus {
@@ -1509,6 +1734,7 @@ mod tests {
     #[test]
     fn test_push_notification_config_roundtrip() {
         let tpnc = TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: "task-1".to_string(),
             tenant: Some("tenant-1".to_string()),
             url: "https://example.com/webhook".to_string(),
@@ -1527,6 +1753,7 @@ mod tests {
     #[test]
     fn test_send_message_request_roundtrip() {
         let req = SendMessageRequest {
+            artifact_updates: Vec::new(),
             message: Message {
                 message_id: "m1".to_string(),
                 context_id: Some("ctx".to_string()),
@@ -1538,8 +1765,11 @@ mod tests {
                 reference_task_ids: Some(vec!["ref1".to_string()]),
             },
             configuration: Some(SendMessageConfiguration {
+                if_generation_match: None,
+                timeline_length: None,
                 accepted_output_modes: Some(vec!["text/plain".to_string()]),
                 task_push_notification_config: Some(TaskPushNotificationConfig {
+                    protocol_version: None,
                     url: "http://push.example.com".to_string(),
                     id: Some("pnc-1".to_string()),
                     task_id: String::new(),
@@ -1575,8 +1805,65 @@ mod tests {
     }
 
     #[test]
-    fn test_send_message_request_minimal() {
+    fn test_artifact_only_request_survives_the_round_trip_unchanged() {
+        let request = SendMessageRequest {
+            message: Message {
+                role: Role::Unspecified,
+                message_id: String::new(),
+                ..Message::new(Role::Unspecified, vec![])
+            },
+            configuration: None,
+            metadata: None,
+            tenant: None,
+            artifact_updates: vec![TaskArtifactUpdateEvent {
+                generation: 0,
+                task_id: "t1".to_string(),
+                context_id: "c1".to_string(),
+                artifact: Artifact {
+                    end_generation: None,
+                    role: None,
+                    start_generation: None,
+                    artifact_id: "a1".to_string(),
+                    name: None,
+                    description: None,
+                    parts: vec![Part::text("data")],
+                    metadata: None,
+                    extensions: None,
+                },
+                append: None,
+                last_chunk: None,
+                metadata: None,
+            }],
+        };
+        let back = from_proto_send_message_request(&to_proto_send_message_request(&request));
+        assert_eq!(back, request);
+
+        // An empty message that has anything set is a message, and keeps it.
+        let mut variants = Vec::new();
+        for role in [Role::User, Role::Agent] {
+            let mut with_role = request.clone();
+            with_role.message.role = role;
+            variants.push(with_role);
+        }
+        let mut with_references = request.clone();
+        with_references.message.reference_task_ids = Some(vec![String::new()]);
+        variants.push(with_references);
+        let mut with_extensions = request.clone();
+        with_extensions.message.extensions = Some(vec!["x".into()]);
+        variants.push(with_extensions);
+        let mut with_metadata = request.clone();
+        with_metadata.message.metadata = Some(HashMap::new());
+        variants.push(with_metadata);
+        for variant in variants {
+            let back = from_proto_send_message_request(&to_proto_send_message_request(&variant));
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn test_missing_message_remains_invalid_for_handler_validation() {
         let proto = proto::SendMessageRequest {
+            artifact_updates: Vec::new(),
             tenant: String::new(),
             message: None,
             configuration: None,
@@ -1584,12 +1871,16 @@ mod tests {
         };
         let back = from_proto_send_message_request(&proto);
         assert!(back.tenant.is_none());
-        assert_eq!(back.message.role, Role::User);
+        assert_eq!(back.message.role, Role::Unspecified);
+        assert!(back.message.message_id.is_empty());
+        assert!(back.message.parts.is_empty());
     }
 
     #[test]
     fn test_get_task_request_roundtrip() {
         let req = GetTaskRequest {
+            current_generation: None,
+            timeline_length: None,
             id: "t1".to_string(),
             history_length: Some(10),
             tenant: Some("ten".to_string()),
@@ -1602,6 +1893,7 @@ mod tests {
     #[test]
     fn test_list_tasks_request_roundtrip() {
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: Some("ctx-1".to_string()),
             status: Some(TaskState::Working),
             page_size: Some(10),
@@ -1625,6 +1917,7 @@ mod tests {
     #[test]
     fn test_from_proto_list_tasks_request_treats_zero_page_size_as_unset() {
         let proto = proto::ListTasksRequest {
+            timeline_length: None,
             tenant: String::new(),
             context_id: "ctx-1".to_string(),
             status: 0,
@@ -1644,6 +1937,8 @@ mod tests {
     fn test_list_tasks_response_roundtrip() {
         let resp = ListTasksResponse {
             tasks: vec![Task {
+                generation: 0,
+                timeline: None,
                 id: "t1".to_string(),
                 context_id: "c1".to_string(),
                 status: TaskStatus {
@@ -1684,6 +1979,7 @@ mod tests {
     #[test]
     fn test_subscribe_to_task_request_roundtrip() {
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "t1".to_string(),
             tenant: Some("ten".to_string()),
         };
@@ -1743,6 +2039,7 @@ mod tests {
     fn test_list_push_notification_configs_response_roundtrip() {
         let resp = ListTaskPushNotificationConfigsResponse {
             configs: vec![TaskPushNotificationConfig {
+                protocol_version: None,
                 task_id: "t1".to_string(),
                 tenant: None,
                 url: "http://x.com".to_string(),
@@ -1776,6 +2073,8 @@ mod tests {
     #[test]
     fn test_stream_response_task_roundtrip() {
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t1".to_string(),
             context_id: "c1".to_string(),
             status: TaskStatus {
@@ -1805,9 +2104,13 @@ mod tests {
     #[test]
     fn test_stream_response_artifact_update_roundtrip() {
         let sr = StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            generation: 0,
             task_id: "t1".to_string(),
             context_id: "c1".to_string(),
             artifact: Artifact {
+                end_generation: None,
+                role: None,
+                start_generation: None,
                 artifact_id: "a1".to_string(),
                 name: Some("file".to_string()),
                 description: None,
@@ -1999,6 +2302,7 @@ mod tests {
     #[test]
     fn test_agent_capabilities_with_extensions() {
         let caps = AgentCapabilities {
+            user_artifacts: None,
             streaming: Some(true),
             push_notifications: Some(true),
             extensions: Some(vec![AgentExtension {
@@ -2126,6 +2430,8 @@ mod tests {
     #[test]
     fn test_task_with_history() {
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t1".to_string(),
             context_id: "c1".to_string(),
             status: TaskStatus {
@@ -2216,6 +2522,7 @@ mod tests {
     #[test]
     fn test_create_push_notification_config_request_roundtrip() {
         let req = TaskPushNotificationConfig {
+            protocol_version: None,
             url: "http://cb.example.com".to_string(),
             id: Some("c1".to_string()),
             task_id: "t1".to_string(),
@@ -2302,6 +2609,8 @@ mod tests {
     #[test]
     fn test_send_message_configuration_defaults() {
         let config = SendMessageConfiguration {
+            if_generation_match: None,
+            timeline_length: None,
             accepted_output_modes: None,
             task_push_notification_config: None,
             history_length: None,

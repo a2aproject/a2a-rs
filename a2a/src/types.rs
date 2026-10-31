@@ -440,12 +440,129 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<Vec<Artifact>>,
 
+    /// Deprecated since 1.1: read [`Task::timeline`] instead. Servers keep
+    /// populating it throughout the 1.x line; it is removed in 2.0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<Vec<Message>>,
+
+    /// The generation-ordered record of the interaction: agent status
+    /// entries and client messages (A2A 1.1, ADR-002).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "timeline_entries"
+    )]
+    pub timeline: Option<Vec<TimelineEntry>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "fuzzing", arbitrary(default))]
     pub metadata: Option<HashMap<String, Value>>,
+
+    /// Counter the server increments by exactly 1 on every state-changing
+    /// mutation of the task, starting at 1 when the task is created. Zero
+    /// means the peer did not report one (a pre-1.1 peer).
+    #[serde(default, with = "int64", skip_serializing_if = "is_zero")]
+    pub generation: i64,
+}
+
+/// One entry of a task [`Task::timeline`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineEntry {
+    /// What was recorded.
+    #[serde(flatten)]
+    pub content: TimelineContent,
+
+    /// The task generation at the point this entry was appended. Entries are
+    /// ordered by it; values are monotonic but not contiguous.
+    #[serde(default, with = "int64", skip_serializing_if = "is_zero")]
+    pub generation: i64,
+}
+
+/// The content of a [`TimelineEntry`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum TimelineContent {
+    /// A standalone message, used for client input.
+    Message(Message),
+    /// An agent status: the state plus the agent's message at that point.
+    Status(TaskStatus),
+}
+
+/// Reads a timeline, skipping an entry of a kind this version does not know
+/// (A2A 1.1 §3.2.8: clients MUST skip rather than reject the timeline).
+fn timeline_entries<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<TimelineEntry>>, D::Error> {
+    let Some(entries) = Option::<Vec<Value>>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    entries
+        .into_iter()
+        .filter(|entry| entry.get("message").is_some() || entry.get("status").is_some())
+        .map(|entry| serde_json::from_value(entry).map_err(serde::de::Error::custom))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+pub(crate) fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
+/// `int64` fields travel as JSON strings in ProtoJSON. Serialise that way and
+/// accept either form when reading.
+pub(crate) mod int64 {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(value: &i64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Int64 {
+            Number(i64),
+            Text(String),
+        }
+        // `null` is an unset field, which for a plain `int64` is zero.
+        match Option::<Int64>::deserialize(deserializer)? {
+            None => Ok(0),
+            Some(Int64::Number(n)) => Ok(n),
+            Some(Int64::Text(t)) => t.parse().map_err(D::Error::custom),
+        }
+    }
+}
+
+/// `optional int64` flavour of [`int64`].
+pub(crate) mod opt_int64 {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(value: &Option<i64>, serializer: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => serializer.collect_str(value),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<i64>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Int64 {
+            Number(i64),
+            Text(String),
+        }
+        match Option::<Int64>::deserialize(deserializer)? {
+            None => Ok(None),
+            Some(Int64::Number(n)) => Ok(Some(n)),
+            Some(Int64::Text(t)) => t.parse().map(Some).map_err(D::Error::custom),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +590,20 @@ pub struct Artifact {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Vec<String>>,
+
+    /// The task generation at which this artifact first appeared.
+    #[serde(default, with = "opt_int64", skip_serializing_if = "Option::is_none")]
+    pub start_generation: Option<i64>,
+
+    /// The task generation at which this artifact was completed; unset while
+    /// it is still streaming.
+    #[serde(default, with = "opt_int64", skip_serializing_if = "Option::is_none")]
+    pub end_generation: Option<i64>,
+
+    /// The originator of this artifact. Unset means the agent; an artifact
+    /// written by the client is [`Role::User`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
 }
 
 // ---------------------------------------------------------------------------
@@ -491,11 +622,21 @@ pub struct SendMessageConfiguration {
     #[serde(alias = "pushNotificationConfig")]
     pub task_push_notification_config: Option<TaskPushNotificationConfig>,
 
+    /// Deprecated since 1.1: use [`SendMessageConfiguration::timeline_length`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_length: Option<i32>,
 
+    /// The maximum number of most recent `timeline` entries to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_length: Option<i32>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_immediately: Option<bool>,
+
+    /// Optimistic concurrency: reject the request unless the task's current
+    /// generation equals this value.
+    #[serde(default, with = "opt_int64", skip_serializing_if = "Option::is_none")]
+    pub if_generation_match: Option<i64>,
 }
 
 /// Request to send a message to an agent.
@@ -514,6 +655,11 @@ pub struct SendMessageRequest {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+
+    /// Artifacts the client writes to the task (A2A 1.1). Only honoured by
+    /// agents advertising `capabilities.userArtifacts`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_updates: Vec<crate::event::TaskArtifactUpdateEvent>,
 }
 
 /// Response from `SendMessage` — either a Task or a Message.
@@ -561,11 +707,21 @@ impl<'de> Deserialize<'de> for SendMessageResponse {
 pub struct GetTaskRequest {
     pub id: TaskId,
 
+    /// Deprecated since 1.1: use [`GetTaskRequest::timeline_length`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_length: Option<i32>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+
+    /// The maximum number of most recent `timeline` entries to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_length: Option<i32>,
+
+    /// Long-poll: the server should not return until the task's generation is
+    /// strictly greater than this value.
+    #[serde(default, with = "opt_int64", skip_serializing_if = "Option::is_none")]
+    pub current_generation: Option<i64>,
 }
 
 /// Request to list tasks.
@@ -585,8 +741,13 @@ pub struct ListTasksRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_token: Option<String>,
 
+    /// Deprecated since 1.1: use [`ListTasksRequest::timeline_length`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_length: Option<i32>,
+
+    /// The maximum number of `timeline` entries to include in each task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_length: Option<i32>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "fuzzing", arbitrary(with = fuzz_support::bounded_timestamp))]
@@ -634,6 +795,43 @@ pub struct SubscribeToTaskRequest {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+
+    /// Resume after this generation: the server replays only what followed it
+    /// and does not open with a `Task` snapshot.
+    #[serde(default, with = "opt_int64", skip_serializing_if = "Option::is_none")]
+    pub last_seen_generation: Option<i64>,
+}
+
+/// A client-to-server message on a live (`SendLiveMessage`) stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
+#[serde(rename_all = "camelCase")]
+pub struct StreamRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+
+    #[serde(flatten)]
+    pub payload: StreamRequestPayload,
+}
+
+/// The payload of a [`StreamRequest`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+// Boxing would make the public variant awkward to build for a type that is
+// created once per stream.
+#[allow(clippy::large_enum_variant)]
+pub enum StreamRequestPayload {
+    /// Send a message on the stream.
+    SendMessage(SendMessageRequest),
+    /// Attach to an existing task. Only valid as the first request.
+    Subscribe(SubscribeToTaskRequest),
+    /// A payload kind this version does not know. It is never read from or
+    /// written to the native JSON form; the protobuf conversions use it so a
+    /// server can refuse the request (with a `StreamError`) instead of losing it.
+    #[serde(skip)]
+    Unrecognised,
 }
 
 /// Request to get an extended (authenticated) agent card.
@@ -688,6 +886,11 @@ pub struct TaskPushNotificationConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+
+    /// The protocol version the push payloads follow. Defaults to the version
+    /// of the request that created the configuration, or "1.0".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
 }
 
 /// Request to get a specific push config.
@@ -807,6 +1010,8 @@ mod tests {
     #[test]
     fn test_send_message_response_serde() {
         let resp = SendMessageResponse::Task(Task {
+            generation: 0,
+            timeline: None,
             id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -922,6 +1127,8 @@ mod tests {
     #[test]
     fn test_task_full_serde() {
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t1".to_string(),
             context_id: "c1".to_string(),
             status: TaskStatus {
@@ -930,6 +1137,9 @@ mod tests {
                 timestamp: None,
             },
             artifacts: Some(vec![Artifact {
+                end_generation: None,
+                role: None,
+                start_generation: None,
                 artifact_id: "a1".to_string(),
                 name: Some("output".to_string()),
                 description: None,
@@ -951,6 +1161,7 @@ mod tests {
     #[test]
     fn test_push_notification_config_serde() {
         let config = TaskPushNotificationConfig {
+            protocol_version: None,
             url: "https://example.com/webhook".to_string(),
             id: Some("cfg-1".to_string()),
             task_id: "task-1".to_string(),
@@ -969,8 +1180,11 @@ mod tests {
     #[test]
     fn test_send_message_request_serde() {
         let req = SendMessageRequest {
+            artifact_updates: Vec::new(),
             message: Message::new(Role::User, vec![Part::text("hello")]),
             configuration: Some(SendMessageConfiguration {
+                if_generation_match: None,
+                timeline_length: None,
                 accepted_output_modes: Some(vec!["text/plain".to_string()]),
                 task_push_notification_config: None,
                 history_length: Some(10),
@@ -1094,6 +1308,7 @@ mod tests {
     #[test]
     fn test_list_tasks_request_serde() {
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: Some("c1".to_string()),
             status: Some(TaskState::Working),
             page_size: Some(10),
@@ -1123,6 +1338,7 @@ mod tests {
     #[test]
     fn test_subscribe_to_task_request_serde() {
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "t1".to_string(),
             tenant: None,
         };

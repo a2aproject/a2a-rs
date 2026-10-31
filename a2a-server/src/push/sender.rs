@@ -382,6 +382,7 @@ mod tests {
     fn sample_status_update() -> StreamResponse {
         use a2a::event::*;
         StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -395,6 +396,7 @@ mod tests {
 
     fn sample_config(url: &str) -> TaskPushNotificationConfig {
         TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: String::new(),
             url: url.to_string(),
             id: None,
@@ -412,6 +414,7 @@ mod tests {
             ..Default::default()
         }));
         let config = TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: String::new(),
             url: "http://127.0.0.1:1/callback".to_string(),
             id: None,
@@ -448,6 +451,7 @@ mod tests {
             ..Default::default()
         }));
         let config = TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: String::new(),
             url: "http://127.0.0.1:1/callback".to_string(),
             id: None,
@@ -471,6 +475,7 @@ mod tests {
             ..Default::default()
         }));
         let config = TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: String::new(),
             url: "http://127.0.0.1:1/callback".to_string(),
             id: None,
@@ -641,6 +646,7 @@ mod tests {
         install_crypto_provider();
         let sender = HttpPushSender::new(None);
         let config = TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: String::new(),
             url: "https://example.com/callback".to_string(),
             id: None,
@@ -661,6 +667,7 @@ mod tests {
         install_crypto_provider();
         let sender = HttpPushSender::new(None);
         let config = TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: String::new(),
             url: "https://example.com/callback".to_string(),
             id: None,
