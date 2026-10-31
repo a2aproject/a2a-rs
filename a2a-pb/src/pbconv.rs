@@ -64,9 +64,7 @@ pub fn proto_value_to_json_value(v: &prost_types::Value) -> Value {
     match &v.kind {
         Some(Kind::NullValue(_)) => Value::Null,
         Some(Kind::BoolValue(b)) => Value::Bool(*b),
-        Some(Kind::NumberValue(n)) => serde_json::Number::from_f64(*n)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+        Some(Kind::NumberValue(n)) => json_number(*n).map(Value::Number).unwrap_or(Value::Null),
         Some(Kind::StringValue(s)) => Value::String(s.clone()),
         Some(Kind::ListValue(list)) => {
             Value::Array(list.values.iter().map(proto_value_to_json_value).collect())
@@ -80,6 +78,18 @@ pub fn proto_value_to_json_value(v: &prost_types::Value) -> Value {
             Value::Object(map)
         }
         None => Value::Null,
+    }
+}
+
+/// `google.protobuf.Value` holds every number as a double, so an integer such
+/// as `3600` arrives as `3600.0`. A whole number within ±2^53, where a double
+/// is exact, is given back as an integer so it still deserializes into one.
+fn json_number(n: f64) -> Option<serde_json::Number> {
+    const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_992.0;
+    if n.fract() == 0.0 && n.abs() <= MAX_EXACT_INTEGER {
+        Some((n as i64).into())
+    } else {
+        serde_json::Number::from_f64(n)
     }
 }
 
@@ -1495,10 +1505,9 @@ mod tests {
     fn test_struct_roundtrip() {
         let mut map = HashMap::new();
         map.insert("str".to_string(), Value::String("hello".to_string()));
-        map.insert(
-            "num".to_string(),
-            Value::Number(serde_json::Number::from_f64(42.0).unwrap()),
-        );
+        map.insert("num".to_string(), serde_json::json!(42));
+        map.insert("negative".to_string(), serde_json::json!(-7));
+        map.insert("fraction".to_string(), serde_json::json!(4.5));
         map.insert("bool".to_string(), Value::Bool(true));
         map.insert("null".to_string(), Value::Null);
         let proto_s = to_proto_struct(&map);
@@ -2166,8 +2175,7 @@ mod tests {
 
     #[test]
     fn test_part_data_roundtrip() {
-        // Use f64 numbers since proto Value stores all numbers as f64
-        let data = serde_json::json!({"nested": [1.0, 2.0, 3.0]});
+        let data = serde_json::json!({"nested": [1, 2, 3], "ratio": 0.5});
         let part = Part {
             content: PartContent::Data(data),
             filename: None,
