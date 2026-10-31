@@ -4,6 +4,7 @@
 use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use async_trait::async_trait;
+use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, PercentEncode, utf8_percent_encode};
 use reqwest::Client;
@@ -19,6 +20,7 @@ use crate::wire;
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
 const REST_STREAM_MESSAGE_PATH: &str = "/message:stream";
+const REST_LIVE_MESSAGE_PATH: &str = "/message:live";
 const REST_EXTENDED_AGENT_CARD_PATH: &str = "/extendedAgentCard";
 
 /// Everything but the RFC 3986 unreserved characters is percent-encoded, so an
@@ -58,9 +60,16 @@ struct RestErrorStatus {
 /// REST (HTTP+JSON) transport implementation.
 ///
 /// Maps A2A operations to RESTful HTTP endpoints.
+#[derive(Clone)]
 pub struct RestTransport {
     client: Client,
     base_url: String,
+}
+
+/// What a call that may either stream or answer plainly came back with.
+enum StreamOrTask {
+    Stream(BoxStream<'static, Result<StreamResponse, A2AError>>),
+    Task(Box<Task>),
 }
 
 impl RestTransport {
@@ -230,14 +239,61 @@ impl RestTransport {
         Ok(crate::jsonrpc::parse_sse_stream_rest(stream))
     }
 
+    /// `POST /message:live`: the call that opens a live exchange answers with
+    /// its events; one that only feeds an open exchange answers with the task.
+    async fn post_live(
+        &self,
+        params: &ServiceParams,
+        body: &StreamRequest,
+    ) -> Result<StreamOrTask, A2AError> {
+        let payload = protojson_conv::to_value(body).map_err(|e| {
+            A2AError::internal(format!("failed to serialize request as ProtoJSON: {e}"))
+        })?;
+        let resp = self
+            .send(
+                self.build_request(reqwest::Method::POST, REST_LIVE_MESSAGE_PATH, params)
+                    .header("Accept", "text/event-stream, application/json")
+                    .json(&payload),
+            )
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(Self::into_rest_error(resp).await);
+        }
+
+        let is_event_stream = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .map(|v| v.as_bytes().starts_with(b"text/event-stream"))
+            .unwrap_or(true);
+        if is_event_stream {
+            return Ok(StreamOrTask::Stream(crate::jsonrpc::parse_sse_stream_rest(
+                resp.bytes_stream(),
+            )));
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+        wire::log_response(reqwest::StatusCode::OK, &body);
+        let payload = serde_json::from_str::<Value>(&body)
+            .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+        protojson_conv::from_value(payload)
+            .map(|task| StreamOrTask::Task(Box::new(task)))
+            .map_err(|e| {
+                A2AError::internal(format!("failed to deserialize response as ProtoJSON: {e}"))
+            })
+    }
+
     async fn get_streaming(
         &self,
         path: &str,
         params: &ServiceParams,
+        query: &[(String, String)],
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let resp = self
             .send(
-                self.build_request(reqwest::Method::GET, path, params)
+                self.build_request_with_query(reqwest::Method::GET, path, params, query)
                     .header("Accept", "text/event-stream"),
             )
             .await?;
@@ -259,6 +315,31 @@ impl RestTransport {
             return Err(Self::into_rest_error(resp).await);
         }
         Ok(())
+    }
+}
+
+/// The uplink of a live exchange over REST: each request is a short-lived
+/// `POST /message:live`, which the server answers with the task.
+#[derive(Clone)]
+struct RestLiveUplink {
+    transport: RestTransport,
+    params: ServiceParams,
+}
+
+#[async_trait]
+impl crate::LiveUplink for RestLiveUplink {
+    async fn send(&self, request: StreamRequest) -> Result<crate::LiveAck, A2AError> {
+        match self.transport.post_live(&self.params, &request).await? {
+            StreamOrTask::Task(task) => Ok(crate::LiveAck::Task(task)),
+            // The exchange this was meant for is gone, so the server opened a
+            // new one for it and carried the request out: this is that one.
+            StreamOrTask::Stream(events) => {
+                Ok(crate::LiveAck::Reopened(Box::new(crate::LiveConnection {
+                    events,
+                    sender: crate::LiveSender::new(std::sync::Arc::new(self.clone())),
+                })))
+            }
+        }
     }
 }
 
@@ -313,6 +394,32 @@ impl Transport for RestTransport {
         self.post_streaming(&path, params, req).await
     }
 
+    async fn send_live_message(
+        &self,
+        params: &ServiceParams,
+        first: &StreamRequest,
+    ) -> Result<crate::LiveConnection, A2AError> {
+        let params = crate::transport::live_params(params);
+        match self.post_live(&params, first).await? {
+            StreamOrTask::Stream(events) => Ok(crate::LiveConnection {
+                events,
+                sender: crate::LiveSender::new(std::sync::Arc::new(RestLiveUplink {
+                    transport: self.clone(),
+                    params: params.clone(),
+                })),
+            }),
+            // A peer without the SDK routing convention may acknowledge this
+            // opening as input to an existing exchange instead of streaming.
+            StreamOrTask::Task(task) => Ok(crate::LiveConnection {
+                events: futures::stream::iter([Ok(StreamResponse::Task(*task))]).boxed(),
+                sender: crate::LiveSender::new(std::sync::Arc::new(RestLiveUplink {
+                    transport: self.clone(),
+                    params: params.clone(),
+                })),
+            }),
+        }
+    }
+
     async fn get_task(
         &self,
         params: &ServiceParams,
@@ -325,6 +432,12 @@ impl Transport for RestTransport {
         let mut query_parts = Vec::new();
         if let Some(hl) = req.history_length {
             query_parts.push(("historyLength".to_string(), hl.to_string()));
+        }
+        if let Some(tl) = req.timeline_length {
+            query_parts.push(("timelineLength".to_string(), tl.to_string()));
+        }
+        if let Some(generation) = req.current_generation {
+            query_parts.push(("currentGeneration".to_string(), generation.to_string()));
         }
         self.get_json(&path, params, &query_parts).await
     }
@@ -353,6 +466,9 @@ impl Transport for RestTransport {
         }
         if let Some(hl) = req.history_length {
             query_parts.push(("historyLength".to_string(), hl.to_string()));
+        }
+        if let Some(tl) = req.timeline_length {
+            query_parts.push(("timelineLength".to_string(), tl.to_string()));
         }
         if let Some(ref ts) = req.status_timestamp_after {
             query_parts.push((
@@ -384,12 +500,22 @@ impl Transport for RestTransport {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let tenant = req.tenant.as_deref();
         let canonical_path = tenant_path(tenant, &format!("/tasks/{}:subscribe", segment(&req.id)));
-        match self.get_streaming(&canonical_path, params).await {
+        let mut query_parts = Vec::new();
+        if let Some(generation) = req.last_seen_generation {
+            query_parts.push(("lastSeenGeneration".to_string(), generation.to_string()));
+        }
+        match self
+            .get_streaming(&canonical_path, params, &query_parts)
+            .await
+        {
             Ok(stream) => Ok(stream),
             Err(err) if should_retry_subscribe_with_legacy_path(&err) => {
-                let legacy_path = format!("/tasks/{}/subscribe", segment(&req.id));
-                self.get_streaming(&tenant_path(tenant, &legacy_path), params)
-                    .await
+                self.get_streaming(
+                    &tenant_path(tenant, &format!("/tasks/{}/subscribe", segment(&req.id))),
+                    params,
+                    &query_parts,
+                )
+                .await
             }
             Err(err) => Err(err),
         }
