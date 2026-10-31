@@ -50,6 +50,10 @@ The live client runs the same conversation over all three bindings:
 `live.events` carries task updates for every binding. HTTP sends subsequent input
 as individual requests and returns task receipts; gRPC writes input on the duplex
 stream. The executor and conversation code are shared across these bindings.
+The executor uses the same owned `ExecutorContext` and `'static` output stream
+as `main`. Its input receiver can also move into a spawned Tokio worker. When
+the execution stream ends, the old receiver is revoked and unread messages are
+handed to the next invocation; workers cannot consume that handed-off input.
 The client reports errors with a nonzero exit status and bounds each conversation
 to 30 seconds.
 
