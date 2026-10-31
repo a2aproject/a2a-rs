@@ -52,6 +52,15 @@ fn extract_service_params(
     params
 }
 
+/// §3.6.2 for every gRPC method, on the `A2A-Version` read from metadata
+/// (§10.2) -- the same check the HTTP bindings apply.
+#[allow(clippy::result_large_err)]
+fn validate_protocol_version(
+    params: &a2a_server::middleware::ServiceParams,
+) -> Result<(), tonic::Status> {
+    a2a_server::middleware::check_a2a_version(params).map_err(|error| a2a_error_to_status(&error))
+}
+
 #[allow(clippy::result_large_err)]
 fn map_proto_stream_item(
     item: Result<StreamResponse, A2AError>,
@@ -69,6 +78,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
         request: tonic::Request<proto::SendMessageRequest>,
     ) -> Result<tonic::Response<proto::SendMessageResponse>, tonic::Status> {
         let params = extract_service_params(request.metadata());
+        validate_protocol_version(&params)?;
         let native_req = pbconv::from_proto_send_message_request(request.get_ref());
         let result = self
             .handler
@@ -87,6 +97,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
         request: tonic::Request<proto::SendMessageRequest>,
     ) -> Result<tonic::Response<Self::SendStreamingMessageStream>, tonic::Status> {
         let params = extract_service_params(request.metadata());
+        validate_protocol_version(&params)?;
         let native_req = pbconv::from_proto_send_message_request(request.get_ref());
         let stream = self
             .handler
@@ -102,6 +113,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
         request: tonic::Request<proto::GetTaskRequest>,
     ) -> Result<tonic::Response<proto::Task>, tonic::Status> {
         let params = extract_service_params(request.metadata());
+        validate_protocol_version(&params)?;
         let native_req = pbconv::from_proto_get_task_request(request.get_ref());
         let result = self
             .handler
@@ -116,6 +128,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
         request: tonic::Request<proto::ListTasksRequest>,
     ) -> Result<tonic::Response<proto::ListTasksResponse>, tonic::Status> {
         let params = extract_service_params(request.metadata());
+        validate_protocol_version(&params)?;
         let native_req = pbconv::from_proto_list_tasks_request(request.get_ref());
         let result = self
             .handler
@@ -132,6 +145,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
         request: tonic::Request<proto::CancelTaskRequest>,
     ) -> Result<tonic::Response<proto::Task>, tonic::Status> {
         let params = extract_service_params(request.metadata());
+        validate_protocol_version(&params)?;
         let native_req = pbconv::from_proto_cancel_task_request(request.get_ref());
         let result = self
             .handler
@@ -148,6 +162,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
         request: tonic::Request<proto::SubscribeToTaskRequest>,
     ) -> Result<tonic::Response<Self::SubscribeToTaskStream>, tonic::Status> {
         let params = extract_service_params(request.metadata());
+        validate_protocol_version(&params)?;
         let native_req = pbconv::from_proto_subscribe_to_task_request(request.get_ref());
         let stream = self
             .handler
@@ -163,6 +178,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
         request: tonic::Request<proto::TaskPushNotificationConfig>,
     ) -> Result<tonic::Response<proto::TaskPushNotificationConfig>, tonic::Status> {
         let params = extract_service_params(request.metadata());
+        validate_protocol_version(&params)?;
         let native_req =
             pbconv::from_proto_create_task_push_notification_config_request(request.get_ref());
         let result = self
@@ -180,6 +196,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
         request: tonic::Request<proto::GetTaskPushNotificationConfigRequest>,
     ) -> Result<tonic::Response<proto::TaskPushNotificationConfig>, tonic::Status> {
         let params = extract_service_params(request.metadata());
+        validate_protocol_version(&params)?;
         let native_req =
             pbconv::from_proto_get_task_push_notification_config_request(request.get_ref());
         let result = self
@@ -198,6 +215,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
     ) -> Result<tonic::Response<proto::ListTaskPushNotificationConfigsResponse>, tonic::Status>
     {
         let params = extract_service_params(request.metadata());
+        validate_protocol_version(&params)?;
         let native_req =
             pbconv::from_proto_list_task_push_notification_configs_request(request.get_ref());
         let result = self
@@ -215,6 +233,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
         request: tonic::Request<proto::GetExtendedAgentCardRequest>,
     ) -> Result<tonic::Response<proto::AgentCard>, tonic::Status> {
         let params = extract_service_params(request.metadata());
+        validate_protocol_version(&params)?;
         let native_req = pbconv::from_proto_get_extended_agent_card_request(request.get_ref());
         let result = self
             .handler
@@ -229,6 +248,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
         request: tonic::Request<proto::DeleteTaskPushNotificationConfigRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
         let params = extract_service_params(request.metadata());
+        validate_protocol_version(&params)?;
         let native_req =
             pbconv::from_proto_delete_task_push_notification_config_request(request.get_ref());
         self.handler
