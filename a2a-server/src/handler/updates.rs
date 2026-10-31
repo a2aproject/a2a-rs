@@ -1,12 +1,15 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-use super::{
-    artifacts::{artifacts_differ, close_open_artifacts, merge_artifact},
-    events::ActiveExecution,
-};
+//! Persist task updates, record status changes, and rebase executor snapshots.
+
+use super::artifacts::{artifacts_differ, close_open_artifacts, merge_artifact};
+use super::events::ActiveExecution;
 use a2a::*;
 
+/// An execution may only publish or mutate its bound task and context.
+/// A message's optional task/context IDs may be absent for direct replies, but never name
+/// another task. Validate before looking up or saving the event's IDs.
 pub(super) fn validate_event_identity(task: &Task, event: &StreamResponse) -> Result<(), A2AError> {
     let (id, context) = match event {
         StreamResponse::Task(value) => (Some(value.id.as_str()), Some(value.context_id.as_str())),
@@ -36,12 +39,21 @@ pub(super) fn validate_event_identity(task: &Task, event: &StreamResponse) -> Re
 
 pub(super) async fn save_task(
     task_store: &dyn crate::TaskStore,
+    task: Task,
+) -> Result<Task, A2AError> {
+    save_task_with(task_store, task, false).await
+}
+
+/// Saves `task`: `creating` for the first save of a task, which is created
+/// outright; otherwise it is updated, and created if the store does not know it.
+pub(super) async fn save_task_with(
+    task_store: &dyn crate::TaskStore,
     mut task: Task,
+    creating: bool,
 ) -> Result<Task, A2AError> {
     if task.status.state.is_terminal() {
-        for artifact in task.artifacts.iter_mut().flatten() {
-            artifact.end_generation.get_or_insert(task.generation);
-        }
+        let generation = task.generation;
+        close_open_artifacts(&mut task, generation);
     }
     // DM-SERIAL-001: a persisted/returned task status must carry a timestamp.
     // This is the single persistence chokepoint for executor events, so
@@ -49,6 +61,10 @@ pub(super) async fn save_task(
     // alike, while preserving any timestamp the executor already supplied.
     if task.status.timestamp.is_none() {
         task.status.timestamp = Some(chrono::Utc::now());
+    }
+    if creating {
+        task_store.create(task.clone()).await?;
+        return Ok(task);
     }
     match task_store.update(task.clone()).await {
         Ok(_) => Ok(task),
@@ -188,6 +204,17 @@ pub(super) async fn apply_event_to_task(
     current_task: Option<Task>,
     event: &mut StreamResponse,
 ) -> Result<Option<Task>, A2AError> {
+    apply_event_to_new_or_stored_task(task_store, current_task, event, false).await
+}
+
+/// [`apply_event_to_task`], where `creating` says the event is the first of a
+/// task that is not in the store yet.
+pub(super) async fn apply_event_to_new_or_stored_task(
+    task_store: &dyn crate::TaskStore,
+    current_task: Option<Task>,
+    event: &mut StreamResponse,
+    creating: bool,
+) -> Result<Option<Task>, A2AError> {
     if let Some(task) = &current_task {
         validate_event_identity(task, event)?;
     }
@@ -211,7 +238,9 @@ pub(super) async fn apply_event_to_task(
                     }
                 }
             }
-            save_task(task_store, task.clone()).await.map(Some)
+            save_task_with(task_store, task.clone(), creating)
+                .await
+                .map(Some)
         }
         StreamResponse::StatusUpdate(update) => {
             let mut task = match current_task {
@@ -226,7 +255,7 @@ pub(super) async fn apply_event_to_task(
             if task.status.state.is_terminal() {
                 close_open_artifacts(&mut task, update.generation);
             }
-            save_task(task_store, task).await.map(Some)
+            save_task_with(task_store, task, creating).await.map(Some)
         }
         StreamResponse::ArtifactUpdate(update) => {
             let mut task = match current_task {
@@ -237,7 +266,7 @@ pub(super) async fn apply_event_to_task(
                     .ok_or_else(|| A2AError::task_not_found(&update.task_id))?,
             };
             update.generation = merge_artifact(&mut task, update)?;
-            save_task(task_store, task).await.map(Some)
+            save_task_with(task_store, task, creating).await.map(Some)
         }
         // A message appended to the task, and a rejection of a client request,
         // are what the server reports about *clients*. An executor has no
@@ -264,8 +293,20 @@ pub(super) async fn apply_and_publish(
     base: Option<Task>,
     event: &mut StreamResponse,
 ) -> Result<bool, A2AError> {
+    apply_and_publish_with(task_store, active, base, event, false).await
+}
+
+/// [`apply_and_publish`], where `creating` says the event is the first of a
+/// task that is not in the store yet.
+pub(super) async fn apply_and_publish_with(
+    task_store: &dyn crate::TaskStore,
+    active: &ActiveExecution,
+    base: Option<Task>,
+    event: &mut StreamResponse,
+    creating: bool,
+) -> Result<bool, A2AError> {
     let generation_before = base.as_ref().map(|task| task.generation);
-    let updated_task = apply_event_to_task(task_store, base, event).await?;
+    let updated_task = apply_event_to_new_or_stored_task(task_store, base, event, creating).await?;
     let repeated = matches!(
         &*event,
         StreamResponse::Task(task) if Some(task.generation) == generation_before

@@ -625,10 +625,14 @@ mod tests {
     }
 
     fn make_app() -> axum::Router {
-        let handler = Arc::new(DefaultRequestHandler::new(
-            EchoExecutor,
-            InMemoryTaskStore::new(),
-        ));
+        let handler = Arc::new(
+            DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new()).with_capabilities(
+                AgentCapabilities {
+                    streaming: Some(true),
+                    ..Default::default()
+                },
+            ),
+        );
         rest_router(handler)
     }
 

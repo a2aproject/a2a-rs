@@ -164,6 +164,10 @@ impl HttpPushSender {
         Ok(())
     }
 
+    pub(crate) fn fail_on_error(&self) -> bool {
+        self.fail_on_error
+    }
+
     fn handle_error(&self, msg: String) -> Result<(), A2AError> {
         if self.fail_on_error {
             Err(crate::sanitized_internal_error(&msg))

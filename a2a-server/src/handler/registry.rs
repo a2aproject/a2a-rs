@@ -1,25 +1,29 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+//! Manage active executions, task writer locks, and reservation cleanup.
 
-use super::events::{ActiveExecution, ExecutionEvent};
+use super::events::{ActiveExecution, ExecutionReceiver};
+use super::push_delivery::PushQueues;
 use a2a::*;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
 
 #[derive(Default)]
 pub(super) struct ExecutionManager {
-    pub(super) executions: RwLock<HashMap<TaskId, Arc<ActiveExecution>>>,
+    executions: RwLock<HashMap<TaskId, Arc<ActiveExecution>>>,
     /// One writer lock per task, shared by whoever is mutating it. Held weakly
     /// so a task nobody is touching costs nothing.
-    pub(super) writers: std::sync::Mutex<TaskWriters>,
+    writers: std::sync::Mutex<TaskWriters>,
+    /// The webhook deliveries of each task, in the order its events were
+    /// published.
+    pub(super) pushes: PushQueues,
 }
 
 #[derive(Default)]
-pub(super) struct TaskWriters {
-    pub(super) locks: HashMap<TaskId, std::sync::Weak<tokio::sync::Mutex<()>>>,
-    pub(super) calls: usize,
+struct TaskWriters {
+    locks: HashMap<TaskId, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    calls: usize,
 }
 
 impl ExecutionManager {
@@ -27,8 +31,14 @@ impl ExecutionManager {
     /// events, a cancel, a follow-up being prepared. Two callers asking for the
     /// same task while either still holds it get the same lock.
     pub(super) fn writer_for(&self, task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut writers = self
-            .writers
+        Self::lock_for(&self.writers, task_id)
+    }
+
+    fn lock_for(
+        locks: &std::sync::Mutex<TaskWriters>,
+        task_id: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut writers = locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         writers.calls += 1;
@@ -48,6 +58,7 @@ impl ExecutionManager {
             .insert(task_id.to_string(), Arc::downgrade(&lock));
         lock
     }
+
     /// Claims the task for one execution before anything reads it, so two
     /// requests for the same task cannot both prepare from the same stored
     /// state. The snapshot is filled in once the request has been applied.
@@ -59,9 +70,33 @@ impl ExecutionManager {
     pub(super) async fn reserve(
         &self,
         task_id: &str,
-    ) -> Result<(Arc<ActiveExecution>, tokio::sync::OwnedMutexGuard<()>), A2AError> {
+    ) -> Result<
+        (
+            Arc<ActiveExecution>,
+            crate::ClientInputs,
+            tokio::sync::OwnedMutexGuard<()>,
+        ),
+        A2AError,
+    > {
         let writer = self.writer_for(task_id);
         let guard = Arc::clone(&writer).lock_owned().await;
+        self.reserve_held(task_id, guard).await
+    }
+
+    /// [`Self::reserve`] for a caller that already holds the task's writer.
+    pub(super) async fn reserve_held(
+        &self,
+        task_id: &str,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<
+        (
+            Arc<ActiveExecution>,
+            crate::ClientInputs,
+            tokio::sync::OwnedMutexGuard<()>,
+        ),
+        A2AError,
+    > {
+        let writer = self.writer_for(task_id);
         let mut executions = self.executions.write().await;
         if let Some(existing) = executions.get(task_id) {
             // A live reservation holds the writer until its snapshot is set,
@@ -76,9 +111,9 @@ impl ExecutionManager {
             }
         }
 
-        let active = ActiveExecution::with_writer(None, writer);
+        let (active, inputs) = ActiveExecution::with_writer(None, writer);
         executions.insert(task_id.to_string(), active.clone());
-        Ok((active, guard))
+        Ok((active, inputs, guard))
     }
 
     pub(super) async fn get(&self, task_id: &str) -> Option<Arc<ActiveExecution>> {
@@ -89,7 +124,7 @@ impl ExecutionManager {
     pub(super) async fn resubscribe(
         &self,
         task_id: &str,
-    ) -> Option<(broadcast::Receiver<ExecutionEvent>, Option<Task>, u64)> {
+    ) -> Option<(ExecutionReceiver, Option<Task>, u64)> {
         let active = self.get(task_id).await?;
         let (receiver, snapshot_task, sequence) = active.resubscribe().await;
         Some((receiver, snapshot_task, sequence))
@@ -126,10 +161,10 @@ impl ExecutionManager {
 /// dropped part-way (a client that disconnects) or an executor that panics
 /// would otherwise leave the task "already in progress" for good.
 pub(super) struct ReservationGuard {
-    pub(super) manager: Arc<ExecutionManager>,
-    pub(super) task_id: TaskId,
-    pub(super) active: Arc<ActiveExecution>,
-    pub(super) armed: bool,
+    manager: Arc<ExecutionManager>,
+    task_id: TaskId,
+    active: Arc<ActiveExecution>,
+    armed: bool,
 }
 
 impl ReservationGuard {
@@ -182,6 +217,9 @@ impl Drop for ReservationGuard {
     }
 }
 
+/// Execution and delivery share the same immutable handler services.
+pub(super) type ExecutionRuntime = super::DefaultRequestHandler;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,10 +231,10 @@ mod tests {
     #[tokio::test]
     async fn test_reserve_replaces_a_dropped_requests_leftover() {
         let manager = ExecutionManager::default();
-        let (stale, guard) = manager.reserve("t-stale").await.unwrap();
+        let (stale, _inputs, guard) = manager.reserve("t-stale").await.unwrap();
         drop(guard); // the request goes away; nothing released its entry
 
-        let (fresh, _guard) = manager
+        let (fresh, _inputs, _guard) = manager
             .reserve("t-stale")
             .await
             .expect("the leftover is not a running execution");
@@ -270,6 +308,49 @@ mod tests {
         }
         assert!(resumed.next().await.is_none());
     }
+
+    /// The reservation hands back the task's writer already held: whoever
+    /// finds the execution registered then waits on a lock that is taken, not
+    /// one that is still free between the registration and the first write.
+    #[tokio::test]
+    async fn test_reserve_holds_the_writer_from_the_moment_it_registers() {
+        let manager = ExecutionManager::default();
+
+        let (active, _inputs, guard) = manager.reserve("t-reserved").await.unwrap();
+        assert!(manager.get("t-reserved").await.is_some());
+        assert!(
+            manager.writer_for("t-reserved").try_lock().is_err(),
+            "the writer is held at registration"
+        );
+        // It is the same lock the execution writes under.
+        assert!(Arc::ptr_eq(
+            &active.writer,
+            &manager.writer_for("t-reserved")
+        ));
+
+        drop(guard);
+        assert!(manager.writer_for("t-reserved").try_lock().is_ok());
+        // Once the execution has its snapshot a second reservation is refused,
+        // and does not leave the writer taken.
+        active
+            .set_snapshot(Task {
+                generation: 1,
+                timeline: None,
+                id: "t-reserved".into(),
+                context_id: "c-reserved".into(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await;
+        assert!(manager.reserve("t-reserved").await.is_err());
+        assert!(manager.writer_for("t-reserved").try_lock().is_ok());
+    }
     #[test]
     fn writer_map_recovers_from_poison_and_prunes_unused_locks() {
         let manager = ExecutionManager::default();
@@ -294,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn dropped_reservation_releases_after_a_contended_registry_is_unlocked() {
         let manager = Arc::new(ExecutionManager::default());
-        let (active, writer) = manager.reserve("contended-drop").await.unwrap();
+        let (active, _inputs, writer) = manager.reserve("contended-drop").await.unwrap();
         drop(writer);
         let reservation =
             ReservationGuard::new(manager.clone(), "contended-drop".into(), active.clone());

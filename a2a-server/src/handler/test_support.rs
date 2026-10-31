@@ -2,15 +2,18 @@
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 
+pub(super) use super::DefaultRequestHandler;
 pub(super) use super::updates::apply_event_to_task;
-pub(super) use super::{DefaultRequestHandler, RequestHandler, ServiceParams};
+
+pub(super) use super::RequestHandler;
 pub(super) use crate::executor::ExecutorContext;
+pub(super) use crate::middleware::ServiceParams;
 pub(super) use crate::pagination::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
 pub(super) use crate::push::{InMemoryPushConfigStore, PushConfigStore};
 pub(super) use crate::task_store::{InMemoryTaskStore, TaskStore, TaskVersion};
 pub(super) use a2a::*;
 pub(super) use async_trait::async_trait;
-pub(super) use futures::stream::BoxStream;
+pub(super) use futures::{StreamExt, stream::BoxStream};
 
 pub(super) use crate::test_util::install_crypto_provider;
 pub(super) use axum::{
@@ -35,6 +38,39 @@ pub(super) struct PushEventExecutor;
 
 pub(super) struct ResumableExecutor {
     pub(super) release: Arc<Notify>,
+}
+
+/// Pauses after committing cancellation, before the handler can stop execution.
+pub(super) struct PausingCancelStore {
+    pub(super) inner: Arc<InMemoryTaskStore>,
+    pub(super) committed: Arc<Notify>,
+    pub(super) release: Arc<Notify>,
+}
+
+#[async_trait]
+impl TaskStore for PausingCancelStore {
+    async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
+        self.inner.create(task).await
+    }
+
+    async fn update(&self, task: Task) -> Result<TaskVersion, A2AError> {
+        self.inner.update(task).await
+    }
+
+    async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
+        self.inner.get(task_id).await
+    }
+
+    async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+        self.inner.list(req).await
+    }
+
+    async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError> {
+        let task = self.inner.begin_cancel(task_id).await?;
+        self.committed.notify_one();
+        self.release.notified().await;
+        Ok(task)
+    }
 }
 
 #[derive(Debug)]
@@ -439,24 +475,38 @@ pub(super) async fn seed_task(handler: &DefaultRequestHandler, task_id: &str, co
 }
 
 pub(super) fn make_handler() -> DefaultRequestHandler {
-    DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+    DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new()).with_capabilities(
+        a2a::AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        },
+    )
 }
 
 pub(super) fn make_handler_with_push_configs() -> DefaultRequestHandler {
     DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+        .with_capabilities(a2a::AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        })
         .with_push_config_store(InMemoryPushConfigStore::new())
 }
 
 pub(super) fn make_push_delivery_handler() -> DefaultRequestHandler {
     // URL validation is disabled because the test webhook runs on
     // 127.0.0.1; the default HttpPushSender rejects loopback targets.
-    DefaultRequestHandler::new(PushEventExecutor, InMemoryTaskStore::new()).with_push_notifications(
-        InMemoryPushConfigStore::new(),
-        crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
-            validate_urls: false,
+    DefaultRequestHandler::new(PushEventExecutor, InMemoryTaskStore::new())
+        .with_capabilities(a2a::AgentCapabilities {
+            streaming: Some(true),
             ..Default::default()
-        })),
-    )
+        })
+        .with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                validate_urls: false,
+                ..Default::default()
+            })),
+        )
 }
 
 pub(super) fn make_resumable_handler() -> (DefaultRequestHandler, Arc<Notify>) {
@@ -467,7 +517,11 @@ pub(super) fn make_resumable_handler() -> (DefaultRequestHandler, Arc<Notify>) {
                 release: release.clone(),
             },
             InMemoryTaskStore::new(),
-        ),
+        )
+        .with_capabilities(a2a::AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        }),
         release,
     )
 }

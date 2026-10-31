@@ -1,34 +1,287 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+//! Keep ordered webhook input across execution turns for the shared runner.
 
+use super::DefaultRequestHandler;
+use super::output::{DeliveryEvent, DeliverySink, EventSource, FailureSignal, Notification};
+use super::response::{Run, RunCompletion};
+use crate::middleware::ServiceParams;
 use a2a::*;
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::sync::mpsc;
 
-pub(super) async fn send_push_notifications(
-    task_id: &str,
-    push_config_store: Option<&dyn crate::PushConfigStore>,
-    push_sender: Option<&crate::HttpPushSender>,
-    event: &StreamResponse,
-) -> Result<(), A2AError> {
-    let Some(push_config_store) = push_config_store else {
-        return Ok(());
-    };
-    let Some(push_sender) = push_sender else {
-        return Ok(());
-    };
+/// Drop new notifications when full, preserving the order of already accepted input.
+const PUSH_QUEUE_CAPACITY: usize = 1024;
+const PUSH_WORKER_IDLE: Duration = Duration::from_secs(60);
 
-    let configs = push_config_store.list(task_id).await?;
-    for config in configs {
-        push_sender.send_push(&config, event.clone()).await?;
+struct PushQueue {
+    id: u64,
+    tx: mpsc::Sender<DeliveryEvent>,
+    done: tokio_util::sync::CancellationToken,
+}
+
+#[derive(Default)]
+struct PushQueuesInner {
+    queues: std::sync::Mutex<HashMap<TaskId, PushQueue>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default, Clone)]
+pub(super) struct PushQueues(Arc<PushQueuesInner>);
+
+impl PushQueues {
+    /// Queue without awaiting network I/O or holding up the task writer.
+    pub(super) fn push(
+        &self,
+        handler: &DefaultRequestHandler,
+        task_id: &str,
+        failure: Option<FailureSignal>,
+        event: &StreamResponse,
+    ) {
+        let (Some(store), Some(sender)) = (&handler.push_config_store, &handler.push_sender) else {
+            return;
+        };
+        let mut job = DeliveryEvent {
+            result: Ok(event.clone()),
+            notification: Some(Notification {
+                store: store.clone(),
+                sender: sender.clone(),
+                failure,
+            }),
+        };
+        for _ in 0..2 {
+            let tx = self.queue_for(handler, task_id);
+            match tx.try_send(job) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(task_id, "webhook queue full; dropping a notification");
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Closed(returned)) => job = returned,
+            }
+        }
     }
 
-    Ok(())
+    fn queue_for(
+        &self,
+        handler: &DefaultRequestHandler,
+        task_id: &str,
+    ) -> mpsc::Sender<DeliveryEvent> {
+        let mut queues = self
+            .0
+            .queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(queue) = queues.get(task_id).filter(|q| !q.tx.is_closed()) {
+            return queue.tx.clone();
+        }
+        let (tx, rx) = mpsc::channel(PUSH_QUEUE_CAPACITY);
+        // Queue immediately, but wait for any retiring runner's accepted work.
+        let previous = queues.get(task_id).map(|queue| queue.done.clone());
+        let done = tokio_util::sync::CancellationToken::new();
+        let id = self
+            .0
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        queues.insert(
+            task_id.to_string(),
+            PushQueue {
+                id,
+                tx: tx.clone(),
+                done: done.clone(),
+            },
+        );
+        drop(queues);
+        let queue = QueuedNotifications {
+            inner: self.0.clone(),
+            task_id: task_id.into(),
+            id,
+            rx,
+            previous,
+            done,
+        };
+        Run::new(
+            handler.clone(),
+            ServiceParams::new(),
+            task_id.into(),
+            RunCompletion::Notifications,
+        )
+        .start_notifications(
+            EventSource::Notifications(queue),
+            DeliverySink::Webhook(task_id.into()),
+        );
+        tx
+    }
+}
+
+/// The queue spans turns. A successor can accept input while this runner
+/// retires, but cannot deliver until this queue and its final delivery finish.
+pub(super) struct QueuedNotifications {
+    inner: Arc<PushQueuesInner>,
+    task_id: TaskId,
+    id: u64,
+    rx: mpsc::Receiver<DeliveryEvent>,
+    previous: Option<tokio_util::sync::CancellationToken>,
+    done: tokio_util::sync::CancellationToken,
+}
+
+impl QueuedNotifications {
+    pub(super) async fn next(&mut self) -> Option<DeliveryEvent> {
+        if let Some(previous) = &self.previous {
+            previous.cancelled().await;
+            self.previous = None;
+        }
+        if self.rx.is_closed() {
+            return self.rx.recv().await;
+        }
+        match tokio::time::timeout(PUSH_WORKER_IDLE, self.rx.recv()).await {
+            Ok(job) => job,
+            Err(_) => {
+                self.rx.close();
+                self.rx.recv().await
+            }
+        }
+    }
+
+    fn retire(&self) {
+        let mut queues = self
+            .inner
+            .queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queues.get(&self.task_id).is_some_and(|q| q.id == self.id) {
+            queues.remove(&self.task_id);
+        }
+    }
+}
+
+impl Drop for QueuedNotifications {
+    fn drop(&mut self) {
+        self.retire();
+        self.done.cancel();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn successor_waits_for_retiring_delivery_and_keeps_its_registration() {
+        let inner = Arc::new(PushQueuesInner::default());
+        let (_old_tx, old_rx) = mpsc::channel(2);
+        let done = tokio_util::sync::CancellationToken::new();
+        let mut old = QueuedNotifications {
+            inner: inner.clone(),
+            task_id: "task".into(),
+            id: 1,
+            rx: old_rx,
+            previous: None,
+            done: done.clone(),
+        };
+        old.rx.close();
+        let (tx, rx) = mpsc::channel(2);
+        let next_done = tokio_util::sync::CancellationToken::new();
+        inner.queues.lock().unwrap().insert(
+            "task".into(),
+            PushQueue {
+                id: 2,
+                tx: tx.clone(),
+                done: next_done.clone(),
+            },
+        );
+        let mut successor = QueuedNotifications {
+            inner: inner.clone(),
+            task_id: "task".into(),
+            id: 2,
+            rx,
+            previous: Some(done),
+            done: next_done,
+        };
+        assert!(
+            tx.try_send(Ok(StreamResponse::Message(make_message())).into())
+                .is_ok()
+        );
+        let mut waiting = Box::pin(successor.next());
+        assert!(
+            futures::poll!(waiting.as_mut()).is_pending(),
+            "queued work must not overtake the retiring runner"
+        );
+        drop(old);
+        assert!(waiting.await.is_some());
+        assert_eq!(inner.queues.lock().unwrap().get("task").unwrap().id, 2);
+        drop(successor);
+        assert!(inner.queues.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn webhook_failure_wakes_an_executor_waiting_for_more_input() {
+        install_crypto_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let app = Router::new().route("/", post(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let handler = DefaultRequestHandler::new(
+            ResumableExecutor {
+                release: Arc::new(Notify::new()),
+            },
+            InMemoryTaskStore::new(),
+        )
+        .with_capabilities(AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        })
+        .with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                timeout: Duration::from_secs(1),
+                fail_on_error: true,
+                validate_urls: false,
+            })),
+        );
+        seed_task(&handler, "push-failure", "context").await;
+        handler
+            .create_push_config(
+                &ServiceParams::new(),
+                TaskPushNotificationConfig {
+                    protocol_version: Some("1.1".into()),
+                    task_id: "push-failure".into(),
+                    url,
+                    id: None,
+                    token: None,
+                    authentication: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut events = handler
+            .send_streaming_message(&ServiceParams::new(), send_req(Some("push-failure"), None))
+            .await
+            .unwrap();
+        let error = timeout(Duration::from_secs(3), async {
+            loop {
+                match events.next().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => break error,
+                    None => panic!("the webhook failure must be reported"),
+                }
+            }
+        })
+        .await
+        .expect("webhook failure must wake the driver without another executor event");
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert!(
+            handler
+                .execution_manager
+                .get("push-failure")
+                .await
+                .is_none()
+        );
+        server.abort();
+    }
 
     #[tokio::test]
     async fn test_push_config_not_supported_without_store() {
