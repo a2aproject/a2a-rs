@@ -15,7 +15,7 @@ use axum::{
 use futures::{StreamExt, stream::BoxStream};
 use serde_json::Value;
 
-use crate::handler::RequestHandler;
+use crate::handler::{LiveResponse, RequestHandler};
 use crate::middleware::{
     ServiceParams, add_query_version, check_a2a_version, extract_service_params,
 };
@@ -240,6 +240,23 @@ async fn handle_streaming_request<H: RequestHandler>(
                 Err(e) => error_response(id, invalid_params(e)),
             }
         }
+        methods::SEND_LIVE_MESSAGE => {
+            match protojson_conv::from_value::<StreamRequest>(raw_params) {
+                Ok(req) => match state.handler.send_live_request(params, req).await {
+                    // The call that opens the exchange is its downlink.
+                    Ok(LiveResponse::Stream(stream)) => {
+                        sse::sse_jsonrpc_stream(id, protojson_stream(stream)).into_response()
+                    }
+                    // A later call is input to it and only gets the task back.
+                    Ok(LiveResponse::Ack(task)) => match protojson_value(&*task) {
+                        Ok(value) => Json(JsonRpcResponse::success(id, value)).into_response(),
+                        Err(e) => error_response(id, e),
+                    },
+                    Err(e) => error_response(id, e),
+                },
+                Err(e) => error_response(id, invalid_params(e)),
+            }
+        }
         methods::SUBSCRIBE_TO_TASK => {
             match protojson_conv::from_value::<SubscribeToTaskRequest>(raw_params) {
                 Ok(req) => match state.handler.subscribe_to_task(params, req).await {
@@ -368,10 +385,14 @@ mod tests {
     }
 
     fn make_app() -> axum::Router {
-        let handler = Arc::new(DefaultRequestHandler::new(
-            EchoExecutor,
-            InMemoryTaskStore::new(),
-        ));
+        let handler = Arc::new(
+            DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new()).with_capabilities(
+                a2a::AgentCapabilities {
+                    streaming: Some(true),
+                    ..Default::default()
+                },
+            ),
+        );
         jsonrpc_router(handler)
     }
 
@@ -382,6 +403,10 @@ mod tests {
                 EchoExecutor,
                 crate::test_util::seeded_task_store("t1").await,
             )
+            .with_capabilities(a2a::AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            })
             .with_push_config_store(InMemoryPushConfigStore::new()),
         );
         jsonrpc_router(handler)
