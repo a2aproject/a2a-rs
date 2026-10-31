@@ -274,6 +274,15 @@ impl DefaultRequestHandler {
         }
     }
 
+    /// A handler for an [`Agent`](crate::Agent), which decides for each message
+    /// whether a task exists.
+    pub fn from_agent(agent: impl crate::Agent, task_store: impl crate::TaskStore) -> Self {
+        Self::new(
+            crate::executor::AgentExecutorAdapter(Arc::new(agent)),
+            task_store,
+        )
+    }
+
     /// Bounds how long a `GetTask` carrying `currentGeneration` is held open
     /// when the task does not advance. The request then returns the current
     /// state, which the spec allows.
@@ -992,8 +1001,9 @@ impl DefaultRequestHandler {
         } = message;
         let params = &params;
         let include_task_snapshot_in_context = mode == StartMode::Blocking;
-        // This layer stores new tasks before starting the executor. Deferred
-        // creation is enabled by the later lazy-task layer.
+        // A new task is created by the executor: only a live exchange, which is
+        // bound to its task from the first request, creates it up front.
+        let lazy = mode != StartMode::Bidi;
         let artifact_only = is_artifact_only(&req);
         let task_id = request_task_id(&req).unwrap_or_else(new_task_id);
 
@@ -1015,13 +1025,23 @@ impl DefaultRequestHandler {
             // wait for it instead of racing it.
             let prepared = async {
                 let prepared = self.prepare_task_for_execution(&req, &task_id).await?;
-                self.save_request_push_config(params, &task_id, &req)
-                    .await?;
+                if lazy && !prepared.1 {
+                    // For a task that may never exist, the configuration waits
+                    // for the executor to create it.
+                    let config = self.request_push_config(params, &task_id, &req)?;
+                    *active
+                        .pending_push
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+                } else {
+                    self.save_request_push_config(params, &task_id, &req)
+                        .await?;
+                }
                 // All admission checks and configuration saves precede the
                 // input commit. The owned preparation then starts its executor.
                 if prepared.1 {
                     self.task_store.update(prepared.0.clone()).await?;
-                } else {
+                } else if !lazy {
                     self.task_store.create(prepared.0.clone()).await?;
                 }
                 Ok::<_, A2AError>(prepared)
@@ -1030,6 +1050,11 @@ impl DefaultRequestHandler {
             match prepared {
                 Ok(prepared) => {
                     active.set_snapshot(prepared.0.clone()).await;
+                    if lazy && !prepared.1 {
+                        active
+                            .uncreated
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     prepared
                 }
                 Err(error) => {
@@ -1043,12 +1068,14 @@ impl DefaultRequestHandler {
         self.execution_manager
             .pushes
             .attach(self, &task_id, &active.events);
-        // Existing subscribers and webhooks observe persisted client input
-        // through the same publication path as executor output. The new
-        // response subscribes below and announces its input via its opening
-        // snapshot (or recorded follow-up), avoiding duplicate generations.
-        for event in &input_events {
-            active.publish(Ok(event), None).await;
+        if existed || !lazy {
+            // Existing subscribers and webhooks observe persisted client input
+            // through the same publication path as executor output. The new
+            // response subscribes below and announces its input via its opening
+            // snapshot (or recorded follow-up), avoiding duplicate generations.
+            for event in &input_events {
+                active.publish(Ok(event), None).await;
+            }
         }
         self.changes.notify(&task_id);
         // The task input queue is owned by the server and already exists
