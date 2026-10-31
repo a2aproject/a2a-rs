@@ -5270,6 +5270,188 @@ mod tests {
             .unwrap();
         assert_eq!(card.name, "full");
     }
+    #[tokio::test]
+    async fn idle_cancellation_invokes_executor_hooks_and_persists_their_result() {
+        for handler in [
+            DefaultRequestHandler::new(PushEventExecutor, InMemoryTaskStore::new()),
+            DefaultRequestHandler::new(MultiTurnExecutor, InMemoryTaskStore::new()),
+        ] {
+            seed_task(&handler, "idle-cancel", "context").await;
+            let canceled = handler
+                .cancel_task(
+                    &ServiceParams::new(),
+                    CancelTaskRequest {
+                        id: "idle-cancel".into(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(canceled.status.state, TaskState::Canceled);
+            assert_eq!(
+                handler
+                    .task_store
+                    .get("idle-cancel")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                canceled
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canceling_a_waiting_executor_wakes_subscribers_without_releasing_its_work_gate() {
+        let (handler, _release) = make_resumable_handler();
+        seed_task(&handler, "active-cancel", "context").await;
+        let mut request = send_req(Some("active-cancel"), Some("context"));
+        request.message.parts = vec![Part::text("wait")];
+        let mut events = handler
+            .send_streaming_message(&ServiceParams::new(), request)
+            .await
+            .unwrap();
+        // An executor snapshot may itself be the opening response.
+        loop {
+            let event = timeout(Duration::from_secs(1), events.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if matches!(event, StreamResponse::Task(ref task) if task.status.state == TaskState::Working)
+            {
+                break;
+            }
+        }
+        let canceled = timeout(
+            Duration::from_secs(1),
+            handler.cancel_task(
+                &ServiceParams::new(),
+                CancelTaskRequest {
+                    id: "active-cancel".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(canceled.status.state, TaskState::Canceled);
+        let mut saw_cancel = false;
+        while let Some(event) = timeout(Duration::from_secs(1), events.next())
+            .await
+            .unwrap()
+        {
+            let event = event.unwrap();
+            saw_cancel |= matches!(event, StreamResponse::Task(ref task) if task.status.state == TaskState::Canceled)
+                || matches!(event, StreamResponse::StatusUpdate(ref update) if update.status.state == TaskState::Canceled);
+        }
+        assert!(
+            saw_cancel,
+            "subscribers must observe the cancellation before closing"
+        );
+    }
+
+    #[test]
+    fn writer_map_recovers_from_poison_and_prunes_unused_locks() {
+        let manager = ExecutionManager::default();
+        let held = manager.writer_for("held");
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _writers = manager.writers.lock().unwrap();
+            panic!("interrupted registry owner");
+        }));
+        assert!(poisoned.is_err());
+        for id in 0..256 {
+            drop(manager.writer_for(&format!("abandoned-{id}")));
+        }
+        assert!(Arc::ptr_eq(&held, &manager.writer_for("held")));
+        let writers = manager
+            .writers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!writers.locks.contains_key("abandoned-0"));
+        assert!(writers.locks.contains_key("held"));
+    }
+
+    #[tokio::test]
+    async fn dropped_reservation_releases_after_a_contended_registry_is_unlocked() {
+        let manager = Arc::new(ExecutionManager::default());
+        let (active, writer) = manager.reserve("contended-drop").await.unwrap();
+        drop(writer);
+        let reservation =
+            ReservationGuard::new(manager.clone(), "contended-drop".into(), active.clone());
+        let registry = manager.executions.write().await;
+        drop(reservation);
+        assert!(registry.contains_key("contended-drop"));
+        drop(registry);
+        timeout(Duration::from_secs(1), async {
+            while manager.get("contended-drop").await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_artifact_contexts_and_unknown_appends_do_not_change_storage() {
+        let handler = make_handler().with_capabilities(AgentCapabilities {
+            user_artifacts: Some(true),
+            ..AgentCapabilities::default()
+        });
+        seed_task(&handler, "artifact-validation", "context").await;
+        let before = handler
+            .task_store
+            .get("artifact-validation")
+            .await
+            .unwrap()
+            .unwrap();
+        for (context, append) in [("other-context", false), ("context", true)] {
+            let mut request = send_req(Some("artifact-validation"), Some("context"));
+            request.artifact_updates = vec![TaskArtifactUpdateEvent {
+                task_id: "artifact-validation".into(),
+                context_id: context.into(),
+                artifact: serde_json::from_value(serde_json::json!({
+                    "artifactId": "unknown", "parts": [{"text": "client payload"}]
+                }))
+                .unwrap(),
+                append: Some(append),
+                last_chunk: Some(true),
+                metadata: None,
+                generation: 0,
+            }];
+            let error = handler
+                .send_message(&ServiceParams::new(), request)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, error_code::INVALID_PARAMS);
+            assert_eq!(
+                handler
+                    .task_store
+                    .get("artifact-validation")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+        }
+    }
+    #[test]
+    fn immediate_unary_responses_do_not_discard_a_direct_message() {
+        let mut request = send_req(None, None);
+        request.configuration = Some(SendMessageConfiguration {
+            return_immediately: Some(true),
+            accepted_output_modes: None,
+            task_push_notification_config: None,
+            history_length: None,
+            timeline_length: None,
+            if_generation_match: None,
+        });
+        let reply = StreamResponse::Message(make_message());
+        assert_eq!(should_interrupt_non_streaming(&request, &reply), None);
+        assert_eq!(task_id_for_event(&reply), None);
+    }
 }
 
 #[cfg(test)]
