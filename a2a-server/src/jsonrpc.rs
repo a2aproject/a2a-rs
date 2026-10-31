@@ -375,11 +375,14 @@ mod tests {
         jsonrpc_router(handler)
     }
 
-    fn make_push_app() -> axum::Router {
+    async fn make_push_app() -> axum::Router {
         install_crypto_provider();
         let handler = Arc::new(
-            DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
-                .with_push_config_store(InMemoryPushConfigStore::new()),
+            DefaultRequestHandler::new(
+                EchoExecutor,
+                crate::test_util::seeded_task_store("t1").await,
+            )
+            .with_push_config_store(InMemoryPushConfigStore::new()),
         );
         jsonrpc_router(handler)
     }
@@ -663,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_push_config() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let params = serde_json::json!({
             "taskId": "t1",
             "id": "cfg1",
@@ -680,7 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_push_config_accepts_flat_config_object() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let params = serde_json::json!({
             "taskId": "t1",
             "id": "cfg1",
@@ -708,7 +711,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_push_configs() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let params = serde_json::json!({
             "taskId": "t1"
         });

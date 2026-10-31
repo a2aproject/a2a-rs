@@ -11,33 +11,31 @@ use std::collections::HashMap;
 /// Service parameters — metadata from HTTP headers or gRPC metadata.
 pub type ServiceParams = HashMap<String, Vec<String>>;
 
-/// The major version this build implements (§3.6.2). Minor is accepted
-/// unconditionally since nothing here branches on it.
-const SUPPORTED_MAJOR_VERSION: u32 = 1;
-
-/// Mirrors a2acli's own `parse_protocol_version`: tolerant of a bare major,
-/// extra trailing components, and surrounding whitespace.
-fn parse_major_version(value: &str) -> Option<u32> {
-    value.trim().split('.').next()?.parse().ok()
-}
-
-/// §3.6.2: reject a request whose `A2A-Version` service parameter names an
-/// unsupported major version. §3.6.1/§3.6.2 both require an absent value
-/// to be interpreted as "0.3", not as "whatever this interface happens to
-/// serve" -- so it's rejected here exactly like any other unsupported
-/// version, rather than silently processed as this build's version.
+/// Validate the protocol version announced by a transport binding.
 ///
-/// Every protocol binding calls this before dispatching a request, since
-/// §3.6.2 applies to each interface the agent exposes.
+/// This SDK implements the 1.x protocol family, including its 1.0
+/// compatibility surface. An absent or empty value is the legacy 0.3
+/// version, which this SDK does not implement.
 pub fn check_a2a_version(params: &ServiceParams) -> Result<(), A2AError> {
-    let requested = params
-        .get("a2a-version")
-        .and_then(|v| v.first())
-        .map(String::as_str)
-        .unwrap_or("0.3");
-    match parse_major_version(requested) {
-        Some(SUPPORTED_MAJOR_VERSION) => Ok(()),
-        _ => Err(A2AError::version_not_supported(requested)),
+    let mut values = params
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("a2a-version"))
+        .flat_map(|(_, values)| values);
+    let requested = values.next().map(String::as_str).unwrap_or("0.3");
+    if values.next().is_some() {
+        return Err(A2AError::version_not_supported(requested));
+    }
+    let parts: Vec<_> = requested.trim().split('.').collect();
+    let numeric = (2..=3).contains(&parts.len())
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && part.parse::<u32>().is_ok()
+        });
+    if numeric && parts[0].parse::<u32>() == Ok(1) {
+        Ok(())
+    } else {
+        Err(A2AError::version_not_supported(requested))
     }
 }
 
@@ -79,7 +77,7 @@ pub(crate) fn add_query_version(params: &mut ServiceParams, uri: &Uri) {
 }
 
 /// Authenticated user information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct User {
     pub name: String,
     pub authenticated: bool,
@@ -179,6 +177,32 @@ impl CallInterceptor for LoggingInterceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_protocol_version_accepts_supported_versions() {
+        for version in ["1.0", "1.1", "1.4"] {
+            let params = ServiceParams::from([("a2a-version".to_string(), vec![version.into()])]);
+            assert!(check_a2a_version(&params).is_ok(), "{version}");
+        }
+    }
+
+    #[test]
+    fn test_protocol_version_rejects_missing_malformed_and_unsupported_versions() {
+        let missing = ServiceParams::new();
+        assert_eq!(
+            check_a2a_version(&missing).unwrap_err().code,
+            a2a::error_code::VERSION_NOT_SUPPORTED
+        );
+
+        for version in ["", "0.3", "2.0", "invalid"] {
+            let params = ServiceParams::from([("a2a-version".to_string(), vec![version.into()])]);
+            assert_eq!(
+                check_a2a_version(&params).unwrap_err().code,
+                a2a::error_code::VERSION_NOT_SUPPORTED,
+                "{version:?}"
+            );
+        }
+    }
     use axum::http::HeaderValue;
 
     #[test]
