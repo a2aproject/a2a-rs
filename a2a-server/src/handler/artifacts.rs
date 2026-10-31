@@ -1,6 +1,7 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+//! Apply client and executor artifact changes, preserving ownership and generations.
 
 use a2a::*;
 
@@ -69,8 +70,14 @@ pub(super) fn apply_client_artifacts(
     task: &mut Task,
     req: &SendMessageRequest,
     new_task: bool,
-) -> Result<(), A2AError> {
+) -> Result<Vec<TaskArtifactUpdateEvent>, A2AError> {
+    let mut applied = Vec::with_capacity(req.artifact_updates.len());
     for update in &req.artifact_updates {
+        if update.artifact.artifact_id.is_empty() {
+            return Err(A2AError::invalid_params(
+                "an artifact update needs an artifactId",
+            ));
+        }
         let mut update = update.clone();
         if !new_task {
             if !update.task_id.is_empty() && update.task_id != task.id {
@@ -101,32 +108,15 @@ pub(super) fn apply_client_artifacts(
         update.artifact.role = Some(Role::User);
         update.task_id = task.id.clone();
         update.context_id = task.context_id.clone();
-        merge_artifact(task, &mut update).map_err(|_| {
+        update.generation = merge_artifact(task, &mut update).map_err(|_| {
             A2AError::invalid_params(format!(
                 "cannot append to unknown artifact {}",
                 update.artifact.artifact_id
             ))
         })?;
+        applied.push(update);
     }
-    Ok(())
-}
-
-/// Records a follow-up client message in the task's timeline, then applies
-/// the artifacts sent with it (A2A 1.1 §3.4: the message first).
-pub(super) fn record_client_input(
-    task: &mut Task,
-    req: &SendMessageRequest,
-) -> Result<(), A2AError> {
-    if let Some(message) = &req.message {
-        task.generation += 1;
-        task.timeline
-            .get_or_insert_with(Vec::new)
-            .push(TimelineEntry {
-                content: TimelineContent::Message(message.clone()),
-                generation: task.generation,
-            });
-    }
-    apply_client_artifacts(task, req, false)
+    Ok(applied)
 }
 
 /// Whether the artifacts an executor supplied differ in content from the
