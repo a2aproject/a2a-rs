@@ -99,13 +99,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Only OUT_DIR is ours to write: the crate's own sources can be read-only
+    // (`cargo vendor`, Nix, a sandboxed build).
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+    let grpc_out_dir = out_dir.join("grpc");
+    std::fs::create_dir_all(&grpc_out_dir)?;
+
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .out_dir("src/gen")
+        .out_dir(&grpc_out_dir)
         .compile_protos(PROTO_FILES, PROTO_INCLUDES)?;
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
     let descriptor_path = out_dir.join("a2a-descriptor.bin");
 
     tonic_prost_build::configure()
