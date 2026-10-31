@@ -57,7 +57,7 @@ handed to the next invocation; workers cannot consume that handed-off input.
 The client reports errors with a nonzero exit status and bounds each conversation
 to 30 seconds.
 
-See [the executor and conversation](src/live/mod.rs), [server](src/live/server.rs),
+See [the executor and conversation](src/live.rs), [server](src/live/server.rs),
 and [client](src/live/client.rs).
 
 ## Tests
@@ -71,3 +71,9 @@ live server on ephemeral ports, checks persisted state and event ordering for ea
 binding, and runs the live client binary through all three conversations. The
 existing suites cover task generations, live exchange edge cases, transports,
 and push delivery.
+
+The live transport suite also attaches two clients to one task over each binding.
+It checks that a stale-generation request is rejected on its sender's downlink,
+then verifies that both clients receive accepted input and executor updates in
+order through completion. The REST and JSON-RPC clients automatically use the
+SDK's optional exchange-routing header to keep their uplinks distinct.
