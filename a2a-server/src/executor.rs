@@ -9,8 +9,13 @@ use std::collections::HashMap;
 use crate::middleware::{ServiceParams, User};
 
 /// Context passed to the [`AgentExecutor`] for each execution.
+///
+/// Non-exhaustive: fields are added as the protocol grows (live input is next),
+/// and only the handler builds one.
+#[non_exhaustive]
 pub struct ExecutorContext {
-    /// The message that triggered execution (None for cancellation without message).
+    /// The message that triggered execution. `None` for a cancellation, and for
+    /// a request that carried only `artifactUpdates` for an existing task.
     pub message: Option<Message>,
     /// The task ID being executed.
     pub task_id: TaskId,
@@ -29,6 +34,53 @@ pub struct ExecutorContext {
 }
 
 impl ExecutorContext {
+    /// A context for `task_id` in `context_id` with nothing else set. The
+    /// handler builds the real ones; this is for exercising an executor on its
+    /// own, as the struct is non-exhaustive and cannot be built literally
+    /// outside this crate.
+    pub fn new(task_id: impl Into<TaskId>, context_id: impl Into<String>) -> Self {
+        ExecutorContext {
+            message: None,
+            task_id: task_id.into(),
+            stored_task: None,
+            context_id: context_id.into(),
+            metadata: None,
+            user: None,
+            service_params: ServiceParams::new(),
+            tenant: None,
+        }
+    }
+
+    pub fn with_message(mut self, message: Message) -> Self {
+        self.message = Some(message);
+        self
+    }
+
+    pub fn with_stored_task(mut self, task: Task) -> Self {
+        self.stored_task = Some(task);
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: HashMap<String, Value>) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_user(mut self, user: User) -> Self {
+        self.user = Some(user);
+        self
+    }
+
+    pub fn with_service_params(mut self, service_params: ServiceParams) -> Self {
+        self.service_params = service_params;
+        self
+    }
+
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
+    }
+
     pub fn task_info(&self) -> (TaskId, String) {
         (self.task_id.clone(), self.context_id.clone())
     }
