@@ -51,10 +51,9 @@ fn caller_subject(params: &ServiceParams) -> Option<&str> {
 
 ## Install
 
-```toml
-[dependencies]
-a2a = { package = "a2a-lf", version = "0.2" }
-a2a-slimrpc = { package = "a2a-slimrpc", version = "0.3" }
+```sh
+cargo add a2a-lf --rename a2a
+cargo add a2a-slimrpc
 ```
 
 Built on the SLIM 3.4 release line (`agntcy-slim-rpc` 3.4, `agntcy-slim-auth` and

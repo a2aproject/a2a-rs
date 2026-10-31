@@ -13,10 +13,9 @@ This crate is published as `a2a-client-lf` and imported in Rust as `a2a_client`.
 
 ## Install
 
-```toml
-[dependencies]
-a2a = { package = "a2a-lf", version = "0.2" }
-a2a-client = { package = "a2a-client-lf", version = "0.1" }
+```sh
+cargo add a2a-lf --rename a2a
+cargo add a2a-client-lf --rename a2a-client
 ```
 
 ## Workspace
