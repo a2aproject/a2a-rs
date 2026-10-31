@@ -270,9 +270,13 @@ fn task_with_file(
 
 fn artifact_update(task_id: &str) -> Result<StreamResponse, A2AError> {
     Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+        generation: 0,
         task_id: task_id.to_string(),
         context_id: format!("{task_id}-ctx"),
         artifact: Artifact {
+            end_generation: None,
+            role: None,
+            start_generation: None,
             artifact_id: "artifact-1".to_string(),
             name: None,
             description: None,
@@ -288,6 +292,7 @@ fn artifact_update(task_id: &str) -> Result<StreamResponse, A2AError> {
 
 fn working_status_update(task_id: &str) -> Result<StreamResponse, A2AError> {
     Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+        generation: 0,
         task_id: task_id.to_string(),
         context_id: format!("{task_id}-ctx"),
         status: TaskStatus {
@@ -754,6 +759,7 @@ impl RequestHandler for TestHandler {
 
         Ok(Box::pin(stream::iter(vec![
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id,
                 context_id,
                 status: TaskStatus {
@@ -883,6 +889,7 @@ impl RequestHandler for TestHandler {
 
         Ok(Box::pin(stream::iter(vec![
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: req.id.clone(),
                 context_id: task.context_id.clone(),
                 status: TaskStatus {
@@ -1022,6 +1029,7 @@ fn make_agent_card(base_url: &str, name: &str) -> AgentCard {
             AgentInterface::new(format!("{base_url}/rest"), TRANSPORT_PROTOCOL_HTTP_JSON),
         ],
         capabilities: AgentCapabilities {
+            user_artifacts: None,
             streaming: Some(true),
             push_notifications: Some(true),
             extensions: None,
@@ -1050,6 +1058,8 @@ fn make_task_with_parts(
     parts: Vec<Part>,
 ) -> Task {
     Task {
+        generation: 0,
+        timeline: None,
         id: task_id.to_string(),
         context_id: context_id.to_string(),
         status: TaskStatus {
@@ -3836,6 +3846,7 @@ fn declares(
     extended_agent_card: bool,
 ) -> AgentCapabilities {
     AgentCapabilities {
+        user_artifacts: None,
         streaming: Some(streaming),
         push_notifications: Some(push_notifications),
         extensions: None,

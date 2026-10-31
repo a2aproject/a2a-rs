@@ -795,6 +795,7 @@ mod tests {
 
     fn sample_create_push_config_request() -> TaskPushNotificationConfig {
         TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: "task-1".into(),
             url: "https://example.invalid/webhook".into(),
             id: Some("cfg-1".into()),
@@ -811,6 +812,7 @@ mod tests {
     async fn test_parse_sse_stream_jsonrpc_envelope() {
         // Build a JSON-RPC response wrapping a StreamResponse (StatusUpdate)
         let status_update = TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -856,6 +858,7 @@ mod tests {
     async fn test_parse_sse_stream_direct_stream_response() {
         // When the data is not a valid JSON-RPC envelope, try parsing directly as StreamResponse
         let status_update = TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -878,6 +881,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_sse_stream_rest_ok() {
         let status_update = TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -919,6 +923,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_sse_stream_rest_skips_unknown_payload() {
         let known = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1096,6 +1101,7 @@ mod tests {
     async fn test_parse_sse_stream_empty_data_lines_skipped() {
         // Event with no data: lines should be skipped
         let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1119,6 +1125,7 @@ mod tests {
     async fn test_parse_sse_stream_chunked_delivery() {
         // Data arrives split across multiple chunks
         let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1144,6 +1151,7 @@ mod tests {
     async fn test_parse_sse_stream_data_no_space() {
         // data:VALUE (no space after colon) is valid SSE
         let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1166,6 +1174,7 @@ mod tests {
     async fn test_parse_sse_stream_multiple_events_separate_chunks() {
         let make_sr = |state| {
             StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "t1".into(),
                 context_id: "c1".into(),
                 status: TaskStatus {
@@ -1200,6 +1209,7 @@ mod tests {
     async fn test_parse_sse_stream_multiple_events_single_chunk() {
         let make_status = |state| {
             StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "t1".into(),
                 context_id: "c1".into(),
                 status: TaskStatus {
@@ -1240,6 +1250,7 @@ mod tests {
     async fn test_parse_sse_stream_rest_multiple_events_single_chunk() {
         let make_status = |state| {
             StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "t1".into(),
                 context_id: "c1".into(),
                 status: TaskStatus {
@@ -1289,6 +1300,7 @@ mod tests {
             reference_task_ids: None,
         };
         let status_update = TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1455,6 +1467,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_sse_stream_crlf_line_endings() {
         let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1479,6 +1492,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_sse_stream_cr_line_endings() {
         let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1644,6 +1658,7 @@ mod tests {
         // end to end through the real HTTP call, not just via the parser's
         // own unit tests.
         let status_update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "task-1".into(),
             context_id: "ctx-1".into(),
             status: TaskStatus {
@@ -1663,6 +1678,7 @@ mod tests {
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "task-1".into(),
             tenant: None,
         };
@@ -1696,6 +1712,7 @@ mod tests {
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "task-1".into(),
             tenant: None,
         };
@@ -1729,6 +1746,7 @@ mod tests {
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "task-1".into(),
             tenant: None,
         };
@@ -1757,6 +1775,7 @@ mod tests {
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "task-1".into(),
             tenant: None,
         };

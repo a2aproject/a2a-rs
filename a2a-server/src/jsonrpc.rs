@@ -325,6 +325,8 @@ mod tests {
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let task = Task {
+                generation: 0,
+                timeline: None,
                 id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {
@@ -346,6 +348,8 @@ mod tests {
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let task = Task {
+                generation: 0,
+                timeline: None,
                 id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {

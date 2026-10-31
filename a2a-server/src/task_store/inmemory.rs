@@ -231,6 +231,8 @@ mod tests {
 
     fn make_task(id: &str, ctx: &str, state: TaskState) -> Task {
         Task {
+            generation: 0,
+            timeline: None,
             id: id.to_string(),
             context_id: ctx.to_string(),
             status: TaskStatus {
@@ -443,6 +445,7 @@ mod tests {
             .unwrap();
 
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: Some("c1".to_string()),
             status: None,
             page_size: None,
@@ -470,6 +473,7 @@ mod tests {
             .unwrap();
 
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: Some(TaskState::Working),
             page_size: None,
@@ -512,6 +516,7 @@ mod tests {
 
         let resp = store
             .list(&ListTasksRequest {
+                timeline_length: None,
                 context_id: None,
                 status: None,
                 page_size: None,
@@ -545,6 +550,7 @@ mod tests {
         }
 
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: Some(2),
@@ -580,6 +586,7 @@ mod tests {
         }
 
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: Some(0),
@@ -606,6 +613,7 @@ mod tests {
         store.create(task).await.unwrap();
 
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: None,
@@ -648,6 +656,7 @@ mod tests {
             .unwrap();
 
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: None,
@@ -673,6 +682,7 @@ mod tests {
         }
 
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: Some(1000),
@@ -697,6 +707,7 @@ mod tests {
             .unwrap();
 
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: None,
@@ -722,6 +733,7 @@ mod tests {
         }
 
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: None,
