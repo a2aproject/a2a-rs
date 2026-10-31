@@ -138,7 +138,12 @@ fn get(id: &str) -> GetTaskRequest {
 }
 
 fn quick_handler() -> DefaultRequestHandler {
-    DefaultRequestHandler::new(QuickAgent, InMemoryTaskStore::new())
+    DefaultRequestHandler::new(QuickAgent, InMemoryTaskStore::new()).with_capabilities(
+        a2a::AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        },
+    )
 }
 
 fn task_of(response: SendMessageResponse) -> Task {
@@ -237,7 +242,11 @@ async fn streamed_events_carry_consecutive_generations() {
             release: release.clone(),
         },
         InMemoryTaskStore::new(),
-    );
+    )
+    .with_capabilities(a2a::AgentCapabilities {
+        streaming: Some(true),
+        ..Default::default()
+    });
     let params = ServiceParams::new();
     let mut stream = handler
         .send_streaming_message(&params, send("go", None))
@@ -275,7 +284,11 @@ async fn artifacts_record_the_generations_they_started_and_ended_at() {
             release: release.clone(),
         },
         InMemoryTaskStore::new(),
-    );
+    )
+    .with_capabilities(a2a::AgentCapabilities {
+        streaming: Some(true),
+        ..Default::default()
+    });
     let task = open_step_task(&handler).await;
     // Let the executor reach its wait, then read the stored state.
     let mut stored = handler.get_task(&params, get(&task.id)).await.unwrap();
@@ -422,12 +435,18 @@ async fn long_poll_returns_at_once_when_the_task_is_already_ahead() {
 #[tokio::test]
 async fn long_poll_holds_until_the_generation_advances() {
     let release = Arc::new(Notify::new());
-    let handler = Arc::new(DefaultRequestHandler::new(
-        StepAgent {
-            release: release.clone(),
-        },
-        InMemoryTaskStore::new(),
-    ));
+    let handler = Arc::new(
+        DefaultRequestHandler::new(
+            StepAgent {
+                release: release.clone(),
+            },
+            InMemoryTaskStore::new(),
+        )
+        .with_capabilities(a2a::AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        }),
+    );
     let params = ServiceParams::new();
     let task = open_step_task(&handler).await;
     // Wait for the executor to settle at its release point.
@@ -470,6 +489,10 @@ async fn long_poll_gives_up_with_the_current_state_after_its_timeout() {
         },
         InMemoryTaskStore::new(),
     )
+    .with_capabilities(a2a::AgentCapabilities {
+        streaming: Some(true),
+        ..Default::default()
+    })
     .with_long_poll_timeout(Duration::from_millis(150));
     let params = ServiceParams::new();
     let task = open_step_task(&handler).await;
@@ -500,7 +523,11 @@ async fn subscribe_resumes_without_a_snapshot_when_the_client_is_current() {
             release: release.clone(),
         },
         InMemoryTaskStore::new(),
-    );
+    )
+    .with_capabilities(a2a::AgentCapabilities {
+        streaming: Some(true),
+        ..Default::default()
+    });
     let params = ServiceParams::new();
     let task = open_step_task(&handler).await;
     let mut settled = handler.get_task(&params, get(&task.id)).await.unwrap();
@@ -591,6 +618,7 @@ async fn artifact_updates_are_refused_unless_the_agent_declares_them() {
 async fn declared_user_artifacts_are_stored_as_the_clients_and_numbered_by_the_server() {
     let handler = quick_handler().with_capabilities(AgentCapabilities {
         user_artifacts: Some(true),
+        streaming: Some(true),
         ..AgentCapabilities::default()
     });
     let mut request = send("hi", None);
@@ -625,7 +653,11 @@ async fn cancelling_advances_the_generation() {
             release: release.clone(),
         },
         InMemoryTaskStore::new(),
-    );
+    )
+    .with_capabilities(a2a::AgentCapabilities {
+        streaming: Some(true),
+        ..Default::default()
+    });
     let params = ServiceParams::new();
     let task = open_step_task(&handler).await;
     let before = handler.get_task(&params, get(&task.id)).await.unwrap();
@@ -966,6 +998,7 @@ fn script_handler(cancel: CancelMode) -> (DefaultRequestHandler, Arc<Notify>) {
     )
     .with_capabilities(AgentCapabilities {
         user_artifacts: Some(true),
+        streaming: Some(true),
         ..AgentCapabilities::default()
     });
     (handler, release)
@@ -1174,6 +1207,8 @@ async fn a_follow_up_is_visible_while_its_turn_is_still_running() {
 struct SlowGetStore {
     inner: Arc<InMemoryTaskStore>,
     slow: Arc<std::sync::atomic::AtomicBool>,
+    /// Signalled when the slow `get` has begun.
+    entered: Arc<Notify>,
 }
 
 impl SlowGetStore {
@@ -1181,7 +1216,16 @@ impl SlowGetStore {
         SlowGetStore {
             inner: Arc::new(InMemoryTaskStore::new()),
             slow: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            entered: Arc::new(Notify::new()),
         }
+    }
+
+    /// Waits until the slow `get` has begun, that is, until a request is held
+    /// between reading the task and acting on it.
+    async fn slow_get_entered(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.entered.notified())
+            .await
+            .expect("a request reached the slow read");
     }
 
     fn slow_next_get(&self) {
@@ -1200,6 +1244,7 @@ impl a2a_server::TaskStore for SlowGetStore {
     async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
         if self.slow.swap(false, std::sync::atomic::Ordering::SeqCst) {
             let read = self.inner.get(task_id).await;
+            self.entered.notify_one();
             tokio::time::sleep(Duration::from_millis(200)).await;
             return read;
         }
@@ -1217,13 +1262,19 @@ impl a2a_server::TaskStore for SlowGetStore {
 async fn racing_follow_ups_with_the_same_expected_generation_do_not_both_win() {
     let release = Arc::new(Notify::new());
     let store = SlowGetStore::new();
-    let handler = Arc::new(DefaultRequestHandler::new(
-        ScriptAgent {
-            release: release.clone(),
-            cancel: CancelMode::Status,
-        },
-        store.clone(),
-    ));
+    let handler = Arc::new(
+        DefaultRequestHandler::new(
+            ScriptAgent {
+                release: release.clone(),
+                cancel: CancelMode::Status,
+            },
+            store.clone(),
+        )
+        .with_capabilities(a2a::AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        }),
+    );
     let params = ServiceParams::new();
     let first = task_of(
         handler
@@ -1261,12 +1312,13 @@ async fn racing_follow_ups_with_the_same_expected_generation_do_not_both_win() {
         1,
         "exactly one wins: {slow:?} / {fast:?}"
     );
-    // The reservation turns the loser away; the guard on the generation is
-    // what refuses a request that gets past it (see the stale-generation test).
+    // The reservation turns the loser away as busy, or, once it reaches the
+    // task the winner changed, the guard on the generation refuses it.
     let loser = if slow.is_ok() { &fast } else { &slow };
-    assert_eq!(
-        loser.as_ref().unwrap_err().code,
-        error_code::INVALID_REQUEST
+    let code = loser.as_ref().unwrap_err().code;
+    assert!(
+        code == error_code::INVALID_REQUEST || code == error_code::TASK_GENERATION_MISMATCH,
+        "unexpected error {code}"
     );
     let stored = handler.get_task(&params, get(&first.id)).await.unwrap();
     let from_clients: Vec<_> = timeline_of(&stored)
@@ -1419,6 +1471,7 @@ async fn a_client_cannot_change_an_artifact_the_agent_wrote() {
     )
     .with_capabilities(AgentCapabilities {
         user_artifacts: Some(true),
+        streaming: Some(true),
         ..AgentCapabilities::default()
     });
 
@@ -1436,7 +1489,7 @@ async fn a_client_cannot_change_an_artifact_the_agent_wrote() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_dropped_request_gives_the_task_back() {
+async fn a_dropped_request_finishes_preparation_and_can_be_canceled() {
     let release = Arc::new(Notify::new());
     let store = SlowGetStore::new();
     let handler = DefaultRequestHandler::new(
@@ -1445,7 +1498,11 @@ async fn a_dropped_request_gives_the_task_back() {
             cancel: CancelMode::Status,
         },
         store.clone(),
-    );
+    )
+    .with_capabilities(a2a::AgentCapabilities {
+        streaming: Some(true),
+        ..Default::default()
+    });
     let params = ServiceParams::new();
     let first = task_of(
         handler
@@ -1463,14 +1520,26 @@ async fn a_dropped_request_gives_the_task_back() {
     .await;
     assert!(abandoned.is_err(), "the request was still in flight");
 
-    // The reservation went with the dropped future: the very next request,
-    // with no pause, finds the task free.
-    let retried = handler
-        .send_message(&params, send("ask", Some(&first.id)))
-        .await;
-    assert!(
-        retried.is_ok(),
-        "the task stayed reserved after its request was dropped: {retried:?}"
+    // Preparation is owned by the runtime: dropping the caller must not
+    // abandon input between persistence and delivery. A cancel waits for that
+    // preparation, then releases the execution normally.
+    let canceled = tokio::time::timeout(
+        Duration::from_secs(5),
+        handler.cancel_task(&params, cancel(&first.id)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(canceled.status.state, TaskState::Canceled);
+    assert_eq!(
+        canceled
+            .history
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|message| message.text() == Some("hold"))
+            .count(),
+        1
     );
 }
 
@@ -1478,13 +1547,19 @@ async fn a_dropped_request_gives_the_task_back() {
 async fn a_cancel_during_a_follow_ups_preparation_is_ordered_after_it() {
     let release = Arc::new(Notify::new());
     let store = SlowGetStore::new();
-    let handler = Arc::new(DefaultRequestHandler::new(
-        ScriptAgent {
-            release: release.clone(),
-            cancel: CancelMode::Status,
-        },
-        store.clone(),
-    ));
+    let handler = Arc::new(
+        DefaultRequestHandler::new(
+            ScriptAgent {
+                release: release.clone(),
+                cancel: CancelMode::Status,
+            },
+            store.clone(),
+        )
+        .with_capabilities(a2a::AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        }),
+    );
     let params = ServiceParams::new();
     let first = task_of(
         handler
@@ -1503,7 +1578,7 @@ async fn a_cancel_during_a_follow_ups_preparation_is_ordered_after_it() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    store.slow_get_entered().await;
     let canceled = handler
         .cancel_task(&params, cancel(&first.id))
         .await
@@ -1605,7 +1680,11 @@ async fn an_executor_snapshot_without_metadata_keeps_the_stored_metadata() {
             cancel: CancelMode::Status,
         },
         store,
-    );
+    )
+    .with_capabilities(a2a::AgentCapabilities {
+        streaming: Some(true),
+        ..Default::default()
+    });
 
     // The "snapshot" script answers with a Task that carries no metadata.
     let task = task_of(
@@ -1637,13 +1716,19 @@ async fn first_event(
 async fn subscribing_while_a_follow_up_is_prepared_opens_with_the_task() {
     let release = Arc::new(Notify::new());
     let store = SlowGetStore::new();
-    let handler = Arc::new(DefaultRequestHandler::new(
-        ScriptAgent {
-            release: release.clone(),
-            cancel: CancelMode::Status,
-        },
-        store.clone(),
-    ));
+    let handler = Arc::new(
+        DefaultRequestHandler::new(
+            ScriptAgent {
+                release: release.clone(),
+                cancel: CancelMode::Status,
+            },
+            store.clone(),
+        )
+        .with_capabilities(a2a::AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        }),
+    );
     let params = ServiceParams::new();
     let first = task_of(
         handler
@@ -1661,7 +1746,7 @@ async fn subscribing_while_a_follow_up_is_prepared_opens_with_the_task() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    store.slow_get_entered().await;
 
     let stream = handler
         .subscribe_to_task(
@@ -1691,13 +1776,19 @@ async fn subscribing_while_a_follow_up_is_prepared_opens_with_the_task() {
 #[tokio::test]
 async fn subscribing_while_a_follow_up_fails_never_yields_an_empty_stream() {
     let store = SlowGetStore::new();
-    let handler = Arc::new(DefaultRequestHandler::new(
-        ScriptAgent {
-            release: Arc::new(Notify::new()),
-            cancel: CancelMode::Status,
-        },
-        store.clone(),
-    ));
+    let handler = Arc::new(
+        DefaultRequestHandler::new(
+            ScriptAgent {
+                release: Arc::new(Notify::new()),
+                cancel: CancelMode::Status,
+            },
+            store.clone(),
+        )
+        .with_capabilities(a2a::AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        }),
+    );
     let params = ServiceParams::new();
     let first = task_of(
         handler
@@ -1721,7 +1812,7 @@ async fn subscribing_while_a_follow_up_fails_never_yields_an_empty_stream() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    store.slow_get_entered().await;
 
     let subscribed = handler
         .subscribe_to_task(
@@ -1839,7 +1930,14 @@ async fn a_snapshot_listing_only_the_agents_artifacts_keeps_the_clients() {
     let mut task_id = None;
     while let Some(event) = stream.next().await {
         if let StreamResponse::Task(task) = event.unwrap() {
+            let interrupted = matches!(
+                task.status.state,
+                TaskState::InputRequired | TaskState::AuthRequired
+            );
             task_id = Some(task.id);
+            if interrupted {
+                break;
+            }
         }
     }
 
@@ -1861,13 +1959,19 @@ async fn a_snapshot_listing_only_the_agents_artifacts_keeps_the_clients() {
 #[tokio::test]
 async fn a_cancel_and_a_follow_up_on_an_idle_task_are_ordered() {
     let store = SlowGetStore::new();
-    let handler = Arc::new(DefaultRequestHandler::new(
-        ScriptAgent {
-            release: Arc::new(Notify::new()),
-            cancel: CancelMode::Status,
-        },
-        store.clone(),
-    ));
+    let handler = Arc::new(
+        DefaultRequestHandler::new(
+            ScriptAgent {
+                release: Arc::new(Notify::new()),
+                cancel: CancelMode::Status,
+            },
+            store.clone(),
+        )
+        .with_capabilities(a2a::AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        }),
+    );
     let params = ServiceParams::new();
     let first = task_of(
         handler
@@ -1887,7 +1991,7 @@ async fn a_cancel_and_a_follow_up_on_an_idle_task_are_ordered() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    store.slow_get_entered().await;
     // ...so a follow-up arriving meanwhile has to wait and then finds the
     // task finished.
     let follow_up = handler
@@ -2034,7 +2138,11 @@ async fn a_message_only_answer_is_not_preceded_by_a_task() {
             Box::pin(stream::empty())
         }
     }
-    let handler = DefaultRequestHandler::new(MessageAgent, InMemoryTaskStore::new());
+    let handler = DefaultRequestHandler::new(MessageAgent, InMemoryTaskStore::new())
+        .with_capabilities(a2a::AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        });
     let events: Vec<_> = handler
         .send_streaming_message(&ServiceParams::new(), send("hi", None))
         .await
@@ -2051,13 +2159,19 @@ async fn a_subscription_that_races_a_follow_up_always_opens_with_the_task() {
     let mut opened_with_task = 0;
     for round in 0..300 {
         let release = Arc::new(Notify::new());
-        let handler = Arc::new(DefaultRequestHandler::new(
-            ScriptAgent {
-                release: release.clone(),
-                cancel: CancelMode::Status,
-            },
-            InMemoryTaskStore::new(),
-        ));
+        let handler = Arc::new(
+            DefaultRequestHandler::new(
+                ScriptAgent {
+                    release: release.clone(),
+                    cancel: CancelMode::Status,
+                },
+                InMemoryTaskStore::new(),
+            )
+            .with_capabilities(a2a::AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            }),
+        );
         let params = ServiceParams::new();
         let first = task_of(
             handler
@@ -2114,17 +2228,19 @@ async fn a_subscription_that_races_a_follow_up_always_opens_with_the_task() {
 async fn a_streaming_send_that_only_restates_the_task_still_opens_with_it() {
     let (handler, _) = script_handler(CancelMode::Status);
 
-    let events: Vec<_> = handler
+    let mut events = handler
         .send_streaming_message(&ServiceParams::new(), send("restate", None))
         .await
-        .unwrap()
-        .collect()
-        .await;
-
-    assert_eq!(events.len(), 1, "{events:?}");
+        .unwrap();
+    assert!(matches!(
+        events.next().await,
+        Some(Ok(StreamResponse::Task(_)))
+    ));
     assert!(
-        matches!(events[0], Ok(StreamResponse::Task(_))),
-        "{events:?}"
+        tokio::time::timeout(Duration::from_millis(30), events.next())
+            .await
+            .is_err(),
+        "a restated nonterminal task does not end the stream"
     );
 }
 
@@ -2165,7 +2281,11 @@ async fn restating_the_agents_artifacts_keeps_the_stored_order_and_is_no_change(
             cancel: CancelMode::Status,
         },
         store,
-    );
+    )
+    .with_capabilities(a2a::AgentCapabilities {
+        streaming: Some(true),
+        ..Default::default()
+    });
 
     let task = task_of(
         handler
@@ -2191,7 +2311,8 @@ async fn restating_the_agents_artifacts_keeps_the_stored_order_and_is_no_change(
 
 #[test]
 fn an_executor_can_be_exercised_with_a_hand_built_context() {
-    let ctx = ExecutorContext::new("t-direct", "c-direct")
+    let (_sender, inputs) = a2a_server::ClientInputs::channel(1);
+    let ctx = ExecutorContext::new("t-direct", "c-direct", inputs)
         .with_message(Message::new(Role::User, vec![Part::text("snapshot")]))
         .with_tenant("acme");
     assert_eq!(
@@ -2342,7 +2463,11 @@ async fn a_store_that_does_not_bump_on_cancel_is_recorded_by_the_handler() {
         PlainCancelStore {
             inner: Arc::new(InMemoryTaskStore::new()),
         },
-    );
+    )
+    .with_capabilities(a2a::AgentCapabilities {
+        streaming: Some(true),
+        ..Default::default()
+    });
     let (task_id, _held) = open_held_task(&handler).await;
     let before = handler
         .get_task(&ServiceParams::new(), get(&task_id))
