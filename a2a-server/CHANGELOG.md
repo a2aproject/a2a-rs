@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.5.3...a2a-server-lf-v0.5.4) - 2026-10-31
+
+### Other
+
+- *(readme)* install the crates with cargo add ([#408](https://github.com/a2aproject/a2a-rs/pull/408))
+
 ## [0.5.3](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.5.2...a2a-server-lf-v0.5.3) - 2026-10-16
 
 ### Other
