@@ -337,4 +337,36 @@ mod tests {
         assert_eq!(back.last_chunk, Some(true));
         assert!(back.append.is_none());
     }
+
+    #[test]
+    fn native_message_updates_and_live_errors_round_trip_without_proto_conversion() {
+        let events = [
+            StreamResponse::MessageUpdate(TaskMessageUpdateEvent {
+                task_id: "t".into(),
+                context_id: "c".into(),
+                message: Message::new(Role::User, vec![Part::text("follow-up")]),
+                generation: i64::MAX,
+                metadata: None,
+            }),
+            StreamResponse::Error(StreamError {
+                task_id: "t".into(),
+                code: "INVALID_ARGUMENT".into(),
+                message: "wrong context".into(),
+                reference_id: Some("input-id".into()),
+                metadata: None,
+            }),
+        ];
+        for event in events {
+            let wire = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                serde_json::from_value::<StreamResponse>(wire).unwrap(),
+                event
+            );
+        }
+        for field in ["messageUpdate", "error"] {
+            assert!(
+                serde_json::from_value::<StreamResponse>(serde_json::json!({field: {}})).is_err()
+            );
+        }
+    }
 }

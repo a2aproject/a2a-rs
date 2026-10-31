@@ -5646,4 +5646,35 @@ mod tests {
         assert_eq!(envelope.error.message, "unexpected argument '--nope' found");
         assert!(envelope.error.hint.unwrap().contains("--help"));
     }
+    #[test]
+    fn live_updates_render_the_message_and_rejection_details() {
+        let update = StreamResponse::MessageUpdate(TaskMessageUpdateEvent {
+            task_id: "live-task".into(),
+            context_id: "live-context".into(),
+            message: Message::new(Role::User, vec![Part::text("follow-up content")]),
+            generation: 42,
+            metadata: None,
+        });
+        let rendered = update.render_text();
+        for expected in ["live-task", "live-context", "follow-up content"] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected} from {rendered}"
+            );
+        }
+        for message in ["retry this input", ""] {
+            let rejection = StreamResponse::Error(StreamError {
+                task_id: "live-task".into(),
+                code: "UNAVAILABLE".into(),
+                message: message.into(),
+                reference_id: Some("rejected-input".into()),
+                metadata: None,
+            });
+            let rendered = rejection.render_text();
+            assert!(rendered.contains("UNAVAILABLE"));
+            if !message.is_empty() {
+                assert!(rendered.contains(message));
+            }
+        }
+    }
 }

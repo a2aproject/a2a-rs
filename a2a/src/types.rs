@@ -1346,4 +1346,82 @@ mod tests {
         let back: SubscribeToTaskRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }
+
+    #[test]
+    fn generation_json_accepts_exact_int64_values_and_rejects_lossy_values() {
+        for n in [i64::MIN, 0, i64::MAX] {
+            for encoded in [serde_json::json!(n), serde_json::json!(n.to_string())] {
+                let request: GetTaskRequest = serde_json::from_value(serde_json::json!({
+                    "id": "t", "currentGeneration": encoded,
+                }))
+                .unwrap();
+                assert_eq!(request.current_generation, Some(n));
+                assert_eq!(
+                    serde_json::to_value(request).unwrap()["currentGeneration"],
+                    n.to_string()
+                );
+            }
+        }
+        for value in [
+            serde_json::json!(true),
+            serde_json::json!(1.5),
+            serde_json::json!("9223372036854775808"),
+            serde_json::json!("not-a-generation"),
+        ] {
+            assert!(
+                serde_json::from_value::<GetTaskRequest>(serde_json::json!({
+                    "id": "t", "currentGeneration": value,
+                }))
+                .is_err()
+            );
+        }
+        let request: GetTaskRequest = serde_json::from_value(serde_json::json!({
+            "id": "t", "currentGeneration": null,
+        }))
+        .unwrap();
+        assert_eq!(request.current_generation, None);
+        assert!(
+            serde_json::to_value(request)
+                .unwrap()
+                .get("currentGeneration")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn null_timeline_is_unset_but_malformed_known_entries_are_errors() {
+        let task = serde_json::json!({
+            "id": "t", "contextId": "c", "status": {"state": "TASK_STATE_WORKING"},
+            "generation": null, "timeline": null,
+        });
+        let parsed: Task = serde_json::from_value(task.clone()).unwrap();
+        assert_eq!(parsed.generation, 0);
+        assert_eq!(parsed.timeline, None);
+        for entry in [
+            serde_json::json!({"message": {}}),
+            serde_json::json!({"status": "broken"}),
+        ] {
+            let mut malformed = task.clone();
+            malformed["timeline"] = serde_json::json!([entry]);
+            assert!(serde_json::from_value::<Task>(malformed).is_err());
+        }
+        let mut unknown = task;
+        unknown["timeline"] = serde_json::json!([{"futureEvent": {"generation": "5"}}]);
+        assert_eq!(
+            serde_json::from_value::<Task>(unknown).unwrap().timeline,
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn malformed_message_responses_and_unknown_roles_are_rejected() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"task": {}}),
+            serde_json::json!({"message": {"role": "ROLE_FUTURE", "messageId": "m", "parts": []}}),
+        ] {
+            assert!(serde_json::from_value::<SendMessageResponse>(value).is_err());
+        }
+        assert!(serde_json::from_str::<Role>("\"ROLE_FUTURE\"").is_err());
+    }
 }
