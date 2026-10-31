@@ -57,6 +57,30 @@ pub struct A2AClientFactory {
     interceptors: Vec<Arc<dyn CallInterceptor>>,
 }
 
+/// A2A §3.6.2: the version to signal to an interface that declares
+/// `declared`. Within 1.x the client speaks the lower of the two minors, so a
+/// 1.0 agent is not sent 1.1 semantics it never advertised; a declaration
+/// outside 1.x, or one that does not parse, leaves the SDK's own version.
+pub fn negotiate_protocol_version(declared: &str) -> String {
+    negotiate_against(declared, VERSION)
+}
+
+fn negotiate_against(declared: &str, own: &str) -> String {
+    fn parse(version: &str) -> Option<(u64, u64)> {
+        let mut parts = version.trim().split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next().map_or(Some(0), |minor| minor.parse().ok())?;
+        Some((major, minor))
+    }
+    let own_version = parse(own).unwrap_or((1, 0));
+    match parse(declared) {
+        Some(declared) if declared.0 == own_version.0 && declared < own_version => {
+            format!("{}.{}", declared.0, declared.1)
+        }
+        _ => own.to_string(),
+    }
+}
+
 impl A2AClientFactory {
     /// Create a builder for configuring the factory.
     pub fn builder() -> A2AClientFactoryBuilder {
@@ -122,8 +146,9 @@ impl A2AClientFactory {
         for (_prio, iface, factory) in &candidates {
             match factory.create(card, iface).await {
                 Ok(transport) => {
-                    let mut client =
-                        A2AClient::new(transport).with_interceptors(self.interceptors.clone());
+                    let mut client = A2AClient::new(transport)
+                        .with_protocol_version(negotiate_protocol_version(&iface.protocol_version))
+                        .with_interceptors(self.interceptors.clone());
                     // A2A §8.3.2 rule 4: echo the tenant the selected
                     // interface declares on every request. An empty string
                     // is proto3's default for an unset field, so it means
@@ -234,6 +259,33 @@ mod tests {
         iface.protocol_version = "bad".to_string();
         let key = TransportKey::from_interface(&iface);
         assert_eq!(key.major_version, 1); // defaults to 1
+    }
+
+    // The SDK's own version is a parameter so these hold whichever minor it
+    // currently advertises.
+    #[test]
+    fn test_negotiate_protocol_version_follows_an_older_1x_down() {
+        // An SDK speaking 1.1 signals 1.0 to a 1.0 agent, not 1.1.
+        assert_eq!(negotiate_against("1.0", "1.1"), "1.0");
+        assert_eq!(negotiate_against(" 1.0 ", "1.1"), "1.0");
+        // A patch component is ignored, as is a bare major.
+        assert_eq!(negotiate_against("1.0.2", "1.3"), "1.0");
+        assert_eq!(negotiate_against("1", "1.1"), "1.0");
+        assert_eq!(negotiate_against("1.1", "1.3"), "1.1");
+    }
+
+    #[test]
+    fn test_negotiate_protocol_version_holds_at_its_own_version() {
+        assert_eq!(negotiate_against("1.1", "1.1"), "1.1");
+        // Newer than the SDK: nothing to follow up to.
+        assert_eq!(negotiate_against("1.9", "1.1"), "1.1");
+        // Outside 1.x, or unparseable: never negotiate below 1.0.
+        assert_eq!(negotiate_against("0.3", "1.1"), "1.1");
+        assert_eq!(negotiate_against("2.0", "1.1"), "1.1");
+        assert_eq!(negotiate_against("garbage", "1.1"), "1.1");
+        assert_eq!(negotiate_against("", "1.1"), "1.1");
+        // And the public entry point uses the SDK's own version.
+        assert_eq!(negotiate_protocol_version(VERSION), VERSION);
     }
 
     #[test]

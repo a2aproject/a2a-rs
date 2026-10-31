@@ -4,6 +4,7 @@
 use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use async_trait::async_trait;
+use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use reqwest::Client;
 use serde::Deserialize;
@@ -18,6 +19,7 @@ use crate::wire;
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
 const REST_STREAM_MESSAGE_PATH: &str = "/message:stream";
+const REST_LIVE_MESSAGE_PATH: &str = "/message:live";
 const REST_EXTENDED_AGENT_CARD_PATH: &str = "/extendedAgentCard";
 
 #[derive(Debug, Deserialize)]
@@ -36,9 +38,16 @@ struct RestErrorStatus {
 /// REST (HTTP+JSON) transport implementation.
 ///
 /// Maps A2A operations to RESTful HTTP endpoints.
+#[derive(Clone)]
 pub struct RestTransport {
     client: Client,
     base_url: String,
+}
+
+/// What a call that may either stream or answer plainly came back with.
+enum StreamOrTask {
+    Stream(BoxStream<'static, Result<StreamResponse, A2AError>>),
+    Task(Box<Task>),
 }
 
 impl RestTransport {
@@ -208,14 +217,61 @@ impl RestTransport {
         Ok(crate::jsonrpc::parse_sse_stream_rest(stream))
     }
 
+    /// `POST /message:live`: the call that opens a live exchange answers with
+    /// its events; one that only feeds an open exchange answers with the task.
+    async fn post_live(
+        &self,
+        params: &ServiceParams,
+        body: &StreamRequest,
+    ) -> Result<StreamOrTask, A2AError> {
+        let payload = protojson_conv::to_value(body).map_err(|e| {
+            A2AError::internal(format!("failed to serialize request as ProtoJSON: {e}"))
+        })?;
+        let resp = self
+            .send(
+                self.build_request(reqwest::Method::POST, REST_LIVE_MESSAGE_PATH, params)
+                    .header("Accept", "text/event-stream, application/json")
+                    .json(&payload),
+            )
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(Self::into_rest_error(resp).await);
+        }
+
+        let is_event_stream = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .map(|v| v.as_bytes().starts_with(b"text/event-stream"))
+            .unwrap_or(true);
+        if is_event_stream {
+            return Ok(StreamOrTask::Stream(crate::jsonrpc::parse_sse_stream_rest(
+                resp.bytes_stream(),
+            )));
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+        wire::log_response(reqwest::StatusCode::OK, &body);
+        let payload = serde_json::from_str::<Value>(&body)
+            .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+        protojson_conv::from_value(payload)
+            .map(|task| StreamOrTask::Task(Box::new(task)))
+            .map_err(|e| {
+                A2AError::internal(format!("failed to deserialize response as ProtoJSON: {e}"))
+            })
+    }
+
     async fn get_streaming(
         &self,
         path: &str,
         params: &ServiceParams,
+        query: &[(String, String)],
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let resp = self
             .send(
-                self.build_request(reqwest::Method::GET, path, params)
+                self.build_request_with_query(reqwest::Method::GET, path, params, query)
                     .header("Accept", "text/event-stream"),
             )
             .await?;
@@ -237,6 +293,31 @@ impl RestTransport {
             return Err(Self::into_rest_error(resp).await);
         }
         Ok(())
+    }
+}
+
+/// The uplink of a live exchange over REST: each request is a short-lived
+/// `POST /message:live`, which the server answers with the task.
+#[derive(Clone)]
+struct RestLiveUplink {
+    transport: RestTransport,
+    params: ServiceParams,
+}
+
+#[async_trait]
+impl crate::LiveUplink for RestLiveUplink {
+    async fn send(&self, request: StreamRequest) -> Result<crate::LiveAck, A2AError> {
+        match self.transport.post_live(&self.params, &request).await? {
+            StreamOrTask::Task(task) => Ok(crate::LiveAck::Task(task)),
+            // The exchange this was meant for is gone, so the server opened a
+            // new one for it and carried the request out: this is that one.
+            StreamOrTask::Stream(events) => {
+                Ok(crate::LiveAck::Reopened(Box::new(crate::LiveConnection {
+                    events,
+                    sender: crate::LiveSender::new(std::sync::Arc::new(self.clone())),
+                })))
+            }
+        }
     }
 }
 
@@ -287,6 +368,32 @@ impl Transport for RestTransport {
             .await
     }
 
+    async fn send_live_message(
+        &self,
+        params: &ServiceParams,
+        first: &StreamRequest,
+    ) -> Result<crate::LiveConnection, A2AError> {
+        let params = crate::transport::live_params(params);
+        match self.post_live(&params, first).await? {
+            StreamOrTask::Stream(events) => Ok(crate::LiveConnection {
+                events,
+                sender: crate::LiveSender::new(std::sync::Arc::new(RestLiveUplink {
+                    transport: self.clone(),
+                    params: params.clone(),
+                })),
+            }),
+            // A peer without the SDK routing convention may acknowledge this
+            // opening as input to an existing exchange instead of streaming.
+            StreamOrTask::Task(task) => Ok(crate::LiveConnection {
+                events: futures::stream::iter([Ok(StreamResponse::Task(*task))]).boxed(),
+                sender: crate::LiveSender::new(std::sync::Arc::new(RestLiveUplink {
+                    transport: self.clone(),
+                    params: params.clone(),
+                })),
+            }),
+        }
+    }
+
     async fn get_task(
         &self,
         params: &ServiceParams,
@@ -296,6 +403,12 @@ impl Transport for RestTransport {
         let mut query_parts = Vec::new();
         if let Some(hl) = req.history_length {
             query_parts.push(("historyLength".to_string(), hl.to_string()));
+        }
+        if let Some(tl) = req.timeline_length {
+            query_parts.push(("timelineLength".to_string(), tl.to_string()));
+        }
+        if let Some(generation) = req.current_generation {
+            query_parts.push(("currentGeneration".to_string(), generation.to_string()));
         }
         self.get_json(&path, params, &query_parts).await
     }
@@ -325,6 +438,9 @@ impl Transport for RestTransport {
         if let Some(hl) = req.history_length {
             query_parts.push(("historyLength".to_string(), hl.to_string()));
         }
+        if let Some(tl) = req.timeline_length {
+            query_parts.push(("timelineLength".to_string(), tl.to_string()));
+        }
         if let Some(ref ts) = req.status_timestamp_after {
             query_parts.push(("statusTimestampAfter".to_string(), ts.to_rfc3339()));
         }
@@ -349,11 +465,22 @@ impl Transport for RestTransport {
         req: &SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let canonical_path = format!("/tasks/{}:subscribe", req.id);
-        match self.get_streaming(&canonical_path, params).await {
+        let mut query_parts = Vec::new();
+        if let Some(generation) = req.last_seen_generation {
+            query_parts.push(("lastSeenGeneration".to_string(), generation.to_string()));
+        }
+        match self
+            .get_streaming(&canonical_path, params, &query_parts)
+            .await
+        {
             Ok(stream) => Ok(stream),
             Err(err) if should_retry_subscribe_with_legacy_path(&err) => {
-                self.get_streaming(&format!("/tasks/{}/subscribe", req.id), params)
-                    .await
+                self.get_streaming(
+                    &format!("/tasks/{}/subscribe", req.id),
+                    params,
+                    &query_parts,
+                )
+                .await
             }
             Err(err) => Err(err),
         }
@@ -844,5 +971,138 @@ mod tests {
         let iface = AgentInterface::new("https://localhost:3443/rest", "HTTP+JSON");
         let transport = f.create(&card, &iface).await.unwrap();
         transport.destroy().await.unwrap();
+    }
+    #[tokio::test]
+    async fn live_http_receipts_reopen_streams_and_preserve_exchange_and_tenant() {
+        use crate::{A2AClient, LiveAck};
+        for (rpc, streaming_opening) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let task = json!({"id":"task", "contextId":"context", "generation":"4",
+                    "status":{"state":"TASK_STATE_WORKING"}})
+                .to_string();
+                let sse = format!("data: {{\"task\":{task}}}\n\n");
+                let mut exchange = None;
+                for step in 0..4 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut raw = read_http_request(&mut socket).await;
+                    let boundary = raw.find("\r\n\r\n").unwrap() + 4;
+                    let length = raw[..boundary]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    while raw.len() < boundary + length {
+                        let mut bytes = [0; 1024];
+                        let read = socket.read(&mut bytes).await.unwrap();
+                        assert!(read > 0);
+                        raw.push_str(std::str::from_utf8(&bytes[..read]).unwrap());
+                    }
+                    assert!(raw.starts_with(if rpc {
+                        "POST /rpc HTTP/1.1"
+                    } else {
+                        "POST /message:live HTTP/1.1"
+                    }));
+                    let routing = raw[..boundary]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case(SDK_LIVE_EXCHANGE_HEADER)
+                                .then(|| value.trim().to_owned())
+                        })
+                        .unwrap();
+                    match &exchange {
+                        None => exchange = Some(routing),
+                        Some(expected) => assert_eq!(&routing, expected),
+                    }
+                    let envelope: Value = serde_json::from_str(&raw[boundary..]).unwrap();
+                    let body = if rpc {
+                        assert_eq!(envelope["method"], "SendLiveMessage");
+                        &envelope["params"]
+                    } else {
+                        &envelope
+                    };
+                    assert_eq!(body["tenant"], "tenant-a");
+                    let payload = if step == 2 || (step == 0 && streaming_opening) {
+                        "subscribe"
+                    } else {
+                        "sendMessage"
+                    };
+                    assert_eq!(body[payload]["tenant"], "tenant-a");
+                    let streamed = step == 2 || (step == 0 && streaming_opening);
+                    let rpc_json = json!({"jsonrpc":"2.0", "id":envelope["id"], "result":serde_json::from_str::<Value>(&task).unwrap()}).to_string();
+                    let rpc_sse = format!(
+                        "data: {}\n\n",
+                        json!({"jsonrpc":"2.0", "id":envelope["id"], "result":{"task":serde_json::from_str::<Value>(&task).unwrap()}})
+                    );
+                    let (kind, body) = match (streamed, rpc) {
+                        (true, false) => ("text/event-stream", &sse),
+                        (true, true) => ("text/event-stream", &rpc_sse),
+                        (false, false) => ("application/json", &task),
+                        (false, true) => ("application/json", &rpc_json),
+                    };
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let transport: Box<dyn Transport> = if rpc {
+                Box::new(crate::jsonrpc::JsonRpcTransport::new(
+                    Client::new(),
+                    format!("http://{address}/rpc"),
+                ))
+            } else {
+                Box::new(RestTransport::new(
+                    Client::new(),
+                    format!("http://{address}"),
+                ))
+            };
+            let client = A2AClient::new(transport).with_tenant("tenant-a");
+            let subscribe = || StreamRequest {
+                tenant: None,
+                payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                    id: "task".into(),
+                    tenant: None,
+                    last_seen_generation: None,
+                }),
+            };
+            let message = Message::new(Role::User, vec![Part::text("input")]);
+            let first = if streaming_opening {
+                subscribe()
+            } else {
+                StreamRequest {
+                    tenant: None,
+                    payload: StreamRequestPayload::SendMessage(SendMessageRequest {
+                        message: message.clone(),
+                        configuration: None,
+                        metadata: None,
+                        tenant: None,
+                        artifact_updates: Vec::new(),
+                    }),
+                }
+            };
+            let mut connection = client.send_live_message(&first).await.unwrap();
+            assert!(
+                matches!(connection.events.next().await.unwrap().unwrap(), StreamResponse::Task(task) if task.generation == 4)
+            );
+            assert!(connection.events.next().await.is_none());
+            assert!(
+                matches!(connection.sender.send_message(message.clone()).await.unwrap(), LiveAck::Task(task) if task.id == "task")
+            );
+            let LiveAck::Reopened(mut renewed) = connection.sender.send(subscribe()).await.unwrap()
+            else {
+                panic!("expected a new downlink")
+            };
+            assert!(
+                matches!(renewed.events.next().await.unwrap().unwrap(), StreamResponse::Task(task) if task.id == "task")
+            );
+            assert!(
+                matches!(renewed.sender.send_message(message).await.unwrap(), LiveAck::Task(task) if task.id == "task")
+            );
+            server.await.unwrap();
+        }
     }
 }

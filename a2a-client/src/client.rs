@@ -8,6 +8,7 @@ use futures::stream::BoxStream;
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use crate::LiveConnection;
 use crate::middleware::CallInterceptor;
 use crate::transport::{ServiceParams, Transport};
 
@@ -29,6 +30,15 @@ impl<T: Transport> A2AClient<T> {
             default_params,
             tenant: None,
         }
+    }
+
+    /// Signal `version` in the `A2A-Version` service parameter instead of the
+    /// SDK's own [`VERSION`]. A client talking to an agent that declares an
+    /// older minor version uses this to speak that version.
+    pub fn with_protocol_version(mut self, version: impl Into<String>) -> Self {
+        self.default_params
+            .insert(SVC_PARAM_VERSION.to_string(), vec![version.into()]);
+        self
     }
 
     pub fn with_interceptors(mut self, interceptors: Vec<Arc<dyn CallInterceptor>>) -> Self {
@@ -130,6 +140,32 @@ impl<T: Transport> A2AClient<T> {
         let result = self.transport.send_streaming_message(&params, &req).await;
         self.finish_call(methods::SEND_STREAMING_MESSAGE, result)
             .await
+    }
+
+    /// Opens a live exchange (`SendLiveMessage`, A2A 1.1 §3.1.12) with `first`,
+    /// the request that binds it to a task: a message (to a task, or to create
+    /// one) or a subscription. Read the task's events from the connection and
+    /// send further messages through its sender.
+    pub async fn send_live_message(
+        &self,
+        first: &StreamRequest,
+    ) -> Result<LiveConnection, A2AError> {
+        let params = self.apply_before(methods::SEND_LIVE_MESSAGE).await?;
+        let mut first = first.clone();
+        if let Some(tenant) = &self.tenant {
+            first.tenant = Some(tenant.clone());
+            match &mut first.payload {
+                StreamRequestPayload::SendMessage(inner) => inner.tenant = Some(tenant.clone()),
+                StreamRequestPayload::Subscribe(inner) => inner.tenant = Some(tenant.clone()),
+                _ => {}
+            }
+        }
+        let result = self.transport.send_live_message(&params, &first).await;
+        let mut connection = self.finish_call(methods::SEND_LIVE_MESSAGE, result).await?;
+        if let Some(tenant) = &self.tenant {
+            connection.sender = connection.sender.with_tenant(tenant.clone());
+        }
+        Ok(connection)
     }
 
     pub async fn get_task(&self, req: &GetTaskRequest) -> Result<Task, A2AError> {
@@ -536,6 +572,19 @@ mod tests {
     }
 
     #[test]
+    fn test_with_protocol_version_replaces_the_signaled_version() {
+        let client = make_client().with_protocol_version("1.0");
+        assert_eq!(
+            client.params().get(SVC_PARAM_VERSION),
+            Some(&vec!["1.0".to_string()])
+        );
+        assert_eq!(
+            make_client().params().get(SVC_PARAM_VERSION),
+            Some(&vec![VERSION.to_string()])
+        );
+    }
+
+    #[test]
     fn test_with_interceptors() {
         let client = make_client().with_interceptors(vec![]);
         assert!(client.interceptors.is_empty());
@@ -838,5 +887,23 @@ mod tests {
             state.request_tenants.lock().unwrap().clone(),
             vec![Some("caller-chosen".to_string()), None]
         );
+    }
+    #[tokio::test]
+    async fn legacy_transports_reject_live_openings_explicitly() {
+        let client = make_client().with_tenant("tenant-a");
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        let error = client
+            .send_live_message(&request)
+            .await
+            .err()
+            .expect("legacy transport must refuse live input");
+        assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
     }
 }

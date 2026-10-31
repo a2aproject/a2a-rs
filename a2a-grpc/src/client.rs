@@ -107,6 +107,33 @@ impl Transport for GrpcTransport {
         Ok(Box::pin(stream))
     }
 
+    async fn send_live_message(
+        &self,
+        params: &ServiceParams,
+        first: &StreamRequest,
+    ) -> Result<a2a_client::LiveConnection, A2AError> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        sender
+            .send(pbconv::to_proto_stream_request(first))
+            .await
+            .map_err(|_| A2AError::internal("could not queue the first live request"))?;
+        let requests = tokio_stream::wrappers::ReceiverStream::new(receiver);
+        let response = self
+            .client()
+            .send_live_message(make_request(params, requests))
+            .await
+            .map_err(|s| status_to_a2a_error(&s))?;
+        // Payload kinds this client does not know are skipped, as on any stream.
+        let events = response
+            .into_inner()
+            .filter_map(|item| std::future::ready(decode_stream_item(item)))
+            .boxed();
+        Ok(a2a_client::LiveConnection {
+            events,
+            sender: a2a_client::LiveSender::new(std::sync::Arc::new(GrpcLiveUplink { sender })),
+        })
+    }
+
     async fn get_task(
         &self,
         params: &ServiceParams,
@@ -341,6 +368,23 @@ impl TransportFactory for GrpcTransportFactory {
     }
 }
 
+/// The uplink of a live exchange over gRPC: requests are written to the stream
+/// the call opened. It closes when the last sender is dropped.
+struct GrpcLiveUplink {
+    sender: tokio::sync::mpsc::Sender<a2a_pb::proto::StreamRequest>,
+}
+
+#[async_trait]
+impl a2a_client::LiveUplink for GrpcLiveUplink {
+    async fn send(&self, request: StreamRequest) -> Result<a2a_client::LiveAck, A2AError> {
+        self.sender
+            .send(pbconv::to_proto_stream_request(&request))
+            .await
+            .map_err(|_| A2AError::invalid_request("the live exchange is no longer open"))?;
+        Ok(a2a_client::LiveAck::Sent)
+    }
+}
+
 /// Decodes one item of a server stream. A payload kind this client does not
 /// know decodes to `None` and is skipped, as the spec requires of stream
 /// readers.
@@ -567,5 +611,32 @@ mod stream_decode_tests {
     fn stream_status_error_is_reported() {
         let item = decode_stream_item(Err(tonic::Status::internal("boom")));
         assert!(matches!(item, Some(Err(_))));
+    }
+    #[tokio::test]
+    async fn live_uplink_preserves_routing_and_reports_a_closed_exchange() {
+        use a2a_client::LiveUplink;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let uplink = GrpcLiveUplink { sender };
+        let request = StreamRequest {
+            tenant: Some("tenant-a".into()),
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: Some("tenant-a".into()),
+                last_seen_generation: Some(i64::MAX),
+            }),
+        };
+        assert!(matches!(
+            uplink.send(request.clone()).await.unwrap(),
+            a2a_client::LiveAck::Sent
+        ));
+        let wire = receiver.recv().await.unwrap();
+        assert_eq!(pbconv::from_proto_stream_request(&wire), request);
+        drop(receiver);
+        let error = uplink
+            .send(request)
+            .await
+            .err()
+            .expect("closed uplink must reject the request");
+        assert_eq!(error.code, error_code::INVALID_REQUEST);
     }
 }

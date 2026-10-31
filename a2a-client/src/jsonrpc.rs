@@ -39,9 +39,16 @@ fn parse_jsonrpc_error(err: JsonRpcError) -> A2AError {
 ///
 /// Sends all requests as JSON-RPC 2.0 POSTs to a single endpoint.
 /// Streaming responses are received via Server-Sent Events (SSE).
+#[derive(Clone)]
 pub struct JsonRpcTransport {
     client: Client,
     endpoint: String,
+}
+
+/// What a call that may either stream or answer plainly came back with.
+enum StreamOrResult {
+    Stream(BoxStream<'static, Result<StreamResponse, A2AError>>),
+    Result(serde_json::Value),
 }
 
 impl JsonRpcTransport {
@@ -127,6 +134,28 @@ impl JsonRpcTransport {
     where
         Req: ProtoJsonPayload,
     {
+        match self
+            .call_stream_or_result(params, method, request_params)
+            .await?
+        {
+            StreamOrResult::Stream(stream) => Ok(stream),
+            StreamOrResult::Result(_) => Err(A2AError::internal(
+                "expected streaming response but got non-streaming JSON-RPC result",
+            )),
+        }
+    }
+
+    /// A call whose answer is a stream, or, for `SendLiveMessage`, a plain
+    /// result when the call only fed an exchange that was already open.
+    async fn call_stream_or_result<Req>(
+        &self,
+        params: &ServiceParams,
+        method: &str,
+        request_params: &Req,
+    ) -> Result<StreamOrResult, A2AError>
+    where
+        Req: ProtoJsonPayload,
+    {
         let id = JsonRpcId::String(uuid::Uuid::now_v7().to_string());
         let payload = protojson_conv::to_value(request_params).map_err(|e| {
             A2AError::internal(format!("failed to serialize request as ProtoJSON: {e}"))
@@ -161,7 +190,7 @@ impl JsonRpcTransport {
 
         if is_event_stream {
             let stream = response.bytes_stream();
-            Ok(parse_sse_stream(stream))
+            Ok(StreamOrResult::Stream(parse_sse_stream(stream)))
         } else {
             let body = wire::response_text(response).await.map_err(|e| {
                 A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
@@ -170,11 +199,41 @@ impl JsonRpcTransport {
                 A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
             })?;
 
-            match rpc_response.error {
-                Some(err) => Err(parse_jsonrpc_error(err)),
-                None => Err(A2AError::internal(
-                    "expected streaming response but got non-streaming JSON-RPC result",
-                )),
+            match (rpc_response.error, rpc_response.result) {
+                (Some(err), _) => Err(parse_jsonrpc_error(err)),
+                (None, Some(result)) => Ok(StreamOrResult::Result(result)),
+                (None, None) => Err(A2AError::internal("JSON-RPC response missing result")),
+            }
+        }
+    }
+}
+
+/// The uplink of a live exchange over JSON-RPC: each request is a short-lived
+/// call to the same method, which the server answers with the task.
+#[derive(Clone)]
+struct JsonRpcLiveUplink {
+    transport: JsonRpcTransport,
+    params: ServiceParams,
+}
+
+#[async_trait]
+impl crate::LiveUplink for JsonRpcLiveUplink {
+    async fn send(&self, request: StreamRequest) -> Result<crate::LiveAck, A2AError> {
+        match self
+            .transport
+            .call_stream_or_result(&self.params, methods::SEND_LIVE_MESSAGE, &request)
+            .await?
+        {
+            StreamOrResult::Result(result) => protojson_conv::from_value(result)
+                .map(|task| crate::LiveAck::Task(Box::new(task)))
+                .map_err(|e| A2AError::internal(format!("failed to deserialize result: {e}"))),
+            // The exchange this was meant for is gone, so the server opened a
+            // new one for it and carried the request out: this is that one.
+            StreamOrResult::Stream(events) => {
+                Ok(crate::LiveAck::Reopened(Box::new(crate::LiveConnection {
+                    events,
+                    sender: crate::LiveSender::new(std::sync::Arc::new(self.clone())),
+                })))
             }
         }
     }
@@ -447,6 +506,40 @@ impl Transport for JsonRpcTransport {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.call_streaming(params, methods::SEND_STREAMING_MESSAGE, req)
             .await
+    }
+
+    async fn send_live_message(
+        &self,
+        params: &ServiceParams,
+        first: &StreamRequest,
+    ) -> Result<crate::LiveConnection, A2AError> {
+        let params = crate::transport::live_params(params);
+        match self
+            .call_stream_or_result(&params, methods::SEND_LIVE_MESSAGE, first)
+            .await?
+        {
+            StreamOrResult::Stream(events) => Ok(crate::LiveConnection {
+                events,
+                sender: crate::LiveSender::new(std::sync::Arc::new(JsonRpcLiveUplink {
+                    transport: self.clone(),
+                    params: params.clone(),
+                })),
+            }),
+            // A peer without the SDK routing convention may acknowledge this
+            // opening as input to an existing exchange instead of streaming.
+            StreamOrResult::Result(result) => {
+                let task: Task = protojson_conv::from_value(result).map_err(|e| {
+                    A2AError::internal(format!("failed to deserialize result: {e}"))
+                })?;
+                Ok(crate::LiveConnection {
+                    events: futures::stream::iter([Ok(StreamResponse::Task(task))]).boxed(),
+                    sender: crate::LiveSender::new(std::sync::Arc::new(JsonRpcLiveUplink {
+                        transport: self.clone(),
+                        params: params.clone(),
+                    })),
+                })
+            }
+        }
     }
 
     async fn get_task(
