@@ -13,9 +13,8 @@ This crate is published as `a2a-lf` and imported in Rust as `a2a`.
 
 ## Install
 
-```toml
-[dependencies]
-a2a = { package = "a2a-lf", version = "0.2" }
+```sh
+cargo add a2a-lf --rename a2a
 ```
 
 ## Example
