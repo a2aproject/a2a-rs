@@ -10,6 +10,36 @@ use std::collections::HashMap;
 /// Service parameters — metadata from HTTP headers or gRPC metadata.
 pub type ServiceParams = HashMap<String, Vec<String>>;
 
+/// The major version this build implements (§3.6.2). Minor is accepted
+/// unconditionally since nothing here branches on it.
+const SUPPORTED_MAJOR_VERSION: u32 = 1;
+
+/// Mirrors a2acli's own `parse_protocol_version`: tolerant of a bare major,
+/// extra trailing components, and surrounding whitespace.
+fn parse_major_version(value: &str) -> Option<u32> {
+    value.trim().split('.').next()?.parse().ok()
+}
+
+/// §3.6.2: reject a request whose `A2A-Version` service parameter names an
+/// unsupported major version. §3.6.1/§3.6.2 both require an absent value
+/// to be interpreted as "0.3", not as "whatever this interface happens to
+/// serve" -- so it's rejected here exactly like any other unsupported
+/// version, rather than silently processed as this build's version.
+///
+/// Every protocol binding calls this before dispatching a request, since
+/// §3.6.2 applies to each interface the agent exposes.
+pub fn check_a2a_version(params: &ServiceParams) -> Result<(), A2AError> {
+    let requested = params
+        .get("a2a-version")
+        .and_then(|v| v.first())
+        .map(String::as_str)
+        .unwrap_or("0.3");
+    match parse_major_version(requested) {
+        Some(SUPPORTED_MAJOR_VERSION) => Ok(()),
+        _ => Err(A2AError::version_not_supported(requested)),
+    }
+}
+
 /// Build [`ServiceParams`] from an axum [`HeaderMap`].
 ///
 /// Header names are normalized to lowercase (axum does this for us), values
