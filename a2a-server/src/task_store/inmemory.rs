@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use a2a::*;
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
@@ -79,7 +80,28 @@ impl TaskStore for InMemoryTaskStore {
         }
         entry.version += 1;
         entry.task.status.state = TaskState::Canceled;
+        // What the agent said while working does not describe the cancellation.
+        entry.task.status.message = None;
         entry.task.status.timestamp = Some(chrono::Utc::now());
+        // The state change and its generation land in one write: no reader
+        // sees the task canceled at the generation it had while working. The
+        // handler announces the transition as the one status event of this
+        // generation.
+        entry.task.generation += 1;
+        // Cancellation completes every artifact at this same generation.
+        for artifact in entry.task.artifacts.iter_mut().flatten() {
+            artifact.end_generation.get_or_insert(entry.task.generation);
+        }
+        let status = entry.task.status.clone();
+        let generation = entry.task.generation;
+        entry
+            .task
+            .timeline
+            .get_or_insert_with(Vec::new)
+            .push(TimelineEntry {
+                content: TimelineContent::Status(status),
+                generation,
+            });
         Ok(entry.task.clone())
     }
 
@@ -89,10 +111,21 @@ impl TaskStore for InMemoryTaskStore {
     }
 
     async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+        self.list_scoped(req, &|_| true).await
+    }
+
+    async fn list_scoped(
+        &self,
+        req: &ListTasksRequest,
+        visible: &(dyn for<'id> Fn(&'id str) -> bool + Send + Sync),
+    ) -> Result<ListTasksResponse, A2AError> {
         let store = self.tasks.read().await;
         let mut tasks: Vec<Task> = store
             .values()
             .filter(|entry| {
+                if !visible(&entry.task.id) {
+                    return false;
+                }
                 // Filter by context_id if provided
                 if let Some(ref ctx_id) = req.context_id {
                     if entry.task.context_id != *ctx_id {
@@ -123,34 +156,43 @@ impl TaskStore for InMemoryTaskStore {
             .map(|e| e.task.clone())
             .collect();
 
-        // Sort by ID for deterministic output
-        tasks.sort_by(|a, b| a.id.cmp(&b.id));
-
-        // Apply pagination
-        // Defence in depth: DefaultRequestHandler clamps before calling a
-        // store, but a store reached by another route must still bound its
-        // own page.
-        let page_size = resolve_page_size(req.page_size);
-        let start = if let Some(ref token) = req.page_token {
-            // Simple offset-based pagination
-            token
-                .parse::<usize>()
-                .map_err(|_| A2AError::invalid_params("invalid page token"))?
-        } else {
-            0
-        };
-
+        // Latest status first, with task ID as a stable tie-breaker. None
+        // timestamps follow dated tasks. The cursor stores the last sort key,
+        // so inserting a newer task cannot duplicate entries on the next page.
+        tasks.sort_by_key(|task| (std::cmp::Reverse(task.status.timestamp), task.id.clone()));
         let total_size = tasks.len();
-        // Make sure start is within bounds
-        let start = start.min(total_size);
-        let end = start.saturating_add(page_size).min(total_size);
-        let page = tasks[start..end].to_vec();
-
-        let next_page_token = if end < total_size {
-            Some(end.to_string())
+        let page_size = resolve_page_size(req.page_size);
+        let cursor: Option<(Option<chrono::DateTime<chrono::Utc>>, String)> = req
+            .page_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(token)
+                    .map_err(|_| A2AError::invalid_params("invalid page token"))?;
+                serde_json::from_slice(&bytes)
+                    .map_err(|_| A2AError::invalid_params("invalid page token"))
+            })
+            .transpose()?;
+        if let Some((timestamp, id)) = cursor {
+            tasks.retain(|task| {
+                (std::cmp::Reverse(task.status.timestamp), &task.id)
+                    > (std::cmp::Reverse(timestamp), &id)
+            });
+        }
+        let has_more = tasks.len() > page_size;
+        tasks.truncate(page_size);
+        let next_page_token = if has_more {
+            tasks.last().map(|task| {
+                URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&(task.status.timestamp, &task.id))
+                        .expect("timestamp and task ID serialize infallibly"),
+                )
+            })
         } else {
             None
         };
+        let page = tasks;
 
         let page = page
             .into_iter()
@@ -622,7 +664,9 @@ mod tests {
             context_id: None,
             status: None,
             page_size: None,
-            page_token: Some("999".to_string()),
+            page_token: Some(URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&(None::<chrono::DateTime<chrono::Utc>>, "zzzz")).unwrap(),
+            )),
             history_length: None,
             status_timestamp_after: None,
             include_artifacts: None,

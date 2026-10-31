@@ -9,6 +9,26 @@ pub use store::{StoredTask, TaskStore, TaskVersion};
 
 use a2a::Task;
 
+/// Truncate `task.timeline` to the last `timeline_length` entries.
+///
+/// Same convention as [`apply_history_length`]: `None` leaves the timeline
+/// unchanged, and `Some(n)` with `n <= 0` omits it.
+pub(crate) fn apply_timeline_length(task: &mut Task, timeline_length: Option<i32>) {
+    let Some(requested) = timeline_length else {
+        return;
+    };
+    if requested <= 0 {
+        task.timeline = None;
+        return;
+    }
+    let keep = requested as usize;
+    if let Some(timeline) = task.timeline.as_mut() {
+        if timeline.len() > keep {
+            timeline.drain(..timeline.len() - keep);
+        }
+    }
+}
+
 /// Truncate `task.history` to the last `history_length` messages.
 ///
 /// `None` leaves history unchanged. `Some(n)` with `n <= 0` clears it.

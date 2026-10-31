@@ -20,7 +20,8 @@ pub struct HttpPushSender {
 pub struct HttpPushSenderConfig {
     /// HTTP request timeout (default: 30s).
     pub timeout: Duration,
-    /// If true, push sending errors abort execution.
+    /// If true, a failed delivery asynchronously wakes the active execution's
+    /// driver with an error. Delivery does not roll back an already published event.
     pub fail_on_error: bool,
     /// If true (default), guard push URLs against SSRF. A string pre-check
     /// (scheme must be http/https; host must not be a loopback, private,
@@ -84,28 +85,7 @@ impl HttpPushSender {
         config: &TaskPushNotificationConfig,
         event: StreamResponse,
     ) -> Result<(), A2AError> {
-        if self.validate_urls {
-            validate_push_url(&config.url)?;
-        }
-
-        // Reject credentials containing CR/LF so they cannot inject
-        // additional headers into the outgoing request (BUG-34).
-        if let Some(ref token) = config.token {
-            if token.contains('\r') || token.contains('\n') {
-                return Err(A2AError::invalid_params(
-                    "push notification token must not contain CR/LF",
-                ));
-            }
-        }
-        if let Some(ref auth) = config.authentication {
-            if let Some(ref creds) = auth.credentials {
-                if creds.contains('\r') || creds.contains('\n') {
-                    return Err(A2AError::invalid_params(
-                        "push credentials must not contain CR/LF",
-                    ));
-                }
-            }
-        }
+        self.validate_config(config)?;
 
         let body = match serde_json::to_vec(&event) {
             Ok(b) => b,
@@ -146,6 +126,42 @@ impl HttpPushSender {
             }
             Err(e) => self.handle_error(format!("failed to send push notification: {e}")),
         }
+    }
+
+    /// Configuration errors are rejected before recording an associated input.
+    pub(crate) fn validate_config(
+        &self,
+        config: &TaskPushNotificationConfig,
+    ) -> Result<(), A2AError> {
+        if config.url.is_empty() {
+            return Err(A2AError::invalid_params(
+                "push configuration requires a URL",
+            ));
+        }
+        if self.validate_urls {
+            validate_push_url(&config.url)?;
+        }
+
+        // Reject credentials containing CR/LF so they cannot inject
+        // additional headers into the outgoing request (BUG-34).
+        if let Some(ref token) = config.token {
+            if token.contains('\r') || token.contains('\n') {
+                return Err(A2AError::invalid_params(
+                    "push notification token must not contain CR/LF",
+                ));
+            }
+        }
+        if let Some(ref auth) = config.authentication {
+            if let Some(ref creds) = auth.credentials {
+                if creds.contains('\r') || creds.contains('\n') {
+                    return Err(A2AError::invalid_params(
+                        "push credentials must not contain CR/LF",
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn handle_error(&self, msg: String) -> Result<(), A2AError> {
