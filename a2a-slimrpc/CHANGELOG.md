@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.3.5...a2a-slimrpc-v0.3.6) - 2026-10-31
+
+### Other
+
+- *(readme)* install the crates with cargo add ([#408](https://github.com/a2aproject/a2a-rs/pull/408))
+
 ## [0.3.5](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.3.4...a2a-slimrpc-v0.3.5) - 2026-10-18
 
 ### Other

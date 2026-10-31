@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/a2aproject/a2a-rs/compare/a2a-pb-v0.3.2...a2a-pb-v0.3.3) - 2026-10-31
+
+### Fixed
+
+- *(a2a-pb)* generate the gRPC code into OUT_DIR ([#409](https://github.com/a2aproject/a2a-rs/pull/409))
+
+### Other
+
+- *(readme)* install the crates with cargo add ([#408](https://github.com/a2aproject/a2a-rs/pull/408))
+
 ## [0.3.2](https://github.com/a2aproject/a2a-rs/compare/a2a-pb-v0.3.1...a2a-pb-v0.3.2) - 2026-10-16
 
 ### Other
