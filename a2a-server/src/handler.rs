@@ -685,9 +685,6 @@ impl DefaultRequestHandler {
             _ => None,
         };
         match running {
-            Some(_) if mode != StartMode::Bidi => Err(Rejection::Failed(
-                A2AError::invalid_request("task execution is already in progress"),
-            )),
             Some(active) => self.inject(&message, &task_id, &active, writer).await,
             None => self.start_delivery(message, mode, Some(writer)).await,
         }
