@@ -61,7 +61,7 @@ coverage-lcov:
 
 # Run the helloworld example
 example:
-    cargo run -p helloworld
+    cargo run -p examples --bin helloworld-server
 
 # Clean build artifacts
 clean:

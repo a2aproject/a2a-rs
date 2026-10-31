@@ -24,6 +24,14 @@ path = "src/helloworld_tls/server.rs"
 name = "helloworld-tls-client"
 path = "src/helloworld_tls/client.rs"
 
+[[bin]]
+name = "live-server"
+path = "src/live/server.rs"
+
+[[bin]]
+name = "live-client"
+path = "src/live/client.rs"
+
 [dependencies]
 a2a = { workspace = true }
 a2a-client = { workspace = true, features = ["rustls-tls"] }
@@ -34,6 +42,7 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic-tls = { workspace = true, features = ["rustls"] }
 async-trait = { workspace = true }
+async-stream = { workspace = true }
 reqwest = { workspace = true, features = ["rustls"] }
 futures = { workspace = true }
 axum = { workspace = true }
@@ -48,5 +57,4 @@ rcgen = { workspace = true }
 time = { version = "0.3", features = ["std"] }
 
 [dev-dependencies]
-async-stream = { workspace = true }
 serde_json = { workspace = true }

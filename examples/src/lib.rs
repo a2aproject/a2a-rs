@@ -10,6 +10,8 @@ use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use tokio_stream::wrappers::ReceiverStream;
 
+pub mod live;
+
 // ---------------------------------------------------------------------------
 // EchoExecutor — shared across plain and TLS server examples
 // ---------------------------------------------------------------------------
