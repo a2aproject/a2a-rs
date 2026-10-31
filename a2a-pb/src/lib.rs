@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 /// Generated protobuf types for the A2A v1 protocol.
 pub mod proto {
+    // The generated `oneof` enums wrap whole messages (`Task`, `SendMessageRequest`),
+    // which differ widely in size.
+    #![allow(clippy::large_enum_variant)]
+
     include!(concat!(env!("OUT_DIR"), "/grpc/lf.a2a.v1.rs"));
 }
 
@@ -13,6 +17,7 @@ pub mod protojson {
     // `unknown_lints` keeps this compiling on clippy versions predating the lint.
     #![allow(unknown_lints)]
     #![allow(clippy::useless_borrows_in_formatting)]
+    #![allow(clippy::large_enum_variant)]
 
     include!(concat!(env!("OUT_DIR"), "/lf.a2a.v1.rs"));
     include!(concat!(env!("OUT_DIR"), "/lf.a2a.v1.serde.rs"));

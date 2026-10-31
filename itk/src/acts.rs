@@ -55,6 +55,7 @@ pub fn capabilities() -> AgentCapabilities {
     if std::env::var_os(REDUCED_CAPABILITIES_ENV).is_some() {
         info!("Advertising no optional capabilities (ACTS reduced pass)");
         return AgentCapabilities {
+            user_artifacts: None,
             streaming: Some(false),
             push_notifications: Some(false),
             extensions: None,
@@ -62,6 +63,7 @@ pub fn capabilities() -> AgentCapabilities {
         };
     }
     AgentCapabilities {
+        user_artifacts: None,
         streaming: Some(true),
         push_notifications: Some(true),
         extensions: None,
@@ -119,6 +121,7 @@ pub fn behavior_for(ctx: &ExecutorContext) -> Option<String> {
 
 fn status(ctx: &ExecutorContext, state: TaskState, text: Option<&str>) -> StreamResponse {
     StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+        generation: 0,
         task_id: ctx.task_id.clone(),
         context_id: ctx.context_id.clone(),
         status: TaskStatus {
@@ -132,9 +135,13 @@ fn status(ctx: &ExecutorContext, state: TaskState, text: Option<&str>) -> Stream
 
 fn artifact(ctx: &ExecutorContext, name: &str, parts: Vec<Part>) -> StreamResponse {
     StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+        generation: 0,
         task_id: ctx.task_id.clone(),
         context_id: ctx.context_id.clone(),
         artifact: Artifact {
+            end_generation: None,
+            role: None,
+            start_generation: None,
             artifact_id: new_artifact_id(),
             name: Some(name.to_string()),
             description: None,
@@ -250,10 +257,10 @@ pub fn run(
                 let chunks = ["chunk one ", "chunk two ", "chunk three"];
                 for (index, chunk) in chunks.iter().enumerate() {
                     let first = index == 0;
-                    yield StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    yield StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent { generation: 0,
                         task_id: ctx.task_id.clone(),
                         context_id: ctx.context_id.clone(),
-                        artifact: Artifact {
+                        artifact: Artifact { end_generation: None, role: None, start_generation: None,
                             artifact_id: artifact_id.clone(),
                             name: first.then(|| "chunked".to_string()),
                             description: None,
@@ -353,6 +360,7 @@ mod tests {
         // Not asserted against the env var, which is process-global and would
         // make this test order-dependent; the shape is the contract.
         let full = AgentCapabilities {
+            user_artifacts: None,
             streaming: Some(true),
             push_notifications: Some(true),
             extensions: None,

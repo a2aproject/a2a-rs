@@ -602,6 +602,7 @@ mod tests {
             );
 
             let status_update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "task-1".into(),
                 context_id: "ctx-1".into(),
                 status: TaskStatus {
@@ -994,6 +995,7 @@ mod tests {
             &transport,
             &ServiceParams::new(),
             &SubscribeToTaskRequest {
+                last_seen_generation: None,
                 id: "task-1".into(),
                 tenant: None,
             },
