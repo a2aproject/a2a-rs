@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use a2a::*;
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tokio::sync::RwLock;
 
 use super::apply_history_length;
@@ -15,16 +15,53 @@ struct StoredEntry {
     version: TaskVersion,
 }
 
+#[derive(Default)]
+struct Tasks {
+    entries: HashMap<TaskId, StoredEntry>,
+    /// Terminal task ids, oldest first; tracked only under a limit.
+    terminal: VecDeque<TaskId>,
+}
+
+impl Tasks {
+    /// Records that `id` reached a terminal state, then purges the tasks that
+    /// reached one earliest until at most `limit` remain.
+    fn retire(&mut self, id: &str, limit: Option<usize>) {
+        let Some(limit) = limit else {
+            return;
+        };
+        self.terminal.push_back(id.to_string());
+        while self.terminal.len() > limit {
+            if let Some(oldest) = self.terminal.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+}
+
 /// In-memory task store. Contents do not survive restarts.
+///
+/// Keeps every task for the life of the process unless
+/// [`Self::with_terminal_task_limit`] bounds how many finished ones it holds.
 pub struct InMemoryTaskStore {
-    tasks: RwLock<HashMap<TaskId, StoredEntry>>,
+    tasks: RwLock<Tasks>,
+    terminal_task_limit: Option<usize>,
 }
 
 impl InMemoryTaskStore {
     pub fn new() -> Self {
         InMemoryTaskStore {
-            tasks: RwLock::new(HashMap::new()),
+            tasks: RwLock::new(Tasks::default()),
+            terminal_task_limit: None,
         }
+    }
+
+    /// Keep at most `limit` tasks in a terminal state, purging the one that
+    /// reached its terminal state earliest first. A purged task is reported
+    /// as `TaskNotFoundError`, which §3.3.2 allows for a completed and purged
+    /// task. Tasks that are not terminal are never purged.
+    pub fn with_terminal_task_limit(mut self, limit: usize) -> Self {
+        self.terminal_task_limit = Some(limit);
+        self
     }
 }
 
@@ -38,17 +75,24 @@ impl Default for InMemoryTaskStore {
 impl TaskStore for InMemoryTaskStore {
     async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
         let mut store = self.tasks.write().await;
-        if store.contains_key(&task.id) {
+        if store.entries.contains_key(&task.id) {
             return Err(crate::sanitized_internal_error("task already exists"));
         }
         let id = task.id.clone();
-        store.insert(id, StoredEntry { task, version: 1 });
+        let terminal = task.status.state.is_terminal();
+        store
+            .entries
+            .insert(id.clone(), StoredEntry { task, version: 1 });
+        if terminal {
+            store.retire(&id, self.terminal_task_limit);
+        }
         Ok(1)
     }
 
     async fn update(&self, task: Task) -> Result<TaskVersion, A2AError> {
         let mut store = self.tasks.write().await;
         let entry = store
+            .entries
             .get_mut(&task.id)
             .ok_or_else(|| A2AError::task_not_found(&task.id))?;
         // A terminal task's state is immutable. Re-applying the same
@@ -61,9 +105,15 @@ impl TaskStore for InMemoryTaskStore {
                 task.id, entry.task.status.state, task.status.state
             )));
         }
+        let retired = !entry.task.status.state.is_terminal() && task.status.state.is_terminal();
         entry.version += 1;
         entry.task = task;
-        Ok(entry.version)
+        let version = entry.version;
+        if retired {
+            let id = entry.task.id.clone();
+            store.retire(&id, self.terminal_task_limit);
+        }
+        Ok(version)
     }
 
     async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError> {
@@ -72,6 +122,7 @@ impl TaskStore for InMemoryTaskStore {
         // window.
         let mut store = self.tasks.write().await;
         let entry = store
+            .entries
             .get_mut(task_id)
             .ok_or_else(|| A2AError::task_not_found(task_id))?;
         if entry.task.status.state.is_terminal() {
@@ -80,17 +131,20 @@ impl TaskStore for InMemoryTaskStore {
         entry.version += 1;
         entry.task.status.state = TaskState::Canceled;
         entry.task.status.timestamp = Some(chrono::Utc::now());
-        Ok(entry.task.clone())
+        let task = entry.task.clone();
+        store.retire(task_id, self.terminal_task_limit);
+        Ok(task)
     }
 
     async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
         let store = self.tasks.read().await;
-        Ok(store.get(task_id).map(|e| e.task.clone()))
+        Ok(store.entries.get(task_id).map(|e| e.task.clone()))
     }
 
     async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
         let store = self.tasks.read().await;
         let mut tasks: Vec<Task> = store
+            .entries
             .values()
             .filter(|entry| {
                 // Filter by context_id if provided
@@ -307,6 +361,60 @@ mod tests {
         let result = store.begin_cancel("nonexistent").await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, error_code::TASK_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_terminal_task_limit_purges_the_oldest_finished_task() {
+        let store = InMemoryTaskStore::new().with_terminal_task_limit(2);
+        store
+            .create(make_task("working", "c1", TaskState::Working))
+            .await
+            .unwrap();
+        for id in ["t1", "t2", "t3"] {
+            store
+                .create(make_task(id, "c1", TaskState::Working))
+                .await
+                .unwrap();
+            store
+                .update(make_task(id, "c1", TaskState::Completed))
+                .await
+                .unwrap();
+        }
+        // Re-applying a terminal state does not count the task twice.
+        store
+            .update(make_task("t3", "c1", TaskState::Completed))
+            .await
+            .unwrap();
+
+        assert!(store.get("t1").await.unwrap().is_none());
+        assert!(store.get("t2").await.unwrap().is_some());
+        assert!(store.get("t3").await.unwrap().is_some());
+        assert!(store.get("working").await.unwrap().is_some());
+
+        store.begin_cancel("working").await.unwrap();
+        assert!(store.get("t2").await.unwrap().is_none());
+        assert!(store.get("working").await.unwrap().is_some());
+
+        store
+            .create(make_task("t4", "c1", TaskState::Failed))
+            .await
+            .unwrap();
+        assert!(store.get("t3").await.unwrap().is_none());
+        assert_eq!(store.tasks.read().await.entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_unlimited_store_keeps_every_finished_task() {
+        let store = InMemoryTaskStore::new();
+        for i in 0..100 {
+            let id = format!("t{i}");
+            store
+                .create(make_task(&id, "c1", TaskState::Completed))
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.tasks.read().await.entries.len(), 100);
+        assert!(store.tasks.read().await.terminal.is_empty());
     }
 
     #[tokio::test]
