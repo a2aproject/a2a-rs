@@ -105,6 +105,7 @@ fn http_truncated() -> &'static str {
 
 fn send_request() -> SendMessageRequest {
     SendMessageRequest {
+        artifact_updates: Vec::new(),
         message: Message {
             message_id: "m1".to_string(),
             context_id: None,
@@ -149,6 +150,8 @@ async fn a_credential_header_is_logged_by_name_without_its_value() {
         .get_task(
             &params,
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "t1".to_string(),
                 history_length: None,
                 tenant: None,
@@ -183,6 +186,8 @@ async fn the_response_body_is_logged() {
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "task-42".to_string(),
                 history_length: None,
                 tenant: None,
@@ -264,6 +269,8 @@ async fn an_unreachable_endpoint_logs_the_attempt_and_fails() {
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "t1".to_string(),
                 history_length: None,
                 tenant: None,
@@ -293,6 +300,8 @@ async fn a_truncated_unary_body_is_reported_as_a_read_failure() {
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "t1".to_string(),
                 history_length: None,
                 tenant: None,
@@ -403,6 +412,8 @@ async fn an_unsendable_header_value_fails_the_request() {
         .get_task(
             &params,
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "t1".to_string(),
                 history_length: None,
                 tenant: None,

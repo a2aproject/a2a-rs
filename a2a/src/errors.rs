@@ -20,6 +20,7 @@ pub mod error_code {
     pub const EXTENDED_CARD_NOT_CONFIGURED: i32 = -32007;
     pub const EXTENSION_SUPPORT_REQUIRED: i32 = -32008;
     pub const VERSION_NOT_SUPPORTED: i32 = -32009;
+    pub const TASK_GENERATION_MISMATCH: i32 = -32010;
 
     // Standard JSON-RPC errors
     pub const PARSE_ERROR: i32 = -32700;
@@ -41,6 +42,7 @@ pub fn error_reason(code: i32) -> &'static str {
         error_code::EXTENDED_CARD_NOT_CONFIGURED => "EXTENDED_AGENT_CARD_NOT_CONFIGURED",
         error_code::EXTENSION_SUPPORT_REQUIRED => "EXTENSION_SUPPORT_REQUIRED",
         error_code::VERSION_NOT_SUPPORTED => "VERSION_NOT_SUPPORTED",
+        error_code::TASK_GENERATION_MISMATCH => "TASK_GENERATION_MISMATCH",
         error_code::PARSE_ERROR => "PARSE_ERROR",
         error_code::INVALID_REQUEST => "INVALID_REQUEST",
         error_code::METHOD_NOT_FOUND => "METHOD_NOT_FOUND",
@@ -65,6 +67,7 @@ pub fn reason_to_error_code(reason: &str) -> Option<i32> {
         }
         "EXTENSION_SUPPORT_REQUIRED" => Some(error_code::EXTENSION_SUPPORT_REQUIRED),
         "VERSION_NOT_SUPPORTED" => Some(error_code::VERSION_NOT_SUPPORTED),
+        "TASK_GENERATION_MISMATCH" => Some(error_code::TASK_GENERATION_MISMATCH),
         "PARSE_ERROR" => Some(error_code::PARSE_ERROR),
         "INVALID_REQUEST" => Some(error_code::INVALID_REQUEST),
         "METHOD_NOT_FOUND" => Some(error_code::METHOD_NOT_FOUND),
@@ -153,6 +156,24 @@ impl A2AError {
         )
     }
 
+    /// `ifGenerationMatch` did not equal the task's current generation. The
+    /// client should re-fetch the task and retry if appropriate.
+    pub fn task_generation_mismatch(task_id: &str, expected: i64, current: i64) -> Self {
+        A2AError::new(
+            error_code::TASK_GENERATION_MISMATCH,
+            format!("task {task_id} is at generation {current}, expected {expected}"),
+        )
+        .with_details(vec![TypedDetail::error_info(
+            "TASK_GENERATION_MISMATCH",
+            errordetails::PROTOCOL_DOMAIN,
+            Some(HashMap::from([
+                ("taskId".to_string(), task_id.to_string()),
+                ("expectedGeneration".to_string(), expected.to_string()),
+                ("currentGeneration".to_string(), current.to_string()),
+            ])),
+        )])
+    }
+
     pub fn internal(msg: impl Into<String>) -> Self {
         A2AError::new(error_code::INTERNAL_ERROR, msg)
     }
@@ -185,6 +206,7 @@ impl A2AError {
             error_code::UNSUPPORTED_OPERATION => 400,
             error_code::CONTENT_TYPE_NOT_SUPPORTED => 400,
             error_code::VERSION_NOT_SUPPORTED => 400,
+            error_code::TASK_GENERATION_MISMATCH => 409,
             // These two were absent and fell through to 500, contradicting
             // `rest_grpc_status`, which already classes both as
             // FAILED_PRECONDITION. A caller asking for something this
@@ -256,6 +278,32 @@ impl From<A2AError> for crate::JsonRpcError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_task_generation_mismatch_error() {
+        let err = A2AError::task_generation_mismatch("t1", 3, 5);
+
+        assert_eq!(err.code, error_code::TASK_GENERATION_MISMATCH);
+        assert_eq!(err.code, -32010);
+        assert_eq!(err.http_status_code(), 409);
+        assert_eq!(error_reason(err.code), "TASK_GENERATION_MISMATCH");
+        assert_eq!(
+            reason_to_error_code("TASK_GENERATION_MISMATCH"),
+            Some(error_code::TASK_GENERATION_MISMATCH)
+        );
+
+        let data = err.to_jsonrpc_error().data.unwrap();
+        let info = data
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|detail| detail["reason"] == "TASK_GENERATION_MISMATCH")
+            .expect("an ErrorInfo detail");
+        assert_eq!(info["domain"], errordetails::PROTOCOL_DOMAIN);
+        assert_eq!(info["metadata"]["taskId"], "t1");
+        assert_eq!(info["metadata"]["expectedGeneration"], "3");
+        assert_eq!(info["metadata"]["currentGeneration"], "5");
+    }
+
     use super::*;
 
     #[test]

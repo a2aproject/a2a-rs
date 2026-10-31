@@ -32,6 +32,8 @@ fn sample_message(role: Role, text: &str) -> Message {
 
 fn sample_task(id: &str, state: TaskState) -> Task {
     Task {
+        generation: 0,
+        timeline: None,
         id: id.to_string(),
         context_id: "ctx-1".to_string(),
         status: TaskStatus {
@@ -47,6 +49,7 @@ fn sample_task(id: &str, state: TaskState) -> Task {
 
 fn sample_push_config(id: &str) -> TaskPushNotificationConfig {
     TaskPushNotificationConfig {
+        protocol_version: None,
         task_id: "task-1".to_string(),
         tenant: None,
         url: "https://example.com/callback".to_string(),
@@ -103,6 +106,7 @@ impl RequestHandler for TestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         Ok(Box::pin(stream::iter(vec![
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "task-1".to_string(),
                 context_id: "ctx-1".to_string(),
                 status: TaskStatus {
@@ -164,6 +168,7 @@ impl RequestHandler for TestHandler {
         }
         Ok(Box::pin(stream::once(async move {
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: req.id,
                 context_id: "ctx-1".to_string(),
                 status: TaskStatus {
@@ -196,6 +201,7 @@ impl RequestHandler for TestHandler {
             return Err(A2AError::task_not_found(&req.id));
         }
         Ok(TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: req.task_id,
             tenant: req.tenant,
             url: "https://example.com/callback".to_string(),
@@ -246,6 +252,8 @@ impl a2a_server::AgentExecutor for StoredTaskExecutor {
         ctx: a2a_server::ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let response = StreamResponse::Task(Task {
+            generation: 0,
+            timeline: None,
             id: ctx.task_id.clone(),
             context_id: ctx.context_id.clone(),
             status: TaskStatus {
@@ -275,6 +283,8 @@ impl a2a_server::AgentExecutor for StoredTaskExecutor {
         ctx: a2a_server::ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let response = StreamResponse::Task(Task {
+            generation: 0,
+            timeline: None,
             id: ctx.task_id.clone(),
             context_id: ctx.context_id.clone(),
             status: TaskStatus {
@@ -337,6 +347,7 @@ fn endpoint_without_scheme(endpoint: &str) -> String {
 
 fn send_message_request() -> SendMessageRequest {
     SendMessageRequest {
+        artifact_updates: Vec::new(),
         message: sample_message(Role::User, "hello"),
         configuration: None,
         metadata: None,
@@ -358,6 +369,8 @@ async fn grpc_transport_end_to_end() {
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "task-1".to_string(),
                 history_length: Some(1),
                 tenant: None,
@@ -371,6 +384,7 @@ async fn grpc_transport_end_to_end() {
         .list_tasks(
             &ServiceParams::new(),
             &ListTasksRequest {
+                timeline_length: None,
                 context_id: Some("ctx-1".to_string()),
                 status: Some(TaskState::Completed),
                 page_size: Some(1),
@@ -476,6 +490,7 @@ async fn grpc_transport_streaming_and_error_paths() {
         .subscribe_to_task(
             &ServiceParams::new(),
             &SubscribeToTaskRequest {
+                last_seen_generation: None,
                 id: "task-1".to_string(),
                 tenant: None,
             },
@@ -489,6 +504,8 @@ async fn grpc_transport_streaming_and_error_paths() {
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "missing".to_string(),
                 history_length: None,
                 tenant: None,
@@ -535,6 +552,8 @@ async fn grpc_transport_accepts_bare_host_port_endpoints() {
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "task-1".to_string(),
                 history_length: Some(1),
                 tenant: None,
@@ -571,6 +590,7 @@ async fn grpc_transport_treats_zero_page_size_as_unset() {
         .send_message(
             &ServiceParams::new(),
             &SendMessageRequest {
+                artifact_updates: Vec::new(),
                 message: Message::new(Role::User, vec![Part::text("hello")]),
                 configuration: None,
                 metadata: None,
@@ -589,6 +609,7 @@ async fn grpc_transport_treats_zero_page_size_as_unset() {
         .list_tasks(
             &ServiceParams::new(),
             &ListTasksRequest {
+                timeline_length: None,
                 context_id: Some(task.context_id.clone()),
                 status: None,
                 page_size: Some(0),

@@ -17,7 +17,7 @@ pub use event::*;
 pub use jsonrpc::*;
 pub use types::*;
 
-/// The A2A protocol version this SDK implements.
+/// The A2A protocol version this SDK advertises and signals.
 pub const VERSION: &str = "1.0";
 
 /// Service parameter key for the A2A protocol version.
@@ -25,3 +25,9 @@ pub const SVC_PARAM_VERSION: &str = "A2A-Version";
 
 /// Service parameter key for extensions the client wants to use.
 pub const SVC_PARAM_EXTENSIONS: &str = "A2A-Extensions";
+
+/// Optional Rust SDK HTTP routing header identifying one live exchange.
+///
+/// This is an SDK transport convention, not a standard A2A service parameter.
+/// It disambiguates live uplinks for the same task and grants no access rights.
+pub const SDK_LIVE_EXCHANGE_HEADER: &str = "x-a2a-rs-live-exchange";

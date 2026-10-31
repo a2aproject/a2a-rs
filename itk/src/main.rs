@@ -261,6 +261,7 @@ impl ItkExecutor {
         msg: Message,
     ) -> Result<Vec<String>, String> {
         let req = SendMessageRequest {
+            artifact_updates: Vec::new(),
             message: msg,
             configuration: None,
             metadata: None,
@@ -278,6 +279,7 @@ impl ItkExecutor {
         msg: Message,
     ) -> Result<Vec<String>, String> {
         let req = SendMessageRequest {
+            artifact_updates: Vec::new(),
             message: msg,
             configuration: None,
             metadata: None,
@@ -304,6 +306,7 @@ impl ItkExecutor {
         streaming: bool,
     ) -> Result<Vec<String>, String> {
         let push_config = TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: String::new(), // will be filled by the server
             url: format!("{push_url}/notifications"),
             id: Some("itk-push".to_string()),
@@ -313,8 +316,11 @@ impl ItkExecutor {
         };
 
         let req = SendMessageRequest {
+            artifact_updates: Vec::new(),
             message: msg,
             configuration: Some(SendMessageConfiguration {
+                if_generation_match: None,
+                timeline_length: None,
                 accepted_output_modes: None,
                 task_push_notification_config: Some(push_config),
                 history_length: None,
@@ -352,6 +358,7 @@ impl ItkExecutor {
         info!("Executing resubscribe behavior");
 
         let req = SendMessageRequest {
+            artifact_updates: Vec::new(),
             message: msg,
             configuration: None,
             metadata: None,
@@ -378,6 +385,7 @@ impl ItkExecutor {
 
         let mut resub = match client
             .subscribe_to_task(&SubscribeToTaskRequest {
+                last_seen_generation: None,
                 id: task_id.clone(),
                 tenant: None,
             })
@@ -404,6 +412,8 @@ impl ItkExecutor {
 
                     if let Ok(task) = client
                         .get_task(&GetTaskRequest {
+                            current_generation: None,
+                            timeline_length: None,
                             id: task_id.clone(),
                             history_length: None,
                             tenant: None,
@@ -482,7 +492,8 @@ impl ItkExecutor {
                 .message
                 .map_or_else(Vec::new, |m| Self::text_from_message(&m)),
             StreamResponse::Message(m) => Self::text_from_message(&m),
-            StreamResponse::ArtifactUpdate(_) => Vec::new(),
+            StreamResponse::MessageUpdate(m) => Self::text_from_message(&m.message),
+            _ => Vec::new(),
         }
     }
 
@@ -558,7 +569,7 @@ impl a2a_server::AgentExecutor for ItkExecutor {
 
             if hold {
                 let working_text = format!("{response}\ntask-finished");
-                yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent { generation: 0,
                     task_id: ctx.task_id.clone(),
                     context_id: ctx.context_id.clone(),
                     status: TaskStatus {
@@ -575,7 +586,7 @@ impl a2a_server::AgentExecutor for ItkExecutor {
                 // Keep alive, yielding working updates until cancellation
                 for _ in 0..5 {
                     sleep(Duration::from_secs(2)).await;
-                    yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent { generation: 0,
                         task_id: ctx.task_id.clone(),
                         context_id: ctx.context_id.clone(),
                         status: TaskStatus {
@@ -588,7 +599,7 @@ impl a2a_server::AgentExecutor for ItkExecutor {
                 }
 
                 // Auto-complete after hold expires
-                yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent { generation: 0,
                     task_id: ctx.task_id.clone(),
                     context_id: ctx.context_id.clone(),
                     status: TaskStatus {
@@ -599,7 +610,7 @@ impl a2a_server::AgentExecutor for ItkExecutor {
                     metadata: None,
                 });
             } else {
-                yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent { generation: 0,
                     task_id: ctx.task_id.clone(),
                     context_id: ctx.context_id.clone(),
                     status: TaskStatus {
@@ -620,6 +631,7 @@ impl a2a_server::AgentExecutor for ItkExecutor {
         info!(task_id = %ctx.task_id, "Cancel requested");
         Box::pin(stream::once(async move {
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: ctx.task_id,
                 context_id: ctx.context_id,
                 status: TaskStatus {

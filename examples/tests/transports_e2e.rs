@@ -46,6 +46,8 @@ fn sample_message(role: Role, text: &str) -> Message {
 
 fn sample_task(id: &str, state: TaskState) -> Task {
     Task {
+        generation: 0,
+        timeline: None,
         id: id.to_string(),
         context_id: "ctx-1".to_string(),
         status: TaskStatus {
@@ -61,6 +63,7 @@ fn sample_task(id: &str, state: TaskState) -> Task {
 
 fn sample_push_config(id: &str) -> TaskPushNotificationConfig {
     TaskPushNotificationConfig {
+        protocol_version: None,
         task_id: "task-1".to_string(),
         tenant: None,
         url: "https://example.com/callback".to_string(),
@@ -127,6 +130,7 @@ impl RequestHandler for TestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         Ok(Box::pin(stream::iter(vec![
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "task-1".to_string(),
                 context_id: "ctx-1".to_string(),
                 status: TaskStatus {
@@ -188,6 +192,7 @@ impl RequestHandler for TestHandler {
         }
         Ok(Box::pin(stream::once(async move {
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: req.id,
                 context_id: "ctx-1".to_string(),
                 status: TaskStatus {
@@ -220,6 +225,7 @@ impl RequestHandler for TestHandler {
             return Err(A2AError::task_not_found(&req.id));
         }
         Ok(TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: req.task_id,
             tenant: req.tenant,
             url: "https://example.com/callback".to_string(),
@@ -270,6 +276,7 @@ impl a2a_server::AgentExecutor for PushTransportExecutor {
         ctx: ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let working = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: ctx.task_id.clone(),
             context_id: ctx.context_id.clone(),
             status: TaskStatus {
@@ -280,6 +287,8 @@ impl a2a_server::AgentExecutor for PushTransportExecutor {
             metadata: None,
         });
         let completed = StreamResponse::Task(Task {
+            generation: 0,
+            timeline: None,
             id: ctx.task_id,
             context_id: ctx.context_id,
             status: TaskStatus {
@@ -298,6 +307,8 @@ impl a2a_server::AgentExecutor for PushTransportExecutor {
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         Box::pin(stream::once(async move {
             Ok(StreamResponse::Task(Task {
+                generation: 0,
+                timeline: None,
                 id: ctx.task_id,
                 context_id: ctx.context_id,
                 status: TaskStatus {
@@ -441,6 +452,7 @@ fn jsonrpc_service_params() -> ServiceParams {
 
 fn send_message_request() -> SendMessageRequest {
     SendMessageRequest {
+        artifact_updates: Vec::new(),
         message: sample_message(Role::User, "hello"),
         configuration: None,
         metadata: None,
@@ -462,6 +474,8 @@ async fn rest_transport_end_to_end() {
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "task-1".to_string(),
                 history_length: Some(2),
                 tenant: None,
@@ -475,6 +489,8 @@ async fn rest_transport_end_to_end() {
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "missing".to_string(),
                 history_length: None,
                 tenant: None,
@@ -488,6 +504,7 @@ async fn rest_transport_end_to_end() {
         .list_tasks(
             &ServiceParams::new(),
             &ListTasksRequest {
+                timeline_length: None,
                 context_id: Some("ctx-1".to_string()),
                 status: Some(TaskState::Completed),
                 page_size: Some(10),
@@ -532,6 +549,7 @@ async fn rest_transport_end_to_end() {
         .subscribe_to_task(
             &ServiceParams::new(),
             &SubscribeToTaskRequest {
+                last_seen_generation: None,
                 id: "task-1".to_string(),
                 tenant: None,
             },
@@ -660,6 +678,8 @@ async fn jsonrpc_transport_end_to_end() {
         .get_task(
             &jsonrpc_service_params(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "task-1".to_string(),
                 history_length: Some(2),
                 tenant: None,
@@ -673,6 +693,8 @@ async fn jsonrpc_transport_end_to_end() {
         .get_task(
             &jsonrpc_service_params(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "missing".to_string(),
                 history_length: None,
                 tenant: None,
@@ -686,6 +708,7 @@ async fn jsonrpc_transport_end_to_end() {
         .list_tasks(
             &jsonrpc_service_params(),
             &ListTasksRequest {
+                timeline_length: None,
                 context_id: Some("ctx-1".to_string()),
                 status: Some(TaskState::Completed),
                 page_size: Some(10),
@@ -730,6 +753,7 @@ async fn jsonrpc_transport_end_to_end() {
         .subscribe_to_task(
             &jsonrpc_service_params(),
             &SubscribeToTaskRequest {
+                last_seen_generation: None,
                 id: "task-1".to_string(),
                 tenant: None,
             },
@@ -844,6 +868,7 @@ async fn rest_transport_push_delivery_end_to_end() {
         .create_push_config(
             &ServiceParams::new(),
             &TaskPushNotificationConfig {
+                protocol_version: None,
                 task_id: "task-rest-push".to_string(),
                 url: webhook_url,
                 id: Some("cfg-rest".to_string()),
@@ -910,8 +935,11 @@ async fn jsonrpc_transport_push_delivery_end_to_end() {
     request.message.task_id = Some("task-rpc-push".to_string());
     request.message.context_id = Some("ctx-rpc-push".to_string());
     request.configuration = Some(SendMessageConfiguration {
+        if_generation_match: None,
+        timeline_length: None,
         accepted_output_modes: None,
         task_push_notification_config: Some(TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: String::new(),
             url: webhook_url.clone(),
             id: Some("cfg-rpc".to_string()),

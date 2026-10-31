@@ -158,6 +158,17 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
         Ok(tonic::Response::new(Box::pin(proto_stream)))
     }
 
+    type SendLiveMessageStream = BoxStreamResult<proto::StreamResponse>;
+
+    async fn send_live_message(
+        &self,
+        _request: tonic::Request<tonic::Streaming<proto::StreamRequest>>,
+    ) -> Result<tonic::Response<Self::SendLiveMessageStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "SendLiveMessage is not supported by this server",
+        ))
+    }
+
     async fn create_task_push_notification_config(
         &self,
         request: tonic::Request<proto::TaskPushNotificationConfig>,

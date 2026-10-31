@@ -143,6 +143,7 @@ mod tests {
 
     fn make_config(task_id: &str, url: &str) -> TaskPushNotificationConfig {
         TaskPushNotificationConfig {
+            protocol_version: None,
             url: url.to_string(),
             id: None,
             task_id: task_id.to_string(),

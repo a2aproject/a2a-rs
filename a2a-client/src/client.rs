@@ -236,6 +236,7 @@ impl<T: Transport> SendMessageExt for A2AClient<T> {
     ) -> Result<SendMessageResponse, A2AError> {
         let msg = Message::new(Role::User, vec![Part::text(text)]);
         let req = SendMessageRequest {
+            artifact_updates: Vec::new(),
             message: msg,
             configuration: None,
             metadata: None,
@@ -303,6 +304,8 @@ mod tests {
                 return Err(error);
             }
             Ok(SendMessageResponse::Task(Task {
+                generation: 0,
+                timeline: None,
                 id: "t1".into(),
                 context_id: "c1".into(),
                 status: TaskStatus {
@@ -325,6 +328,7 @@ mod tests {
             Ok(Box::pin(stream::once(async {
                 Ok(StreamResponse::StatusUpdate(
                     a2a::event::TaskStatusUpdateEvent {
+                        generation: 0,
                         task_id: "t1".into(),
                         context_id: "c1".into(),
                         status: TaskStatus {
@@ -350,6 +354,8 @@ mod tests {
                 .unwrap()
                 .push(req.tenant.clone());
             Ok(Task {
+                generation: 0,
+                timeline: None,
                 id: req.id.clone(),
                 context_id: "c1".into(),
                 status: TaskStatus {
@@ -384,6 +390,8 @@ mod tests {
         ) -> Result<Task, A2AError> {
             self.record(methods::CANCEL_TASK, params);
             Ok(Task {
+                generation: 0,
+                timeline: None,
                 id: req.id.clone(),
                 context_id: "c1".into(),
                 status: TaskStatus {
@@ -422,6 +430,7 @@ mod tests {
         ) -> Result<TaskPushNotificationConfig, A2AError> {
             self.record(methods::GET_PUSH_CONFIG, params);
             Ok(TaskPushNotificationConfig {
+                protocol_version: None,
                 task_id: req.task_id.clone(),
                 url: "http://example.com".into(),
                 id: Some(req.id.clone()),
@@ -536,6 +545,7 @@ mod tests {
     async fn test_send_message() {
         let client = make_client();
         let req = SendMessageRequest {
+            artifact_updates: Vec::new(),
             message: Message::new(Role::User, vec![Part::text("hi")]),
             configuration: None,
             metadata: None,
@@ -561,6 +571,7 @@ mod tests {
         ]);
 
         let req = SendMessageRequest {
+            artifact_updates: Vec::new(),
             message: Message::new(Role::User, vec![Part::text("hi")]),
             configuration: None,
             metadata: None,
@@ -600,6 +611,7 @@ mod tests {
             })]);
 
         let req = SendMessageRequest {
+            artifact_updates: Vec::new(),
             message: Message::new(Role::User, vec![Part::text("hi")]),
             configuration: None,
             metadata: None,
@@ -621,6 +633,7 @@ mod tests {
         use futures::StreamExt;
         let client = make_client();
         let req = SendMessageRequest {
+            artifact_updates: Vec::new(),
             message: Message::new(Role::User, vec![Part::text("hi")]),
             configuration: None,
             metadata: None,
@@ -635,6 +648,8 @@ mod tests {
     async fn test_get_task() {
         let client = make_client();
         let req = GetTaskRequest {
+            current_generation: None,
+            timeline_length: None,
             id: "t1".into(),
             history_length: None,
             tenant: None,
@@ -647,6 +662,7 @@ mod tests {
     async fn test_list_tasks() {
         let client = make_client();
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: None,
@@ -676,6 +692,7 @@ mod tests {
     async fn test_subscribe_to_task() {
         let client = make_client();
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "t1".into(),
             tenant: None,
         };
@@ -686,6 +703,7 @@ mod tests {
     async fn test_create_push_config() {
         let client = make_client();
         let req = TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: "t1".into(),
             url: "http://example.com".into(),
             id: None,
@@ -749,6 +767,7 @@ mod tests {
 
     fn send_request() -> SendMessageRequest {
         SendMessageRequest {
+            artifact_updates: Vec::new(),
             message: Message::new(Role::User, vec![Part::text("hi")]),
             configuration: None,
             metadata: None,
@@ -765,6 +784,8 @@ mod tests {
         client.send_message(&send_request()).await.unwrap();
         client
             .get_task(&GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "t1".into(),
                 history_length: None,
                 tenant: None,
