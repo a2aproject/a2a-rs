@@ -14,10 +14,10 @@ use futures::{StreamExt, stream::BoxStream};
 pub struct LiveEchoExecutor;
 
 impl AgentExecutor for LiveEchoExecutor {
-    fn execute<'a>(
-        &'a self,
-        ctx: ExecutorContext<'a>,
-    ) -> BoxStream<'a, Result<StreamResponse, A2AError>> {
+    fn execute(
+        &self,
+        mut ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         Box::pin(async_stream::stream! {
             // The triggering message belongs to this invocation, not the inbox.
             let mut message = ctx.message;
@@ -33,8 +33,8 @@ impl AgentExecutor for LiveEchoExecutor {
                 if !keep_running {
                     return;
                 }
-                // The handler owns this bounded Tokio receiver. Awaiting it
-                // yields the worker; it does not block other tasks or clients.
+                // This owned receiver can also move into a Tokio worker.
+                // Awaiting input yields; it does not block other tasks.
                 match ctx.inputs.recv().await {
                     Some(input) => message = Some(input.message),
                     None => return,
@@ -43,10 +43,7 @@ impl AgentExecutor for LiveEchoExecutor {
         })
     }
 
-    fn cancel<'a>(
-        &'a self,
-        ctx: ExecutorContext<'a>,
-    ) -> BoxStream<'a, Result<StreamResponse, A2AError>> {
+    fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         Box::pin(futures::stream::once(async move {
             Ok(status(
                 &ctx.task_id,
