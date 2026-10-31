@@ -330,4 +330,74 @@ mod tests {
         assert_eq!(tid, "t1");
         assert_eq!(cid, "c1");
     }
+    struct StartOnly;
+    #[async_trait::async_trait]
+    impl Agent for StartOnly {
+        async fn start(&self, message: NewMessage) -> Result<Start, A2AError> {
+            Ok(Start::Task(message.new_task(TaskState::Working)))
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_agents_report_unsupported_execution_and_cancellation_by_default() {
+        use futures::StreamExt;
+        let adapter = AgentExecutorAdapter(Arc::new(StartOnly));
+        let mut context = ExecutorContext::new("task", "context", ClientInputs::closed())
+            .with_message(Message::new(Role::User, vec![Part::text("input")]));
+        context.new_task = true;
+        let mut events = adapter.execute(context);
+        assert!(
+            matches!(events.next().await.unwrap().unwrap(), StreamResponse::Task(task) if task.id == "task")
+        );
+        assert_eq!(
+            events.next().await.unwrap().unwrap_err().code,
+            error_code::UNSUPPORTED_OPERATION
+        );
+        let mut events = adapter.cancel(ExecutorContext::new(
+            "task",
+            "context",
+            ClientInputs::closed(),
+        ));
+        assert_eq!(
+            events.next().await.unwrap().unwrap_err().code,
+            error_code::UNSUPPORTED_OPERATION
+        );
+    }
+
+    struct InvalidStart(bool);
+    #[async_trait::async_trait]
+    impl Agent for InvalidStart {
+        async fn start(&self, message: NewMessage) -> Result<Start, A2AError> {
+            if self.0 {
+                return Err(A2AError::internal("start refused"));
+            }
+            let mut task = message.new_task(TaskState::Working);
+            task.context_id = "unrelated-context".into();
+            Ok(Start::Task(task))
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_start_rejects_missing_messages_foreign_tasks_and_start_failures() {
+        use futures::StreamExt;
+        for (message, failure) in [(false, false), (true, false), (true, true)] {
+            let adapter = AgentExecutorAdapter(Arc::new(InvalidStart(failure)));
+            let mut context = ExecutorContext::new("task", "context", ClientInputs::closed());
+            context.new_task = true;
+            if message {
+                context.message = Some(Message::new(Role::User, vec![Part::text("input")]));
+            }
+            let mut events = adapter.execute(context);
+            let error = events.next().await.unwrap().unwrap_err();
+            assert_eq!(
+                error.code,
+                if failure {
+                    error_code::INTERNAL_ERROR
+                } else {
+                    error_code::INVALID_AGENT_RESPONSE
+                }
+            );
+            assert!(events.next().await.is_none());
+        }
+    }
 }
