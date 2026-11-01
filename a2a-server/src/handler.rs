@@ -1053,6 +1053,10 @@ impl RequestHandler for DefaultRequestHandler {
         response.tasks.truncate(page_size);
         for task in &mut response.tasks {
             apply_history_length(task, req.history_length);
+            // §3.1.4: artifacts are omitted unless the caller asks for them.
+            if req.include_artifacts != Some(true) {
+                task.artifacts = None;
+            }
         }
         Ok(response)
     }
@@ -2714,6 +2718,61 @@ mod tests {
         };
         let resp = handler.list_tasks(&params, req).await.unwrap();
         assert!(resp.tasks.is_empty());
+    }
+
+    /// ListTasks omits artifacts unless `includeArtifacts` is true (§3.1.4).
+    #[tokio::test]
+    async fn test_list_tasks_includes_artifacts_only_on_request() {
+        let store = InMemoryTaskStore::new();
+        store
+            .create(Task {
+                id: "t-artifact".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: Some(chrono::Utc::now()),
+                },
+                artifacts: Some(vec![Artifact {
+                    artifact_id: "a1".into(),
+                    name: None,
+                    description: None,
+                    parts: vec![Part::text("result")],
+                    metadata: None,
+                    extensions: None,
+                }]),
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let handler = DefaultRequestHandler::new(EchoExecutor, store);
+        let params = ServiceParams::new();
+        for (include_artifacts, expected) in
+            [(None, false), (Some(false), false), (Some(true), true)]
+        {
+            let resp = handler
+                .list_tasks(
+                    &params,
+                    ListTasksRequest {
+                        context_id: None,
+                        status: None,
+                        page_size: None,
+                        page_token: None,
+                        history_length: None,
+                        status_timestamp_after: None,
+                        include_artifacts,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.tasks[0].artifacts.is_some(),
+                expected,
+                "include_artifacts={include_artifacts:?}"
+            );
+        }
     }
 
     #[tokio::test]
