@@ -7,7 +7,10 @@ use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use axum::{
     Json,
-    extract::{Path, Query, Request, State},
+    extract::{
+        Path, Query, Request, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -150,8 +153,12 @@ async fn validate_protocol_version(request: Request, next: Next) -> Response {
 async fn handle_send_message<H: RequestHandler>(
     State(state): State<RestState<H>>,
     headers: HeaderMap,
-    Json(raw_req): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> impl IntoResponse {
+    let Json(raw_req) = match body {
+        Ok(body) => body,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
     let req = match protojson_conv::from_value::<SendMessageRequest>(raw_req) {
         Ok(req) => req,
         Err(e) => return rest_payload_error_response(e),
@@ -166,8 +173,12 @@ async fn handle_send_message<H: RequestHandler>(
 async fn handle_stream_message<H: RequestHandler>(
     State(state): State<RestState<H>>,
     headers: HeaderMap,
-    Json(raw_req): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> impl IntoResponse {
+    let Json(raw_req) = match body {
+        Ok(body) => body,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
     let req = match protojson_conv::from_value::<SendMessageRequest>(raw_req) {
         Ok(req) => req,
         Err(e) => return rest_payload_error_response(e),
@@ -205,9 +216,13 @@ async fn handle_get_task_inner<H: RequestHandler>(
 async fn handle_get_task_or_subscribe<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(id): Path<String>,
-    Query(query): Query<GetTaskQuery>,
+    query: Result<Query<GetTaskQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => return rest_payload_error_response(rejection.body_text()),
+    };
     let params = extract_service_params(&headers);
     if let Some(task_id) = id.strip_suffix(":subscribe") {
         return handle_subscribe_to_task_inner(state, params, task_id.to_string()).await;
@@ -238,9 +253,13 @@ pub struct ListTasksQuery {
 
 async fn handle_list_tasks<H: RequestHandler>(
     State(state): State<RestState<H>>,
-    Query(query): Query<ListTasksQuery>,
+    query: Result<Query<ListTasksQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => return rest_payload_error_response(rejection.body_text()),
+    };
     let params = extract_service_params(&headers);
     let status = match query.status {
         Some(s) => match serde_json::from_value::<TaskState>(serde_json::Value::String(s)) {
@@ -342,8 +361,12 @@ async fn handle_create_push_config<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(raw_config): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> impl IntoResponse {
+    let Json(raw_config) = match body {
+        Ok(body) => body,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
     let req = match parse_create_push_config_request(id, raw_config) {
         Ok(req) => req,
         Err(e) => return rest_payload_error_response(e),
@@ -375,9 +398,13 @@ async fn handle_get_push_config<H: RequestHandler>(
 async fn handle_list_push_configs<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(id): Path<String>,
-    Query(query): Query<ListPushConfigsQuery>,
+    query: Result<Query<ListPushConfigsQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => return rest_payload_error_response(rejection.body_text()),
+    };
     let params = extract_service_params(&headers);
     let req = ListTaskPushNotificationConfigsRequest {
         task_id: id,
@@ -483,6 +510,15 @@ fn parse_create_push_config_request(
                 Ok(config)
             }
         })
+}
+
+/// A body over `DefaultBodyLimit` keeps axum's 413; any other body the `Json`
+/// extractor rejects is an invalid request body like an undecodable one.
+fn json_rejection_response(rejection: JsonRejection) -> axum::response::Response {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return rejection.into_response();
+    }
+    rest_payload_error_response(rejection.body_text())
 }
 
 fn rest_payload_error_response(error: impl std::fmt::Display) -> axum::response::Response {
@@ -1631,5 +1667,72 @@ mod tests {
 
         let uri = format!("{REST_SEND_MESSAGE_PATH}?A2A-Version=99.0");
         assert_version_not_supported(send_message_with_version(&uri, None).await).await;
+    }
+
+    /// Input axum rejects before a handler runs gets the google.rpc.Status
+    /// body of every other REST error (§11.6), not axum's plain-text rejection.
+    #[tokio::test]
+    async fn test_extractor_rejections_answer_google_rpc_status() {
+        let requests = [
+            Request::builder()
+                .uri("/tasks/t1?historyLength=abc")
+                .method("GET")
+                .header("a2a-version", "1.0")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/tasks?pageSize=x")
+                .method("GET")
+                .header("a2a-version", "1.0")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri(REST_SEND_MESSAGE_PATH)
+                .method("POST")
+                .header("a2a-version", "1.0")
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+            Request::builder()
+                .uri(REST_SEND_MESSAGE_PATH)
+                .method("POST")
+                .header("a2a-version", "1.0")
+                .body(Body::from("{}"))
+                .unwrap(),
+            Request::builder()
+                .uri(REST_STREAM_MESSAGE_PATH)
+                .method("POST")
+                .header("a2a-version", "1.0")
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+            Request::builder()
+                .uri("/tasks/t1/pushNotificationConfigs")
+                .method("POST")
+                .header("a2a-version", "1.0")
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+            Request::builder()
+                .uri("/tasks/t1/pushNotificationConfigs?pageSize=x")
+                .method("GET")
+                .header("a2a-version", "1.0")
+                .body(Body::empty())
+                .unwrap(),
+        ];
+        for req in requests {
+            let target = req.uri().to_string();
+            let resp = make_app().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{target}");
+            assert_eq!(
+                resp.headers().get("content-type").unwrap(),
+                "application/json",
+                "{target}"
+            );
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], 400, "{target}");
+            assert_eq!(body["error"]["status"], "INVALID_ARGUMENT", "{target}");
+        }
     }
 }
