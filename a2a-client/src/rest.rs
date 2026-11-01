@@ -241,15 +241,18 @@ impl RestTransport {
 }
 
 fn parse_rest_error(status: reqwest::StatusCode, body: &str) -> A2AError {
-    let Ok(envelope) = serde_json::from_str::<RestErrorEnvelope>(body) else {
-        return A2AError::internal(format!("HTTP {status}: {body}"));
-    };
+    rest_error(body).unwrap_or_else(|| A2AError::internal(format!("HTTP {status}: {body}")))
+}
 
-    crate::a2a_error_from_details(
+/// The `{"error": google.rpc.Status}` body of an HTTP+JSON error, which a
+/// stream also sends in-band as an event (§11.6).
+pub(crate) fn rest_error(body: &str) -> Option<A2AError> {
+    let envelope = serde_json::from_str::<RestErrorEnvelope>(body).ok()?;
+    Some(crate::a2a_error_from_details(
         error_code::INTERNAL_ERROR,
         envelope.error.message,
         envelope.error.details,
-    )
+    ))
 }
 
 fn should_retry_subscribe_with_legacy_path(err: &A2AError) -> bool {

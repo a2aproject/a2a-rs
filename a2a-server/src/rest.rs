@@ -174,7 +174,7 @@ async fn handle_stream_message<H: RequestHandler>(
     };
     let params = extract_service_params(&headers);
     match state.handler.send_streaming_message(&params, req).await {
-        Ok(stream) => sse::sse_from_stream(protojson_stream(stream)).into_response(),
+        Ok(stream) => rest_sse(protojson_stream(stream)),
         Err(e) => rest_error_response(e),
     }
 }
@@ -315,7 +315,7 @@ async fn handle_subscribe_to_task_inner<H: RequestHandler>(
 ) -> axum::response::Response {
     let req = SubscribeToTaskRequest { id, tenant: None };
     match state.handler.subscribe_to_task(&params, req).await {
-        Ok(stream) => sse::sse_from_stream(protojson_stream(stream)).into_response(),
+        Ok(stream) => rest_sse(protojson_stream(stream)),
         Err(e) => rest_error_response(e),
     }
 }
@@ -455,6 +455,17 @@ fn protojson_stream<T: ProtoJsonPayload + 'static>(
     }))
 }
 
+/// Spec §11.6: an error inside an HTTP+JSON stream is an event carrying the
+/// same `{"error": google.rpc.Status}` body a non-streaming error has.
+fn rest_sse(stream: BoxStream<'static, Result<Value, A2AError>>) -> axum::response::Response {
+    let events = stream.map(|item| {
+        Ok(item.unwrap_or_else(|err| {
+            serde_json::to_value(rest_error_envelope(err).1).unwrap_or_default()
+        }))
+    });
+    sse::sse_from_stream(Box::pin(events)).into_response()
+}
+
 fn parse_create_push_config_request(
     task_id: String,
     raw_config: Value,
@@ -486,6 +497,13 @@ fn rest_payload_error_response(error: impl std::fmt::Display) -> axum::response:
 }
 
 fn rest_error_response(err: A2AError) -> axum::response::Response {
+    let (status, body) = rest_error_envelope(err);
+    // The body is google.rpc.Status, not an RFC 9457 problem document, and
+    // `application/json` is what the Go and .NET clients parse an error from.
+    (status, Json(body)).into_response()
+}
+
+fn rest_error_envelope(err: A2AError) -> (StatusCode, RestErrorEnvelope) {
     let status =
         StatusCode::from_u16(err.http_status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let reason = error_reason(err.code);
@@ -524,10 +542,7 @@ fn rest_error_response(err: A2AError) -> axum::response::Response {
             details,
         },
     };
-
-    // The body is google.rpc.Status, not an RFC 9457 problem document, and
-    // `application/json` is what the Go and .NET clients parse an error from.
-    (status, Json(body)).into_response()
+    (status, body)
 }
 
 fn rest_grpc_status(code: i32) -> &'static str {
@@ -962,6 +977,32 @@ mod tests {
         let err = item.expect_err("transcode must fail");
         assert_eq!(err.code, a2a::error_code::INTERNAL_ERROR);
         assert_eq!(err.message, "Internal error");
+    }
+
+    #[tokio::test]
+    async fn test_stream_error_event_is_a_google_rpc_status() {
+        let stream: BoxStream<'static, Result<Value, A2AError>> =
+            Box::pin(futures::stream::iter(vec![
+                Ok(serde_json::json!({"statusUpdate": {}})),
+                Err(A2AError::task_not_found("t1")),
+            ]));
+        let body = rest_sse(stream)
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let frames: Vec<Value> = String::from_utf8(body.to_vec())
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 2);
+        let error = &frames[1]["error"];
+        assert_eq!(error["code"], 404);
+        assert_eq!(error["status"], "NOT_FOUND");
+        assert_eq!(error["details"][0]["reason"], "TASK_NOT_FOUND");
     }
 
     #[tokio::test]
