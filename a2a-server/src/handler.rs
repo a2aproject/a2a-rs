@@ -404,6 +404,29 @@ async fn apply_event_to_task(
     }
 }
 
+/// The task an execution that failed midway leaves behind: FAILED, so a
+/// caller polling `GetTask` or listing tasks sees it end. The status message
+/// is the sanitized error; the error itself still reaches the live
+/// subscribers. A task already terminal (canceled meanwhile) is left alone.
+async fn fail_task(
+    task_store: &dyn crate::TaskStore,
+    task: Option<Task>,
+    error: &A2AError,
+) -> Option<Task> {
+    let mut task = task.filter(|task| !task.status.state.is_terminal())?;
+    let text = crate::sanitized_internal_error(&error.message).message;
+    task.status = TaskStatus {
+        state: TaskState::Failed,
+        message: Some(Message {
+            task_id: Some(task.id.clone()),
+            context_id: Some(task.context_id.clone()),
+            ..Message::new(Role::Agent, vec![Part::text(text)])
+        }),
+        timestamp: Some(chrono::Utc::now()),
+    };
+    save_task(task_store, task).await.ok()
+}
+
 fn subscription_stream(
     receiver: broadcast::Receiver<ExecutionEvent>,
     snapshot_task: Option<Task>,
@@ -467,6 +490,7 @@ async fn drive_execution(
         state.snapshot_task.clone()
     };
     let mut stream = runtime.executor.execute(exec_ctx);
+    let mut failure = None;
 
     while let Some(result) = stream.next().await {
         if active.snapshot_is_terminal().await {
@@ -489,7 +513,7 @@ async fn drive_execution(
                         )
                         .await
                         {
-                            active.publish(Err(&error), None).await;
+                            failure = Some(error);
                             break;
                         }
                         active.publish(Ok(&event), updated_task).await;
@@ -498,16 +522,21 @@ async fn drive_execution(
                         }
                     }
                     Err(error) => {
-                        active.publish(Err(&error), None).await;
+                        failure = Some(error);
                         break;
                     }
                 }
             }
             Err(error) => {
-                active.publish(Err(&error), None).await;
+                failure = Some(error);
                 break;
             }
         }
+    }
+
+    if let Some(error) = failure {
+        let failed = fail_task(runtime.task_store.as_ref(), current_task, &error).await;
+        active.publish(Err(&error), failed).await;
     }
 
     runtime.execution_manager.finish(&task_id, &active).await;
@@ -1491,6 +1520,59 @@ mod tests {
         }
     }
 
+    /// Plays the events a test scripts for each call: `execute` gets the
+    /// context with the incoming message, `cancel` the one without. A step
+    /// can wait on a `Notify` first, so a test orders the executor against
+    /// its own calls without sleeping.
+    struct ScriptedExecutor<F>(F);
+
+    type Step = (Option<Arc<Notify>>, Result<StreamResponse, A2AError>);
+
+    impl<F> crate::AgentExecutor for ScriptedExecutor<F>
+    where
+        F: Fn(&ExecutorContext) -> Vec<Step> + Send + Sync + 'static,
+    {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            play((self.0)(&ctx))
+        }
+
+        fn cancel(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            play((self.0)(&ctx))
+        }
+    }
+
+    fn play(steps: Vec<Step>) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        Box::pin(stream::iter(steps).then(|(gate, event)| async move {
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            event
+        }))
+    }
+
+    fn status_event(
+        ctx: &ExecutorContext,
+        state: TaskState,
+        message: Option<Message>,
+    ) -> StreamResponse {
+        StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: ctx.task_id.clone(),
+            context_id: ctx.context_id.clone(),
+            status: TaskStatus {
+                state,
+                message,
+                timestamp: None,
+            },
+            metadata: None,
+        })
+    }
+
     /// Mirrors itk's own `tck-multi-turn` ACTS behavior: only ever emits a
     /// `StatusUpdate`, never a full `Task`, so a test against it exercises
     /// exactly the path a real executor that never touches `history` relies
@@ -2279,6 +2361,227 @@ mod tests {
         let event = receiver.recv().await.unwrap();
         assert_eq!(event.sequence, 1);
         assert_eq!(event.result.unwrap_err().code, error.code);
+    }
+
+    /// An execution that fails midway leaves its task FAILED with a
+    /// sanitized status message; the error itself still reaches the caller.
+    #[tokio::test]
+    async fn test_execution_error_leaves_the_task_failed() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                vec![
+                    (None, Ok(status_event(ctx, TaskState::Working, None))),
+                    (None, Err(A2AError::internal("executor exploded"))),
+                ]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let events: Vec<_> = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(matches!(events.last(), Some(Err(error)) if error.message == "executor exploded"));
+        let task_id = task_id_for_event(events[0].as_ref().unwrap())
+            .unwrap()
+            .to_owned();
+
+        let task = handler
+            .get_task(
+                &ServiceParams::new(),
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.status.state, TaskState::Failed);
+        assert_eq!(
+            task.status.message.as_ref().and_then(Message::text),
+            Some("Internal error")
+        );
+    }
+
+    /// An event the server cannot apply fails the task the same way.
+    #[tokio::test]
+    async fn test_unappliable_event_leaves_the_task_failed() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                let append = StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    task_id: ctx.task_id.clone(),
+                    context_id: ctx.context_id.clone(),
+                    artifact: Artifact {
+                        artifact_id: "unknown".into(),
+                        name: None,
+                        description: None,
+                        parts: vec![Part::text("more")],
+                        metadata: None,
+                        extensions: None,
+                    },
+                    append: Some(true),
+                    last_chunk: None,
+                    metadata: None,
+                });
+                vec![(None, Ok(append))]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let error = handler
+            .send_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+
+        let listed = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.tasks[0].status.state, TaskState::Failed);
+    }
+
+    /// A push the sender cannot deliver, with `fail_on_error`, fails the task
+    /// as well.
+    #[tokio::test]
+    async fn test_failed_push_leaves_the_task_failed() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                vec![(None, Ok(status_event(ctx, TaskState::Working, None)))]
+            }),
+            InMemoryTaskStore::new(),
+        )
+        .with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                fail_on_error: true,
+                ..Default::default()
+            })),
+        );
+        let mut request = send_request();
+        request.configuration = Some(SendMessageConfiguration {
+            accepted_output_modes: None,
+            // A loopback webhook is refused by the default URL validation.
+            task_push_notification_config: Some(TaskPushNotificationConfig {
+                url: "http://127.0.0.1:9/callback".into(),
+                ..push_config("")
+            }),
+            history_length: None,
+            return_immediately: None,
+        });
+        handler
+            .send_message(&ServiceParams::new(), request)
+            .await
+            .unwrap_err();
+
+        let listed = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.tasks[0].status.state, TaskState::Failed);
+    }
+
+    /// Cancelling a running task leaves it CANCELED: the execution the cancel
+    /// stops is not a failure.
+    #[tokio::test]
+    async fn test_canceled_task_is_not_marked_failed() {
+        let gate = Arc::new(Notify::new());
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(move |ctx: &ExecutorContext| {
+                if ctx.message.is_some() {
+                    vec![
+                        (None, Ok(status_event(ctx, TaskState::Working, None))),
+                        (
+                            Some(gate.clone()),
+                            Ok(status_event(ctx, TaskState::Working, None)),
+                        ),
+                    ]
+                } else {
+                    vec![(None, Ok(status_event(ctx, TaskState::Canceled, None)))]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let mut request = send_request();
+        request.configuration = Some(SendMessageConfiguration {
+            accepted_output_modes: None,
+            task_push_notification_config: None,
+            history_length: None,
+            return_immediately: Some(true),
+        });
+        handler
+            .send_message(&ServiceParams::new(), request)
+            .await
+            .unwrap();
+        let task_id = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap()
+            .tasks[0]
+            .id
+            .clone();
+        let canceled = handler
+            .cancel_task(
+                &ServiceParams::new(),
+                CancelTaskRequest {
+                    id: task_id.clone(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(canceled.status.state, TaskState::Canceled);
+
+        let stored = handler
+            .get_task(
+                &ServiceParams::new(),
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.status.state, TaskState::Canceled);
     }
 
     #[tokio::test]
