@@ -4,7 +4,7 @@
 use a2a::*;
 use async_trait::async_trait;
 use futures::{
-    StreamExt,
+    StreamExt, future,
     stream::{self, BoxStream},
 };
 use std::{
@@ -103,7 +103,8 @@ struct ExecutionManager {
     executions: RwLock<HashMap<TaskId, Arc<ActiveExecution>>>,
     /// Subscriptions to tasks with no registered execution, which `start`
     /// attaches to the next one. Taken under `executions` by `start` and
-    /// `subscribe`, alone by `Waiter::drop`, never across an await.
+    /// `subscribe`, alone by `Waiter::drop` and `release`, never across an
+    /// await.
     waiting: Mutex<HashMap<TaskId, Vec<oneshot::Sender<Resubscription>>>>,
 }
 
@@ -162,6 +163,17 @@ impl ExecutionManager {
         }
     }
 
+    /// Ends the subscriptions still waiting for the task's next execution
+    /// with its final snapshot: a canceled task has no execution for them to
+    /// follow, and a terminal snapshot closes their streams.
+    fn release(&self, task: &Task) {
+        let waiting = self.waiting().remove(&task.id).unwrap_or_default();
+        for waiter in waiting {
+            let (_, events) = broadcast::channel(1);
+            let _ = waiter.send((events, Some(task.clone()), 0));
+        }
+    }
+
     async fn finish(&self, task_id: &str, active: &Arc<ActiveExecution>) {
         let mut executions = self.executions.write().await;
         let should_remove = executions
@@ -191,11 +203,9 @@ impl Waiter {
     /// away first.
     fn into_stream(mut self) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         stream::once(async move { self.attached.as_mut()?.await.ok() })
-            .flat_map(|attached| match attached {
-                Some((receiver, snapshot_task, sequence)) => {
-                    subscription_stream(receiver, snapshot_task, sequence)
-                }
-                None => stream::empty().boxed(),
+            .filter_map(future::ready)
+            .flat_map(|(receiver, snapshot_task, sequence)| {
+                subscription_stream(receiver, snapshot_task, sequence)
             })
             .boxed()
     }
@@ -1115,6 +1125,9 @@ impl RequestHandler for DefaultRequestHandler {
                     if let Some(active) = &active_execution {
                         active.publish(Err(&error), None).await;
                     }
+                    if let Some(task) = &current_task {
+                        self.execution_manager.release(task);
+                    }
                     return Err(error);
                 }
             }
@@ -1124,7 +1137,14 @@ impl RequestHandler for DefaultRequestHandler {
             self.execution_manager.finish(&req.id, &active).await;
         }
 
-        self.load_task(&req.id).await
+        // A subscription to a task between turns has no execution to follow
+        // into the cancel; the final snapshot ends it. Subscriptions register
+        // before reading the store, so one that read the task before
+        // `begin_cancel` is waiting now, and one that reads it later finds it
+        // terminal.
+        let task = self.load_task(&req.id).await?;
+        self.execution_manager.release(&task);
+        Ok(task)
     }
 
     async fn subscribe_to_task(
@@ -1653,8 +1673,11 @@ mod tests {
         }
     }
 
-    /// Asks for input on the task's first turn and completes on the next.
-    struct InputRequiredExecutor;
+    /// Asks for input on the task's first turn and completes on the next;
+    /// its cancel reports the task canceled, or fails when asked to.
+    struct InputRequiredExecutor {
+        cancel_fails: bool,
+    }
 
     impl crate::AgentExecutor for InputRequiredExecutor {
         fn execute(
@@ -1680,9 +1703,23 @@ mod tests {
 
         fn cancel(
             &self,
-            _ctx: ExecutorContext,
+            ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-            Box::pin(stream::empty())
+            let event = if self.cancel_fails {
+                Err(A2AError::internal("cancel failed"))
+            } else {
+                Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: ctx.task_id,
+                    context_id: ctx.context_id,
+                    status: TaskStatus {
+                        state: TaskState::Canceled,
+                        message: None,
+                        timestamp: None,
+                    },
+                    metadata: None,
+                }))
+            };
+            Box::pin(stream::once(async move { event }))
         }
     }
 
@@ -1743,7 +1780,12 @@ mod tests {
     }
 
     fn make_input_required_handler() -> DefaultRequestHandler {
-        DefaultRequestHandler::new(InputRequiredExecutor, InMemoryTaskStore::new())
+        DefaultRequestHandler::new(
+            InputRequiredExecutor {
+                cancel_fails: false,
+            },
+            InMemoryTaskStore::new(),
+        )
     }
 
     /// A task whose first turn ended asking for input: stored, but with no
@@ -1761,9 +1803,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let SendMessageResponse::Task(task) = response else {
-            panic!("expected a task");
-        };
+        let mut task = None;
+        if let SendMessageResponse::Task(sent) = response {
+            task = Some(sent);
+        }
+        let task = task.expect("expected a task");
         assert_eq!(task.status.state, TaskState::InputRequired);
         assert!(handler.execution_manager.get(&task.id).await.is_none());
         task
@@ -3111,6 +3155,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cancel_ends_a_subscription_to_a_task_awaiting_input() {
+        let handler = make_input_required_handler();
+        let params = ServiceParams::new();
+        let task = task_awaiting_input(&handler).await;
+        let subscription = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: task.id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let canceled = handler
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: task.id.clone(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(canceled.status.state, TaskState::Canceled);
+
+        // The stored task, then the canceled one, and the stream ends.
+        let events: Vec<_> = timeout(Duration::from_secs(5), subscription.collect())
+            .await
+            .expect("the subscription outlived the canceled task");
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamResponse::Task(stored)), Ok(StreamResponse::Task(last))]
+                if stored.status.state == TaskState::InputRequired
+                    && last.status.state == TaskState::Canceled
+        ));
+        assert!(handler.execution_manager.waiting().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_failing_in_the_executor_still_ends_a_waiting_subscription() {
+        let handler = DefaultRequestHandler::new(
+            InputRequiredExecutor { cancel_fails: true },
+            InMemoryTaskStore::new(),
+        );
+        let params = ServiceParams::new();
+        let task = task_awaiting_input(&handler).await;
+        let subscription = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: task.id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = handler
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: task.id.clone(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "cancel failed");
+
+        // The store holds the task canceled before the executor ran.
+        let events: Vec<_> = timeout(Duration::from_secs(5), subscription.collect())
+            .await
+            .expect("the subscription outlived the canceled task");
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamResponse::Task(stored)), Ok(StreamResponse::Task(last))]
+                if stored.status.state == TaskState::InputRequired
+                    && last.status.state == TaskState::Canceled
+        ));
+    }
+
+    #[tokio::test]
     async fn test_subscriptions_to_a_task_awaiting_input_follow_its_next_turn() {
         let handler = make_input_required_handler();
         let params = ServiceParams::new();
@@ -3149,24 +3279,21 @@ mod tests {
             SendMessageResponse::Task(task) if task.status.state == TaskState::Completed
         ));
 
-        let states = |events: Vec<Result<StreamResponse, A2AError>>| {
-            events
-                .into_iter()
-                .map(|event| match event.unwrap() {
-                    StreamResponse::Task(task) => task.status.state,
-                    StreamResponse::StatusUpdate(update) => update.status.state,
-                    other => panic!("unexpected event {other:?}"),
-                })
-                .collect::<Vec<_>>()
-        };
         // The stored task, the task as the turn found it, then the turn.
-        let expected = [
-            TaskState::InputRequired,
-            TaskState::InputRequired,
-            TaskState::Completed,
-        ];
-        assert_eq!(states(first.collect().await), expected);
-        assert_eq!(states(second.collect().await), expected);
+        let follows_the_turn = |events: Vec<Result<StreamResponse, A2AError>>| {
+            matches!(
+                events.as_slice(),
+                [
+                    Ok(StreamResponse::Task(stored)),
+                    Ok(StreamResponse::Task(found)),
+                    Ok(StreamResponse::StatusUpdate(turn)),
+                ] if stored.status.state == TaskState::InputRequired
+                    && found.status.state == TaskState::InputRequired
+                    && turn.status.state == TaskState::Completed
+            )
+        };
+        assert!(follows_the_turn(first.collect().await));
+        assert!(follows_the_turn(second.collect().await));
 
         // Over: a new subscription is refused as for any finished task.
         let result = handler.subscribe_to_task(&params, subscribe()).await;
