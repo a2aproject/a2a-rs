@@ -491,6 +491,8 @@ async fn drive_execution(
     };
     let mut stream = runtime.executor.execute(exec_ctx);
     let mut failure = None;
+    // §3.1.2: a response is one Message, or a Task and its updates, not both.
+    let (mut answered, mut tracked) = (false, false);
 
     while let Some(result) = stream.next().await {
         if active.snapshot_is_terminal().await {
@@ -499,6 +501,13 @@ async fn drive_execution(
 
         match result {
             Ok(mut event) => {
+                let message = matches!(event, StreamResponse::Message(_));
+                if answered || (message && tracked) {
+                    failure = Some(A2AError::invalid_agent_response());
+                    break;
+                }
+                answered = message;
+                tracked |= !message;
                 backfill_status_timestamp(&mut event);
                 match apply_event_to_task(runtime.task_store.as_ref(), current_task.clone(), &event)
                     .await
@@ -2846,6 +2855,62 @@ mod tests {
             &events[..],
             [Ok(StreamResponse::Task(task))] if task.history.as_ref().map(Vec::len) == Some(1)
         ));
+    }
+
+    /// A Message after the task's own events is an invalid agent response,
+    /// not the answer (§3.1.2), and the task fails.
+    #[tokio::test]
+    async fn test_message_after_task_events_is_an_invalid_agent_response() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                vec![
+                    (None, Ok(status_event(ctx, TaskState::Working, None))),
+                    (
+                        None,
+                        Ok(StreamResponse::Message(Message::new(
+                            Role::Agent,
+                            vec![Part::text("late")],
+                        ))),
+                    ),
+                ]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let error = handler
+            .send_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+    }
+
+    /// Nothing may follow a Message that answered the request.
+    #[tokio::test]
+    async fn test_event_after_an_answering_message_is_an_invalid_agent_response() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                vec![
+                    (
+                        None,
+                        Ok(StreamResponse::Message(Message::new(
+                            Role::Agent,
+                            vec![Part::text("answer")],
+                        ))),
+                    ),
+                    (None, Ok(status_event(ctx, TaskState::Completed, None))),
+                ]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let events: Vec<_> = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(matches!(events[0], Ok(StreamResponse::Message(_))));
+        assert!(
+            matches!(&events[1], Err(error) if error.code == error_code::INVALID_AGENT_RESPONSE)
+        );
     }
 
     #[tokio::test]
