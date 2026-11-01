@@ -876,11 +876,19 @@ impl DefaultRequestHandler {
             // for deciding this turn's behavior, and `apply_event_to_task`
             // only ever merges status/artifact deltas onto the snapshot
             // started here, never anything content-derived. Append it so
-            // `history` actually accumulates across turns.
-            existing
-                .history
-                .get_or_insert_with(Vec::new)
-                .push(req.message.clone());
+            // `history` actually accumulates across turns. The agent's last
+            // word (an INPUT_REQUIRED question) lives only in `status.message`
+            // and the next status replaces it, so it goes in first.
+            let asked = existing.status.message.clone();
+            let history = existing.history.get_or_insert_with(Vec::new);
+            if let Some(asked) = asked.filter(|asked| {
+                history
+                    .iter()
+                    .all(|seen| seen.message_id != asked.message_id)
+            }) {
+                history.push(asked);
+            }
+            history.push(req.message.clone());
             existing
         } else {
             let task = Task {
@@ -2582,6 +2590,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.status.state, TaskState::Canceled);
+    }
+
+    /// The agent's INPUT_REQUIRED question stays in history between the
+    /// turn that asked it and the answer.
+    #[tokio::test]
+    async fn test_continuation_keeps_the_question_in_history() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                let asked = ctx
+                    .message
+                    .as_ref()
+                    .and_then(Message::text)
+                    .is_some_and(|text| text == "ask");
+                let event = if asked {
+                    let question = Message::new(Role::Agent, vec![Part::text("Which file?")]);
+                    status_event(ctx, TaskState::InputRequired, Some(question))
+                } else {
+                    status_event(ctx, TaskState::Completed, None)
+                };
+                vec![(None, Ok(event))]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let params = ServiceParams::new();
+        let ask = SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("ask")]),
+            ..send_request()
+        };
+        handler.send_message(&params, ask).await.unwrap();
+        let task_id = handler
+            .list_tasks(
+                &params,
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap()
+            .tasks[0]
+            .id
+            .clone();
+        let answer = SendMessageRequest {
+            message: Message {
+                task_id: Some(task_id.clone()),
+                ..Message::new(Role::User, vec![Part::text("main.rs")])
+            },
+            ..send_request()
+        };
+        handler.send_message(&params, answer).await.unwrap();
+
+        let task = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        let said: Vec<_> = task
+            .history
+            .unwrap()
+            .iter()
+            .map(|message| message.text().unwrap().to_owned())
+            .collect();
+        assert_eq!(said, ["ask", "Which file?", "main.rs"]);
     }
 
     #[tokio::test]
