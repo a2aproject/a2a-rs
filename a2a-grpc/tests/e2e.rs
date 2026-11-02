@@ -365,10 +365,6 @@ fn send_message_request() -> SendMessageRequest {
     }
 }
 
-fn versioned_params() -> ServiceParams {
-    ServiceParams::from([("a2a-version".to_string(), vec!["1.1".to_string()])])
-}
-
 #[tokio::test]
 async fn grpc_transport_end_to_end() {
     let (endpoint, handle) = spawn_grpc_server().await;
@@ -675,7 +671,7 @@ async fn grpc_transport_rejects_unsupported_a2a_version() {
 }
 
 #[tokio::test]
-async fn live_rpc_preserves_an_unimplemented_method_error() {
+async fn live_rpc_preserves_an_unsupported_operation_error() {
     let (endpoint, server) = spawn_grpc_server().await;
     let transport = GrpcTransport::connect(endpoint).await.unwrap();
     let first = StreamRequest {
@@ -692,6 +688,6 @@ async fn live_rpc_preserves_an_unimplemented_method_error() {
         .await
         .err()
         .expect("handler does not implement live input");
-    assert_eq!(error.code, error_code::METHOD_NOT_FOUND);
+    assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
     server.abort();
 }

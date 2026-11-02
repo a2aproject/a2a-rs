@@ -17,7 +17,6 @@ use crate::middleware::ServiceParams;
 use a2a::*;
 use futures::{FutureExt, StreamExt, stream::BoxStream};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
 /// What looking at an idle task found.
 enum Reattach {
@@ -86,6 +85,7 @@ impl Run {
         uplink: Option<Exchange>,
     ) -> Events {
         let (out, downlink) = mpsc::channel(RESPONSE_BUFFER_CAPACITY);
+        let source = self.handler.execution_manager.events_for(&self.task_id);
         self.spawn(
             opening,
             inner.map(EventSource::Subscription),
@@ -93,7 +93,13 @@ impl Run {
             uplink,
             DeliverySink::Stream(out),
         );
-        ReceiverStream::new(downlink).boxed()
+        // Keep the authoritative snapshot until the response is consumed,
+        // including when retention purges the task before unary delivery.
+        futures::stream::unfold((downlink, source), |(mut downlink, source)| async move {
+            let event = downlink.recv().await?;
+            Some((event, (downlink, source)))
+        })
+        .boxed()
     }
 
     fn spawn(
@@ -129,12 +135,22 @@ impl Run {
         history_length: Option<i32>,
         timeline_length: Option<i32>,
     ) -> Result<SendMessageResponse, A2AError> {
+        let source = handler.execution_manager.events_for(&task_id);
         while let Some(item) = events.next().await {
             if let StreamResponse::Message(message) = item? {
                 return Ok(SendMessageResponse::Message(message));
             }
         }
-        let mut task = handler.load_task(&task_id).await?;
+        let mut task = match handler.load_task(&task_id).await {
+            Ok(task) => task,
+            Err(error) if error.code == error_code::TASK_NOT_FOUND => {
+                match source.snapshot().await {
+                    Some(task) if task.status.state.is_terminal() => task,
+                    _ => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         apply_lengths(&mut task, history_length, timeline_length);
         Ok(SendMessageResponse::Task(task))
     }
@@ -594,5 +610,96 @@ mod tests {
             Ok(Ok(StreamResponse::Message(_)))
         ));
         assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn detached_responses_finish_on_missing_or_terminal_tasks() {
+        for exists in [false, true] {
+            let handler = make_handler();
+            if exists {
+                let task = task_with_history("task", "context", 0);
+                handler.task_store.create(task).await.unwrap();
+            }
+            let mut events = Run::new(
+                handler,
+                ServiceParams::new(),
+                "task".into(),
+                RunCompletion::Task,
+            )
+            .start(None, None, 0, None);
+            let event = timeout(Duration::from_secs(1), events.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if exists {
+                assert!(
+                    matches!(event.unwrap(), StreamResponse::Task(task) if task.status.state == TaskState::Completed)
+                );
+            } else {
+                assert_eq!(event.unwrap_err().code, error_code::TASK_NOT_FOUND);
+            }
+            assert!(events.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn unary_direct_messages_and_errors_do_not_require_a_stored_task() {
+        let message = make_message();
+        let events = stream::once({
+            let message = message.clone();
+            async move { Ok(StreamResponse::Message(message)) }
+        })
+        .boxed();
+        let response = Run::unary_response(make_handler(), "missing".into(), events, None, None)
+            .await
+            .unwrap();
+        assert!(matches!(response, SendMessageResponse::Message(reply) if reply == message));
+        let events = stream::once(async { Err(A2AError::internal("executor error")) }).boxed();
+        let error = Run::unary_response(make_handler(), "missing".into(), events, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "executor error");
+    }
+
+    #[tokio::test]
+    async fn detached_responses_catch_up_with_nonterminal_stored_generations() {
+        let handler = make_handler();
+        let mut task = task_with_history("working", "context", 0);
+        task.status.state = TaskState::Working;
+        task.generation = 3;
+        handler.task_store.create(task.clone()).await.unwrap();
+        let mut events = Run::new(
+            handler,
+            ServiceParams::new(),
+            task.id.clone(),
+            RunCompletion::Task,
+        )
+        .start(None, None, 0, None);
+        assert!(
+            matches!(timeout(Duration::from_secs(1), events.next()).await.unwrap().unwrap().unwrap(), StreamResponse::Task(snapshot) if snapshot == task)
+        );
+        assert!(
+            timeout(Duration::from_millis(10), events.next())
+                .await
+                .is_err(),
+            "unchanged state must not be replayed"
+        );
+    }
+    #[tokio::test]
+    async fn unary_completion_survives_immediate_terminal_task_retention() {
+        use crate::handler::test_support::*;
+        let handler = DefaultRequestHandler::new(
+            EchoExecutor,
+            InMemoryTaskStore::new().with_terminal_task_limit(0),
+        );
+        let response = handler
+            .send_message(&ServiceParams::new(), send_req(None, None))
+            .await
+            .unwrap();
+        let SendMessageResponse::Task(task) = response else {
+            panic!("expected the completed task");
+        };
+        assert_eq!(task.status.state, TaskState::Completed);
+        assert!(handler.task_store.get(&task.id).await.unwrap().is_none());
     }
 }

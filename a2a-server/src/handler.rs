@@ -762,7 +762,7 @@ impl DefaultRequestHandler {
         let task = save_task(self.task_store.as_ref(), task).await?;
 
         let sequence_before = active.sequence().await;
-        let receiver = active.subscribe();
+        let receiver = active.subscribe().await;
         let last = events.len().saturating_sub(1);
         for (index, event) in events.iter().enumerate() {
             let snapshot = (index == last).then(|| task.clone());
@@ -995,9 +995,8 @@ impl DefaultRequestHandler {
         } = message;
         let params = &params;
         let include_task_snapshot_in_context = mode == StartMode::Blocking;
-        // A new task is created by the executor: only a live exchange, which is
-        // bound to its task from the first request, creates it up front.
-        let lazy = false;
+        // This layer stores new tasks before starting the executor. Deferred
+        // creation is enabled by the later lazy-task layer.
         let artifact_only = is_artifact_only(&req);
         let task_id = request_task_id(&req).unwrap_or_else(new_task_id);
 
@@ -1019,23 +1018,13 @@ impl DefaultRequestHandler {
             // wait for it instead of racing it.
             let prepared = async {
                 let prepared = self.prepare_task_for_execution(&req, &task_id).await?;
-                if lazy && !prepared.1 {
-                    // For a task that may never exist, the configuration waits
-                    // for the executor to create it.
-                    let config = self.request_push_config(params, &task_id, &req)?;
-                    *active
-                        .pending_push
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
-                } else {
-                    self.save_request_push_config(params, &task_id, &req)
-                        .await?;
-                }
+                self.save_request_push_config(params, &task_id, &req)
+                    .await?;
                 // All admission checks and configuration saves precede the
                 // input commit. The owned preparation then starts its executor.
                 if prepared.1 {
                     self.task_store.update(prepared.0.clone()).await?;
-                } else if !lazy {
+                } else {
                     self.task_store.create(prepared.0.clone()).await?;
                 }
                 Ok::<_, A2AError>(prepared)
@@ -1044,11 +1033,6 @@ impl DefaultRequestHandler {
             match prepared {
                 Ok(prepared) => {
                     active.set_snapshot(prepared.0.clone()).await;
-                    if lazy && !prepared.1 {
-                        active
-                            .uncreated
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
                     prepared
                 }
                 Err(error) => {
@@ -1062,21 +1046,19 @@ impl DefaultRequestHandler {
         self.execution_manager
             .pushes
             .attach(self, &task_id, &active.events);
-        if existed || !lazy {
-            // Existing subscribers and webhooks observe persisted client input
-            // through the same publication path as executor output. The new
-            // response subscribes below and announces its input via its opening
-            // snapshot (or recorded follow-up), avoiding duplicate generations.
-            for event in &input_events {
-                active.publish(Ok(event), None).await;
-            }
+        // Existing subscribers and webhooks observe persisted client input
+        // through the same publication path as executor output. The new
+        // response subscribes below and announces its input via its opening
+        // snapshot (or recorded follow-up), avoiding duplicate generations.
+        for event in &input_events {
+            active.publish(Ok(event), None).await;
         }
         self.changes.notify(&task_id);
         // The task input queue is owned by the server and already exists
         // before the writer is let go, so every channel can feed this turn.
         // Subscribed before the writer is let go: nothing published after that
         // can be missed, a cancel that lands straight away included.
-        let receiver = active.subscribe();
+        let receiver = active.subscribe().await;
         drop(writer_guard);
 
         let runtime = self.clone();
@@ -3961,6 +3943,353 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
         assert!(error.message.contains("authorized task listing"));
+    }
+
+    #[tokio::test]
+    async fn a_full_executor_inbox_declines_input_without_persisting_it() {
+        let (handler, release) = make_resumable_handler();
+        let params = ServiceParams::from([(SVC_PARAM_VERSION.into(), vec!["1.1".into()])]);
+        let mut events = handler
+            .send_streaming_message(&params, send_req(None, None))
+            .await
+            .unwrap();
+        let StreamResponse::Task(task) = events.next().await.unwrap().unwrap() else {
+            panic!("expected Task");
+        };
+        for _ in 0..TASK_INPUT_CAPACITY {
+            let request = StreamRequest {
+                tenant: None,
+                payload: StreamRequestPayload::SendMessage(send_req(
+                    Some(&task.id),
+                    Some(&task.context_id),
+                )),
+            };
+            assert!(
+                handler
+                    .receive_message(
+                        &params,
+                        IncomingRequest::Raw(request),
+                        StartMode::Bidi,
+                        Some(&task.id),
+                        None
+                    )
+                    .await
+                    .is_ok()
+            );
+        }
+        let before = handler.load_task(&task.id).await.unwrap();
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::SendMessage(send_req(
+                Some(&task.id),
+                Some(&task.context_id),
+            )),
+        };
+        let refusal = handler
+            .receive_message(
+                &params,
+                IncomingRequest::Raw(request),
+                StartMode::Bidi,
+                Some(&task.id),
+                None,
+            )
+            .await
+            .err()
+            .expect("full inbox must decline input");
+        assert!(matches!(refusal, Rejection::Declined(_)));
+        assert_eq!(handler.load_task(&task.id).await.unwrap(), before);
+        release.notify_one();
+        timeout(Duration::from_secs(2), events.collect::<Vec<_>>())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_but_uncreated_tasks_are_not_visible_to_other_requests() {
+        let handler = make_handler();
+        let (active, _inputs, writer) = handler
+            .execution_manager
+            .reserve("uncreated")
+            .await
+            .unwrap();
+        let mut task = task_with_history("uncreated", "context", 0);
+        task.status.state = TaskState::Submitted;
+        active.set_snapshot(task).await;
+        active
+            .uncreated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(writer);
+        let params = ServiceParams::from([(SVC_PARAM_VERSION.into(), vec!["1.1".into()])]);
+        for payload in [
+            StreamRequestPayload::SendMessage(send_req(Some("uncreated"), Some("context"))),
+            StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "uncreated".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        ] {
+            let request = StreamRequest {
+                tenant: None,
+                payload,
+            };
+            let error = handler
+                .send_live_message(&params, stream::once(async move { request }).boxed())
+                .await
+                .err()
+                .expect("uncreated tasks must stay private");
+            assert_eq!(error.code, error_code::TASK_NOT_FOUND);
+        }
+        assert!(handler.task_store.get("uncreated").await.unwrap().is_none());
+        handler.execution_manager.finish("uncreated", &active).await;
+    }
+
+    #[test]
+    fn subscriptions_and_unknown_payloads_are_rejected_as_live_follow_ups() {
+        let handler = make_handler();
+        for payload in [
+            StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+            StreamRequestPayload::Unrecognised,
+        ] {
+            let input = IncomingRequest::Raw(StreamRequest {
+                tenant: None,
+                payload,
+            });
+            let error = handler
+                .authorize_message(&ServiceParams::new(), input, Some("task"))
+                .err()
+                .expect("not a message")
+                .into_error();
+            assert_eq!(error.code, error_code::INVALID_REQUEST);
+        }
+    }
+
+    struct RacingStore {
+        inner: Arc<InMemoryTaskStore>,
+        other_state: TaskState,
+        panic_on_get: bool,
+    }
+    #[async_trait]
+    impl TaskStore for RacingStore {
+        async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.create(task).await
+        }
+        async fn update(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.update(task).await
+        }
+        async fn get(&self, id: &str) -> Result<Option<Task>, A2AError> {
+            assert!(!self.panic_on_get, "private storage failure");
+            self.inner.get(id).await
+        }
+        async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+            self.inner.list(req).await
+        }
+        async fn begin_cancel(&self, id: &str) -> Result<Task, A2AError> {
+            // Model an external writer winning before this process's CAS.
+            let mut task = self.inner.get(id).await?.unwrap();
+            task.status.state = self.other_state.clone();
+            task.status.timestamp = Some(chrono::Utc::now());
+            task.generation += 1;
+            task.timeline
+                .get_or_insert_with(Vec::new)
+                .push(TimelineEntry {
+                    generation: task.generation,
+                    content: TimelineContent::Status(task.status.clone()),
+                });
+            self.inner.update(task).await?;
+            Err(A2AError::task_not_cancelable(id))
+        }
+    }
+
+    #[tokio::test]
+    async fn external_cancel_races_preserve_the_winning_terminal_state() {
+        for state in [TaskState::Canceled, TaskState::Completed] {
+            let store = Arc::new(InMemoryTaskStore::new());
+            let handler = DefaultRequestHandler::new(
+                EchoExecutor,
+                RacingStore {
+                    inner: store.clone(),
+                    other_state: state.clone(),
+                    panic_on_get: false,
+                },
+            );
+            seed_task(&handler, "race", "context").await;
+            let result = handler
+                .cancel_task(
+                    &ServiceParams::new(),
+                    CancelTaskRequest {
+                        id: "race".into(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await;
+            if state == TaskState::Canceled {
+                assert_eq!(result.unwrap().status.state, state);
+            } else {
+                assert_eq!(result.unwrap_err().code, error_code::TASK_NOT_CANCELABLE);
+            }
+            let saved = store.get("race").await.unwrap().unwrap();
+            assert_eq!(saved.status.state, state);
+            assert_eq!(saved.generation, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_panics_release_reservations_and_hide_internal_details() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let handler = DefaultRequestHandler::new(
+            EchoExecutor,
+            RacingStore {
+                inner: store.clone(),
+                other_state: TaskState::Canceled,
+                panic_on_get: true,
+            },
+        );
+        seed_task(&handler, "panic", "context").await;
+        let error = handler
+            .send_message(
+                &ServiceParams::new(),
+                send_req(Some("panic"), Some("context")),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert_eq!(error.message, "message preparation failed unexpectedly");
+        assert!(handler.execution_manager.get("panic").await.is_none());
+        assert_eq!(
+            store.get("panic").await.unwrap().unwrap().status.state,
+            TaskState::Submitted
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_opening_accepts_subscriptions_but_rejects_unknown_request_kinds() {
+        let handler = make_handler();
+        seed_task(&handler, "task", "context").await;
+        let params = ServiceParams::from([(SVC_PARAM_VERSION.into(), vec!["1.1".into()])]);
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        let before = handler.load_task("task").await.unwrap();
+        let mut events = handler
+            .send_live_message(&params, stream::once(async move { request }).boxed())
+            .await
+            .unwrap();
+        assert!(
+            matches!(events.next().await.unwrap().unwrap(), StreamResponse::Task(task) if task == before)
+        );
+        drop(events);
+        assert_eq!(handler.load_task("task").await.unwrap(), before);
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Unrecognised,
+        };
+        let error = handler
+            .send_live_message(&params, stream::once(async move { request }).boxed())
+            .await
+            .err()
+            .expect("unknown request kind");
+        assert_eq!(error.code, error_code::INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn terminal_active_snapshots_cannot_be_resubscribed() {
+        let handler = make_handler();
+        let task = task_with_history("finished", "context", 0);
+        handler.task_store.create(task.clone()).await.unwrap();
+        let (active, _inputs, writer) = handler.execution_manager.reserve(&task.id).await.unwrap();
+        active.set_snapshot(task.clone()).await;
+        drop(writer);
+        let error = handler
+            .subscribe_to_task(
+                &ServiceParams::new(),
+                SubscribeToTaskRequest {
+                    id: task.id.clone(),
+                    tenant: None,
+                    last_seen_generation: None,
+                },
+            )
+            .await
+            .err()
+            .expect("task is terminal");
+        assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+        handler.execution_manager.finish(&task.id, &active).await;
+    }
+
+    #[tokio::test]
+    async fn artifact_only_inputs_update_storage_without_consuming_executor_inbox_capacity() {
+        let (handler, release) = make_resumable_handler();
+        let handler = handler.with_capabilities(AgentCapabilities {
+            streaming: Some(true),
+            user_artifacts: Some(true),
+            ..Default::default()
+        });
+        let params = ServiceParams::from([(SVC_PARAM_VERSION.into(), vec!["1.1".into()])]);
+        let mut events = handler
+            .send_streaming_message(&params, send_req(None, None))
+            .await
+            .unwrap();
+        let StreamResponse::Task(task) = events.next().await.unwrap().unwrap() else {
+            panic!("expected Task");
+        };
+        let active = handler.execution_manager.get(&task.id).await.unwrap();
+        let capacity = active.inputs.sender.capacity();
+        let mut request = send_req(None, None);
+        request.message = Message::new(Role::Unspecified, Vec::new());
+        request.message.message_id.clear();
+        request.artifact_updates = vec![TaskArtifactUpdateEvent {
+            task_id: task.id.clone(),
+            context_id: task.context_id.clone(),
+            artifact: serde_json::from_value(
+                serde_json::json!({"artifactId":"client","parts":[{"text":"input artifact"}]}),
+            )
+            .unwrap(),
+            append: Some(false),
+            last_chunk: Some(true),
+            metadata: None,
+            generation: 0,
+        }];
+        let before = handler.load_task(&task.id).await.unwrap();
+        assert!(
+            handler
+                .receive_message(
+                    &params,
+                    IncomingRequest::Raw(StreamRequest {
+                        tenant: None,
+                        payload: StreamRequestPayload::SendMessage(request)
+                    }),
+                    StartMode::Bidi,
+                    Some(&task.id),
+                    None
+                )
+                .await
+                .is_ok()
+        );
+        assert_eq!(active.inputs.sender.capacity(), capacity);
+        let stored = handler.load_task(&task.id).await.unwrap();
+        assert_eq!(stored.history, before.history);
+        assert!(
+            stored
+                .artifacts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|artifact| artifact.artifact_id == "client"
+                    && artifact.role == Some(Role::User))
+        );
+        release.notify_one();
+        timeout(Duration::from_secs(2), events.collect::<Vec<_>>())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

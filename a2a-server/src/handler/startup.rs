@@ -108,3 +108,18 @@ pub(super) fn with_opening_task(
         .flatten(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_http_acknowledgement_cannot_be_misclassified_as_a_response_stream() {
+        let task = crate::handler::test_support::task_with_history("task", "context", 0);
+        let error = StartedResponse::Ack(Box::new(task))
+            .into_stream()
+            .err()
+            .expect("an ACK is not a downlink");
+        assert_eq!(error.code, a2a::error_code::INTERNAL_ERROR);
+    }
+}

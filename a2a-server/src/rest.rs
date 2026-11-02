@@ -195,8 +195,8 @@ async fn validate_protocol_version(mut request: Request, next: Next) -> Response
                 Err(_) => return rest_error_response(A2AError::version_not_supported(&version)),
             };
             // Dispatch receives the same negotiated version as the binding.
-            request.headers_mut().insert(SVC_PARAM_VERSION, value);
-            params.insert(SVC_PARAM_VERSION.to_owned(), vec![version]);
+            request.headers_mut().insert("a2a-version", value);
+            params.insert("a2a-version".to_owned(), vec![version]);
         }
     }
     match check_a2a_version(&params) {
@@ -1885,7 +1885,6 @@ mod tests {
         });
         let req = versioned_request()
             .uri(REST_SEND_MESSAGE_PATH)
-            .header("a2a-version", "1.1")
             .method("POST")
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_string(&body).unwrap()))
@@ -1900,7 +1899,6 @@ mod tests {
         let get = |query: &str| {
             versioned_request()
                 .uri(format!("/tasks/{task_id}{query}"))
-                .header("a2a-version", "1.1")
                 .method("GET")
                 .body(Body::empty())
                 .unwrap()
@@ -2436,5 +2434,97 @@ mod tests {
                 StatusCode::NOT_FOUND
             );
         }
+    }
+
+    #[tokio::test]
+    async fn live_bindings_distinguish_malformed_requests_from_missing_tasks() {
+        for rpc in [false, true] {
+            for malformed in [false, true] {
+                let handler = Arc::new(
+                    DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+                        .with_capabilities(AgentCapabilities {
+                            streaming: Some(true),
+                            ..Default::default()
+                        }),
+                );
+                let app = if rpc {
+                    crate::jsonrpc::jsonrpc_router(handler)
+                } else {
+                    rest_router(handler)
+                };
+                let payload = if malformed {
+                    serde_json::json!("not-a-stream-request")
+                } else {
+                    serde_json::json!({"subscribe":{"id":"absent"}})
+                };
+                let body = if rpc {
+                    serde_json::json!({"jsonrpc":"2.0","id":7,"method":methods::SEND_LIVE_MESSAGE,"params":payload})
+                } else {
+                    payload
+                };
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(if rpc { "/" } else { REST_LIVE_MESSAGE_PATH })
+                    .header("content-type", "application/json")
+                    .header("A2A-Version", "1.1")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                let response = app.oneshot(request).await.unwrap();
+                if rpc {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(
+                        value["error"]["code"],
+                        if malformed {
+                            error_code::INVALID_PARAMS
+                        } else {
+                            error_code::TASK_NOT_FOUND
+                        }
+                    );
+                } else {
+                    assert_eq!(
+                        response.status(),
+                        if malformed {
+                            StatusCode::BAD_REQUEST
+                        } else {
+                            StatusCode::NOT_FOUND
+                        }
+                    );
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn query_version_is_forwarded_to_the_handler() {
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = seen.clone();
+        let handler = DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+            .with_authorizer(move |params: &ServiceParams, _: Option<&str>| {
+                observed.store(
+                    params
+                        .get("a2a-version")
+                        .and_then(|values| values.first())
+                        .map(String::as_str)
+                        == Some("1.1"),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                Ok(())
+            });
+        let request = Request::builder()
+            .uri(format!("{REST_SEND_MESSAGE_PATH}?A2A-Version=1.1"))
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({
+                "message": {"messageId":"query-version", "role":"ROLE_USER", "parts":[{"text":"hello"}]}
+            }).to_string())).unwrap();
+        let response = rest_router(Arc::new(handler))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

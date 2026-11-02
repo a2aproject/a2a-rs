@@ -454,10 +454,6 @@ fn versioned_params() -> ServiceParams {
     params
 }
 
-fn jsonrpc_service_params() -> ServiceParams {
-    versioned_params()
-}
-
 fn send_message_request() -> SendMessageRequest {
     SendMessageRequest {
         artifact_updates: Vec::new(),
