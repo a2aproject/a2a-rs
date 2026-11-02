@@ -11,7 +11,7 @@ use super::turns::{
     release_execution_locked, save_pending_push_config,
 };
 use super::updates::{
-    apply_and_publish, apply_and_publish_with, backfill_status_timestamp, validate_event_identity,
+    apply_and_publish, backfill_status_timestamp, persist_event, validate_event_identity,
 };
 use a2a::*;
 use futures::StreamExt;
@@ -157,15 +157,15 @@ async fn apply_executor_event_locked(
     backfill_status_timestamp(event);
     let base = active.snapshot().await;
     let creating = active.uncreated.load(std::sync::atomic::Ordering::SeqCst);
-    let applied =
-        apply_and_publish_with(runtime.task_store.as_ref(), active, base, event, creating).await;
+    let applied = persist_event(runtime.task_store.as_ref(), base, event, creating).await;
     active
         .uncreated
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    applied?;
+    let (snapshot, repeated) = applied?;
     if creating {
         save_pending_push_config(active, runtime).await;
     }
+    active.publish_marked(Ok(event), snapshot, repeated).await;
     runtime.changes.notify(task_id);
     Ok(())
 }
@@ -321,6 +321,101 @@ pub(super) async fn drive_execution_guarded(
 mod tests {
     use super::*;
     use crate::handler::test_support::*;
+
+    struct GatedPushStore {
+        inner: InMemoryPushConfigStore,
+        saving: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl PushConfigStore for GatedPushStore {
+        async fn save(
+            &self,
+            config: TaskPushNotificationConfig,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.saving.notify_one();
+            self.release.notified().await;
+            self.inner.save(config).await
+        }
+        async fn get(&self, task: &str, id: &str) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.inner.get(task, id).await
+        }
+        async fn list(&self, task: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
+            self.inner.list(task).await
+        }
+        async fn delete(&self, task: &str, id: &str) -> Result<(), A2AError> {
+            self.inner.delete(task, id).await
+        }
+        async fn delete_all(&self, task: &str) -> Result<(), A2AError> {
+            self.inner.delete_all(task).await
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_creation_saves_push_configuration_before_publishing_its_first_event() {
+        install_crypto_provider();
+        let (url, mut pushes, shutdown, server) = start_push_webhook().await;
+        let saving = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let handler = DefaultRequestHandler::new(PushEventExecutor, InMemoryTaskStore::new())
+            .with_capabilities(AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            })
+            .with_push_notifications(
+                GatedPushStore {
+                    inner: InMemoryPushConfigStore::new(),
+                    saving: saving.clone(),
+                    release: release.clone(),
+                },
+                crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                    validate_urls: false,
+                    ..Default::default()
+                })),
+            );
+        let mut request = send_req(None, None);
+        let mut config = push_config("");
+        config.url = url;
+        request.configuration = Some(SendMessageConfiguration {
+            task_push_notification_config: Some(config),
+            accepted_output_modes: None,
+            history_length: None,
+            timeline_length: None,
+            return_immediately: None,
+            if_generation_match: None,
+        });
+        let mut stream = handler
+            .send_streaming_message(&ServiceParams::new(), request)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), saving.notified())
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), stream.next())
+                .await
+                .is_err(),
+            "the first output became visible before its webhook configuration was saved"
+        );
+        release.notify_one();
+        assert!(matches!(
+            timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap(),
+            Some(Ok(_))
+        ));
+        assert!(matches!(
+            next_push(&mut pushes).await.event,
+            StreamResponse::StatusUpdate(_)
+        ));
+        assert!(matches!(
+            next_push(&mut pushes).await.event,
+            StreamResponse::Task(_)
+        ));
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
 
     async fn registered(
         runtime: &ExecutionRuntime,
