@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Follow task output with a shared runner and an explicit completion policy.
 
-use super::delivery::{Delivery, StartMode};
+use super::delivery::StartMode;
 use super::exchange::Exchange;
 use super::output::{DeliveryEvent, DeliverySink, EventSource};
 use super::protocol::{
@@ -49,8 +49,6 @@ pub(super) enum RunCompletion {
     Unary(Box<SendMessageRequest>),
     /// Follow later turns while the uplink remains open.
     Exchange,
-    /// Drain ordered webhook input across turns, retiring after its idle timeout.
-    Notifications,
 }
 
 pub(super) type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
@@ -62,8 +60,7 @@ impl Run {
         task_id: TaskId,
         completion: RunCompletion,
     ) -> Self {
-        let wants_message_updates = matches!(completion, RunCompletion::Notifications)
-            || is_at_least_1_1(&requested_protocol_version(&params));
+        let wants_message_updates = is_at_least_1_1(&requested_protocol_version(&params));
         Self {
             handler,
             params,
@@ -97,10 +94,6 @@ impl Run {
             DeliverySink::Stream(out),
         );
         ReceiverStream::new(downlink).boxed()
-    }
-
-    pub(super) fn start_notifications(self, source: EventSource, sink: DeliverySink) {
-        self.spawn(None, Some(source), 0, None, sink);
     }
 
     fn spawn(
@@ -147,9 +140,6 @@ impl Run {
     }
 
     fn completes(&self, event: &StreamResponse) -> bool {
-        if matches!(self.completion, RunCompletion::Notifications) {
-            return false;
-        }
         is_terminal_event(event)
             || matches!(event, StreamResponse::Message(_))
             || match &self.completion {
@@ -163,7 +153,7 @@ impl Run {
     fn subscription_policy(&self) -> SubscriptionPolicy {
         let mode = match self.completion {
             RunCompletion::Unary(_) => StartMode::Blocking,
-            RunCompletion::Task | RunCompletion::Notifications => StartMode::Streaming,
+            RunCompletion::Task => StartMode::Streaming,
             RunCompletion::Exchange => StartMode::Bidi,
         };
         SubscriptionPolicy::new(mode, self.wants_message_updates).for_response(self.response_id)
@@ -244,9 +234,6 @@ impl Run {
                             // The execution is over. The task may not be: the
                             // exchange stays open for the next message.
                             inner = None;
-                            // The webhook source already spans turns and drains
-                            // before retirement; it must never replay snapshots.
-                            if matches!(self.completion, RunCompletion::Notifications) { break; }
                             if matches!(self.completion, RunCompletion::Exchange) && !uplink_open {
                                 break;
                             }
@@ -426,21 +413,18 @@ impl Run {
                 self.response_id,
             )
             .await?;
-        let starts_turn = matches!(delivery, Delivery::Started { .. });
-        // An attached stream already receives injected inputs from its current
-        // subscription. Replacing it could lose events that are still queued.
-        if !starts_turn && inner.is_some() {
+        // The source belongs to the Task, so this subscription also receives
+        // a newly started turn's input and output. Keep its buffered events:
+        // replacing it or replaying recorded inputs would duplicate updates.
+        if inner.is_some() {
             return Ok(true);
-        }
-        if starts_turn && !self.flush(inner, last_generation, out).await {
-            return Ok(false);
         }
         let subscription = self
             .subscription_policy()
             .delivery(delivery, DeliveryAttachment::FollowUp);
         *inner = Some(EventSource::Subscription(subscription.events));
-        // A new turn recorded input before it had subscribers. Announce it
-        // once here; injected inputs arrive through their subscription instead.
+        // This response was detached when input was published. Announce the
+        // recorded input once; the newly attached receiver starts after it.
         for event in subscription.recorded {
             if matches!(event, StreamResponse::MessageUpdate(_)) && !self.wants_message_updates {
                 continue;

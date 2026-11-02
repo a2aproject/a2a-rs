@@ -305,16 +305,28 @@ pub(super) async fn apply_and_publish_with(
     event: &mut StreamResponse,
     creating: bool,
 ) -> Result<bool, A2AError> {
+    let (updated_task, repeated) = persist_event(task_store, base, event, creating).await?;
+    active
+        .publish_marked(Ok(&*event), updated_task, repeated)
+        .await;
+    Ok(!repeated)
+}
+
+/// Persist first, leaving callers a chance to finalize newly created task
+/// configuration before the update becomes observable by any subscriber.
+pub(super) async fn persist_event(
+    task_store: &dyn crate::TaskStore,
+    base: Option<Task>,
+    event: &mut StreamResponse,
+    creating: bool,
+) -> Result<(Option<Task>, bool), A2AError> {
     let generation_before = base.as_ref().map(|task| task.generation);
     let updated_task = apply_event_to_new_or_stored_task(task_store, base, event, creating).await?;
     let repeated = matches!(
         &*event,
         StreamResponse::Task(task) if Some(task.generation) == generation_before
     );
-    active
-        .publish_marked(Ok(&*event), updated_task, repeated)
-        .await;
-    Ok(!repeated)
+    Ok((updated_task, repeated))
 }
 
 /// Where a cancellation stands while its executor's events are applied.

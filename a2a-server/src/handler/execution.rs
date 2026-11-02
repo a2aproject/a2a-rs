@@ -160,17 +160,9 @@ async fn apply_executor_event_locked(
     active
         .uncreated
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    let published = applied?;
+    applied?;
     if creating {
         save_pending_push_config(active, runtime).await;
-    }
-    if published {
-        runtime.execution_manager.pushes.push(
-            runtime,
-            task_id,
-            Some(active.push_failure.clone()),
-            event,
-        );
     }
     runtime.changes.notify(task_id);
     Ok(())
@@ -254,7 +246,10 @@ pub(super) async fn drive_execution_guarded(
     let task_store = Arc::clone(&runtime.task_store);
     let manager = Arc::clone(&runtime.execution_manager);
     let changes = Arc::clone(&runtime.changes);
-    let notification_handler = runtime.clone();
+    runtime
+        .execution_manager
+        .pushes
+        .attach(&runtime, &task_id, &active.events);
     let outcome = std::panic::AssertUnwindSafe(drive_execution(
         runtime,
         task_id.clone(),
@@ -268,7 +263,6 @@ pub(super) async fn drive_execution_guarded(
     }
 
     tracing::error!(task_id = %task_id, "the agent executor panicked; failing the task");
-    let mut failed_event = None;
     {
         let _writer = active.writer.lock().await;
         // A task the executor never created, or answered with a message alone,
@@ -308,7 +302,7 @@ pub(super) async fn drive_execution_guarded(
                 });
                 match apply_and_publish(task_store.as_ref(), &active, Some(base), &mut event).await
                 {
-                    Ok(_) => failed_event = Some(event),
+                    Ok(_) => {}
                     Err(error) => {
                         release_execution_locked(&manager, &active, &task_id).await;
                         active.publish(Err(&error), None).await;
@@ -318,11 +312,6 @@ pub(super) async fn drive_execution_guarded(
         }
     }
     reject_unread_inputs(&active, &task_id).await;
-    if let Some(event) = failed_event {
-        manager
-            .pushes
-            .push(&notification_handler, &task_id, None, &event);
-    }
     release_execution(&manager, &active, &task_id).await;
     changes.notify(&task_id);
 }

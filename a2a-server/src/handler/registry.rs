@@ -4,7 +4,8 @@
 //! Manage active executions, task writer locks, and reservation cleanup.
 
 use super::events::{ActiveExecution, ExecutionReceiver};
-use super::push_delivery::PushQueues;
+use super::push_delivery::PushSubscriptions;
+use super::task_events::TaskEvents;
 use a2a::*;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
@@ -15,9 +16,10 @@ pub(super) struct ExecutionManager {
     /// One writer lock per task, shared by whoever is mutating it. Held weakly
     /// so a task nobody is touching costs nothing.
     writers: std::sync::Mutex<TaskWriters>,
+    sources: std::sync::Mutex<HashMap<TaskId, std::sync::Weak<TaskEvents>>>,
     /// The webhook deliveries of each task, in the order its events were
     /// published.
-    pub(super) pushes: PushQueues,
+    pub(super) pushes: PushSubscriptions,
 }
 
 #[derive(Default)]
@@ -59,6 +61,21 @@ impl ExecutionManager {
         lock
     }
 
+    /// Sources survive turns while any response or webhook subscriber owns them.
+    pub(super) fn events_for(&self, task_id: &str) -> Arc<TaskEvents> {
+        let mut sources = self
+            .sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sources.retain(|_, source| source.strong_count() > 0);
+        if let Some(source) = sources.get(task_id).and_then(std::sync::Weak::upgrade) {
+            return source;
+        }
+        let source = TaskEvents::new(self.writer_for(task_id), None);
+        sources.insert(task_id.to_owned(), Arc::downgrade(&source));
+        source
+    }
+
     /// Claims the task for one execution before anything reads it, so two
     /// requests for the same task cannot both prepare from the same stored
     /// state. The snapshot is filled in once the request has been applied.
@@ -96,7 +113,6 @@ impl ExecutionManager {
         ),
         A2AError,
     > {
-        let writer = self.writer_for(task_id);
         let mut executions = self.executions.write().await;
         if let Some(existing) = executions.get(task_id) {
             // A live reservation holds the writer until its snapshot is set,
@@ -111,7 +127,7 @@ impl ExecutionManager {
             }
         }
 
-        let (active, inputs) = ActiveExecution::with_writer(None, writer);
+        let (active, inputs) = ActiveExecution::with_events(self.events_for(task_id));
         executions.insert(task_id.to_string(), active.clone());
         Ok((active, inputs, guard))
     }
