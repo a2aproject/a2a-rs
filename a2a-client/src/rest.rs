@@ -51,10 +51,36 @@ struct RestErrorEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct RestErrorStatus {
+    // A symbolic StreamError code belongs to a live payload, not this envelope.
+    #[serde(rename = "code", default, deserialize_with = "deserialize_status_code")]
+    _code: Option<i32>,
     message: String,
 
     #[serde(default)]
     details: Vec<TypedDetail>,
+}
+
+fn deserialize_status_code<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i32>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    // ProtoJSON accepts integer codes as numbers or numeric strings.
+    let number = match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
+    };
+    number
+        .filter(|number| {
+            number.is_finite()
+                && number.fract() == 0.0
+                && (i32::MIN as f64..=i32::MAX as f64).contains(number)
+        })
+        .map(|number| Some(number as i32))
+        .ok_or_else(|| serde::de::Error::custom("expected numeric google.rpc.Status.code"))
 }
 
 /// REST (HTTP+JSON) transport implementation.
@@ -1305,6 +1331,103 @@ mod tests {
                 matches!(renewed.sender.send_message(message).await.unwrap(), LiveAck::Task(task) if task.id == "task")
             );
             server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_http_errors_and_malformed_task_receipts_are_not_streams() {
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        for status in [200, 503] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = read_http_request(&mut socket).await;
+                let body = "\"not-a-task\"";
+                socket.write_all(format!("HTTP/1.1 {status} Response\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let error = RestTransport::new(Client::new(), url)
+                .send_live_message(&ServiceParams::new(), &request)
+                .await
+                .err()
+                .expect("invalid receipt must fail");
+            assert_eq!(error.code, error_code::INTERNAL_ERROR);
+            if status == 200 {
+                assert!(error.message.contains("deserialize"));
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn timeline_and_int64_generation_queries_reach_the_http_binding() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for list in [false, true] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let raw = read_http_request(&mut socket).await;
+                assert!(raw.contains(if list {
+                    "timelineLength=3"
+                } else {
+                    "timelineLength=2"
+                }));
+                if !list {
+                    assert!(raw.contains("currentGeneration=9223372036854775807"));
+                }
+                let body = if list { json!({"tasks":[],"nextPageToken":"","pageSize":0,"totalSize":0}) }
+                    else { json!({"id":"task","contextId":"context","generation":"9223372036854775807","status":{"state":"TASK_STATE_WORKING"}}) }.to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let transport = RestTransport::new(Client::new(), url);
+        let get: GetTaskRequest = serde_json::from_value(
+            json!({"id":"task","timelineLength":2,"currentGeneration":i64::MAX.to_string()}),
+        )
+        .unwrap();
+        assert_eq!(
+            transport
+                .get_task(&ServiceParams::new(), &get)
+                .await
+                .unwrap()
+                .generation,
+            i64::MAX
+        );
+        let list: ListTasksRequest = serde_json::from_value(json!({"timelineLength":3})).unwrap();
+        assert!(
+            transport
+                .list_tasks(&ServiceParams::new(), &list)
+                .await
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
+        server.await.unwrap();
+    }
+    #[test]
+    fn rpc_status_codes_are_numeric_and_live_error_codes_are_symbolic() {
+        for code in [
+            serde_json::json!(404),
+            serde_json::json!("4.04e2"),
+            serde_json::Value::Null,
+        ] {
+            let body = serde_json::json!({"error":{"code":code,"message":"missing"}});
+            assert_eq!(rest_error(&body.to_string()).unwrap().message, "missing");
+        }
+        for code in [
+            serde_json::json!("INVALID_ARGUMENT"),
+            serde_json::json!(404.5),
+            serde_json::json!(true),
+        ] {
+            let body = serde_json::json!({"error":{"code":code,"message":"bad input"}});
+            assert!(rest_error(&body.to_string()).is_none());
         }
     }
 }

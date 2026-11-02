@@ -906,4 +906,19 @@ mod tests {
             .expect("legacy transport must refuse live input");
         assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
     }
+
+    #[tokio::test]
+    async fn unknown_live_openings_still_report_legacy_transport_errors() {
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Unrecognised,
+        };
+        let error = make_client()
+            .with_tenant("tenant-a")
+            .send_live_message(&request)
+            .await
+            .err()
+            .expect("legacy transport must reject live input");
+        assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+    }
 }

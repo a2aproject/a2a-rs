@@ -6159,4 +6159,17 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn client_message_updates_advance_the_resumption_generation() {
+        let event = StreamResponse::MessageUpdate(a2a::TaskMessageUpdateEvent {
+            task_id: "task".into(),
+            context_id: "context".into(),
+            message: Message::new(Role::User, vec![Part::text("follow-up")]),
+            generation: i64::MAX,
+            metadata: None,
+        });
+        assert_eq!(stream_response_generation(&event), i64::MAX);
+        assert_eq!(stream_response_state(&event), None);
+    }
 }
