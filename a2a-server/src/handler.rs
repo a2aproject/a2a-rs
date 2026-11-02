@@ -185,6 +185,19 @@ impl ExecutionManager {
     }
 }
 
+/// Ends the subscriptions still waiting for a task when dropped, so a cancel
+/// that fails part-way leaves none of them behind.
+struct ReleaseOnDrop<'a> {
+    manager: &'a ExecutionManager,
+    task: Task,
+}
+
+impl Drop for ReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.manager.release(&self.task);
+    }
+}
+
 /// A subscription that `ExecutionManager::start` attaches to the task's next
 /// execution. Dropped first, it leaves nothing behind in the registry.
 struct Waiter {
@@ -1080,6 +1093,13 @@ impl RequestHandler for DefaultRequestHandler {
             Err(error) => return Err(error),
         };
 
+        // The task is canceled in the store from here on, however the rest of
+        // this ends, so no subscription may stay waiting for its next turn.
+        let _release = ReleaseOnDrop {
+            manager: &self.execution_manager,
+            task: task.clone(),
+        };
+
         let active_execution = self.execution_manager.get(&req.id).await;
 
         let exec_ctx = crate::ExecutorContext {
@@ -1124,9 +1144,6 @@ impl RequestHandler for DefaultRequestHandler {
                 Err(error) => {
                     if let Some(active) = &active_execution {
                         active.publish(Err(&error), None).await;
-                    }
-                    if let Some(task) = &current_task {
-                        self.execution_manager.release(task);
                     }
                     return Err(error);
                 }
@@ -1673,10 +1690,19 @@ mod tests {
         }
     }
 
+    /// How the cancel of an `InputRequiredExecutor` ends.
+    enum Cancel {
+        Cancels,
+        Fails,
+        /// Appends to an artifact the task does not have, which the handler
+        /// cannot apply to the task.
+        SendsAnInapplicableEvent,
+    }
+
     /// Asks for input on the task's first turn and completes on the next;
-    /// its cancel reports the task canceled, or fails when asked to.
+    /// its cancel reports the task canceled, or ends as asked to.
     struct InputRequiredExecutor {
-        cancel_fails: bool,
+        cancel: Cancel,
     }
 
     impl crate::AgentExecutor for InputRequiredExecutor {
@@ -1705,10 +1731,26 @@ mod tests {
             &self,
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-            let event = if self.cancel_fails {
-                Err(A2AError::internal("cancel failed"))
-            } else {
-                Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            let event = match self.cancel {
+                Cancel::Fails => Err(A2AError::internal("cancel failed")),
+                Cancel::SendsAnInapplicableEvent => {
+                    Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                        task_id: ctx.task_id,
+                        context_id: ctx.context_id,
+                        artifact: Artifact {
+                            artifact_id: "missing".into(),
+                            name: None,
+                            description: None,
+                            parts: vec![Part::text("tail")],
+                            metadata: None,
+                            extensions: None,
+                        },
+                        append: Some(true),
+                        last_chunk: None,
+                        metadata: None,
+                    }))
+                }
+                Cancel::Cancels => Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
                     task_id: ctx.task_id,
                     context_id: ctx.context_id,
                     status: TaskStatus {
@@ -1717,7 +1759,7 @@ mod tests {
                         timestamp: None,
                     },
                     metadata: None,
-                }))
+                })),
             };
             Box::pin(stream::once(async move { event }))
         }
@@ -1782,7 +1824,7 @@ mod tests {
     fn make_input_required_handler() -> DefaultRequestHandler {
         DefaultRequestHandler::new(
             InputRequiredExecutor {
-                cancel_fails: false,
+                cancel: Cancel::Cancels,
             },
             InMemoryTaskStore::new(),
         )
@@ -3197,47 +3239,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_failing_in_the_executor_still_ends_a_waiting_subscription() {
-        let handler = DefaultRequestHandler::new(
-            InputRequiredExecutor { cancel_fails: true },
-            InMemoryTaskStore::new(),
-        );
-        let params = ServiceParams::new();
-        let task = task_awaiting_input(&handler).await;
-        let subscription = handler
-            .subscribe_to_task(
-                &params,
-                SubscribeToTaskRequest {
-                    id: task.id.clone(),
-                    tenant: None,
-                },
-            )
-            .await
-            .unwrap();
+    async fn test_cancel_failing_part_way_still_ends_a_waiting_subscription() {
+        for (cancel, code) in [
+            (Cancel::Fails, error_code::INTERNAL_ERROR),
+            (
+                Cancel::SendsAnInapplicableEvent,
+                error_code::INVALID_AGENT_RESPONSE,
+            ),
+        ] {
+            let handler = DefaultRequestHandler::new(
+                InputRequiredExecutor { cancel },
+                InMemoryTaskStore::new(),
+            );
+            let params = ServiceParams::new();
+            let task = task_awaiting_input(&handler).await;
+            let subscription = handler
+                .subscribe_to_task(
+                    &params,
+                    SubscribeToTaskRequest {
+                        id: task.id.clone(),
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
 
-        let error = handler
-            .cancel_task(
-                &params,
-                CancelTaskRequest {
-                    id: task.id.clone(),
-                    metadata: None,
-                    tenant: None,
-                },
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.message, "cancel failed");
+            let error = handler
+                .cancel_task(
+                    &params,
+                    CancelTaskRequest {
+                        id: task.id.clone(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, code);
 
-        // The store holds the task canceled before the executor ran.
-        let events: Vec<_> = timeout(Duration::from_secs(5), subscription.collect())
-            .await
-            .expect("the subscription outlived the canceled task");
-        assert!(matches!(
-            events.as_slice(),
-            [Ok(StreamResponse::Task(stored)), Ok(StreamResponse::Task(last))]
-                if stored.status.state == TaskState::InputRequired
-                    && last.status.state == TaskState::Canceled
-        ));
+            // The store holds the task canceled before the executor ran.
+            let events: Vec<_> = timeout(Duration::from_secs(5), subscription.collect())
+                .await
+                .expect("the subscription outlived the canceled task");
+            assert!(matches!(
+                events.as_slice(),
+                [Ok(StreamResponse::Task(stored)), Ok(StreamResponse::Task(last))]
+                    if stored.status.state == TaskState::InputRequired
+                        && last.status.state == TaskState::Canceled
+            ));
+            assert!(handler.execution_manager.waiting().is_empty());
+        }
     }
 
     #[tokio::test]
