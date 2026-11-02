@@ -427,6 +427,9 @@ pub(crate) fn parse_sse_stream_rest(
         if data.is_empty() {
             return None;
         }
+        if let Some(error) = crate::rest::rest_error(&data) {
+            return Some(Err(error));
+        }
 
         match protojson_conv::from_str::<StreamResponse>(&data) {
             Ok(sr) => Some(Ok(sr)),
@@ -842,6 +845,25 @@ mod tests {
         let mut parsed = parse_sse_stream_rest(stream);
         let item = parsed.next().await.unwrap().unwrap();
         assert!(matches!(item, StreamResponse::StatusUpdate(_)));
+    }
+
+    #[tokio::test]
+    async fn test_parse_sse_stream_rest_error_event_keeps_its_code() {
+        let error = serde_json::json!({"error": {
+            "code": 404,
+            "status": "NOT_FOUND",
+            "message": "task not found: t1",
+            "details": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "TASK_NOT_FOUND",
+                "domain": "a2a-protocol.org"
+            }]
+        }});
+        let stream = byte_stream(vec![format!("data: {error}\n\n")]);
+        let mut parsed = parse_sse_stream_rest(stream);
+        let err = parsed.next().await.unwrap().unwrap_err();
+        assert_eq!(err.code, error_code::TASK_NOT_FOUND);
+        assert_eq!(err.message, "task not found: t1");
     }
 
     #[tokio::test]
