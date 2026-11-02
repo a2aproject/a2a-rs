@@ -353,6 +353,15 @@ mod tests {
             events.next().await.unwrap().unwrap_err().code,
             error_code::UNSUPPORTED_OPERATION
         );
+        let mut resumed = adapter.execute(ExecutorContext::new(
+            "task",
+            "context",
+            ClientInputs::closed(),
+        ));
+        assert_eq!(
+            resumed.next().await.unwrap().unwrap_err().code,
+            error_code::UNSUPPORTED_OPERATION
+        );
         let mut events = adapter.cancel(ExecutorContext::new(
             "task",
             "context",

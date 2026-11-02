@@ -409,10 +409,28 @@ mod tests {
             next_push(&mut pushes).await.event,
             StreamResponse::StatusUpdate(_)
         ));
-        assert!(matches!(
-            next_push(&mut pushes).await.event,
-            StreamResponse::Task(_)
-        ));
+        let StreamResponse::Task(task) = next_push(&mut pushes).await.event else {
+            panic!("expected the final task notification");
+        };
+        // Deferred creation must leave an ordinary, manageable push configuration.
+        let configs = handler.push_config_store.as_ref().unwrap();
+        let saved = configs.list(&task.id).await.unwrap();
+        assert_eq!(saved.len(), 1);
+        let id = saved[0].id.as_deref().unwrap();
+        assert_eq!(configs.get(&task.id, id).await.unwrap(), saved[0]);
+        handler
+            .delete_push_config(
+                &ServiceParams::new(),
+                DeleteTaskPushNotificationConfigRequest {
+                    task_id: task.id.clone(),
+                    id: id.into(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(configs.get(&task.id, id).await.is_err());
+        assert!(configs.list(&task.id).await.unwrap().is_empty());
         let _ = shutdown.send(());
         server.await.unwrap();
     }
