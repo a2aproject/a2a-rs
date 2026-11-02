@@ -661,6 +661,9 @@ mod tests {
             .get_task(
                 &ServiceParams::new(),
                 &GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
+
                     id: "../admin?x=1".into(),
                     history_length: None,
                     tenant: None,

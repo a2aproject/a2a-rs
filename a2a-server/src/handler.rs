@@ -1926,6 +1926,8 @@ mod tests {
                 _ => TaskState::InputRequired,
             };
             let update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
+
                 task_id: ctx.task_id,
                 context_id: ctx.context_id,
                 status: TaskStatus {
@@ -1946,9 +1948,15 @@ mod tests {
                 Cancel::Fails => Err(A2AError::internal("cancel failed")),
                 Cancel::SendsAnInapplicableEvent => {
                     Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                        generation: 0,
+
                         task_id: ctx.task_id,
                         context_id: ctx.context_id,
                         artifact: Artifact {
+                            end_generation: None,
+                            role: None,
+                            start_generation: None,
+
                             artifact_id: "missing".into(),
                             name: None,
                             description: None,
@@ -1962,6 +1970,8 @@ mod tests {
                     }))
                 }
                 Cancel::Cancels => Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    generation: 0,
+
                     task_id: ctx.task_id,
                     context_id: ctx.context_id,
                     status: TaskStatus {
@@ -2050,6 +2060,8 @@ mod tests {
             .send_message(
                 &ServiceParams::new(),
                 SendMessageRequest {
+                    artifact_updates: Vec::new(),
+
                     message: make_message(),
                     configuration: None,
                     metadata: None,
@@ -3502,6 +3514,9 @@ mod tests {
         let store = InMemoryTaskStore::new();
         store
             .create(Task {
+                generation: 0,
+                timeline: None,
+
                 id: "t-artifact".into(),
                 context_id: "ctx".into(),
                 status: TaskStatus {
@@ -3510,6 +3525,10 @@ mod tests {
                     timestamp: Some(chrono::Utc::now()),
                 },
                 artifacts: Some(vec![Artifact {
+                    end_generation: None,
+                    role: None,
+                    start_generation: None,
+
                     artifact_id: "a1".into(),
                     name: None,
                     description: None,
@@ -3531,6 +3550,8 @@ mod tests {
                 .list_tasks(
                     &params,
                     ListTasksRequest {
+                        timeline_length: None,
+
                         context_id: None,
                         status: None,
                         page_size: None,
@@ -4034,6 +4055,9 @@ mod tests {
             .get_task(
                 &params,
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
+
                     id: task.id.clone(),
                     history_length: None,
                     tenant: None,
@@ -4047,6 +4071,8 @@ mod tests {
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
+                    last_seen_generation: None,
+
                     id: task.id.clone(),
                     tenant: None,
                 },
@@ -4068,6 +4094,8 @@ mod tests {
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
+                    last_seen_generation: None,
+
                     id: task.id.clone(),
                     tenant: None,
                 },
@@ -4120,6 +4148,8 @@ mod tests {
                 .subscribe_to_task(
                     &params,
                     SubscribeToTaskRequest {
+                        last_seen_generation: None,
+
                         id: task.id.clone(),
                         tenant: None,
                     },
@@ -4160,6 +4190,8 @@ mod tests {
         let params = ServiceParams::new();
         let task = task_awaiting_input(&handler).await;
         let subscribe = || SubscribeToTaskRequest {
+            last_seen_generation: None,
+
             id: task.id.clone(),
             tenant: None,
         };
@@ -4180,6 +4212,8 @@ mod tests {
             .send_message(
                 &params,
                 SendMessageRequest {
+                    artifact_updates: Vec::new(),
+
                     message: follow_up,
                     configuration: None,
                     metadata: None,
@@ -4223,6 +4257,8 @@ mod tests {
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
+                    last_seen_generation: None,
+
                     id: task.id.clone(),
                     tenant: None,
                 },
