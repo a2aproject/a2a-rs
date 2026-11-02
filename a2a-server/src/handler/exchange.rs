@@ -326,4 +326,41 @@ mod tests {
         );
         assert!(output.next().await.is_none());
     }
+
+    #[tokio::test]
+    async fn a_second_subscription_cannot_reuse_an_open_http_exchange_identifier() {
+        let handler = make_handler();
+        seed_task(&handler, "task", "context").await;
+        let params =
+            ServiceParams::from([(a2a::SDK_LIVE_EXCHANGE_HEADER.into(), vec!["shared".into()])]);
+        let subscribe = || {
+            ResponseInput::Request(Box::new(StreamRequest {
+                tenant: None,
+                payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                    id: "task".into(),
+                    tenant: None,
+                    last_seen_generation: None,
+                }),
+            }))
+        };
+        let OpenExchange::Attached(mut first) = ExchangeAdapter::new(&handler, &params)
+            .open(subscribe(), StartMode::Bidi)
+            .await
+            .unwrap()
+        else {
+            panic!("expected exchange");
+        };
+        first.bind("task");
+        let error = ExchangeAdapter::new(&handler, &params)
+            .open(subscribe(), StartMode::Bidi)
+            .await
+            .err()
+            .expect("identifier is already bound");
+        assert_eq!(error.code, a2a::error_code::INVALID_REQUEST);
+        assert_eq!(
+            handler.live.task_for_exchange("shared").unwrap().as_deref(),
+            Some("task")
+        );
+        first.close().await;
+    }
 }

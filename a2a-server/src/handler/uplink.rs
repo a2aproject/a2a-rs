@@ -329,3 +329,48 @@ pub enum LiveResponse {
     /// task as it stands. Its events arrive on the downlink, never here.
     Ack(Box<Task>),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_registrations_cannot_route_an_ambiguous_exchange_identifier() {
+        let sessions = LiveSessions::default();
+        let (first, _rx1) = mpsc::channel(1);
+        let (second, _rx2) = mpsc::channel(1);
+        sessions.register("first", first.clone(), Some("shared".into()), None);
+        sessions.register("second", second, Some("shared".into()), None);
+        let error = sessions.task_for_exchange("shared").unwrap_err();
+        assert_eq!(error.code, a2a::error_code::INVALID_REQUEST);
+        assert!(error.message.contains("ambiguous"));
+        sessions.unregister("first", &first);
+        assert_eq!(
+            sessions.task_for_exchange("shared").unwrap().as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn exchange_headers_reject_ambiguous_or_invalid_routing_values() {
+        for values in [
+            vec!["".to_string()],
+            vec!["contains spaces".to_string()],
+            vec!["x".repeat(129)],
+            vec!["non-ascii-☃".to_string()],
+            vec!["first".to_string(), "second".to_string()],
+        ] {
+            let params =
+                ServiceParams::from([(a2a::SDK_LIVE_EXCHANGE_HEADER.to_ascii_uppercase(), values)]);
+            assert_eq!(
+                exchange_id(&params).unwrap_err().code,
+                a2a::error_code::INVALID_PARAMS
+            );
+        }
+        let params = ServiceParams::from([(
+            a2a::SDK_LIVE_EXCHANGE_HEADER.into(),
+            vec!["safe_A-1".into()],
+        )]);
+        assert_eq!(exchange_id(&params).unwrap().as_deref(), Some("safe_A-1"));
+    }
+}

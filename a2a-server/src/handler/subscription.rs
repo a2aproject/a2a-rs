@@ -109,3 +109,31 @@ impl SubscriptionPolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn immediate_unary_joins_return_a_snapshot_without_waiting_for_executor_events() {
+        use crate::handler::test_support::task_with_history;
+        let task = task_with_history("task", "context", 0);
+        let active = super::super::events::ActiveExecution::new(Some(task.clone()));
+        let delivery = Delivery::Injected {
+            task: task.clone(),
+            receiver: active.subscribe().await,
+            sequence_before: 0,
+            sequence_after: 0,
+        };
+        let mut subscription = SubscriptionPolicy::new(StartMode::Blocking, false).delivery(
+            delivery,
+            DeliveryAttachment::Opening {
+                return_immediately: true,
+            },
+        );
+        assert!(
+            matches!(subscription.events.next().await.unwrap().unwrap(), StreamResponse::Task(snapshot) if snapshot == task)
+        );
+        assert!(subscription.events.next().await.is_none());
+    }
+}

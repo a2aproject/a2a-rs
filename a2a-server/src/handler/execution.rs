@@ -341,7 +341,7 @@ mod tests {
         runtime.task_store.create(task.clone()).await.unwrap();
         task.status.state = TaskState::Working;
         let (active, context) = registered(&runtime, task.clone()).await;
-        let mut events = active.subscribe();
+        let mut events = active.subscribe().await;
         timeout(
             Duration::from_secs(1),
             drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context),
@@ -399,7 +399,7 @@ mod tests {
         task.status.state = TaskState::Submitted;
         runtime.task_store.create(task.clone()).await.unwrap();
         let (active, context) = registered(&runtime, task.clone()).await;
-        let mut events = active.subscribe();
+        let mut events = active.subscribe().await;
         let runner = tokio::spawn({
             let runtime = runtime.clone();
             let active = active.clone();
@@ -458,7 +458,7 @@ mod tests {
         runtime.task_store.create(task.clone()).await.unwrap();
         task.status.state = TaskState::Working;
         let (active, context) = registered(&runtime, task.clone()).await;
-        let mut events = active.subscribe();
+        let mut events = active.subscribe().await;
         timeout(
             Duration::from_secs(1),
             drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context),
@@ -482,5 +482,140 @@ mod tests {
                 .state,
             TaskState::Canceled
         );
+    }
+
+    struct Scripted(Vec<Result<StreamResponse, A2AError>>);
+    impl crate::AgentExecutor for Scripted {
+        fn execute(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            Box::pin(stream::iter(self.0.clone()))
+        }
+        fn cancel(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            self.execute(ctx)
+        }
+    }
+
+    #[tokio::test]
+    async fn uncreated_runs_reply_without_a_task_and_reject_foreign_reply_ids() {
+        for foreign in [false, true] {
+            let mut task = task_with_history("reply", "context", 0);
+            task.status.state = TaskState::Submitted;
+            let mut reply = Message::new(Role::Agent, vec![Part::text("direct reply")]);
+            if foreign {
+                reply.task_id = Some("foreign-task".into());
+            }
+            let runtime = DefaultRequestHandler::new(
+                Scripted(vec![
+                    Ok(StreamResponse::Message(reply)),
+                    Ok(StreamResponse::Task(task.clone())),
+                ]),
+                InMemoryTaskStore::new(),
+            );
+            let (active, mut context) = registered(&runtime, task.clone()).await;
+            active
+                .uncreated
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            context.new_task = true;
+            let mut events = active.subscribe().await;
+            drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context)
+                .await;
+            let event = events.recv().await.unwrap();
+            if foreign {
+                assert_eq!(
+                    event.result.unwrap_err().code,
+                    error_code::INVALID_AGENT_RESPONSE
+                );
+            } else {
+                assert!(event.kind == EventKind::Reply);
+                assert!(matches!(event.result, Ok(StreamResponse::Message(_))));
+            }
+            assert!(runtime.task_store.get(&task.id).await.unwrap().is_none());
+            assert!(runtime.execution_manager.get(&task.id).await.is_none());
+            assert!(
+                events.try_recv().is_err(),
+                "outputs following a direct reply must be ignored"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_uncreated_runs_save_pending_configuration_and_handle_create_collisions() {
+        for collision in [false, true] {
+            let runtime =
+                DefaultRequestHandler::new(Scripted(Vec::new()), InMemoryTaskStore::new())
+                    .with_push_config_store(InMemoryPushConfigStore::new());
+            let mut task = task_with_history("empty", "context", 0);
+            task.status.state = TaskState::Submitted;
+            if collision {
+                runtime.task_store.create(task.clone()).await.unwrap();
+            }
+            let (active, context) = registered(&runtime, task.clone()).await;
+            active
+                .uncreated
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            *active.pending_push.lock().unwrap() = Some(push_config(&task.id));
+            drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context)
+                .await;
+            assert_eq!(
+                runtime.task_store.get(&task.id).await.unwrap().unwrap().id,
+                task.id
+            );
+            assert!(runtime.execution_manager.get(&task.id).await.is_none());
+            let configs = runtime
+                .push_config_store
+                .as_ref()
+                .unwrap()
+                .list(&task.id)
+                .await
+                .unwrap();
+            assert_eq!(configs.len(), usize::from(!collision));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panic_before_task_creation_does_not_leave_an_orphan_task() {
+        let runtime = DefaultRequestHandler::new(Panics, InMemoryTaskStore::new());
+        let mut task = task_with_history("panic-before-create", "context", 0);
+        task.status.state = TaskState::Submitted;
+        let (active, context) = registered(&runtime, task.clone()).await;
+        active
+            .uncreated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut events = active.subscribe().await;
+        drive_execution_guarded(runtime.clone(), task.id.clone(), active, context).await;
+        assert_eq!(
+            events.recv().await.unwrap().result.unwrap_err().code,
+            error_code::INTERNAL_ERROR
+        );
+        assert!(runtime.task_store.get(&task.id).await.unwrap().is_none());
+        assert!(runtime.execution_manager.get(&task.id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_cancellation_hooks_still_finalize_idle_tasks() {
+        let handlers = [
+            DefaultRequestHandler::new(Panics, InMemoryTaskStore::new()),
+            DefaultRequestHandler::new(Scripted(Vec::new()), InMemoryTaskStore::new()),
+        ];
+        for handler in handlers {
+            seed_task(&handler, "idle", "context").await;
+            let task = handler
+                .cancel_task(
+                    &ServiceParams::new(),
+                    CancelTaskRequest {
+                        id: "idle".into(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(task.status.state, TaskState::Canceled);
+        }
     }
 }

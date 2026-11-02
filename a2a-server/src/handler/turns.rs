@@ -258,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn artifact_only_unread_input_has_no_empty_message_reference() {
         let active = ActiveExecution::new(None);
-        let mut events = active.subscribe();
+        let mut events = active.subscribe().await;
         let mut message = make_message();
         message.message_id.clear();
         reject_inputs(&active, "task", vec![crate::ClientInput::new(message, 3)]).await;

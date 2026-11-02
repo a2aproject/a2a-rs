@@ -13,6 +13,7 @@ use tokio::sync::{RwLock, broadcast};
 struct State {
     sequence: u64,
     snapshot: Option<Task>,
+    last_error: Option<(u64, A2AError)>,
 }
 
 pub(super) struct TaskEvents {
@@ -49,12 +50,34 @@ impl TaskEvents {
         self.state.read().await.sequence
     }
 
+    pub(super) async fn subscribe(&self) -> (broadcast::Receiver<ExecutionEvent>, u64) {
+        let receiver = self.sender.subscribe();
+        let sequence = self.state.read().await.sequence;
+        (receiver, sequence)
+    }
+
     pub(super) async fn resubscribe(
         &self,
     ) -> (broadcast::Receiver<ExecutionEvent>, Option<Task>, u64) {
         let receiver = self.sender.subscribe();
         let state = self.state.read().await;
         (receiver, state.snapshot.clone(), state.sequence)
+    }
+
+    /// A lagging response must still observe an execution error published since
+    /// its cursor, even after a later turn has overwritten the broadcast buffer.
+    pub(super) async fn resynchronize(
+        &self,
+        after: u64,
+    ) -> Result<(broadcast::Receiver<ExecutionEvent>, Option<Task>, u64), A2AError> {
+        let receiver = self.sender.subscribe();
+        let state = self.state.read().await;
+        if let Some((sequence, error)) = &state.last_error
+            && *sequence > after
+        {
+            return Err(error.clone());
+        }
+        Ok((receiver, state.snapshot.clone(), state.sequence))
     }
 
     /// The caller holds the task writer, including across persistence. Every
@@ -72,6 +95,9 @@ impl TaskEvents {
                 state.snapshot = Some(task);
             }
             state.sequence += 1;
+            if let Err(error) = result {
+                state.last_error = Some((state.sequence, error.clone()));
+            }
             state.sequence
         };
         // Subscription startup/retirement and send share this short lock; an

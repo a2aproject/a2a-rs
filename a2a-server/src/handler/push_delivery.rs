@@ -845,4 +845,98 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, error_code::PUSH_NOTIFICATION_NOT_SUPPORTED);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_webhook_subscribers_retire_and_restart_without_changing_task_source() {
+        let handler = make_push_delivery_handler();
+        let source = handler.execution_manager.events_for("task");
+        handler
+            .execution_manager
+            .pushes
+            .attach(&handler, "task", &source);
+        let event = StreamResponse::Task(task_with_history("task", "context", 0));
+        source
+            .publish(Ok(&event), None, EventKind::Normal, None)
+            .await;
+        while !source.sender.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(PUSH_WORKER_IDLE + Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!source.webhook_subscribed.lock().unwrap().running);
+        source
+            .publish(Ok(&event), None, EventKind::Normal, None)
+            .await;
+        assert!(source.webhook_subscribed.lock().unwrap().running);
+        assert!(Arc::ptr_eq(
+            &source,
+            &handler.execution_manager.events_for("task")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_lagging_webhook_subscriber_continues_and_a_closed_dispatcher_retires_it() {
+        for closed in [false, true] {
+            let handler = make_push_delivery_handler();
+            let source = handler.execution_manager.events_for("task");
+            handler
+                .execution_manager
+                .pushes
+                .attach(&handler, "task", &source);
+            source.webhook_subscribed.lock().unwrap().running = true;
+            let receiver = source.sender.subscribe();
+            for sequence in 0..super::super::EXECUTION_BUFFER_CAPACITY as u64 + 2 {
+                assert!(
+                    source
+                        .sender
+                        .send(ExecutionEvent {
+                            sequence,
+                            kind: EventKind::Repeated,
+                            result: Ok(StreamResponse::Task(task_with_history(
+                                "task", "context", 0
+                            ))),
+                            failure: None
+                        })
+                        .is_ok()
+                );
+            }
+            assert!(
+                source
+                    .sender
+                    .send(ExecutionEvent {
+                        sequence: 999,
+                        kind: EventKind::Normal,
+                        result: Ok(StreamResponse::Task(task_with_history(
+                            "task", "context", 0
+                        ))),
+                        failure: None
+                    })
+                    .is_ok()
+            );
+            let (tx, mut rx) = mpsc::channel(2);
+            if closed {
+                rx.close();
+            }
+            let intake = tokio::spawn(receive_events(source.clone(), receiver, tx));
+            if closed {
+                timeout(Duration::from_secs(1), intake)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!source.webhook_subscribed.lock().unwrap().running);
+            } else {
+                assert_eq!(
+                    timeout(Duration::from_secs(1), rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .sequence,
+                    999
+                );
+                intake.abort();
+            }
+        }
+    }
 }

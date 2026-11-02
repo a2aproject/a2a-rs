@@ -230,4 +230,59 @@ mod tests {
         assert!(done.is_cancelled());
         server.abort();
     }
+
+    #[tokio::test]
+    async fn a_full_endpoint_queue_signals_failure_and_pool_shutdown_drains_workers() {
+        install_crypto_provider();
+        let store = Arc::new(InMemoryPushConfigStore::new());
+        store.save(push_config("task")).await.unwrap();
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let settings = NotificationSettings {
+            task_id: "task".into(),
+            store,
+            sender: Arc::new(crate::HttpPushSender::new(Some(
+                crate::HttpPushSenderConfig {
+                    fail_on_error: true,
+                    validate_urls: false,
+                    ..Default::default()
+                },
+            ))),
+            permits: permits.clone(),
+        };
+        let (tx, rx) = mpsc::channel(PUSH_QUEUE_CAPACITY + 2);
+        let done = CancellationToken::new();
+        let delivery = tokio::spawn(deliver_notifications(settings, rx, None, done.clone()));
+        let (failure, mut observed) = tokio::sync::watch::channel(None);
+        for sequence in 0..PUSH_QUEUE_CAPACITY as u64 + 2 {
+            tx.send(ExecutionEvent {
+                sequence,
+                kind: EventKind::Normal,
+                result: Ok(StreamResponse::Task(task_with_history(
+                    "task", "context", 0,
+                ))),
+                failure: Some(failure.clone()),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), observed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            observed
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("endpoint queue")
+        );
+        permits.close();
+        tokio::time::timeout(Duration::from_secs(2), delivery)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(done.is_cancelled());
+    }
 }

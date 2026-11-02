@@ -381,10 +381,6 @@ fn send_message_request() -> SendMessageRequest {
     }
 }
 
-fn versioned_params() -> ServiceParams {
-    ServiceParams::from([("a2a-version".to_string(), vec!["1.1".to_string()])])
-}
-
 #[tokio::test]
 async fn grpc_transport_end_to_end() {
     let (endpoint, handle) = spawn_grpc_server().await;
@@ -728,7 +724,7 @@ async fn grpc_transport_decodes_error_details_from_a_real_server() {
 }
 
 #[tokio::test]
-async fn live_rpc_preserves_an_unimplemented_method_error() {
+async fn live_rpc_preserves_an_unsupported_operation_error() {
     let (endpoint, server) = spawn_grpc_server().await;
     let transport = GrpcTransport::connect(endpoint).await.unwrap();
     let first = StreamRequest {

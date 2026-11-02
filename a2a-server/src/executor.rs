@@ -189,4 +189,21 @@ mod tests {
         assert_eq!(ctx.service_params, params);
         assert_eq!(ctx.tenant.as_deref(), Some("tenant-a"));
     }
+
+    #[tokio::test]
+    async fn an_owned_input_receiver_can_be_moved_into_a_worker() {
+        let (sender, inputs) = ClientInputs::channel(1);
+        let mut context =
+            ExecutorContext::new("task", "context", ClientInputs::closed()).with_inputs(inputs);
+        let worker = tokio::spawn(async move { context.inputs.recv().await });
+        let message = Message::new(Role::User, vec![Part::text("input")]);
+        assert!(
+            sender
+                .try_send(ClientInput::new(message.clone(), 7))
+                .is_ok()
+        );
+        let input = worker.await.unwrap().unwrap();
+        assert_eq!(input.message, message);
+        assert_eq!(input.generation, 7);
+    }
 }
