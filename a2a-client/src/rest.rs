@@ -5,6 +5,7 @@ use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, PercentEncode, utf8_percent_encode};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -19,6 +20,18 @@ use crate::wire;
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
 const REST_STREAM_MESSAGE_PATH: &str = "/message:stream";
 const REST_EXTENDED_AGENT_CARD_PATH: &str = "/extendedAgentCard";
+
+/// Everything but the RFC 3986 unreserved characters is percent-encoded, so an
+/// id always stays one path segment (`/`, `?`, `#` and `%` in it change nothing).
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+fn segment(id: &str) -> PercentEncode<'_> {
+    utf8_percent_encode(id, PATH_SEGMENT)
+}
 
 #[derive(Debug, Deserialize)]
 struct RestErrorEnvelope {
@@ -295,7 +308,7 @@ impl Transport for RestTransport {
         params: &ServiceParams,
         req: &GetTaskRequest,
     ) -> Result<Task, A2AError> {
-        let path = format!("/tasks/{}", req.id);
+        let path = format!("/tasks/{}", segment(&req.id));
         let mut query_parts = Vec::new();
         if let Some(hl) = req.history_length {
             query_parts.push(("historyLength".to_string(), hl.to_string()));
@@ -342,7 +355,7 @@ impl Transport for RestTransport {
         params: &ServiceParams,
         req: &CancelTaskRequest,
     ) -> Result<Task, A2AError> {
-        self.post_json(&format!("/tasks/{}:cancel", req.id), params, req)
+        self.post_json(&format!("/tasks/{}:cancel", segment(&req.id)), params, req)
             .await
     }
 
@@ -351,11 +364,11 @@ impl Transport for RestTransport {
         params: &ServiceParams,
         req: &SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let canonical_path = format!("/tasks/{}:subscribe", req.id);
+        let canonical_path = format!("/tasks/{}:subscribe", segment(&req.id));
         match self.get_streaming(&canonical_path, params).await {
             Ok(stream) => Ok(stream),
             Err(err) if should_retry_subscribe_with_legacy_path(&err) => {
-                self.get_streaming(&format!("/tasks/{}/subscribe", req.id), params)
+                self.get_streaming(&format!("/tasks/{}/subscribe", segment(&req.id)), params)
                     .await
             }
             Err(err) => Err(err),
@@ -369,7 +382,7 @@ impl Transport for RestTransport {
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let payload = self
             .post_value(
-                &format!("/tasks/{}/pushNotificationConfigs", req.task_id),
+                &format!("/tasks/{}/pushNotificationConfigs", segment(&req.task_id)),
                 params,
                 req,
             )
@@ -384,7 +397,11 @@ impl Transport for RestTransport {
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let payload = self
             .get_value(
-                &format!("/tasks/{}/pushNotificationConfigs/{}", req.task_id, req.id),
+                &format!(
+                    "/tasks/{}/pushNotificationConfigs/{}",
+                    segment(&req.task_id),
+                    segment(&req.id)
+                ),
                 params,
                 &[],
             )
@@ -407,7 +424,7 @@ impl Transport for RestTransport {
 
         let payload = self
             .get_value(
-                &format!("/tasks/{}/pushNotificationConfigs", req.task_id),
+                &format!("/tasks/{}/pushNotificationConfigs", segment(&req.task_id)),
                 params,
                 &query_parts,
             )
@@ -421,7 +438,11 @@ impl Transport for RestTransport {
         req: &DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
         self.delete(
-            &format!("/tasks/{}/pushNotificationConfigs/{}", req.task_id, req.id),
+            &format!(
+                "/tasks/{}/pushNotificationConfigs/{}",
+                segment(&req.task_id),
+                segment(&req.id)
+            ),
             params,
         )
         .await
@@ -573,6 +594,67 @@ mod tests {
         });
 
         format!("http://{addr}")
+    }
+
+    /// Answers one request with a task and hands back its request line.
+    async fn spawn_request_line_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            let _ = tx.send(request.lines().next().unwrap_or_default().to_owned());
+            let body =
+                json!({"id": "t", "contextId": "c", "status": {"state": "TASK_STATE_WORKING"}})
+                    .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (format!("http://{addr}/a2a"), rx)
+    }
+
+    #[tokio::test]
+    async fn test_task_ids_are_percent_encoded_into_one_path_segment() {
+        let (url, line) = spawn_request_line_server().await;
+        let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), url);
+        let _ = transport
+            .get_task(
+                &ServiceParams::new(),
+                &GetTaskRequest {
+                    id: "../admin?x=1".into(),
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            line.await.unwrap(),
+            "GET /a2a/tasks/..%2Fadmin%3Fx%3D1 HTTP/1.1"
+        );
+
+        let (url, line) = spawn_request_line_server().await;
+        let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), url);
+        let _ = transport
+            .cancel_task(
+                &ServiceParams::new(),
+                &CancelTaskRequest {
+                    id: "t#1 %".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            line.await.unwrap(),
+            "POST /a2a/tasks/t%231%20%25:cancel HTTP/1.1"
+        );
     }
 
     #[test]

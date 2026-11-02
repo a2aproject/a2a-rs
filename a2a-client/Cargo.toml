@@ -27,6 +27,7 @@ async-trait = { workspace = true }
 auto_impl = { workspace = true }
 reqwest = { workspace = true }
 bytes = "1"
+percent-encoding = "2"
 tracing = { workspace = true }
 uuid = { workspace = true }
 semver = { workspace = true }
