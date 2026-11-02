@@ -404,10 +404,8 @@ fn protojson_json_response<T: ProtoJsonPayload>(value: &T) -> axum::response::Re
     }
 }
 
-/// Spec §9 (REST binding): every worked example response carries a
-/// `Content-Type` naming the A2A media type (`application/a2a+json` for a
-/// success body, `application/problem+json` for an error), not axum's
-/// default `application/json`.
+/// A success body names the A2A media type, `application/a2a+json`, not
+/// axum's default `application/json`; an error body keeps the default.
 fn with_content_type(
     mut response: axum::response::Response,
     content_type: &'static str,
@@ -502,10 +500,9 @@ fn rest_error_response(err: A2AError) -> axum::response::Response {
         },
     };
 
-    with_content_type(
-        (status, Json(body)).into_response(),
-        "application/problem+json",
-    )
+    // The body is google.rpc.Status, not an RFC 9457 problem document, and
+    // `application/json` is what the Go and .NET clients parse an error from.
+    (status, Json(body)).into_response()
 }
 
 fn rest_grpc_status(code: i32) -> &'static str {
@@ -656,9 +653,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rest_error_response_content_type_is_problem_json() {
-        // Spec §9: an error response's Content-Type is
-        // application/problem+json, distinct from a success response's.
+    async fn test_rest_error_response_content_type_is_json() {
+        // Go and .NET clients parse an error body only from this type.
         let resp = rest_error_response(A2AError::task_not_found("missing"));
         assert_eq!(
             resp.headers()
@@ -666,7 +662,7 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "application/problem+json"
+            "application/json"
         );
     }
 
