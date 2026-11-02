@@ -407,30 +407,39 @@ async fn p5_run() -> (usize, usize) {
         .send_live_message(&p, ReceiverStream::new(rx).boxed())
         .await
         .unwrap();
-    let task_id = match next(&mut down).await {
-        StreamResponse::Task(t) => t.id,
+    let opening = next(&mut down).await;
+    let task_id = match &opening {
+        StreamResponse::Task(task) => task.id.clone(),
         other => panic!("{other:?}"),
     };
+    let mut down = stream::once(async move { Ok(opening) }).chain(down).boxed();
     let mut declined = 0;
     let rounds = 50;
-    for _ in 0..rounds {
-        // wait for the turn's INPUT_REQUIRED, then answer at once
+    for round in 0..=rounds {
+        // A completed turn can arrive as its status event or a fresh snapshot,
+        // including when it finishes before the opening snapshot is delivered.
         loop {
-            let e = next(&mut down).await;
-            match &e {
-                StreamResponse::StatusUpdate(u) if u.status.state == TaskState::InputRequired => {
+            match next(&mut down).await {
+                StreamResponse::StatusUpdate(update)
+                    if update.status.state == TaskState::InputRequired =>
+                {
                     break;
                 }
-                StreamResponse::Error(err) => {
+                StreamResponse::Task(task) if task.status.state == TaskState::InputRequired => {
+                    break;
+                }
+                StreamResponse::Error(_) => {
                     declined += 1;
-                    let _ = err;
                     break;
                 }
                 _ => {}
             }
         }
-        up.send(send("ask", Some(&task_id))).await.unwrap();
+        if round < rounds {
+            up.send(send("ask", Some(&task_id))).await.unwrap();
+        }
     }
+    assert_eq!(applied(&get(&h, &task_id).await, "ask"), rounds + 1);
     (declined, rounds)
 }
 
