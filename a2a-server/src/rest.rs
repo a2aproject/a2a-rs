@@ -7,9 +7,10 @@ use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::IntoResponse,
+    middleware::Next,
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream::BoxStream};
@@ -18,7 +19,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::handler::RequestHandler;
-use crate::middleware::{ServiceParams, extract_service_params};
+use crate::middleware::{ServiceParams, check_a2a_version, extract_service_params};
 use crate::sse;
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
@@ -116,10 +117,34 @@ pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
             REST_EXTENDED_AGENT_CARD_LEGACY_PATH,
             axum::routing::get(handle_get_extended_agent_card::<H>),
         )
+        .route_layer(axum::middleware::from_fn(validate_protocol_version))
         .layer(axum::extract::DefaultBodyLimit::max(
             crate::jsonrpc::MAX_REQUEST_BODY_BYTES,
         ))
         .with_state(state)
+}
+
+/// §3.6.2 for every REST operation, ahead of any handler. §3.6.1 lets a
+/// client send `A2A-Version` as a query parameter instead of a header, so
+/// the query form is honored when the header is absent.
+async fn validate_protocol_version(request: Request, next: Next) -> Response {
+    let mut params = extract_service_params(request.headers());
+    if !params.contains_key("a2a-version") {
+        let from_query = Query::<HashMap<String, String>>::try_from_uri(request.uri())
+            .ok()
+            .and_then(|Query(query)| {
+                query
+                    .into_iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(SVC_PARAM_VERSION))
+            });
+        if let Some((_, version)) = from_query {
+            params.insert("a2a-version".to_owned(), vec![version]);
+        }
+    }
+    match check_a2a_version(&params) {
+        Ok(()) => next.run(request).await,
+        Err(error) => rest_error_response(error),
+    }
 }
 
 async fn handle_send_message<H: RequestHandler>(
@@ -613,6 +638,7 @@ mod tests {
             }
         });
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri(REST_SEND_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -635,6 +661,7 @@ mod tests {
             }
         });
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri(REST_SEND_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -677,6 +704,7 @@ mod tests {
             }
         });
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri(REST_SEND_MESSAGE_LEGACY_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -690,6 +718,7 @@ mod tests {
     async fn test_get_task_not_found() {
         let app = make_app();
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/nonexistent")
             .method("GET")
             .body(Body::empty())
@@ -702,6 +731,7 @@ mod tests {
     async fn test_list_tasks_empty() {
         let app = make_app();
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks")
             .method("GET")
             .body(Body::empty())
@@ -719,6 +749,7 @@ mod tests {
     async fn test_cancel_task_not_found() {
         let app = make_app();
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/nonexistent:cancel")
             .method("POST")
             .header("content-type", "application/json")
@@ -735,6 +766,7 @@ mod tests {
             "url": "http://example.com/callback"
         });
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("POST")
             .header("content-type", "application/json")
@@ -752,6 +784,7 @@ mod tests {
             "url": "http://example.com/callback"
         });
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("POST")
             .header("content-type", "application/json")
@@ -775,6 +808,7 @@ mod tests {
             "url": "http://example.com/callback"
         });
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("POST")
             .header("content-type", "application/json")
@@ -797,6 +831,7 @@ mod tests {
             "url": "http://example.com/callback"
         });
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("POST")
             .header("content-type", "application/json")
@@ -810,6 +845,7 @@ mod tests {
     async fn test_get_extended_agent_card() {
         let app = make_app();
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri(REST_EXTENDED_AGENT_CARD_PATH)
             .method("GET")
             .body(Body::empty())
@@ -999,6 +1035,7 @@ mod tests {
     async fn test_subscribe_to_task_not_found() {
         let app = make_app();
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/nonexistent:subscribe")
             .method("GET")
             .body(Body::empty())
@@ -1018,6 +1055,7 @@ mod tests {
             }
         });
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri(REST_STREAM_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -1032,6 +1070,7 @@ mod tests {
     async fn test_get_push_config_not_found() {
         let app = make_app();
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs/cfg1")
             .method("GET")
             .body(Body::empty())
@@ -1045,6 +1084,7 @@ mod tests {
     async fn test_list_push_configs() {
         let app = make_push_app();
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("GET")
             .body(Body::empty())
@@ -1061,6 +1101,7 @@ mod tests {
     async fn test_delete_push_config() {
         let app = make_app();
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs/cfg1")
             .method("DELETE")
             .body(Body::empty())
@@ -1077,6 +1118,7 @@ mod tests {
             "url": "http://example.com/callback"
         });
         let create_req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("POST")
             .header("content-type", "application/json")
@@ -1086,6 +1128,7 @@ mod tests {
         assert_eq!(create_resp.status(), StatusCode::OK);
 
         let delete_req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs/cfg1")
             .method("DELETE")
             .body(Body::empty())
@@ -1094,6 +1137,7 @@ mod tests {
         assert_eq!(delete_resp.status(), StatusCode::OK);
 
         let list_req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("GET")
             .body(Body::empty())
@@ -1110,6 +1154,7 @@ mod tests {
     async fn test_list_tasks_with_query_params() {
         let app = make_app();
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks?contextId=c1&pageSize=5&pageToken=0&historyLength=3&includeArtifacts=true&statusTimestampAfter=2025-01-01T00:00:00Z")
             .method("GET")
             .body(Body::empty())
@@ -1122,6 +1167,7 @@ mod tests {
     async fn test_list_tasks_invalid_status_returns_bad_request() {
         let app = make_app();
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks?status=invalid")
             .method("GET")
             .body(Body::empty())
@@ -1146,6 +1192,7 @@ mod tests {
             }
         });
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri(REST_SEND_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -1177,6 +1224,7 @@ mod tests {
             }
         });
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri(REST_STREAM_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -1201,6 +1249,7 @@ mod tests {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/some-id")
             .method("GET")
             .header("authorization", "Bearer get-task-token")
@@ -1222,6 +1271,7 @@ mod tests {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks")
             .method("GET")
             .header("authorization", "Bearer list-tasks-token")
@@ -1241,6 +1291,7 @@ mod tests {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/some-id:cancel")
             .method("POST")
             .header("authorization", "Bearer cancel-token")
@@ -1261,6 +1312,7 @@ mod tests {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/some-id/cancel")
             .method("POST")
             .header("authorization", "Bearer cancel-legacy-token")
@@ -1284,6 +1336,7 @@ mod tests {
             "url": "http://example.com/callback"
         });
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("POST")
             .header("content-type", "application/json")
@@ -1304,6 +1357,7 @@ mod tests {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("GET")
             .header("authorization", "Bearer push-list-token")
@@ -1323,6 +1377,7 @@ mod tests {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs/cfg1")
             .method("GET")
             .header("authorization", "Bearer push-get-token")
@@ -1342,6 +1397,7 @@ mod tests {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs/cfg1")
             .method("DELETE")
             .header("authorization", "Bearer push-delete-token")
@@ -1361,6 +1417,7 @@ mod tests {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri(REST_EXTENDED_AGENT_CARD_PATH)
             .method("GET")
             .header("authorization", "Bearer card-token")
@@ -1380,6 +1437,7 @@ mod tests {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/some-id:subscribe")
             .method("GET")
             .header("authorization", "Bearer subscribe-token")
@@ -1401,6 +1459,7 @@ mod tests {
         let (handler, captured) = CapturingHandler::new();
         let app = rest_router(handler);
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri("/tasks/some-id/subscribe")
             .method("GET")
             .header("authorization", "Bearer subscribe-legacy-token")
@@ -1429,6 +1488,7 @@ mod tests {
             }
         });
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri(REST_SEND_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -1442,6 +1502,7 @@ mod tests {
 
         let app = make_app();
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri(format!("/tasks/{}?historyLength=5", task_id))
             .method("GET")
             .body(Body::empty())
@@ -1459,6 +1520,7 @@ mod tests {
         let app = make_app();
         let oversized = Body::from("x".repeat(crate::jsonrpc::MAX_REQUEST_BODY_BYTES + 1));
         let req = Request::builder()
+            .header("a2a-version", "1.0")
             .uri(REST_SEND_MESSAGE_PATH)
             .method("POST")
             .header("content-type", "application/json")
@@ -1467,5 +1529,66 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    async fn send_message_with_version(uri: &str, version: Option<&str>) -> Response {
+        let body = serde_json::json!({
+            "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+        });
+        let mut req = Request::builder()
+            .uri(uri)
+            .method("POST")
+            .header("content-type", "application/json");
+        if let Some(version) = version {
+            req = req.header("a2a-version", version);
+        }
+        let req = req.body(Body::from(body.to_string())).unwrap();
+        make_app().oneshot(req).await.unwrap()
+    }
+
+    async fn assert_version_not_supported(resp: Response) {
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["error"]["status"], "FAILED_PRECONDITION",
+            "{payload}"
+        );
+        assert_eq!(
+            payload["error"]["details"][0]["reason"], "VERSION_NOT_SUPPORTED",
+            "{payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_a2a_version_is_rejected() {
+        // §3.6.2, §6.4: same rejection as JSON-RPC, in REST's error shape.
+        let resp = send_message_with_version(REST_SEND_MESSAGE_PATH, Some("99.0")).await;
+        assert_version_not_supported(resp).await;
+    }
+
+    #[tokio::test]
+    async fn test_missing_a2a_version_is_rejected() {
+        // §3.6.2: an absent A2A-Version is "0.3", which this server does not
+        // implement -- on every route, not only SendMessage.
+        let resp = send_message_with_version(REST_SEND_MESSAGE_PATH, None).await;
+        assert_version_not_supported(resp).await;
+
+        let req = Request::builder()
+            .uri("/tasks/t1")
+            .body(Body::empty())
+            .unwrap();
+        assert_version_not_supported(make_app().oneshot(req).await.unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn test_a2a_version_query_parameter_is_accepted() {
+        // §3.6.1: a client MAY send the version as a request parameter.
+        let uri = format!("{REST_SEND_MESSAGE_PATH}?A2A-Version=1.0");
+        let resp = send_message_with_version(&uri, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let uri = format!("{REST_SEND_MESSAGE_PATH}?A2A-Version=99.0");
+        assert_version_not_supported(send_message_with_version(&uri, None).await).await;
     }
 }
