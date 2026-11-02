@@ -5584,6 +5584,38 @@ mod tests {
             .unwrap();
         assert_eq!(card.name, "full");
     }
+    #[tokio::test]
+    async fn idle_interrupted_tasks_can_be_canceled_with_each_executor_style() {
+        let handlers = [
+            make_push_delivery_handler(),
+            make_resumable_handler().0,
+            DefaultRequestHandler::new(MultiTurnExecutor, InMemoryTaskStore::new()),
+        ];
+        for handler in handlers {
+            seed_task(&handler, "idle-cancel", "context").await;
+            let mut task = handler.load_task("idle-cancel").await.unwrap();
+            task.status.state = TaskState::InputRequired;
+            handler.task_store.update(task).await.unwrap();
+            let canceled = handler
+                .cancel_task(
+                    &ServiceParams::new(),
+                    CancelTaskRequest {
+                        id: "idle-cancel".into(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(canceled.id, "idle-cancel");
+            assert_eq!(canceled.context_id, "context");
+            assert_eq!(canceled.status.state, TaskState::Canceled);
+            assert_eq!(
+                handler.load_task("idle-cancel").await.unwrap().status.state,
+                TaskState::Canceled
+            );
+        }
+    }
 }
 
 #[cfg(test)]
