@@ -234,3 +234,36 @@ pub trait TransportFactory: Send + Sync {
         iface: &AgentInterface,
     ) -> Result<Box<dyn Transport>, A2AError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RecordingUplink(std::sync::Mutex<Vec<StreamRequest>>);
+    #[async_trait::async_trait]
+    impl LiveUplink for RecordingUplink {
+        async fn send(&self, request: StreamRequest) -> Result<LiveAck, A2AError> {
+            self.0.lock().unwrap().push(request);
+            Ok(LiveAck::Sent)
+        }
+    }
+    #[tokio::test]
+    async fn unknown_payloads_retain_the_interface_routing_tenant() {
+        let uplink = Arc::new(RecordingUplink(std::sync::Mutex::new(Vec::new())));
+        let sender = LiveSender::new(uplink.clone()).with_tenant("tenant-a");
+        assert!(matches!(
+            sender
+                .send(StreamRequest {
+                    tenant: Some("untrusted".into()),
+                    payload: StreamRequestPayload::Unrecognised
+                })
+                .await
+                .unwrap(),
+            LiveAck::Sent
+        ));
+        assert_eq!(
+            uplink.0.lock().unwrap()[0].tenant.as_deref(),
+            Some("tenant-a")
+        );
+    }
+}

@@ -2456,4 +2456,71 @@ mod tests {
         assert_eq!(items.len(), 1, "expected one item, got {items:?}");
         assert!(items.into_iter().next().unwrap().is_err());
     }
+
+    #[tokio::test]
+    async fn malformed_live_receipts_are_errors_for_opening_and_follow_up_calls() {
+        use crate::LiveUplink;
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        for opening in [true, false] {
+            let (url, _captured) = spawn_jsonrpc_server(
+                json!({"jsonrpc":"2.0","id":1,"result":"not-a-task"}).to_string(),
+            )
+            .await;
+            let transport = JsonRpcTransport::new(Client::new(), url);
+            let error = if opening {
+                transport
+                    .send_live_message(&ServiceParams::new(), &request)
+                    .await
+                    .err()
+                    .expect("malformed opening receipt")
+            } else {
+                JsonRpcLiveUplink {
+                    transport,
+                    params: ServiceParams::new(),
+                }
+                .send(request.clone())
+                .await
+                .err()
+                .expect("malformed follow-up receipt")
+            };
+            assert_eq!(error.code, error_code::INTERNAL_ERROR);
+            assert!(error.message.contains("deserialize"));
+        }
+        let (url, _captured) =
+            spawn_jsonrpc_server(json!({"jsonrpc":"2.0","id":1}).to_string()).await;
+        let error = JsonRpcTransport::new(Client::new(), url)
+            .send_live_message(&ServiceParams::new(), &request)
+            .await
+            .err()
+            .expect("missing receipt");
+        assert!(error.message.contains("missing result"));
+    }
+    #[tokio::test]
+    async fn rest_live_rejections_do_not_end_the_response_stream() {
+        let rejection = serde_json::json!({"error":{
+            "taskId":"task", "code":"INVALID_ARGUMENT", "message":"bad input", "referenceId":"message"
+        }});
+        let update = serde_json::json!({"statusUpdate":{
+            "taskId":"task", "contextId":"context", "generation":"2", "status":{"state":"TASK_STATE_WORKING"}
+        }});
+        let mut events = parse_sse_stream_rest(byte_stream(vec![format!(
+            "data: {rejection}\n\ndata: {update}\n\n"
+        )]));
+        assert!(
+            matches!(events.next().await, Some(Ok(StreamResponse::Error(error)))
+            if error.code == "INVALID_ARGUMENT" && error.reference_id.as_deref() == Some("message"))
+        );
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(StreamResponse::StatusUpdate(_)))
+        ));
+        assert!(events.next().await.is_none());
+    }
 }
