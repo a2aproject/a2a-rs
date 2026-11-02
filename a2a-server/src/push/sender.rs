@@ -933,4 +933,18 @@ mod tests {
             .expect_err("a loopback self-redirect must be refused, not followed");
         assert!(err.is_redirect(), "expected a redirect-policy error: {err}");
     }
+
+    #[test]
+    fn empty_webhook_urls_are_rejected_even_when_url_screening_is_disabled() {
+        install_crypto_provider();
+        for validate_urls in [false, true] {
+            let sender = HttpPushSender::new(Some(HttpPushSenderConfig {
+                validate_urls,
+                ..Default::default()
+            }));
+            let error = sender.validate_config(&sample_config("")).unwrap_err();
+            assert_eq!(error.code, error_code::INVALID_PARAMS);
+            assert!(error.message.contains("URL"));
+        }
+    }
 }
