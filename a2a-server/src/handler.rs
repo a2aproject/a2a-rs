@@ -43,10 +43,12 @@ mod execution;
 mod output;
 mod protocol;
 mod push_delivery;
+mod push_worker;
 mod registry;
 mod response;
 mod startup;
 mod subscription;
+mod task_events;
 mod turns;
 mod updates;
 mod uplink;
@@ -782,13 +784,6 @@ impl DefaultRequestHandler {
             );
             permit.send(active.track_input(input).await);
         }
-        // The webhooks are queued under the writer, in publish order, and never
-        // waited for.
-        for event in &events {
-            self.execution_manager
-                .pushes
-                .push(self, task_id, None, event);
-        }
         drop(writer);
         self.changes.notify(task_id);
 
@@ -1064,6 +1059,18 @@ impl DefaultRequestHandler {
                 }
             }
         };
+        self.execution_manager
+            .pushes
+            .attach(self, &task_id, &active.events);
+        if existed || !lazy {
+            // Existing subscribers and webhooks observe persisted client input
+            // through the same publication path as executor output. The new
+            // response subscribes below and announces its input via its opening
+            // snapshot (or recorded follow-up), avoiding duplicate generations.
+            for event in &input_events {
+                active.publish(Ok(event), None).await;
+            }
+        }
         self.changes.notify(&task_id);
         // The task input queue is owned by the server and already exists
         // before the writer is let go, so every channel can feed this turn.
@@ -1267,6 +1274,8 @@ impl DefaultRequestHandler {
         active: Option<&Arc<ActiveExecution>>,
         exec_ctx: crate::ExecutorContext,
     ) -> Result<(), A2AError> {
+        let source = self.execution_manager.events_for(task_id);
+        self.execution_manager.pushes.attach(self, task_id, &source);
         let mut stream = self.executor.cancel(exec_ctx);
         let mut current_task = Some(canceled.clone());
         let mut failure = None;
@@ -1309,9 +1318,7 @@ impl DefaultRequestHandler {
             if !published {
                 continue;
             }
-            self.execution_manager
-                .pushes
-                .push(self, task_id, None, &event);
+
             if is_terminal_event(&event) {
                 break;
             }
@@ -1327,13 +1334,6 @@ impl DefaultRequestHandler {
             self.record_cancel_if_missing(task_id, canceled, active, &mut current_task)
                 .await
         };
-        // The recorded transition is announced like any other, even when the
-        // cancel itself is about to be reported as failed.
-        if let Ok(Some(event)) = &recorded {
-            self.execution_manager
-                .pushes
-                .push(self, task_id, None, event);
-        }
         if let Some(error) = failure {
             if let Some(active) = active {
                 publish_error(active, &error).await;
@@ -1394,6 +1394,7 @@ impl DefaultRequestHandler {
             {
                 let base = current_task.take().expect("checked above");
                 *current_task = Some(self.amend_cancel_entry(base, event).await?);
+                self.publish_stored_event(event, current_task.clone()).await;
                 entry.announced = true;
                 true
             }
@@ -1409,11 +1410,26 @@ impl DefaultRequestHandler {
                     StreamResponse::Task(task) if Some(task.generation) == generation_before
                 );
                 entry.note_published(published, event);
+                if published {
+                    self.publish_stored_event(event, current_task.clone()).await;
+                }
                 published
             }
         };
         self.changes.notify_event(event);
         Ok(published)
+    }
+
+    /// Publish an already persisted update when no executor invocation owns it.
+    async fn publish_stored_event(&self, event: &StreamResponse, snapshot: Option<Task>) {
+        let Some(task_id) = protocol::task_id_for_event(event) else {
+            return;
+        };
+        let source = self.execution_manager.events_for(task_id);
+        self.execution_manager.pushes.attach(self, task_id, &source);
+        source
+            .publish(Ok(event), snapshot, events::EventKind::Normal, None)
+            .await;
     }
 
     /// Gives the executor's `CANCELED` status to the entry the store already
@@ -1485,7 +1501,10 @@ impl DefaultRequestHandler {
                         .await?;
                 }
                 None => {
-                    apply_event_to_task(self.task_store.as_ref(), Some(base), &mut event).await?;
+                    let task =
+                        apply_event_to_task(self.task_store.as_ref(), Some(base), &mut event)
+                            .await?;
+                    self.publish_stored_event(&event, task).await;
                 }
             }
             self.changes.notify_event(&event);
@@ -1500,6 +1519,8 @@ impl DefaultRequestHandler {
         });
         if let Some(active) = active {
             active.publish(Ok(&event), None).await;
+        } else {
+            self.publish_stored_event(&event, Some(base)).await;
         }
         self.changes.notify_event(&event);
         Ok(Some(event))
@@ -1553,6 +1574,8 @@ impl DefaultRequestHandler {
             None => {
                 *current_task =
                     apply_event_to_task(self.task_store.as_ref(), base, &mut event).await?;
+                self.publish_stored_event(&event, current_task.clone())
+                    .await;
             }
         }
         self.changes.notify_event(&event);
