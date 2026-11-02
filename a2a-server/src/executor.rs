@@ -121,4 +121,29 @@ mod tests {
         assert_eq!(tid, "t1");
         assert_eq!(cid, "c1");
     }
+    #[test]
+    fn executor_context_preserves_caller_identity_and_request_data() {
+        let message = Message::new(Role::User, vec![Part::text("follow-up")]);
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": "task", "contextId": "context", "status": {"state": "TASK_STATE_WORKING"}
+        }))
+        .unwrap();
+        let metadata = HashMap::from([("trace".into(), serde_json::json!(42))]);
+        let user = User::authenticated("alice");
+        let params = ServiceParams::from([("authorization".into(), vec!["Bearer caller".into()])]);
+        let ctx = ExecutorContext::new("task", "context")
+            .with_message(message.clone())
+            .with_stored_task(task.clone())
+            .with_metadata(metadata.clone())
+            .with_user(user.clone())
+            .with_service_params(params.clone())
+            .with_tenant("tenant-a");
+        assert_eq!(ctx.task_info(), ("task".into(), "context".into()));
+        assert_eq!(ctx.message, Some(message));
+        assert_eq!(ctx.stored_task, Some(task));
+        assert_eq!(ctx.metadata, Some(metadata));
+        assert_eq!(ctx.user, Some(user));
+        assert_eq!(ctx.service_params, params);
+        assert_eq!(ctx.tenant.as_deref(), Some("tenant-a"));
+    }
 }

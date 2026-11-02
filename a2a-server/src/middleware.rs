@@ -352,4 +352,16 @@ mod tests {
         let result = interceptor.after(&ctx, &err).await;
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn duplicate_version_values_cannot_hide_behind_header_casing() {
+        let params = ServiceParams::from([
+            ("A2A-Version".into(), vec!["1.1".into()]),
+            ("a2a-version".into(), vec!["1.0".into()]),
+        ]);
+        assert_eq!(
+            check_a2a_version(&params).unwrap_err().code,
+            a2a::error_code::VERSION_NOT_SUPPORTED
+        );
+    }
 }

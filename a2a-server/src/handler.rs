@@ -6966,6 +6966,88 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn required_extensions_are_checked_with_case_insensitive_multi_value_headers() {
+        let handler = make_handler().with_capabilities(AgentCapabilities {
+            extensions: Some(vec![AgentExtension {
+                uri: "urn:required".into(),
+                description: None,
+                required: Some(true),
+                params: None,
+            }]),
+            ..Default::default()
+        });
+        assert_eq!(
+            handler
+                .authorize(&ServiceParams::new(), None)
+                .unwrap_err()
+                .code,
+            error_code::EXTENSION_SUPPORT_REQUIRED
+        );
+        let mut params = ServiceParams::from([(
+            "A2A-Extensions".into(),
+            vec!["urn:other".into(), " urn:required, urn:extra ".into()],
+        )]);
+        handler.authorize(&params, Some("task")).unwrap();
+        params.insert("A2A-Extensions".into(), vec!["urn:required-suffix".into()]);
+        assert_eq!(
+            handler.authorize(&params, None).unwrap_err().code,
+            error_code::EXTENSION_SUPPORT_REQUIRED
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_cancel_without_a_store_generation_is_recorded_exactly_once() {
+        for running in [false, true] {
+            let handler = make_handler();
+            seed_task(&handler, "legacy-cancel", "context").await;
+            let mut canceled = handler.load_task("legacy-cancel").await.unwrap();
+            canceled.status.state = TaskState::Canceled;
+            handler.task_store.update(canceled.clone()).await.unwrap();
+            let active = running.then(|| ActiveExecution::new(Some(canceled.clone())));
+            let mut current = Some(canceled.clone());
+            let event = handler
+                .record_cancel_if_missing("legacy-cancel", &canceled, active.as_ref(), &mut current)
+                .await
+                .unwrap()
+                .unwrap();
+            let StreamResponse::StatusUpdate(status) = event else {
+                panic!("expected cancellation status");
+            };
+            assert_eq!(status.generation, canceled.generation + 1);
+            assert_eq!(status.status.state, TaskState::Canceled);
+            let task = handler.load_task("legacy-cancel").await.unwrap();
+            assert_eq!(task.generation, status.generation);
+            assert_eq!(task.timeline.as_ref().unwrap().len(), 1);
+            assert!(
+                handler
+                    .record_cancel_if_missing(
+                        "legacy-cancel",
+                        &canceled,
+                        active.as_ref(),
+                        &mut current
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(handler.load_task("legacy-cancel").await.unwrap(), task);
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_listing_fails_closed_for_stores_without_scoped_listing() {
+        let handler = DefaultRequestHandler::new(EchoExecutor, PagingTaskStore::new(1, true))
+            .with_authorizer(|_: &ServiceParams, _: Option<&str>| Ok(()));
+        let request: ListTasksRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        let error = handler
+            .list_tasks(&ServiceParams::new(), request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+        assert!(error.message.contains("authorized task listing"));
+    }
 }
 
 #[cfg(test)]

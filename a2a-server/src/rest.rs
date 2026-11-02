@@ -2369,4 +2369,26 @@ mod tests {
             "tenant in the body (body) does not match the tenant in the path (acme)"
         );
     }
+
+    #[tokio::test]
+    async fn get_and_post_subscription_bindings_report_the_same_missing_task() {
+        for method in ["GET", "POST"] {
+            let handler = DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+                .with_capabilities(AgentCapabilities {
+                    streaming: Some(true),
+                    ..Default::default()
+                });
+            let app = rest_router(Arc::new(handler));
+            let request = Request::builder()
+                .method(method)
+                .uri("/tasks/absent:subscribe")
+                .header("A2A-Version", "1.1")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.oneshot(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
 }
