@@ -160,14 +160,16 @@ impl TaskStore for InMemoryTaskStore {
                     }
                 }
                 // A task without a status timestamp cannot satisfy an
-                // "after" filter. Keep this predicate in the store so the
-                // result count and pagination are based on the filtered set.
+                // "after" filter, and one stamped at the bound does (the
+                // proto: "greater than or equal"). Keep this predicate in the
+                // store so the result count and pagination are based on the
+                // filtered set.
                 if let Some(after) = req.status_timestamp_after {
                     if entry
                         .task
                         .status
                         .timestamp
-                        .is_none_or(|timestamp| timestamp <= after)
+                        .is_none_or(|timestamp| timestamp < after)
                     {
                         return false;
                     }
@@ -497,6 +499,11 @@ mod tests {
         recent.status.timestamp = Some(cutoff + chrono::Duration::seconds(1));
         store.create(recent).await.unwrap();
 
+        // The bound itself is included: "greater than or equal".
+        let mut at_cutoff = make_task("at-cutoff", "c1", TaskState::Completed);
+        at_cutoff.status.timestamp = Some(cutoff);
+        store.create(at_cutoff).await.unwrap();
+
         // Missing timestamps do not satisfy an "after" filter.
         store
             .create(make_task("missing", "c1", TaskState::Completed))
@@ -517,13 +524,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.total_size, 1);
+        assert_eq!(resp.total_size, 2);
         assert_eq!(
             resp.tasks
                 .iter()
                 .map(|task| task.id.as_str())
                 .collect::<Vec<_>>(),
-            ["recent"]
+            ["at-cutoff", "recent"]
         );
     }
 
