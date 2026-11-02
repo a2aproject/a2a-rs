@@ -272,3 +272,53 @@ pub(super) async fn apply_and_publish(
         .await;
     Ok(!repeated)
 }
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use crate::{InMemoryTaskStore, TaskStore};
+
+    fn task() -> Task {
+        serde_json::from_value(serde_json::json!({
+            "id":"task", "contextId":"context", "status":{"state":"TASK_STATE_WORKING"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn error_frames_cannot_claim_another_task() {
+        let event = StreamResponse::Error(
+            serde_json::from_value(serde_json::json!({
+                "taskId":"other", "code":"UNAVAILABLE"
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_event_identity(&task(), &event).unwrap_err().code,
+            error_code::INVALID_AGENT_RESPONSE
+        );
+    }
+
+    #[test]
+    fn rebasing_a_snapshot_appends_new_history_without_duplicating_recorded_messages() {
+        let first = Message::new(Role::User, vec![Part::text("first")]);
+        let next = Message::new(Role::Agent, vec![Part::text("next")]);
+        let mut stored = task();
+        stored.history = Some(vec![first.clone()]);
+        let mut snapshot = stored.clone();
+        snapshot.history = Some(vec![first.clone(), next.clone()]);
+        rebase_snapshot(&mut snapshot, stored);
+        assert_eq!(snapshot.history, Some(vec![first, next]));
+    }
+
+    #[tokio::test]
+    async fn saving_a_snapshot_cannot_overwrite_a_terminal_task() {
+        let store = InMemoryTaskStore::new();
+        let mut canceled = task();
+        canceled.status.state = TaskState::Canceled;
+        store.create(canceled.clone()).await.unwrap();
+        let error = save_task(&store, task()).await.unwrap_err();
+        assert_eq!(error.code, error_code::INVALID_REQUEST);
+        assert_eq!(store.get("task").await.unwrap(), Some(canceled));
+    }
+}
