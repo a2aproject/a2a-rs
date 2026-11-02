@@ -1651,6 +1651,9 @@ mod tests {
             .get_task(
                 &ServiceParams::new(),
                 &GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
+
                     id: "task-1".into(),
                     history_length: None,
                     tenant: None,
@@ -1671,6 +1674,8 @@ mod tests {
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
+
             id: "task-1".into(),
             tenant: None,
         };
