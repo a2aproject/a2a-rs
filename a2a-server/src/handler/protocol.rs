@@ -123,4 +123,43 @@ mod coverage_tests {
         assert_eq!(should_interrupt_non_streaming(&request, &reply), None);
         assert_eq!(task_id_for_event(&reply), None);
     }
+    #[test]
+    fn update_events_route_to_their_task_and_auth_required_interrupts_unary_calls() {
+        let artifact = StreamResponse::ArtifactUpdate(
+            serde_json::from_value(serde_json::json!({
+                "taskId":"task", "contextId":"context",
+                "artifact":{"artifactId":"artifact", "parts":[{"text":"artifact"}]}
+            }))
+            .unwrap(),
+        );
+        let message = StreamResponse::MessageUpdate(
+            serde_json::from_value(serde_json::json!({
+                "taskId":"task", "contextId":"context",
+                "message":{"messageId":"message", "role":"ROLE_USER", "parts":[{"text":"message"}]}
+            }))
+            .unwrap(),
+        );
+        assert_eq!(task_id_for_event(&artifact), Some("task"));
+        assert_eq!(task_id_for_event(&message), Some("task"));
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id":"task", "contextId":"context", "status":{"state":"TASK_STATE_AUTH_REQUIRED"}
+        }))
+        .unwrap();
+        let status = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: task.id.clone(),
+            context_id: task.context_id.clone(),
+            status: task.status.clone(),
+            metadata: None,
+            generation: 0,
+        });
+        let request = send_req(None, None);
+        assert_eq!(
+            should_interrupt_non_streaming(&request, &StreamResponse::Task(task)),
+            Some("task".into())
+        );
+        assert_eq!(
+            should_interrupt_non_streaming(&request, &status),
+            Some("task".into())
+        );
+    }
 }
