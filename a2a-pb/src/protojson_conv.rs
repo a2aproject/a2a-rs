@@ -92,6 +92,16 @@ fn normalize_timestamp_strings(value: &mut Value) {
     }
 }
 
+/// Spec §5.7: a REQUIRED field MUST be present, so the defaults proto3-JSON
+/// leaves out are written back.
+fn insert_required(value: &mut Value, defaults: Value) {
+    if let (Value::Object(map), Value::Object(defaults)) = (value, defaults) {
+        for (key, default) in defaults {
+            map.entry(key).or_insert(default);
+        }
+    }
+}
+
 pub fn from_value<T: ProtoJsonPayload>(value: Value) -> Result<T, ProtoJsonPayloadError> {
     let protojson: T::ProtoJson =
         serde_json::from_value(value).map_err(ProtoJsonPayloadError::Json)?;
@@ -239,12 +249,13 @@ impl ProtoJsonPayload for ListTasksResponse {
 
     /// REQ-TASK-LIST-002: `nextPageToken` must always be present, even on
     /// the last page, but the generated serializer follows proto3-JSON's
-    /// own convention of omitting a string left at its default ("").
+    /// own convention of omitting a string left at its default (""). The
+    /// other REQUIRED fields go the same way on an empty page.
     fn normalize_json(value: &mut Value) {
-        if let Value::Object(map) = value {
-            map.entry("nextPageToken")
-                .or_insert_with(|| Value::String(String::new()));
-        }
+        insert_required(
+            value,
+            serde_json::json!({"tasks": [], "nextPageToken": "", "pageSize": 0, "totalSize": 0}),
+        );
     }
 }
 impl_protojson_payload!(
@@ -254,13 +265,35 @@ impl_protojson_payload!(
     crate::pbconv::to_proto_list_task_push_notification_configs_response,
     crate::pbconv::from_proto_list_task_push_notification_configs_response
 );
-impl_protojson_payload!(
-    AgentCard,
-    crate::proto::AgentCard,
-    crate::protojson::AgentCard,
-    crate::pbconv::to_proto_agent_card,
-    crate::pbconv::from_proto_agent_card
-);
+impl ProtoJsonPayload for AgentCard {
+    type Proto = crate::proto::AgentCard;
+    type ProtoJson = crate::protojson::AgentCard;
+
+    fn to_proto(value: &Self) -> Self::Proto {
+        crate::pbconv::to_proto_agent_card(value)
+    }
+
+    fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
+        Ok(crate::pbconv::from_proto_agent_card(value))
+    }
+
+    /// An extended card without skills or input/output modes still carries
+    /// its REQUIRED top-level fields.
+    fn normalize_json(value: &mut Value) {
+        insert_required(
+            value,
+            serde_json::json!({
+                "name": "",
+                "description": "",
+                "supportedInterfaces": [],
+                "version": "",
+                "defaultInputModes": [],
+                "defaultOutputModes": [],
+                "skills": []
+            }),
+        );
+    }
+}
 impl_protojson_payload_optional!(
     SendMessageResponse,
     crate::proto::SendMessageResponse,
@@ -295,6 +328,51 @@ mod tests {
             json.get("nextPageToken"),
             Some(&Value::String(String::new()))
         );
+    }
+
+    /// §5.7: every REQUIRED field of an empty page is present.
+    #[test]
+    fn test_empty_list_tasks_response_keeps_every_required_field() {
+        let response = ListTasksResponse {
+            tasks: vec![],
+            next_page_token: String::new(),
+            page_size: 0,
+            total_size: 0,
+        };
+        assert_eq!(
+            to_value(&response).unwrap(),
+            serde_json::json!({"tasks": [], "nextPageToken": "", "pageSize": 0, "totalSize": 0})
+        );
+    }
+
+    /// §5.7: a card with no skills or modes keeps its REQUIRED fields.
+    #[test]
+    fn test_agent_card_keeps_empty_required_fields() {
+        let card: AgentCard = serde_json::from_value(serde_json::json!({
+            "name": "agent",
+            "description": "",
+            "supportedInterfaces": [],
+            "version": "1.0.0",
+            "capabilities": {},
+            "defaultInputModes": [],
+            "defaultOutputModes": [],
+            "skills": []
+        }))
+        .unwrap();
+        let json = to_value(&card).unwrap();
+        for key in [
+            "name",
+            "description",
+            "supportedInterfaces",
+            "version",
+            "defaultInputModes",
+            "defaultOutputModes",
+            "skills",
+        ] {
+            assert!(json.get(key).is_some(), "{key} missing from {json}");
+        }
+        let decoded: AgentCard = from_value(json).unwrap();
+        assert_eq!(decoded, card);
     }
 
     #[test]

@@ -35,6 +35,22 @@ fn parse_jsonrpc_error(err: JsonRpcError) -> A2AError {
     crate::a2a_error_from_details(err.code, err.message, details)
 }
 
+/// Parses a JSON-RPC envelope. A body that is not one, sent with a non-success
+/// status (an authenticating proxy's 401, a gateway's 429 or 502), is reported
+/// with that status, as the REST transport reports it.
+fn parse_jsonrpc_response(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Result<JsonRpcResponse, A2AError> {
+    serde_json::from_str(body).map_err(|e| {
+        if status.is_success() {
+            A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
+        } else {
+            A2AError::internal(format!("HTTP {status}: {body}"))
+        }
+    })
+}
+
 /// JSON-RPC transport implementation.
 ///
 /// Sends all requests as JSON-RPC 2.0 POSTs to a single endpoint.
@@ -67,6 +83,7 @@ impl JsonRpcTransport {
         }
 
         let response = wire::send(&self.client, builder.json(&rpc_request)).await?;
+        let status = response.status();
 
         // Read the body as text first so the raw bytes can be logged before
         // they become a typed value; one error message still covers both a
@@ -74,8 +91,7 @@ impl JsonRpcTransport {
         let body = wire::response_text(response)
             .await
             .map_err(|e| A2AError::internal(format!("failed to parse JSON-RPC response: {e}")))?;
-        let rpc_response: JsonRpcResponse = serde_json::from_str(&body)
-            .map_err(|e| A2AError::internal(format!("failed to parse JSON-RPC response: {e}")))?;
+        let rpc_response = parse_jsonrpc_response(status, &body)?;
 
         if let Some(err) = rpc_response.error {
             return Err(parse_jsonrpc_error(err));
@@ -150,14 +166,16 @@ impl JsonRpcTransport {
         // in the envelope rather than via status code. Detect that case by
         // content type before handing the body to the SSE parser, which
         // would otherwise find no `data:` frames and yield an empty stream.
-        // A response with no content type is still treated as a stream:
+        // A success with no content type is still treated as a stream:
         // reading it to inspect it would hang on a stream that has not sent
-        // anything yet.
-        let is_event_stream = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .map(|v| v.as_bytes().starts_with(b"text/event-stream"))
-            .unwrap_or(true);
+        // anything yet. A non-success status is never a stream.
+        let status = response.status();
+        let is_event_stream = status.is_success()
+            && response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .map(|v| v.as_bytes().starts_with(b"text/event-stream"))
+                .unwrap_or(true);
 
         if is_event_stream {
             let stream = response.bytes_stream();
@@ -166,9 +184,7 @@ impl JsonRpcTransport {
             let body = wire::response_text(response).await.map_err(|e| {
                 A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
             })?;
-            let rpc_response: JsonRpcResponse = serde_json::from_str(&body).map_err(|e| {
-                A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
-            })?;
+            let rpc_response = parse_jsonrpc_response(status, &body)?;
 
             match rpc_response.error {
                 Some(err) => Err(parse_jsonrpc_error(err)),
@@ -411,6 +427,9 @@ pub(crate) fn parse_sse_stream_rest(
         if data.is_empty() {
             return None;
         }
+        if let Some(error) = crate::rest::rest_error(&data) {
+            return Some(Err(error));
+        }
 
         match protojson_conv::from_str::<StreamResponse>(&data) {
             Ok(sr) => Some(Ok(sr)),
@@ -525,12 +544,12 @@ impl Transport for JsonRpcTransport {
         }
 
         let response = wire::send(&self.client, builder.json(&rpc_request)).await?;
+        let status = response.status();
 
         let body = wire::response_text(response)
             .await
             .map_err(|e| A2AError::internal(format!("failed to parse JSON-RPC response: {e}")))?;
-        let rpc_response: JsonRpcResponse = serde_json::from_str(&body)
-            .map_err(|e| A2AError::internal(format!("failed to parse JSON-RPC response: {e}")))?;
+        let rpc_response = parse_jsonrpc_response(status, &body)?;
 
         if let Some(err) = rpc_response.error {
             return Err(parse_jsonrpc_error(err));
@@ -650,6 +669,25 @@ mod tests {
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n{}",
                 sse_body.len(),
                 sse_body,
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// Answers one request with `status` and a body that is not JSON-RPC, as an
+    /// authenticating proxy or a gateway in front of the agent does.
+    async fn spawn_http_error_server(status: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
             );
             socket.write_all(response.as_bytes()).await.unwrap();
         });
@@ -807,6 +845,25 @@ mod tests {
         let mut parsed = parse_sse_stream_rest(stream);
         let item = parsed.next().await.unwrap().unwrap();
         assert!(matches!(item, StreamResponse::StatusUpdate(_)));
+    }
+
+    #[tokio::test]
+    async fn test_parse_sse_stream_rest_error_event_keeps_its_code() {
+        let error = serde_json::json!({"error": {
+            "code": 404,
+            "status": "NOT_FOUND",
+            "message": "task not found: t1",
+            "details": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "TASK_NOT_FOUND",
+                "domain": "a2a-protocol.org"
+            }]
+        }});
+        let stream = byte_stream(vec![format!("data: {error}\n\n")]);
+        let mut parsed = parse_sse_stream_rest(stream);
+        let err = parsed.next().await.unwrap().unwrap_err();
+        assert_eq!(err.code, error_code::TASK_NOT_FOUND);
+        assert_eq!(err.message, "task not found: t1");
     }
 
     #[tokio::test]
@@ -1500,6 +1557,48 @@ mod tests {
 
         assert_eq!(error.code, error_code::INTERNAL_ERROR);
         assert!(error.message.contains("failed to parse JSON-RPC response"));
+    }
+
+    #[tokio::test]
+    async fn test_http_error_without_jsonrpc_body_reports_the_status() {
+        let endpoint = spawn_http_error_server("429 Too Many Requests", "budget exceeded").await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+
+        let error = transport
+            .get_task(
+                &ServiceParams::new(),
+                &GetTaskRequest {
+                    id: "task-1".into(),
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert_eq!(error.message, "HTTP 429 Too Many Requests: budget exceeded");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_http_error_reports_the_status_not_an_empty_stream() {
+        // No content type, so the status is the only thing marking it as no stream.
+        let endpoint = spawn_http_error_server("401 Unauthorized", "").await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+
+        let req = SubscribeToTaskRequest {
+            id: "task-1".into(),
+            tenant: None,
+        };
+        let error = transport
+            .subscribe_to_task(&ServiceParams::new(), &req)
+            .await
+            .err()
+            .expect("expected error, got a stream");
+
+        assert_eq!(error.message, "HTTP 401 Unauthorized: ");
     }
 
     #[tokio::test]
