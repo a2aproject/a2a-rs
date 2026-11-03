@@ -1044,8 +1044,20 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.authorize(params, req.message.task_id.as_deref())?;
         self.require_streaming()?;
+        // The history cap binds every Task in the response, streamed ones too.
+        let history_length = req
+            .configuration
+            .as_ref()
+            .and_then(|configuration| configuration.history_length);
         let (_, stream) = self.start_execution(params, req, false).await?;
-        Ok(stream)
+        Ok(Box::pin(stream.map(move |item| {
+            item.map(|mut event| {
+                if let StreamResponse::Task(task) = &mut event {
+                    apply_history_length(task, history_length);
+                }
+                event
+            })
+        })))
     }
 
     async fn get_task(
@@ -2788,6 +2800,52 @@ mod tests {
     async fn test_continuation_does_not_repeat_a_question_already_in_history() {
         let said = answer_the_question(&asking_handler(true), false).await;
         assert_eq!(said, ["ask", "Which file?", "main.rs"]);
+    }
+
+    /// `configuration.historyLength` caps the Task snapshots of a stream as
+    /// it caps the task a blocking send returns.
+    #[tokio::test]
+    async fn test_streamed_task_snapshots_respect_history_length() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                let history = ["one", "two", "three"]
+                    .map(|text| Message::new(Role::User, vec![Part::text(text)]))
+                    .to_vec();
+                let task = Task {
+                    id: ctx.task_id.clone(),
+                    context_id: ctx.context_id.clone(),
+                    status: TaskStatus {
+                        state: TaskState::Completed,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: Some(history),
+                    metadata: None,
+                };
+                vec![(None, Ok(StreamResponse::Task(task)))]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let request = SendMessageRequest {
+            configuration: Some(SendMessageConfiguration {
+                accepted_output_modes: None,
+                task_push_notification_config: None,
+                history_length: Some(1),
+                return_immediately: None,
+            }),
+            ..send_request()
+        };
+        let events: Vec<_> = handler
+            .send_streaming_message(&ServiceParams::new(), request)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(matches!(
+            &events[..],
+            [Ok(StreamResponse::Task(task))] if task.history.as_ref().map(Vec::len) == Some(1)
+        ));
     }
 
     #[tokio::test]
