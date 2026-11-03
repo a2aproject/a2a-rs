@@ -88,7 +88,6 @@ slim_auth = { package = "agntcy-slim-auth", version = "0.17.9" }
 
 # Utilities
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
-rustls-pemfile = "2"
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.23"
 thiserror = "2"

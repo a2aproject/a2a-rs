@@ -7,6 +7,7 @@ use a2a::*;
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use axum::{
     Json,
+    body::Bytes,
     extract::{
         Path, Query, Request, State,
         rejection::{JsonRejection, QueryRejection},
@@ -279,12 +280,28 @@ async fn handle_cancel_task_inner<H: RequestHandler>(
     state: RestState<H>,
     params: ServiceParams,
     id: String,
+    body: Bytes,
 ) -> axum::response::Response {
-    let req = CancelTaskRequest {
-        id,
-        metadata: None,
-        tenant: None,
+    // The binding maps the whole request to the body (`body: "*"`), so its
+    // `metadata` arrives there; the path names the task. An empty body is
+    // a cancel without metadata.
+    let mut req = if body.is_empty() {
+        CancelTaskRequest {
+            id: String::new(),
+            metadata: None,
+            tenant: None,
+        }
+    } else {
+        match serde_json::from_slice::<Value>(&body)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| {
+                protojson_conv::from_value::<CancelTaskRequest>(raw).map_err(|e| e.to_string())
+            }) {
+            Ok(req) => req,
+            Err(e) => return rest_payload_error_response(e),
+        }
     };
+    req.id = id;
     match state.handler.cancel_task(&params, req).await {
         Ok(task) => protojson_json_response(&task),
         Err(e) => rest_error_response(e),
@@ -295,10 +312,11 @@ async fn handle_post_task_action<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
     if let Some(task_id) = id.strip_suffix(":cancel") {
-        return handle_cancel_task_inner(state, params, task_id.to_string()).await;
+        return handle_cancel_task_inner(state, params, task_id.to_string(), body).await;
     }
     if let Some(task_id) = id.strip_suffix(":subscribe") {
         return handle_subscribe_to_task_inner(state, params, task_id.to_string()).await;
@@ -311,9 +329,10 @@ async fn handle_cancel_task_legacy<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
-    handle_cancel_task_inner(state, params, id).await
+    handle_cancel_task_inner(state, params, id, body).await
 }
 
 async fn handle_subscribe_to_task_inner<H: RequestHandler>(
@@ -1723,5 +1742,101 @@ mod tests {
             assert_eq!(body["error"]["code"], 400, "{target}");
             assert_eq!(body["error"]["status"], "INVALID_ARGUMENT", "{target}");
         }
+    }
+
+    /// Records the metadata of the cancel it is asked to run.
+    struct CancelMetadataExecutor(Arc<std::sync::Mutex<Option<HashMap<String, Value>>>>);
+
+    impl crate::AgentExecutor for CancelMetadataExecutor {
+        fn execute(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn cancel(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            *self.0.lock().unwrap() = ctx.metadata.clone();
+            let update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: ctx.task_id,
+                context_id: ctx.context_id,
+                status: TaskStatus {
+                    state: TaskState::Canceled,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            });
+            Box::pin(futures::stream::once(async move { Ok(update) }))
+        }
+    }
+
+    /// CancelTask maps the whole request to the body, so its metadata reaches
+    /// the executor on both cancel paths; an empty body still cancels.
+    #[tokio::test]
+    async fn test_cancel_task_passes_body_metadata_to_the_executor() {
+        for (action, body, expected) in [
+            (":cancel", r#"{"metadata":{"reason":"user"}}"#, Some("user")),
+            (
+                "/cancel",
+                r#"{"metadata":{"reason":"legacy"}}"#,
+                Some("legacy"),
+            ),
+            (":cancel", "", None),
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(None));
+            let app = rest_router(Arc::new(DefaultRequestHandler::new(
+                CancelMetadataExecutor(seen.clone()),
+                InMemoryTaskStore::new(),
+            )));
+            let send = serde_json::json!({
+                "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]},
+                "configuration": {"returnImmediately": true}
+            });
+            let req = Request::builder()
+                .uri(REST_SEND_MESSAGE_PATH)
+                .method("POST")
+                .header("a2a-version", "1.0")
+                .header("content-type", "application/json")
+                .body(Body::from(send.to_string()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let sent = resp.into_body().collect().await.unwrap().to_bytes();
+            let sent: Value = serde_json::from_slice(&sent).unwrap();
+            let id = sent["task"]["id"].as_str().unwrap().to_owned();
+
+            let uri = format!("/tasks/{id}{action}");
+            let req = Request::builder()
+                .uri(&uri)
+                .method("POST")
+                .header("a2a-version", "1.0")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri} {body}");
+            let reason = seen
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|metadata| metadata.get("reason").cloned());
+            assert_eq!(reason, expected.map(Value::from), "{uri} {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_rejects_a_body_that_is_not_a_request() {
+        let req = Request::builder()
+            .uri("/tasks/t1:cancel")
+            .method("POST")
+            .header("a2a-version", "1.0")
+            .header("content-type", "application/json")
+            .body(Body::from("{"))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
