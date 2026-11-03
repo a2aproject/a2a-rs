@@ -41,7 +41,7 @@ pub(super) async fn drive_execution(
             Ok(mut event) => {
                 let message = matches!(event, StreamResponse::Message(_));
                 if answered || (message && tracked) {
-                    publish_error(&runtime, &active, &A2AError::invalid_agent_response()).await;
+                    fail_and_publish(&runtime, &active, &A2AError::invalid_agent_response()).await;
                     break;
                 }
                 answered = message;
@@ -74,12 +74,8 @@ pub(super) async fn drive_execution(
                                 Some(published)
                             }
                             Err(error) => {
-                                let failed = fail_task(
-                                    &runtime,
-                                    active.snapshot().await,
-                                    &error,
-                                )
-                                .await;
+                                let failed =
+                                    fail_task(&runtime, active.snapshot().await, &error).await;
                                 active.publish(Err(&error), failed).await;
                                 None
                             }
@@ -100,7 +96,7 @@ pub(super) async fn drive_execution(
                 )
                 .await
                 {
-                    publish_error(&runtime, &active, &error).await;
+                    fail_and_publish(&runtime, &active, &error).await;
                     break;
                 }
                 if is_terminal_event(&event) {
@@ -108,7 +104,7 @@ pub(super) async fn drive_execution(
                 }
             }
             Err(error) => {
-                publish_error(&runtime, &active, &error).await;
+                fail_and_publish(&runtime, &active, &error).await;
                 break;
             }
         }
@@ -121,7 +117,7 @@ pub(super) async fn drive_execution(
 /// Publishes an error to the subscribers in order with the events around it:
 /// two unlocked publishers could broadcast out of sequence, and a subscriber
 /// drops what arrives behind a later sequence number.
-pub(super) async fn publish_error(
+pub(super) async fn fail_and_publish(
     runtime: &ExecutionRuntime,
     active: &ActiveExecution,
     error: &A2AError,
@@ -149,7 +145,9 @@ async fn fail_task(
     };
     let status = task.status.clone();
     super::updates::record_status(&mut task, status);
-    let task = super::updates::save_task(runtime.task_store.as_ref(), task).await.ok()?;
+    let task = super::updates::save_task(runtime.task_store.as_ref(), task)
+        .await
+        .ok()?;
     let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
         generation: task.generation,
         task_id: task.id.clone(),
@@ -157,7 +155,13 @@ async fn fail_task(
         status: task.status.clone(),
         metadata: None,
     });
-    let _ = send_push_notifications(&task.id, runtime.push_config_store.as_deref(), runtime.push_sender.as_deref(), &event).await;
+    let _ = send_push_notifications(
+        &task.id,
+        runtime.push_config_store.as_deref(),
+        runtime.push_sender.as_deref(),
+        &event,
+    )
+    .await;
     Some(task)
 }
 
@@ -231,4 +235,9 @@ pub(super) async fn drive_execution_guarded(
     }
     manager.finish(&task_id, &active).await;
     task_changed.notify_waiters();
+}
+
+pub(super) async fn publish_error(active: &ActiveExecution, error: &A2AError) {
+    let _writer = active.writer.lock().await;
+    active.publish(Err(error), None).await;
 }
