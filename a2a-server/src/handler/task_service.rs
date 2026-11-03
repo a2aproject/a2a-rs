@@ -11,7 +11,7 @@ use super::DefaultRequestHandler;
 use super::cancellation::CancellationStart;
 use super::delivery::{AuthorizedMessage, Delivery, StartMode, request_task_id};
 use super::events::{ActiveExecution, TaskChanges};
-use super::execution::{InvocationState, TurnEnd};
+use super::execution::{ExecutionRequest, InvocationState, TurnEnd};
 use super::protocol::Rejection;
 use super::push_delivery::PushSubscriptions;
 use super::registry::ExecutionRegistry;
@@ -106,13 +106,70 @@ impl TaskService {
         handler: DefaultRequestHandler,
         task_id: TaskId,
         active: Arc<ActiveExecution>,
-        context: crate::ExecutorContext,
+        request: impl Into<ExecutionRequest>,
     ) {
+        let request = request.into();
         let lease = self.queue(&task_id);
         tokio::spawn(async move {
             let _lease = lease;
-            super::execution::drive_execution_guarded(handler, task_id, active, context).await;
+            super::execution::drive_execution_guarded(handler, task_id, active, request).await;
         });
+    }
+
+    /// Administrative startup scan: ordinary request authorization is not involved.
+    pub(super) async fn restart_tasks(
+        &self,
+        handler: DefaultRequestHandler,
+    ) -> Result<usize, A2AError> {
+        let mut token = None;
+        let mut pages = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut restarted = 0;
+        loop {
+            let request = ListTasksRequest {
+                page_size: Some(100),
+                page_token: token,
+                context_id: None,
+                status: None,
+                history_length: None,
+                timeline_length: None,
+                status_timestamp_after: None,
+                include_artifacts: Some(false),
+                tenant: None,
+            };
+            let page = self.store.list(&request).await?;
+            for task in page.tasks {
+                if task.status.state.is_terminal() || !seen.insert(task.id.clone()) {
+                    continue;
+                }
+                let id = task.id.clone();
+                // Re-read and reserve in one task operation, skipping already active tasks.
+                let started = self
+                    .with_task(&id, TaskOperation::Input, {
+                        let handler = handler.clone();
+                        move |state| {
+                            Box::pin(async move { state.restart(&handler, &task.id).await })
+                        }
+                    })
+                    .await??;
+                if let Some(started) = started {
+                    if started.await.map_err(|_| {
+                        A2AError::internal("executor restart failed before accepting the task")
+                    })? {
+                        restarted += 1;
+                    }
+                }
+            }
+            if page.next_page_token.is_empty() {
+                return Ok(restarted);
+            }
+            if !pages.insert(page.next_page_token.clone()) {
+                return Err(A2AError::internal(
+                    "task store repeated a recovery page token",
+                ));
+            }
+            token = Some(page.next_page_token);
+        }
     }
 
     /// Every send mode admits input through the same owned task operation.

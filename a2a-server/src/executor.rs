@@ -145,6 +145,20 @@ pub trait AgentExecutor: Send + Sync + 'static {
     fn execute(&self, ctx: ExecutorContext)
     -> BoxStream<'static, Result<StreamResponse, A2AError>>;
 
+    /// Resume a persisted nonterminal task during opt-in startup recovery.
+    ///
+    /// `ctx.stored_task` contains the persisted snapshot; `ctx.message` is None.
+    /// The execution ID and inbox are fresh. Caller credentials and process-local
+    /// state are not restored. Return None (the default) to leave this task idle.
+    /// Hook construction and stream polling run outside task serialization.
+    fn restart(
+        &self,
+        ctx: ExecutorContext,
+    ) -> Option<BoxStream<'static, Result<StreamResponse, A2AError>>> {
+        let _ = ctx;
+        None
+    }
+
     /// Cancel an in-progress task. Returns a stream of events.
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>>;
 }
@@ -231,6 +245,13 @@ pub trait Agent: Send + Sync + 'static {
         }))
     }
 
+    /// Resume a stored task when the handler explicitly runs startup recovery.
+    /// The default opts out; no new message or task is created.
+    fn restart(&self, ctx: ExecutorContext) -> Option<EventStream> {
+        let _ = ctx;
+        None
+    }
+
     /// Cancels an in-progress task. Returns a stream of events.
     fn cancel(&self, ctx: ExecutorContext) -> EventStream {
         let _ = ctx;
@@ -299,6 +320,10 @@ impl<A: Agent> AgentExecutor for AgentExecutorAdapter<A> {
             })
             .flatten(),
         )
+    }
+
+    fn restart(&self, ctx: ExecutorContext) -> Option<EventStream> {
+        self.0.restart(ctx)
     }
 
     fn cancel(&self, ctx: ExecutorContext) -> EventStream {

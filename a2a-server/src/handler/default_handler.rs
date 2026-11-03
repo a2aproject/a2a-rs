@@ -75,6 +75,26 @@ impl DefaultRequestHandler {
         )
     }
 
+    /// Resume persisted nonterminal tasks at application startup.
+    ///
+    /// Explicitly call this before accepting requests, after configuring the handler.
+    /// Executors opt in through [`crate::AgentExecutor::restart`] (or [`crate::Agent::restart`]).
+    /// Returns the number of tasks whose restart hook accepted execution, not completed work.
+    /// Missing, terminal, already-running, and unsupported tasks are skipped. The store
+    /// must persist across process restarts. This does not provide distributed ownership
+    /// across server processes, restore caller credentials, or replay previous messages.
+    ///
+    /// ```no_run
+    /// # async fn startup(handler: a2a_server::DefaultRequestHandler) -> Result<(), a2a::A2AError> {
+    /// let restarted = handler.restart_tasks().await?;
+    /// // Pass the configured handler to the server after recovery is scheduled.
+    /// # let _ = restarted;
+    /// # Ok(()) }
+    /// ```
+    pub async fn restart_tasks(&self) -> Result<usize, A2AError> {
+        self.tasks.restart_tasks(self.clone()).await
+    }
+
     /// Bounds how long a `GetTask` carrying `currentGeneration` is held open
     /// when the task does not advance. The request then returns the current
     /// state, which the spec allows.

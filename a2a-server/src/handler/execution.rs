@@ -99,6 +99,20 @@ impl ExecutionState {
     }
 }
 
+pub(super) enum ExecutionRequest {
+    Message(crate::ExecutorContext),
+    Restart {
+        context: crate::ExecutorContext,
+        accepted: tokio::sync::oneshot::Sender<bool>,
+    },
+}
+
+impl From<crate::ExecutorContext> for ExecutionRequest {
+    fn from(context: crate::ExecutorContext) -> Self {
+        Self::Message(context)
+    }
+}
+
 /// The output stream has been dropped before these reach the runner. Input
 /// receipts let the server recover unread messages from an owned inbox.
 pub(super) enum TurnEnd {
@@ -112,9 +126,9 @@ async fn drive_execution(
     handler: DefaultRequestHandler,
     task_id: TaskId,
     active: Arc<ActiveExecution>,
-    exec_ctx: crate::ExecutorContext,
+    request: ExecutionRequest,
 ) {
-    let end = poll_executor(&handler, &task_id, &active, exec_ctx).await;
+    let end = poll_executor(&handler, &task_id, &active, request).await;
     handler
         .tasks
         .finished(handler.clone(), &task_id, active, end)
@@ -128,9 +142,19 @@ async fn poll_executor(
     handler: &DefaultRequestHandler,
     task_id: &TaskId,
     active: &Arc<ActiveExecution>,
-    exec_ctx: crate::ExecutorContext,
+    request: impl Into<ExecutionRequest> + Send,
 ) -> TurnEnd {
-    let mut stream = handler.tasks.executor.execute(exec_ctx);
+    let mut stream = match request.into() {
+        ExecutionRequest::Message(context) => handler.tasks.executor.execute(context),
+        ExecutionRequest::Restart { context, accepted } => {
+            let stream = handler.tasks.executor.restart(context);
+            let _ = accepted.send(stream.is_some());
+            match stream {
+                Some(stream) => stream,
+                None => return TurnEnd::Finished,
+            }
+        }
+    };
     let mut push_failure = active.push_failure.subscribe();
     let (mut answered, mut tracked) = (false, false);
     loop {
@@ -198,7 +222,7 @@ pub(super) async fn drive_execution_guarded(
     handler: DefaultRequestHandler,
     task_id: TaskId,
     active: Arc<ActiveExecution>,
-    exec_ctx: crate::ExecutorContext,
+    request: impl Into<ExecutionRequest> + Send,
 ) {
     use futures::FutureExt;
 
@@ -213,7 +237,7 @@ pub(super) async fn drive_execution_guarded(
         handler,
         task_id.clone(),
         active.clone(),
-        exec_ctx,
+        request.into(),
     ))
     .catch_unwind()
     .await;
