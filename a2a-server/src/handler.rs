@@ -6,46 +6,41 @@
 //! Private modules own execution state, task mutations, response running,
 //! and transport input. All default-handler methods are defined here.
 
-use self::delivery::{
-    AuthorizedMessage, Delivery, StartMode, is_artifact_only, record_client_input, request_task_id,
-    validate_existing_task,
-};
-use self::events::{ActiveExecution, ExecutionReceiver, TaskChanges};
+use self::delivery::{AuthorizedMessage, Delivery, StartMode, is_artifact_only, request_task_id};
+use self::events::TaskChanges;
 use self::exchange::{Exchange, ExchangeAdapter, OpenExchange};
-use self::execution::{drive_execution_guarded, publish_error};
 use self::protocol::{
-    Rejection, apply_lengths, is_at_least_1_1, is_terminal_event, requested_protocol_version,
-    unary_refusal,
+    Rejection, apply_lengths, is_at_least_1_1, requested_protocol_version, unary_refusal,
 };
-use self::registry::{ExecutionManager, ReservationGuard};
+use self::registry::ExecutionManager;
 use self::response::{Events, Run, RunCompletion};
 use self::startup::{PreparedResponse, StartedResponse};
 use self::subscription::{SubscriptionAttachment, SubscriptionPolicy};
-use self::updates::{
-    CancelEntry, apply_and_publish, apply_event_to_task, backfill_status_timestamp, save_task,
-    validate_event_identity,
-};
 use self::uplink::{IncomingRequest, LiveSessions, ResponseInput};
-use crate::executor::{ClientInput, ClientInputs};
+
 use crate::middleware::{ServiceParams, User};
 use crate::pagination::resolve_page_size;
 use a2a::*;
 use async_trait::async_trait;
-use futures::{StreamExt, stream::BoxStream};
+use futures::stream::BoxStream;
 use std::{sync::Arc, time::Duration};
-use tokio::sync::mpsc;
 
+mod admission;
 mod artifacts;
+mod cancellation;
+mod coordinator;
 mod delivery;
 mod events;
 mod exchange;
 mod execution;
+mod failure;
 mod output;
 mod protocol;
 mod push_delivery;
 mod push_worker;
 mod registry;
 mod response;
+mod runtime;
 mod startup;
 mod subscription;
 mod task_events;
@@ -495,26 +490,17 @@ impl DefaultRequestHandler {
         // Prepare the initial events and the condition that ends this response.
         let wants_message_updates = is_at_least_1_1(&requested_protocol_version(params));
         let response_id = (mode == StartMode::Bidi).then(uuid::Uuid::now_v7);
-        // Once preparation begins, its mutations and executor delivery finish
-        // even if this caller disconnects while awaiting persistence.
-        let handler = self.clone();
-        let service_params = params.clone();
-        let prepared = tokio::spawn(async move {
-            handler
-                .prepare_response(
-                    &service_params,
-                    mode,
-                    first.request,
-                    wants_message_updates,
-                    response_id,
-                )
-                .await
-        })
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "message preparation failed unexpectedly");
-            A2AError::internal("message preparation failed unexpectedly")
-        })??;
+        // Admission is owned by the coordinator after enqueueing. A caller
+        // disconnecting while it waits cannot interrupt persistence or delivery.
+        let prepared = self
+            .prepare_response(
+                params,
+                mode,
+                first.request,
+                wants_message_updates,
+                response_id,
+            )
+            .await?;
         // Bind its lifetime to the task, then let the shared runner deliver events.
         exchange.bind(&prepared.task_id);
         let task_id = prepared.task_id.clone();
@@ -675,140 +661,12 @@ impl DefaultRequestHandler {
             )
             .into());
         }
-        self.deliver_message(message, mode).await
-    }
-
-    // Delivery.
-    /// Hands a message to a task: into the execution that is running, or as the
-    /// start of a new turn.
-    ///
-    /// The choice and what follows from it happen under the task's writer, which
-    /// the end of a turn also takes to close its input queue and deregister: the
-    /// message finds either a running execution that is taking input, or none.
-    async fn deliver_message(
-        &self,
-        message: AuthorizedMessage,
-        mode: StartMode,
-    ) -> Result<Delivery, Rejection> {
-        // No task named: the message creates one, and there is nothing to join.
-        let Some(task_id) = request_task_id(&message.request) else {
-            return self.start_delivery(message, mode, None).await;
-        };
-        let writer = self
-            .execution_manager
-            .writer_for(&task_id)
-            .lock_owned()
-            .await;
-        // An entry with no snapshot is a request that was dropped before it
-        // began; it is no execution.
-        let running = match self.execution_manager.get(&task_id).await {
-            Some(active) if active.snapshot().await.is_some() => Some(active),
-            _ => None,
-        };
-        match running {
-            Some(active) => self.inject(&message, &task_id, &active, writer).await,
-            None => self.start_delivery(message, mode, Some(writer)).await,
-        }
-    }
-
-    async fn start_delivery(
-        &self,
-        message: AuthorizedMessage,
-        mode: StartMode,
-        writer: Option<tokio::sync::OwnedMutexGuard<()>>,
-    ) -> Result<Delivery, Rejection> {
-        let (task, receiver, recorded) = self
-            .start_execution(message, mode, writer)
+        let task_id = request_task_id(&message.request).unwrap_or_else(new_task_id);
+        self.execution_manager
+            .coordinators
+            .for_task(&task_id)
+            .admit(self.clone(), message, mode)
             .await
-            .map_err(Rejection::Failed)?;
-        Ok(Delivery::Started {
-            task,
-            receiver,
-            recorded,
-        })
-    }
-
-    /// Appends the message to the task and passes it to the running executor,
-    /// under `writer`, which the caller holds for the task.
-    async fn inject(
-        &self,
-        message: &AuthorizedMessage,
-        task_id: &str,
-        active: &Arc<ActiveExecution>,
-        writer: tokio::sync::OwnedMutexGuard<()>,
-    ) -> Result<Delivery, Rejection> {
-        let (params, request) = (&message.params, &message.request);
-        // A task the executor has not created yet is not one a client can know.
-        if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(Rejection::Failed(A2AError::task_not_found(task_id)));
-        }
-        let Some(base) = active.snapshot().await else {
-            return Err(Rejection::Failed(A2AError::internal(
-                "a running execution has no task",
-            )));
-        };
-        validate_existing_task(&base, request)?;
-        let artifact_only = is_artifact_only(request);
-        // Room for the message is secured before anything is changed, so a
-        // message the executor cannot take is declined with nothing recorded.
-        let permit = if artifact_only {
-            None
-        } else {
-            Some(active.inputs.sender.clone().try_reserve_owned().map_err(
-                |refusal| match refusal {
-                    mpsc::error::TrySendError::Full(_) => {
-                        Rejection::Declined("the agent is busy with earlier input".to_string())
-                    }
-                    // The queue is closed only together with the execution being
-                    // deregistered, under the writer held here.
-                    mpsc::error::TrySendError::Closed(_) => Rejection::Failed(A2AError::internal(
-                        "the input queue of a registered execution is closed",
-                    )),
-                },
-            )?)
-        };
-
-        let mut task = base;
-        let recorded = record_client_input(&mut task, request, false)?;
-        let events = recorded.events;
-        // Admit configuration before committing input: a rejected configuration
-        // must not leave a recorded message that no executor will receive.
-        self.save_request_push_config(params, task_id, request)
-            .await?;
-        let task = save_task(self.task_store.as_ref(), task).await?;
-
-        let sequence_before = active.sequence().await;
-        let receiver = active.subscribe().await;
-        let last = events.len().saturating_sub(1);
-        for (index, event) in events.iter().enumerate() {
-            let snapshot = (index == last).then(|| task.clone());
-            active.publish_marked(Ok(event), snapshot, false).await;
-        }
-        if events.is_empty() {
-            active.set_snapshot(task.clone()).await;
-        }
-        let sequence_after = active.sequence().await;
-        if let Some(permit) = permit {
-            let input = ClientInput::received(
-                request,
-                recorded
-                    .message_generation
-                    .expect("a reserved input has a message"),
-                message.user.clone(),
-                params,
-                message.response_id,
-            );
-            permit.send(active.track_input(input).await);
-        }
-        drop(writer);
-        self.changes.notify(task_id);
-
-        Ok(Delivery::Injected {
-            task,
-            receiver,
-            sequence_before,
-            sequence_after,
-        })
     }
 
     // Subscriptions.
@@ -820,86 +678,11 @@ impl DefaultRequestHandler {
     ) -> Result<SubscriptionAttachment, A2AError> {
         self.authorize(params, Some(&req.id))?;
         self.require_streaming()?;
-        // An execution that is still being prepared has no snapshot to open
-        // with yet. Wait for the writer -- the request preparing it holds it --
-        // and look again, so the stream opens with the task, or, if the
-        // request failed and released the task, falls through to the checks
-        // below. The wait follows the lookup that found the execution, not one
-        // before it: a registration made in between is waited for too.
-        // A task the executor has not created yet is not one a client can know.
-        if let Some(active) = self.execution_manager.get(&req.id).await {
-            if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(A2AError::task_not_found(&req.id));
-            }
-        }
-        let mut resubscribed = self.execution_manager.resubscribe(&req.id).await;
-        if matches!(resubscribed, Some((_, None, _))) {
-            resubscribed = match self.execution_manager.get(&req.id).await {
-                Some(active) => {
-                    let _writer = active.writer.lock().await;
-                    // With the writer held a reservation that is still empty
-                    // belongs to a dropped request, so the task is not
-                    // executing; nothing is left to wait for.
-                    match active.snapshot().await {
-                        Some(_) => self.execution_manager.resubscribe(&req.id).await,
-                        None => None,
-                    }
-                }
-                None => None,
-            };
-        }
-        if let Some((receiver, snapshot_task, sequence)) = resubscribed {
-            if snapshot_task
-                .as_ref()
-                .is_some_and(|task| task.status.state.is_terminal())
-            {
-                return Err(A2AError::unsupported_operation(format!(
-                    "task {} has already reached a terminal state",
-                    req.id
-                )));
-            }
-            // A client that already holds the task's current generation has
-            // missed nothing, so it resumes without a snapshot. One that is
-            // behind cannot be replayed to -- events are not retained -- and
-            // falls back to a snapshot, which the spec allows.
-            let snapshot_task = match (req.last_seen_generation, snapshot_task) {
-                (Some(last_seen), Some(task))
-                    if task.generation == last_seen && !task.status.state.is_terminal() =>
-                {
-                    None
-                }
-                (_, snapshot) => snapshot,
-            };
-            return Ok(SubscriptionAttachment {
-                task_id: req.id,
-                receiver: Some(receiver),
-                opening: snapshot_task,
-                sequence,
-                seen_generation: req.last_seen_generation.unwrap_or(0),
-            });
-        }
-
-        // A registry miss also happens once a task finishes and its
-        // execution is cleaned up, so it doesn't by itself mean the task
-        // never existed -- check the store to tell the two apart before
-        // reporting TaskNotFoundError.
-        if let Some(task) = self.task_store.get(&req.id).await? {
-            if task.status.state.is_terminal() {
-                return Err(A2AError::unsupported_operation(format!(
-                    "task {} has already reached a terminal state",
-                    req.id
-                )));
-            }
-            let current = req.last_seen_generation == Some(task.generation);
-            return Ok(SubscriptionAttachment {
-                task_id: req.id,
-                receiver: None,
-                opening: (!current).then_some(task),
-                sequence: 0,
-                seen_generation: req.last_seen_generation.unwrap_or(0),
-            });
-        }
-        Err(A2AError::task_not_found(&req.id))
+        self.execution_manager
+            .coordinators
+            .for_task(&req.id)
+            .subscribe(self.clone(), req)
+            .await
     }
 
     /// Long-poll for `GetTaskRequest.currentGeneration` (A2A 1.1 §3.2.7):
@@ -933,203 +716,6 @@ impl DefaultRequestHandler {
     }
 
     // Preparation.
-    /// Applies the request to a prepared snapshot, returning the
-    /// task, whether it existed before, and its context id.
-    ///
-    /// The caller holds the task's execution reservation and its writer lock,
-    /// so nothing else -- another request, a cancel -- can change it between
-    /// the read, the `ifGenerationMatch` comparison and the save below.
-    async fn prepare_task_for_execution(
-        &self,
-        req: &SendMessageRequest,
-        task_id: &str,
-    ) -> Result<(Task, bool, String, Vec<StreamResponse>), A2AError> {
-        let artifact_only = is_artifact_only(req);
-        // A2A §3.4.2: a client-provided taskId MUST reference an existing task,
-        // and client-provided ids for *creating* tasks are not supported. Only
-        // an absent taskId may mint a new one.
-        let stored = self.task_store.get(task_id).await?;
-        if stored.is_none() && (req.message.task_id.is_some() || artifact_only) {
-            return Err(A2AError::task_not_found(task_id));
-        }
-        if let Some(task) = &stored {
-            validate_existing_task(task, req)?;
-        }
-        let context_id = stored
-            .as_ref()
-            .map(|task| task.context_id.clone())
-            .unwrap_or_else(|| {
-                req.message
-                    .context_id
-                    .clone()
-                    .unwrap_or_else(new_context_id)
-            });
-
-        let existed = stored.is_some();
-        let events;
-        let task = if let Some(mut existing) = stored {
-            events = record_client_input(&mut existing, req, false)?.events;
-            existing
-        } else {
-            let mut task = Task {
-                generation: 0,
-                timeline: None,
-                id: task_id.to_string(),
-                context_id: context_id.clone(),
-                status: TaskStatus {
-                    state: TaskState::Submitted,
-                    message: None,
-                    timestamp: Some(chrono::Utc::now()),
-                },
-                artifacts: None,
-                history: None,
-                metadata: None,
-            };
-            events = record_client_input(&mut task, req, true)?.events;
-            task
-        };
-
-        Ok((task, existed, context_id, events))
-    }
-
-    async fn start_execution(
-        &self,
-        message: AuthorizedMessage,
-        mode: StartMode,
-        writer: Option<tokio::sync::OwnedMutexGuard<()>>,
-    ) -> Result<(Task, ExecutionReceiver, Vec<StreamResponse>), A2AError> {
-        let AuthorizedMessage {
-            request: req,
-            params,
-            user,
-            ..
-        } = message;
-        let params = &params;
-        let include_task_snapshot_in_context = mode == StartMode::Blocking;
-        // A new task is created by the executor: only a live exchange, which is
-        // bound to its task from the first request, creates it up front.
-        let lazy = mode != StartMode::Bidi;
-        let artifact_only = is_artifact_only(&req);
-        let task_id = request_task_id(&req).unwrap_or_else(new_task_id);
-
-        // Claim the task before reading it: from here until the execution
-        // ends, this request and a cancel are the only writers. The guard gives the claim back
-        // on every early return and if this future is dropped.
-        let (active, inputs, writer_guard) = match writer {
-            Some(held) => self.execution_manager.reserve_held(&task_id, held).await?,
-            None => self.execution_manager.reserve(&task_id).await?,
-        };
-        let reservation = ReservationGuard::new(
-            Arc::clone(&self.execution_manager),
-            task_id.clone(),
-            Arc::clone(&active),
-        );
-        let (task, existed, context_id, input_events) = {
-            // The writer, held since the reservation until the snapshot below
-            // is set, makes a cancel or a subscriber that finds this execution
-            // wait for it instead of racing it.
-            let prepared = async {
-                let prepared = self.prepare_task_for_execution(&req, &task_id).await?;
-                if lazy && !prepared.1 {
-                    // For a task that may never exist, the configuration waits
-                    // for the executor to create it.
-                    let config = self.request_push_config(params, &task_id, &req)?;
-                    *active
-                        .pending_push
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
-                } else {
-                    self.save_request_push_config(params, &task_id, &req)
-                        .await?;
-                }
-                // All admission checks and configuration saves precede the
-                // input commit. The owned preparation then starts its executor.
-                if prepared.1 {
-                    self.task_store.update(prepared.0.clone()).await?;
-                } else if !lazy {
-                    self.task_store.create(prepared.0.clone()).await?;
-                }
-                Ok::<_, A2AError>(prepared)
-            }
-            .await;
-            match prepared {
-                Ok(prepared) => {
-                    active.set_snapshot(prepared.0.clone()).await;
-                    if lazy && !prepared.1 {
-                        active
-                            .uncreated
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    prepared
-                }
-                Err(error) => {
-                    // Released while the writer is still held, so whoever was
-                    // waiting for it finds the task free, not half-reserved.
-                    reservation.release().await;
-                    return Err(error);
-                }
-            }
-        };
-        self.execution_manager
-            .pushes
-            .attach(self, &task_id, &active.events);
-        if existed || !lazy {
-            // Existing subscribers and webhooks observe persisted client input
-            // through the same publication path as executor output. The new
-            // response subscribes below and announces its input via its opening
-            // snapshot (or recorded follow-up), avoiding duplicate generations.
-            for event in &input_events {
-                active.publish(Ok(event), None).await;
-            }
-        }
-        self.changes.notify(&task_id);
-        // The task input queue is owned by the server and already exists
-        // before the writer is let go, so every channel can feed this turn.
-        // Subscribed before the writer is let go: nothing published after that
-        // can be missed, a cancel that lands straight away included.
-        let receiver = active.subscribe().await;
-        drop(writer_guard);
-
-        let runtime = self.clone();
-        let stored_task = (existed || include_task_snapshot_in_context).then(|| task.clone());
-        let service_params = params.clone();
-        let active_execution = active.clone();
-        let execution_task_id = task_id.clone();
-
-        // From here the spawned execution owns the reservation. It keeps its
-        // own guard so the task is released even if the executor panics.
-        reservation.disarm();
-        let release = ReservationGuard::new(
-            Arc::clone(&self.execution_manager),
-            task_id.clone(),
-            Arc::clone(&active),
-        );
-        tokio::spawn(async move {
-            let exec_ctx = crate::ExecutorContext {
-                execution_id: active_execution.execution_id.clone(),
-                message: (!artifact_only).then_some(req.message),
-                task_id: execution_task_id.clone(),
-                // The task as it stands once the request is applied. A task this
-                // request created is withheld unless the caller asked for it
-                // (`send_message` does, streaming does not): executors use its
-                // absence to recognise a new task.
-                stored_task,
-                context_id,
-                metadata: req.metadata,
-                user,
-                service_params,
-                tenant: req.tenant,
-                inputs,
-                new_task: !existed,
-            };
-            drive_execution_guarded(runtime, execution_task_id, active_execution, exec_ctx).await;
-            // Reached only if the executor did not panic: the execution has
-            // already released the task itself.
-            release.disarm();
-        });
-
-        Ok((task, receiver, input_events))
-    }
 
     // Push delivery.
     /// The push configuration the request carries, for `task_id`.
@@ -1171,426 +757,6 @@ impl DefaultRequestHandler {
             self.push_config_store_checked()?.save(config).await?;
         }
         Ok(())
-    }
-
-    // Cancellation.
-    /// Complete an authorized cancellation independently of the request
-    /// future, including executor shutdown and cancellation event finalization.
-    async fn cancel_task_owned(
-        &self,
-        params: &ServiceParams,
-        req: CancelTaskRequest,
-        user: Option<User>,
-    ) -> Result<Task, A2AError> {
-        // Whoever is mutating a task holds its writer lock, execution or not,
-        // so a cancel takes its turn here: from the store transition until the
-        // snapshot is updated, nothing else may save. The execution is looked
-        // up only once the lock is held, so it cannot be one that has just
-        // finished (or one a follow-up reserves a moment later).
-        let writer = self.execution_manager.writer_for(&req.id);
-        let transition = writer.lock_owned().await;
-        let active_execution = self.execution_manager.get(&req.id).await;
-        let task = self.load_task(&req.id).await?;
-        let generation_before = task.generation;
-
-        // Idempotent: re-cancelling an already-canceled task is a no-op that
-        // returns the current task (matching a2a-go). Other terminal states
-        // are still not cancelable, per A2A and a2a-cli SPEC.md §10.4.
-        if task.status.state == TaskState::Canceled {
-            return Ok(task);
-        }
-        if task.status.state.is_terminal() {
-            return Err(A2AError::task_not_cancelable(&req.id));
-        }
-
-        // Atomically transition the task to CANCELED so two concurrent cancel
-        // requests cannot both pass the check-then-act window.
-        let task = match self.task_store.begin_cancel(&req.id).await {
-            Ok(task) => task,
-            Err(error) if error.code == error_code::TASK_NOT_CANCELABLE => {
-                // Raced with another cancel or with task completion. Keep the
-                // same semantics as the upfront check: a task another cancel
-                // already moved to CANCELED is returned (idempotent); any
-                // other terminal state is still not cancelable.
-                let raced = self.load_task(&req.id).await?;
-                if raced.status.state == TaskState::Canceled {
-                    return Ok(raced);
-                }
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
-        if let Some(active) = &active_execution {
-            // Stop polling the executor and let its runner recover unread
-            // inputs. Wait only after releasing the writer: the runner needs
-            // it to publish input rejections before the cancellation event.
-            active.set_snapshot(task.clone()).await;
-            active.inputs.close();
-        }
-        drop(transition);
-        if let Some(active) = &active_execution {
-            active.inputs_drained.cancelled().await;
-        }
-        // The task changed under every long-poll waiting on it.
-        self.changes.notify(&req.id);
-
-        let cancel_inputs = ClientInputs::closed();
-        let exec_ctx = crate::ExecutorContext {
-            execution_id: active_execution.as_ref().map_or_else(
-                || uuid::Uuid::now_v7().to_string(),
-                |active| active.execution_id.clone(),
-            ),
-            message: None,
-            task_id: req.id.clone(),
-            stored_task: Some(task.clone()),
-            context_id: task.context_id.clone(),
-            metadata: req.metadata,
-            user,
-            service_params: params.clone(),
-            tenant: req.tenant,
-            inputs: cancel_inputs,
-            new_task: false,
-        };
-        // A store that advanced the generation recorded the transition itself.
-        let recorded_by_store = task.generation > generation_before;
-        let outcome = self
-            .run_cancel(
-                &req.id,
-                &task,
-                recorded_by_store,
-                active_execution.as_ref(),
-                exec_ctx,
-            )
-            .await;
-
-        if let Some(active) = active_execution {
-            self.execution_manager.finish(&req.id, &active).await;
-        }
-        outcome?;
-
-        self.load_task(&req.id).await
-    }
-
-    /// Applies the executor's cancel events, recording the cancellation itself
-    /// when they do not. `begin_cancel` has already moved the task to
-    /// `CANCELED` without an event of its own, so the transition counts as
-    /// recorded only once a `CANCELED` status entry follows it -- including
-    /// when the executor fails, so the state change is never left without a
-    /// generation of its own.
-    async fn run_cancel(
-        &self,
-        task_id: &str,
-        canceled: &Task,
-        recorded_by_store: bool,
-        active: Option<&Arc<ActiveExecution>>,
-        exec_ctx: crate::ExecutorContext,
-    ) -> Result<(), A2AError> {
-        let source = self.execution_manager.events_for(task_id);
-        self.execution_manager.pushes.attach(self, task_id, &source);
-        let mut stream = self.executor.cancel(exec_ctx);
-        let mut current_task = Some(canceled.clone());
-        let mut failure = None;
-        let mut entry = CancelEntry {
-            recorded_by_store,
-            generation: canceled.generation,
-            announced: false,
-        };
-
-        // Whatever goes wrong below, the cancellation is still recorded
-        // afterwards: `begin_cancel` has already changed the task.
-        let deadline = tokio::time::Instant::now() + self.cancel_hook_timeout;
-        loop {
-            let event = match tokio::time::timeout_at(deadline, stream.next()).await {
-                Ok(Some(event)) => event,
-                Ok(None) => break,
-                Err(_) => {
-                    failure = Some(A2AError::internal("agent cancellation hook timed out"));
-                    break;
-                }
-            };
-            let mut event = match event {
-                Ok(event) => event,
-                Err(error) => {
-                    failure = Some(error);
-                    break;
-                }
-            };
-            backfill_status_timestamp(&mut event);
-            let published = match self
-                .apply_cancel_event(active, &mut current_task, &mut entry, &mut event)
-                .await
-            {
-                Ok(published) => published,
-                Err(error) => {
-                    failure = Some(error);
-                    break;
-                }
-            };
-            if !published {
-                continue;
-            }
-
-            if is_terminal_event(&event) {
-                break;
-            }
-        }
-
-        // Release the hook before finalization; the deadline does not wrap
-        // persistence or publication of the cancellation transition.
-        drop(stream);
-        let recorded = if entry.recorded_by_store {
-            self.announce_cancel_if_missing(task_id, active, &entry, &current_task)
-                .await
-        } else {
-            self.record_cancel_if_missing(task_id, canceled, active, &mut current_task)
-                .await
-        };
-        if let Some(error) = failure {
-            if let Some(active) = active {
-                publish_error(active, &error).await;
-            }
-            return Err(error);
-        }
-        recorded?;
-        Ok(())
-    }
-
-    /// Applies one event of a cancel under the task's writer lock. Returns
-    /// whether it was published to the subscribers.
-    async fn apply_cancel_event(
-        &self,
-        active: Option<&Arc<ActiveExecution>>,
-        current_task: &mut Option<Task>,
-        entry: &mut CancelEntry,
-        event: &mut StreamResponse,
-    ) -> Result<bool, A2AError> {
-        if let Some(task) = current_task.as_ref() {
-            validate_event_identity(task, event)?;
-        }
-        // The task is already canceled: a cancel executor may restate that,
-        // with its own message, but not move the task anywhere else -- back to
-        // work, or to a different end.
-        let contradicts = match &*event {
-            StreamResponse::Task(task) => task.status.state != TaskState::Canceled,
-            StreamResponse::StatusUpdate(update) => update.status.state != TaskState::Canceled,
-            _ => false,
-        };
-        if contradicts {
-            return Err(A2AError::invalid_agent_response());
-        }
-        let published = match active {
-            Some(active) => {
-                let _writer = active.writer.lock().await;
-                let base = active.snapshot().await;
-                if let Some(base) = base.as_ref().filter(|base| entry.can_amend(base, event)) {
-                    // The store already gave the cancellation its generation
-                    // and timeline entry; the executor's status is that
-                    // entry's content, announced as its one event.
-                    let amended = self.amend_cancel_entry(base.clone(), event).await?;
-                    active
-                        .publish_marked(Ok(&*event), Some(amended), false)
-                        .await;
-                    entry.announced = true;
-                    true
-                } else {
-                    let published =
-                        apply_and_publish(self.task_store.as_ref(), active, base, event).await?;
-                    entry.note_published(published, event);
-                    published
-                }
-            }
-            None if current_task
-                .as_ref()
-                .is_some_and(|base| entry.can_amend(base, event)) =>
-            {
-                let base = current_task.take().expect("checked above");
-                *current_task = Some(self.amend_cancel_entry(base, event).await?);
-                self.publish_stored_event(event, current_task.clone()).await;
-                entry.announced = true;
-                true
-            }
-            None => {
-                let generation_before = current_task.as_ref().map(|task| task.generation);
-                *current_task =
-                    apply_event_to_task(self.task_store.as_ref(), current_task.take(), event)
-                        .await?;
-                // A snapshot that changed nothing is not announced a second
-                // time at the generation it found.
-                let published = !matches!(
-                    &*event,
-                    StreamResponse::Task(task) if Some(task.generation) == generation_before
-                );
-                entry.note_published(published, event);
-                if published {
-                    self.publish_stored_event(event, current_task.clone()).await;
-                }
-                published
-            }
-        };
-        self.changes.notify_event(event);
-        Ok(published)
-    }
-
-    /// Publish an already persisted update when no executor invocation owns it.
-    async fn publish_stored_event(&self, event: &StreamResponse, snapshot: Option<Task>) {
-        let Some(task_id) = protocol::task_id_for_event(event) else {
-            return;
-        };
-        let source = self.execution_manager.events_for(task_id);
-        self.execution_manager.pushes.attach(self, task_id, &source);
-        source
-            .publish(Ok(event), snapshot, events::EventKind::Normal, None)
-            .await;
-    }
-
-    /// Gives the executor's `CANCELED` status to the entry the store already
-    /// recorded for the cancellation, without advancing the generation, and
-    /// stamps the event with it. Returns the saved task.
-    async fn amend_cancel_entry(
-        &self,
-        mut task: Task,
-        event: &mut StreamResponse,
-    ) -> Result<Task, A2AError> {
-        let StreamResponse::StatusUpdate(update) = event else {
-            return Err(A2AError::internal(
-                "only a status can amend the cancel entry",
-            ));
-        };
-        task.status = update.status.clone();
-        if let Some(TimelineEntry {
-            content: TimelineContent::Status(status),
-            ..
-        }) = task.timeline.iter_mut().flatten().last()
-        {
-            *status = update.status.clone();
-        }
-        update.generation = task.generation;
-        save_task(self.task_store.as_ref(), task).await
-    }
-
-    /// Announces the cancellation the store recorded when the executor sent no
-    /// status of its own: a status event at the generation the store gave it,
-    /// with no further advance. Returns the event, for the push.
-    async fn announce_cancel_if_missing(
-        &self,
-        task_id: &str,
-        active: Option<&Arc<ActiveExecution>>,
-        entry: &CancelEntry,
-        current_task: &Option<Task>,
-    ) -> Result<Option<StreamResponse>, A2AError> {
-        if entry.announced {
-            return Ok(None);
-        }
-        let _writer = match active {
-            Some(active) => Some(active.writer.lock().await),
-            None => None,
-        };
-        let base = match active {
-            Some(active) => active.snapshot().await,
-            None => current_task.clone(),
-        };
-        let Some(base) = base else {
-            return Ok(None);
-        };
-        if base.generation != entry.generation {
-            // Something else changed the task since the store recorded the
-            // cancellation (an artifact the cancel executor produced, say), so
-            // announcing that entry now would repeat a generation already
-            // used. The cancellation is recorded again, at the current one.
-            let mut status = base.status.clone();
-            status.state = TaskState::Canceled;
-            let mut event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-                task_id: task_id.to_string(),
-                context_id: base.context_id.clone(),
-                status,
-                metadata: None,
-                generation: 0,
-            });
-            match active {
-                Some(active) => {
-                    apply_and_publish(self.task_store.as_ref(), active, Some(base), &mut event)
-                        .await?;
-                }
-                None => {
-                    let task =
-                        apply_event_to_task(self.task_store.as_ref(), Some(base), &mut event)
-                            .await?;
-                    self.publish_stored_event(&event, task).await;
-                }
-            }
-            self.changes.notify_event(&event);
-            return Ok(Some(event));
-        }
-        let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-            task_id: task_id.to_string(),
-            context_id: base.context_id.clone(),
-            status: base.status.clone(),
-            metadata: None,
-            generation: base.generation,
-        });
-        if let Some(active) = active {
-            active.publish(Ok(&event), None).await;
-        } else {
-            self.publish_stored_event(&event, Some(base)).await;
-        }
-        self.changes.notify_event(&event);
-        Ok(Some(event))
-    }
-
-    /// Records the cancellation as a status event unless one has followed the
-    /// store transition already. Returns the event it recorded, if any.
-    async fn record_cancel_if_missing(
-        &self,
-        task_id: &str,
-        canceled: &Task,
-        active: Option<&Arc<ActiveExecution>>,
-        current_task: &mut Option<Task>,
-    ) -> Result<Option<StreamResponse>, A2AError> {
-        let _writer = match active {
-            Some(active) => Some(active.writer.lock().await),
-            None => None,
-        };
-        let base = match active {
-            Some(active) => active.snapshot().await,
-            None => current_task.clone(),
-        };
-        let recorded = base.as_ref().is_some_and(|task| {
-            task.timeline.iter().flatten().any(|entry| {
-                entry.generation > canceled.generation
-                    && matches!(
-                        &entry.content,
-                        TimelineContent::Status(status) if status.state == TaskState::Canceled
-                    )
-            })
-        });
-        if recorded {
-            return Ok(None);
-        }
-        // Whatever the executor did, this records a cancellation.
-        let mut status = base
-            .as_ref()
-            .map_or_else(|| canceled.status.clone(), |task| task.status.clone());
-        status.state = TaskState::Canceled;
-        let mut event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-            task_id: task_id.to_string(),
-            context_id: canceled.context_id.clone(),
-            status,
-            metadata: None,
-            generation: 0,
-        });
-        match active {
-            Some(active) => {
-                apply_and_publish(self.task_store.as_ref(), active, base, &mut event).await?;
-            }
-            None => {
-                *current_task =
-                    apply_event_to_task(self.task_store.as_ref(), base, &mut event).await?;
-                self.publish_stored_event(&event, current_task.clone())
-                    .await;
-            }
-        }
-        self.changes.notify_event(&event);
-        Ok(Some(event))
     }
 }
 
@@ -1728,7 +894,7 @@ impl RequestHandler for DefaultRequestHandler {
         let params = params.clone();
         let task_id = req.id.clone();
         let user = self.authenticated_user(&params)?;
-        tokio::spawn(async move { handler.cancel_task_owned(&params, req, user).await })
+        tokio::spawn(async move { cancellation::cancel(handler, params, req, user).await })
             .await
             .map_err(|error| {
                 tracing::error!(%task_id, %error, "cancellation operation failed");
@@ -1865,7 +1031,11 @@ mod test_support;
 
 #[cfg(test)]
 mod tests {
+    use super::coordinator::TaskOperation;
+    use super::events::ActiveExecution;
+    use super::protocol::is_terminal_event;
     use super::test_support::*;
+    use crate::ClientInputs;
     /// How the cancel of an `InputRequiredExecutor` ends.
     enum Cancel {
         Cancels,
@@ -2449,8 +1619,28 @@ mod tests {
 
         let handler = Arc::new(make_handler());
         seed_task(&handler, "t-prep", "c-prep").await;
-        let (active, _inputs, guard) = handler.execution_manager.reserve("t-prep").await.unwrap();
-
+        let (active, _inputs, _invocation) =
+            handler.execution_manager.reserve("t-prep").await.unwrap();
+        let coordinator = handler.execution_manager.coordinators.for_task("t-prep");
+        let (entered, began) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let preparing = {
+            let handler = handler.clone();
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .call(TaskOperation::Input, async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                        active
+                            .set_snapshot(handler.load_task("t-prep").await.unwrap())
+                            .await;
+                    })
+                    .await
+                    .unwrap();
+            })
+        };
+        began.await.unwrap();
         let subscribing = {
             let handler = handler.clone();
             tokio::spawn(async move {
@@ -2469,10 +1659,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!subscribing.is_finished(), "it waits for the preparation");
 
-        let prepared = handler.task_store.get("t-prep").await.unwrap().unwrap();
-        active.set_snapshot(prepared).await;
-        drop(guard);
-
+        release.send(()).unwrap();
+        preparing.await.unwrap();
         let mut stream = subscribing.await.unwrap().unwrap();
         assert!(matches!(
             stream.next().await,
@@ -2486,12 +1674,11 @@ mod tests {
     async fn test_subscribe_ignores_a_dropped_requests_leftover() {
         let handler = make_handler();
         seed_task(&handler, "t-leftover", "c-leftover").await;
-        let (_stale, _inputs, guard) = handler
+        let (_stale, _inputs, _invocation) = handler
             .execution_manager
             .reserve("t-leftover")
             .await
             .unwrap();
-        drop(guard);
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(2),
@@ -2702,28 +1889,21 @@ mod tests {
             history: None,
             metadata: None,
         };
-        let mut current = Some(canceled.clone());
-        let mut event = StreamResponse::Task(canceled);
-
-        let published = handler
-            .apply_cancel_event(
-                None,
-                &mut current,
-                &mut CancelEntry {
-                    recorded_by_store: false,
-                    generation: 3,
-                    announced: false,
-                },
-                &mut event,
-            )
+        let mut canceled = canceled;
+        canceled.status.timestamp = Some(chrono::Utc::now());
+        handler.task_store.create(canceled.clone()).await.unwrap();
+        let active = ActiveExecution::new(Some(canceled.clone()));
+        let mut progress =
+            cancellation::Cancellation::new(active.clone(), canceled.clone(), false, false);
+        let published = progress
+            .apply(&handler, StreamResponse::Task(canceled))
             .await
             .unwrap();
-
         assert!(
             !published,
             "a snapshot that changes nothing is not published"
         );
-        assert_eq!(current.unwrap().generation, 3);
+        assert_eq!(active.snapshot().await.unwrap().generation, 3);
     }
 
     #[tokio::test]
@@ -2879,9 +2059,27 @@ mod tests {
         let inputs = ClientInputs::closed();
         let ctx = ExecutorContext::new("timeout-cancel", "context", inputs)
             .with_stored_task(canceled.clone());
+        let coordinator = handler
+            .execution_manager
+            .coordinators
+            .for_task("timeout-cancel");
+        let progress = cancellation::Cancellation::new(
+            ActiveExecution::new(Some(canceled.clone())),
+            canceled.clone(),
+            false,
+            false,
+        );
+        coordinator
+            .update(TaskOperation::Cancel, move |state| {
+                Box::pin(async move {
+                    state.cancellation = Some(progress);
+                })
+            })
+            .await
+            .unwrap();
         let result = timeout(
             Duration::from_secs(2),
-            handler.run_cancel("timeout-cancel", &canceled, false, None, ctx),
+            cancellation::run(handler.clone(), ctx, coordinator.clone()),
         )
         .await
         .expect("the hook deadline must bound the wait");
@@ -3926,33 +3124,15 @@ mod tests {
             let mut canceled = handler.load_task("legacy-cancel").await.unwrap();
             canceled.status.state = TaskState::Canceled;
             handler.task_store.update(canceled.clone()).await.unwrap();
-            let active = running.then(|| ActiveExecution::new(Some(canceled.clone())));
-            let mut current = Some(canceled.clone());
-            let event = handler
-                .record_cancel_if_missing("legacy-cancel", &canceled, active.as_ref(), &mut current)
-                .await
-                .unwrap()
-                .unwrap();
-            let StreamResponse::StatusUpdate(status) = event else {
-                panic!("expected cancellation status");
-            };
-            assert_eq!(status.generation, canceled.generation + 1);
-            assert_eq!(status.status.state, TaskState::Canceled);
+            let active = ActiveExecution::new(Some(canceled.clone()));
+            let progress =
+                cancellation::Cancellation::new(active.clone(), canceled.clone(), false, running);
+            progress.record_if_missing(&handler).await.unwrap();
             let task = handler.load_task("legacy-cancel").await.unwrap();
-            assert_eq!(task.generation, status.generation);
+            assert_eq!(task.generation, canceled.generation + 1);
+            assert_eq!(task.status.state, TaskState::Canceled);
             assert_eq!(task.timeline.as_ref().unwrap().len(), 1);
-            assert!(
-                handler
-                    .record_cancel_if_missing(
-                        "legacy-cancel",
-                        &canceled,
-                        active.as_ref(),
-                        &mut current
-                    )
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            progress.record_if_missing(&handler).await.unwrap();
             assert_eq!(handler.load_task("legacy-cancel").await.unwrap(), task);
         }
     }
@@ -4032,7 +3212,7 @@ mod tests {
     #[tokio::test]
     async fn prepared_but_uncreated_tasks_are_not_visible_to_other_requests() {
         let handler = make_handler();
-        let (active, _inputs, writer) = handler
+        let (active, _inputs, _invocation) = handler
             .execution_manager
             .reserve("uncreated")
             .await
@@ -4043,7 +3223,6 @@ mod tests {
         active
             .uncreated
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        drop(writer);
         let params = ServiceParams::from([(SVC_PARAM_VERSION.into(), vec!["1.1".into()])]);
         for payload in [
             StreamRequestPayload::SendMessage(send_req(Some("uncreated"), Some("context"))),
@@ -4231,9 +3410,9 @@ mod tests {
         let handler = make_handler();
         let task = task_with_history("finished", "context", 0);
         handler.task_store.create(task.clone()).await.unwrap();
-        let (active, _inputs, writer) = handler.execution_manager.reserve(&task.id).await.unwrap();
+        let (active, _inputs, _invocation) =
+            handler.execution_manager.reserve(&task.id).await.unwrap();
         active.set_snapshot(task.clone()).await;
-        drop(writer);
         let error = handler
             .subscribe_to_task(
                 &ServiceParams::new(),
@@ -5511,10 +4690,9 @@ mod subscription_attachment_tests {
                     task.generation = 5;
                     handler.task_store.update(task.clone()).await.unwrap();
                     let execution = if running {
-                        let (active, inputs, writer) =
+                        let (active, inputs, _invocation) =
                             handler.execution_manager.reserve("task").await.unwrap();
                         active.set_snapshot(task.clone()).await;
-                        drop(writer);
                         Some((active, inputs))
                     } else {
                         None

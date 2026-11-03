@@ -246,8 +246,17 @@ impl Run {
                     },
                     // Nothing is running that this exchange follows: it watches the
                     // task, so another client's turn, or a cancel, reaches it too.
-                    () = watch.changed(), if inner.is_none() => {
-                        if matches!(
+                    () = watch.changed(), if inner.is_none() ||
+                        (matches!(self.completion, RunCompletion::Exchange) && !uplink_open) => {
+                        if inner.is_some() && !uplink_open
+                            && self.handler.execution_manager.get(&self.task_id).await.is_none()
+                        {
+                            // The input half is closed and the invocation ended.
+                            // Preserve all buffered Task events before closing.
+                            self.flush(&mut inner, &mut last_generation, &out).await;
+                            break;
+                        }
+                        if inner.is_none() && matches!(
                             self.reattach(&mut inner, &mut last_generation, &out).await,
                             Reattach::End
                         ) {
@@ -268,6 +277,10 @@ impl Run {
                         None => {
                             uplink_open = false;
                             if inner.is_none() {
+                                break;
+                            }
+                            if self.handler.execution_manager.get(&self.task_id).await.is_none() {
+                                self.flush(&mut inner, &mut last_generation, &out).await;
                                 break;
                             }
                         }
@@ -351,6 +364,7 @@ impl Run {
         let result = self
             .deliver(&self.params, request, inner, last_generation, out)
             .await;
+        let interrupted = matches!(&result, Err(Rejection::Interrupted(_)));
         let mut downlink_open = *result.as_ref().unwrap_or(&true);
         if let Err(rejection) = result {
             // Ordering is by arrival: what the exchange has already published
@@ -361,9 +375,11 @@ impl Run {
                 downlink_open = self.forward(Ok(event).into(), last_generation, out).await;
             }
         }
-        if let Some(receipt) = receipt {
+        if let Some(receipt) = receipt.filter(|_| !interrupted) {
             receipt.complete(self.handler.load_task(&self.task_id).await);
         }
+        // Dropping a begun, interrupted receipt makes the HTTP adapter verify
+        // persistence. A readable Task alone does not prove this input committed.
         downlink_open
     }
 

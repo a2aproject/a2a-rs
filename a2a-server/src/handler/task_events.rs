@@ -17,7 +17,6 @@ struct State {
 }
 
 pub(super) struct TaskEvents {
-    pub(super) writer: Arc<tokio::sync::Mutex<()>>,
     pub(super) sender: broadcast::Sender<ExecutionEvent>,
     state: RwLock<State>,
     pub(super) notifications: std::sync::OnceLock<super::push_delivery::NotificationSettings>,
@@ -25,9 +24,8 @@ pub(super) struct TaskEvents {
 }
 
 impl TaskEvents {
-    pub(super) fn new(writer: Arc<tokio::sync::Mutex<()>>, snapshot: Option<Task>) -> Arc<Self> {
+    pub(super) fn new(snapshot: Option<Task>) -> Arc<Self> {
         Arc::new(Self {
-            writer,
             sender: broadcast::channel(super::EXECUTION_BUFFER_CAPACITY).0,
             state: RwLock::new(State {
                 snapshot,
@@ -80,7 +78,7 @@ impl TaskEvents {
         Ok((receiver, state.snapshot.clone(), state.sequence))
     }
 
-    /// The caller holds the task writer, including across persistence. Every
+    /// The Task coordinator orders this publication after persistence. Every
     /// consumer sees the same publication order, regardless of execution turn.
     pub(super) async fn publish(
         self: &Arc<Self>,
@@ -131,7 +129,7 @@ mod tests {
     #[tokio::test]
     async fn task_subscription_and_sequence_survive_executor_handoff() {
         let manager = ExecutionManager::default();
-        let (first, _inputs, writer) = manager.reserve("task").await.unwrap();
+        let (first, _inputs, _invocation) = manager.reserve("task").await.unwrap();
         let source = first.events.clone();
         let mut subscriber = source.sender.subscribe();
         let task = task_with_history("task", "context", 0);
@@ -140,10 +138,9 @@ mod tests {
             .publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()))
             .await;
         manager.finish("task", &first).await;
-        drop(writer);
         drop(first);
 
-        let (second, _inputs, _writer) = manager.reserve("task").await.unwrap();
+        let (second, _inputs, _invocation) = manager.reserve("task").await.unwrap();
         assert!(Arc::ptr_eq(&source, &second.events));
         assert!(
             second.snapshot().await.is_none(),

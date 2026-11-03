@@ -849,8 +849,18 @@ async fn an_idle_exchange_is_told_when_its_task_is_canceled_and_ends() {
     // Nothing is running; somebody else cancels the task.
     handler.cancel_task(&p, cancel(&task_id)).await.unwrap();
 
-    let told = task_of(next(&mut down).await);
-    assert_eq!(told.status.state, TaskState::Canceled);
+    // The persistent Task subscription receives the status event directly;
+    // a subscriber that had to reattach may instead receive its snapshot.
+    let (id, state, generation) = match next(&mut down).await {
+        StreamResponse::Task(task) => (task.id, task.status.state, task.generation),
+        StreamResponse::StatusUpdate(update) => {
+            (update.task_id, update.status.state, update.generation)
+        }
+        other => panic!("expected cancellation, got {other:?}"),
+    };
+    assert_eq!(id, task_id);
+    assert_eq!(state, TaskState::Canceled);
+    assert!(generation > 0);
     ended(&mut down).await;
 }
 

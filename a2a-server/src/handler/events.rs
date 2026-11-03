@@ -11,7 +11,7 @@ use crate::executor::{ClientInput, ClientInputSender, ClientInputs, QueuedInput,
 use a2a::*;
 use futures::stream::BoxStream;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::broadcast;
 
 #[derive(Clone)]
 pub(super) struct ExecutionEvent {
@@ -44,17 +44,41 @@ pub(super) struct ExecutionReceiver {
     receiver: broadcast::Receiver<ExecutionEvent>,
     /// Keep the Task source, not the executor invocation, alive.
     events: Arc<super::task_events::TaskEvents>,
-    finished: tokio_util::sync::CancellationToken,
+    finished: Option<tokio_util::sync::CancellationToken>,
+    opening_message: bool,
     /// Events at or before this subscription opened must not be replayed.
     opened_at: u64,
 }
 
 impl ExecutionReceiver {
+    /// Streaming responses follow the Task source across invocation boundaries.
+    pub(super) fn follow_task(mut self) -> Self {
+        self.finished = None;
+        self
+    }
+
+    /// A streaming send must still produce its opening snapshot if the agent
+    /// ends without emitting a visible event. Then it follows the Task source.
+    pub(super) fn opening_message(mut self) -> Self {
+        self.opening_message = true;
+        self
+    }
+
+    fn opened(&mut self) {
+        if self.opening_message {
+            self.opening_message = false;
+            self.finished = None;
+        }
+    }
+
     pub(super) async fn recv(&mut self) -> Result<ExecutionEvent, broadcast::error::RecvError> {
+        let Some(finished) = &self.finished else {
+            return self.receiver.recv().await;
+        };
         tokio::select! {
             biased;
             event = self.receiver.recv() => event,
-            _ = self.finished.cancelled() => Err(broadcast::error::RecvError::Closed),
+            _ = finished.cancelled() => Err(broadcast::error::RecvError::Closed),
         }
     }
 
@@ -72,29 +96,42 @@ impl ExecutionReceiver {
     }
 }
 
+/// Mutable bookkeeping held in TaskRuntime, never behind a shared mutex.
 #[derive(Default)]
-struct ActiveExecutionState {
+pub(super) struct InvocationState {
     pending_inputs: Vec<QueuedInput>,
     returned_inputs: Option<ReturnedInputs>,
+    pub(super) pending_push: Option<TaskPushNotificationConfig>,
 }
 
+impl InvocationState {
+    pub(super) fn track_input(&mut self, input: ClientInput) -> QueuedInput {
+        let input = QueuedInput::new(input);
+        self.pending_inputs.retain(QueuedInput::pending);
+        self.pending_inputs.push(input.clone());
+        input
+    }
+
+    /// Revoke even a receiver moved into user work before reclaiming receipts.
+    pub(super) fn drain_inputs(&mut self, inputs: &ClientInputSender) -> Vec<ClientInput> {
+        inputs.revoke();
+        self.returned_inputs.take();
+        self.pending_inputs
+            .drain(..)
+            .filter_map(QueuedInput::reclaim)
+            .collect()
+    }
+}
+
+/// Shareable invocation controls and published-state projection. Mutable input
+/// bookkeeping is exclusively owned by the Task coordinator.
 pub(super) struct ActiveExecution {
     pub(super) execution_id: String,
     pub(super) events: Arc<super::task_events::TaskEvents>,
     pub(super) finished: tokio_util::sync::CancellationToken,
     prepared: std::sync::atomic::AtomicBool,
-    state: RwLock<ActiveExecutionState>,
-    /// Serialises every mutation of the task while it executes. The snapshot
-    /// in `events` is the authoritative copy: a writer takes this lock,
-    /// reads the snapshot, applies its change, saves it and publishes the
-    /// result, so executor events, a cancel and a follow-up cannot each work
-    /// from a stale copy of their own.
-    ///
-    /// It is the task's own writer (see
-    /// [`ExecutionManager::writer_for`](super::registry::ExecutionManager::writer_for)), not
-    /// one per execution: a cancel or a follow-up that arrives while no
-    /// execution is running serialises on the same lock.
-    pub(super) writer: Arc<tokio::sync::Mutex<()>>,
+    /// Keep the coordinator alive until this invocation has released its state.
+    pub(super) _coordinator: Option<Arc<super::coordinator::TaskCoordinator>>,
     /// Where messages sent to this task go while the executor runs. The queue
     /// belongs to the execution turn and is handed off with unread inputs.
     pub(super) inputs: ClientInputSender,
@@ -105,75 +142,42 @@ pub(super) struct ActiveExecution {
     /// task is created by the executor's first event, and does not exist if
     /// the executor answers with a message alone.
     pub(super) uncreated: std::sync::atomic::AtomicBool,
-    /// The push configuration the request carried, kept until the task exists.
-    pub(super) pending_push: std::sync::Mutex<Option<TaskPushNotificationConfig>>,
 }
 
 impl ActiveExecution {
     #[cfg(test)]
     pub(super) fn new(task: Option<Task>) -> Arc<Self> {
-        Self::with_writer(task, Arc::new(tokio::sync::Mutex::new(()))).0
-    }
-
-    #[cfg(test)]
-    pub(super) fn with_writer(
-        task: Option<Task>,
-        writer: Arc<tokio::sync::Mutex<()>>,
-    ) -> (Arc<Self>, ClientInputs) {
         let prepared = task.is_some();
-        let result = Self::with_events(super::task_events::TaskEvents::new(writer, task));
-        result
-            .0
+        let (active, _inputs, _state) =
+            Self::with_events(super::task_events::TaskEvents::new(task));
+        active
             .prepared
             .store(prepared, std::sync::atomic::Ordering::SeqCst);
-        result
+        active
     }
 
     pub(super) fn with_events(
         events: Arc<super::task_events::TaskEvents>,
-    ) -> (Arc<Self>, ClientInputs) {
+    ) -> (Arc<Self>, ClientInputs, InvocationState) {
         let (inputs, receiver, returned_inputs) = ClientInputs::for_execution(TASK_INPUT_CAPACITY);
         (
             Arc::new(Self {
                 execution_id: uuid::Uuid::now_v7().to_string(),
-                writer: events.writer.clone(),
                 events,
                 finished: tokio_util::sync::CancellationToken::new(),
                 prepared: std::sync::atomic::AtomicBool::new(false),
-                state: RwLock::new(ActiveExecutionState {
-                    pending_inputs: Vec::new(),
-                    returned_inputs: Some(returned_inputs),
-                }),
+                _coordinator: None,
                 inputs,
                 inputs_drained: tokio_util::sync::CancellationToken::new(),
                 push_failure: tokio::sync::watch::channel(None).0,
                 uncreated: std::sync::atomic::AtomicBool::new(false),
-                pending_push: std::sync::Mutex::new(None),
             }),
             receiver,
+            InvocationState {
+                returned_inputs: Some(returned_inputs),
+                ..Default::default()
+            },
         )
-    }
-
-    /// Keep receipts in the existing state lock; recv itself takes no lock.
-    pub(super) async fn track_input(&self, input: ClientInput) -> QueuedInput {
-        let input = QueuedInput::new(input);
-        let mut state = self.state.write().await;
-        state.pending_inputs.retain(QueuedInput::pending);
-        state.pending_inputs.push(input.clone());
-        input
-    }
-
-    /// The task writer excludes new input. Revoke the old reader before
-    /// reclaiming unread receipts, even if a worker still owns that receiver.
-    pub(super) async fn drain_inputs(&self) -> Vec<ClientInput> {
-        self.inputs.revoke();
-        let mut state = self.state.write().await;
-        state.returned_inputs.take();
-        state
-            .pending_inputs
-            .drain(..)
-            .filter_map(QueuedInput::reclaim)
-            .collect()
     }
 
     /// The most recently published execution event, read under the state lock.
@@ -200,7 +204,8 @@ impl ActiveExecution {
         ExecutionReceiver {
             receiver,
             events: self.events.clone(),
-            finished: self.finished.clone(),
+            finished: Some(self.finished.clone()),
+            opening_message: false,
             opened_at: sequence,
         }
     }
@@ -216,7 +221,8 @@ impl ActiveExecution {
             ExecutionReceiver {
                 receiver,
                 events: self.events.clone(),
-                finished: self.finished.clone(),
+                finished: Some(self.finished.clone()),
+                opening_message: false,
                 opened_at: sequence,
             },
             snapshot,
@@ -309,6 +315,7 @@ pub(super) fn subscription_stream(
             }
 
             if let Some(task) = state.snapshot_task.take() {
+                state.receiver.opened();
                 if task.status.state.is_terminal() {
                     state.done = true;
                 }
@@ -340,6 +347,7 @@ pub(super) fn subscription_stream(
                         continue;
                     }
                     Ok(event) => {
+                        state.receiver.opened();
                         state.min_sequence = event.sequence;
                         match &event.result {
                             Ok(item) if is_terminal_event(item) => state.done = true,
@@ -353,10 +361,26 @@ pub(super) fn subscription_stream(
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         match state.receiver.resync(state.min_sequence).await {
                             Ok(Some((task, sequence))) => {
+                                state.receiver.opened();
                                 state.min_sequence = sequence;
                                 if task.status.state.is_terminal() {
                                     state.done = true;
                                 }
+                                return Some((Ok(StreamResponse::Task(task)), state));
+                            }
+                            Ok(None) => return None,
+                            Err(error) => {
+                                state.done = true;
+                                return Some((Err(error), state));
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) if state.receiver.opening_message => {
+                        match state.receiver.resync(state.min_sequence).await {
+                            Ok(Some((task, sequence))) => {
+                                state.receiver.opened();
+                                state.min_sequence = sequence;
+                                state.done = task.status.state.is_terminal();
                                 return Some((Ok(StreamResponse::Task(task)), state));
                             }
                             Ok(None) => return None,
@@ -728,7 +752,7 @@ mod tests {
         let manager = ExecutionManager::default();
         let mut task = task_with_history("handoff-error", "context", 0);
         task.status.state = TaskState::Working;
-        let (first, _inputs, writer) = manager.reserve(&task.id).await.unwrap();
+        let (first, _inputs, _invocation) = manager.reserve(&task.id).await.unwrap();
         first.set_snapshot(task.clone()).await;
         let (receiver, _, sequence) = first.resubscribe().await;
         let mut old_response =
@@ -736,10 +760,9 @@ mod tests {
         let error = A2AError::internal("executor failed");
         first.publish(Err(&error), None).await;
         manager.finish(&task.id, &first).await;
-        drop(writer);
         drop(first);
 
-        let (second, _inputs, writer) = manager.reserve(&task.id).await.unwrap();
+        let (second, _inputs, _invocation) = manager.reserve(&task.id).await.unwrap();
         second.set_snapshot(task.clone()).await;
         for _ in 0..EXECUTION_BUFFER_CAPACITY + 1 {
             task.generation += 1;
@@ -771,6 +794,5 @@ mod tests {
             Some(Ok(StreamResponse::Task(snapshot))) if snapshot.generation == task.generation
         ));
         manager.finish("handoff-error", &second).await;
-        drop(writer);
     }
 }

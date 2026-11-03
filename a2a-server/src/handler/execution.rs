@@ -1,25 +1,38 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Drive executor output, persist updates, and handle execution failures.
+//! Poll agent code and submit output and completion to the Task coordinator.
 
-use super::events::{ActiveExecution, EventKind};
+use super::DefaultRequestHandler;
+use super::events::ActiveExecution;
 use super::protocol::is_terminal_event;
-use super::registry::ExecutionRuntime;
-use super::turns::{
-    end_turn, reject_unread_inputs, reject_unread_inputs_locked, release_execution,
-    release_execution_locked, save_pending_push_config,
-};
-use super::updates::{
-    apply_and_publish, backfill_status_timestamp, persist_event, validate_event_identity,
-};
+use super::registry::ReservationGuard;
 use a2a::*;
 use futures::StreamExt;
 use std::sync::Arc;
 
+/// Starting an invocation has the same cleanup contract for initial input and handoff.
+pub(super) fn spawn(
+    handler: DefaultRequestHandler,
+    task_id: TaskId,
+    active: Arc<ActiveExecution>,
+    context: crate::ExecutorContext,
+) {
+    let release = ReservationGuard::new(
+        handler.execution_manager.clone(),
+        task_id.clone(),
+        active.clone(),
+    );
+    let work: futures::future::BoxFuture<'static, ()> = Box::pin(async move {
+        drive_execution_guarded(handler, task_id, active, context).await;
+        release.disarm();
+    });
+    tokio::spawn(work);
+}
+
 /// The output stream has been dropped before these reach the runner. Input
 /// receipts let the server recover unread messages from an owned inbox.
-enum TurnEnd {
+pub(super) enum TurnEnd {
     Finished,
     Terminal(Box<StreamResponse>),
     Failed(A2AError),
@@ -27,46 +40,30 @@ enum TurnEnd {
 }
 
 async fn drive_execution(
-    runtime: ExecutionRuntime,
+    handler: DefaultRequestHandler,
     task_id: TaskId,
     active: Arc<ActiveExecution>,
     exec_ctx: crate::ExecutorContext,
 ) {
-    match poll_executor(&runtime, &task_id, &active, exec_ctx).await {
-        TurnEnd::Finished => {
-            end_turn(&runtime, &active, &task_id).await;
-        }
-        TurnEnd::Terminal(mut event) => {
-            let _writer = active.writer.lock().await;
-            reject_unread_inputs_locked(&active, &task_id).await;
-            if !active.snapshot_is_terminal().await {
-                if let Err(error) =
-                    apply_executor_event_locked(&runtime, &active, &task_id, &mut event).await
-                {
-                    active.publish(Err(&error), None).await;
-                }
-            }
-            runtime.execution_manager.finish(&task_id, &active).await;
-        }
-        TurnEnd::Failed(error) => {
-            fail_execution(&runtime, &active, &task_id, &error).await;
-        }
-        TurnEnd::Stopped => {
-            release_execution(&runtime.execution_manager, &active, &task_id).await;
-        }
-    }
-    runtime.changes.notify(&task_id);
+    let end = poll_executor(&handler, &task_id, &active, exec_ctx).await;
+    handler
+        .execution_manager
+        .coordinators
+        .for_task(&task_id)
+        .finished(handler, active, end)
+        .await
+        .expect("execution completion must reach its coordinator");
 }
 
 /// Cancellation drops the owned output stream; input receipts can be reclaimed
 /// even when an executor moved its receiver into a separate worker task.
 async fn poll_executor(
-    runtime: &ExecutionRuntime,
+    handler: &DefaultRequestHandler,
     task_id: &TaskId,
     active: &Arc<ActiveExecution>,
     exec_ctx: crate::ExecutorContext,
 ) -> TurnEnd {
-    let mut stream = runtime.executor.execute(exec_ctx);
+    let mut stream = handler.executor.execute(exec_ctx);
     let mut push_failure = active.push_failure.subscribe();
     let (mut answered, mut tracked) = (false, false);
     loop {
@@ -102,43 +99,26 @@ async fn poll_executor(
             tracked |= !message;
         }
         match result {
-            Ok(event)
-                if active.uncreated.load(std::sync::atomic::Ordering::SeqCst)
-                    && matches!(event, StreamResponse::Message(_)) =>
-            {
-                // A direct reply has no task to receive follow-ups. Release
-                // its reservation now, while allowing the executor to finish
-                // its work; events after the reply are still ignored.
-                {
-                    let _writer = active.writer.lock().await;
-                    if let Some(task) = active.snapshot().await
-                        && let Err(error) = validate_event_identity(&task, &event)
-                    {
-                        return TurnEnd::Failed(error);
-                    }
-                    active
-                        .publish_kind(Ok(&event), None, EventKind::Reply)
-                        .await;
-                    runtime.execution_manager.finish(task_id, active).await;
-                }
-                runtime.changes.notify(task_id);
-                while let Some(rest) = stream.next().await {
-                    if rest.is_ok() {
-                        tracing::warn!(%task_id, "the executor emitted an event after a direct reply; ignored");
-                    }
-                }
-                return TurnEnd::Stopped;
-            }
             Ok(event) if is_terminal_event(&event) => return TurnEnd::Terminal(Box::new(event)),
-            Ok(mut event) => {
-                let _writer = active.writer.lock().await;
-                if active.snapshot_is_terminal().await {
-                    return TurnEnd::Stopped;
-                }
-                if let Err(error) =
-                    apply_executor_event_locked(runtime, active, task_id, &mut event).await
-                {
-                    return TurnEnd::Failed(error);
+            Ok(event) => {
+                let action = handler
+                    .execution_manager
+                    .coordinators
+                    .for_task(task_id)
+                    .output(handler.clone(), active.clone(), event)
+                    .await;
+                match action {
+                    Ok(super::runtime::OutputAction::Continue) => {}
+                    Ok(super::runtime::OutputAction::Stopped) => return TurnEnd::Stopped,
+                    Ok(super::runtime::OutputAction::Drain) => {
+                        while let Some(rest) = stream.next().await {
+                            if rest.is_ok() {
+                                tracing::warn!(%task_id, "the executor emitted an event after a direct reply; ignored");
+                            }
+                        }
+                        return TurnEnd::Stopped;
+                    }
+                    Err(error) => return TurnEnd::Failed(error),
                 }
             }
             Err(error) => return TurnEnd::Failed(error),
@@ -146,96 +126,11 @@ async fn poll_executor(
     }
 }
 
-/// The caller holds the task writer. Terminal events reach here only after
-/// the executor stream has been dropped and unread messages answered.
-async fn apply_executor_event_locked(
-    runtime: &ExecutionRuntime,
-    active: &Arc<ActiveExecution>,
-    task_id: &TaskId,
-    event: &mut StreamResponse,
-) -> Result<(), A2AError> {
-    backfill_status_timestamp(event);
-    let base = active.snapshot().await;
-    let creating = active.uncreated.load(std::sync::atomic::Ordering::SeqCst);
-    let applied = persist_event(runtime.task_store.as_ref(), base, event, creating).await;
-    active
-        .uncreated
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    let (snapshot, repeated) = applied?;
-    if creating {
-        save_pending_push_config(active, runtime).await;
-    }
-    active.publish_marked(Ok(event), snapshot, repeated).await;
-    runtime.changes.notify(task_id);
-    Ok(())
-}
-
-/// Ends an execution with `error`: what the executor never read is answered
-/// first, then the error reaches the subscribers (which it ends).
-async fn fail_execution(
-    runtime: &ExecutionRuntime,
-    active: &Arc<ActiveExecution>,
-    task_id: &str,
-    error: &A2AError,
-) {
-    let _writer = active.writer.lock().await;
-    // An executor that fails before it has said anything created no task.
-    let creating = active
-        .uncreated
-        .swap(false, std::sync::atomic::Ordering::SeqCst);
-    let failed = if creating {
-        None
-    } else {
-        fail_task(runtime.task_store.as_ref(), active.snapshot().await, error).await
-    };
-    release_execution_locked(&runtime.execution_manager, active, task_id).await;
-    active.publish(Err(error), failed.clone()).await;
-    if let Some(task) = failed {
-        let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-            generation: task.generation,
-            task_id: task.id,
-            context_id: task.context_id,
-            status: task.status,
-            metadata: None,
-        });
-        active.publish(Ok(&event), None).await;
-    }
-}
-
-/// Publishes an error to the subscribers in order with the events around it:
-/// two unlocked publishers could broadcast out of sequence, and a subscriber
-/// drops what arrives behind a later sequence number.
-pub(super) async fn publish_error(active: &ActiveExecution, error: &A2AError) {
-    let _writer = active.writer.lock().await;
-    active.publish(Err(error), None).await;
-}
-
-async fn fail_task(
-    task_store: &dyn crate::TaskStore,
-    task: Option<Task>,
-    error: &A2AError,
-) -> Option<Task> {
-    let mut task = task.filter(|task| !task.status.state.is_terminal())?;
-    let text = crate::sanitized_internal_error(&error.message).message;
-    task.status = TaskStatus {
-        state: TaskState::Failed,
-        message: Some(Message {
-            task_id: Some(task.id.clone()),
-            context_id: Some(task.context_id.clone()),
-            ..Message::new(Role::Agent, vec![Part::text(text)])
-        }),
-        timestamp: Some(chrono::Utc::now()),
-    };
-    let status = task.status.clone();
-    super::updates::record_status(&mut task, status);
-    super::updates::save_task(task_store, task).await.ok()
-}
-
 /// Runs the execution and, if the executor panicked, fails the task: the
 /// subscribers get a terminal `FAILED` event instead of a stream that just
 /// stops, and the stored task does not stay `WORKING` for good.
 pub(super) async fn drive_execution_guarded(
-    runtime: ExecutionRuntime,
+    handler: DefaultRequestHandler,
     task_id: TaskId,
     active: Arc<ActiveExecution>,
     exec_ctx: crate::ExecutorContext,
@@ -243,16 +138,15 @@ pub(super) async fn drive_execution_guarded(
     use futures::FutureExt;
 
     let _drained = active.inputs_drained.clone().drop_guard();
+    let coordinator = handler.execution_manager.coordinators.for_task(&task_id);
 
-    let task_store = Arc::clone(&runtime.task_store);
-    let manager = Arc::clone(&runtime.execution_manager);
-    let changes = Arc::clone(&runtime.changes);
-    runtime
+    let recovery = handler.clone();
+    handler
         .execution_manager
         .pushes
-        .attach(&runtime, &task_id, &active.events);
+        .attach(&handler, &task_id, &active.events);
     let outcome = std::panic::AssertUnwindSafe(drive_execution(
-        runtime,
+        handler,
         task_id.clone(),
         active.clone(),
         exec_ctx,
@@ -263,62 +157,13 @@ pub(super) async fn drive_execution_guarded(
         return;
     }
 
-    tracing::error!(task_id = %task_id, "the agent executor panicked; failing the task");
-    {
-        let _writer = active.writer.lock().await;
-        // A task the executor never created, or answered with a message alone,
-        // stays uncreated: the panic is reported on the streams, and there is
-        // no task to fail.
-        let registered = manager
-            .get(&task_id)
-            .await
-            .is_some_and(|current| Arc::ptr_eq(&current, &active));
-        if !registered {
-            // The execution was released before the panic (it came from
-            // dropping the executor's stream): a later turn may hold the task
-            // now, and this one has nothing left to fail.
-        } else if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
-            active
-                .publish(
-                    Err(&A2AError::internal("the agent failed unexpectedly")),
-                    None,
-                )
-                .await;
-        } else if let Some(base) = active.snapshot().await {
-            if !base.status.state.is_terminal() {
-                reject_unread_inputs_locked(&active, &task_id).await;
-                let mut event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-                    task_id: task_id.clone(),
-                    context_id: base.context_id.clone(),
-                    status: TaskStatus {
-                        state: TaskState::Failed,
-                        message: Some(Message::new(
-                            Role::Agent,
-                            vec![Part::text("The agent failed unexpectedly.")],
-                        )),
-                        timestamp: Some(chrono::Utc::now()),
-                    },
-                    metadata: None,
-                    generation: 0,
-                });
-                match apply_and_publish(task_store.as_ref(), &active, Some(base), &mut event).await
-                {
-                    Ok(_) => {}
-                    Err(error) => {
-                        release_execution_locked(&manager, &active, &task_id).await;
-                        active.publish(Err(&error), None).await;
-                    }
-                }
-            }
-        }
-    }
-    reject_unread_inputs(&active, &task_id).await;
-    release_execution(&manager, &active, &task_id).await;
-    changes.notify(&task_id);
+    let _ = coordinator.panicked(recovery, active, task_id).await;
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::coordinator::TaskOperation;
+    use super::super::events::EventKind;
     use super::*;
     use crate::handler::test_support::*;
 
@@ -436,12 +281,22 @@ mod tests {
     }
 
     async fn registered(
-        runtime: &ExecutionRuntime,
+        runtime: &DefaultRequestHandler,
         task: Task,
     ) -> (Arc<ActiveExecution>, ExecutorContext) {
-        let (active, inputs, writer) = runtime.execution_manager.reserve(&task.id).await.unwrap();
+        let (active, inputs, _invocation) =
+            runtime.execution_manager.reserve(&task.id).await.unwrap();
+        let coordinator = runtime.execution_manager.coordinators.for_task(&task.id);
+        let id = active.execution_id.clone();
+        coordinator
+            .update(TaskOperation::Input, move |state| {
+                Box::pin(async move {
+                    state.invocations.insert(id, _invocation);
+                })
+            })
+            .await
+            .unwrap();
         active.set_snapshot(task.clone()).await;
-        drop(writer);
         let context = ExecutorContext::new(task.id.clone(), task.context_id.clone(), inputs)
             .with_stored_task(task);
         (active, context)
@@ -672,7 +527,17 @@ mod tests {
             active
                 .uncreated
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            *active.pending_push.lock().unwrap() = Some(push_config(&task.id));
+            let coordinator = runtime.execution_manager.coordinators.for_task(&task.id);
+            let id = active.execution_id.clone();
+            let config = push_config(&task.id);
+            coordinator
+                .update(TaskOperation::Input, move |state| {
+                    Box::pin(async move {
+                        state.invocations.get_mut(&id).unwrap().pending_push = Some(config);
+                    })
+                })
+                .await
+                .unwrap();
             drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context)
                 .await;
             assert_eq!(

@@ -1,7 +1,7 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Manage active executions, task writer locks, and reservation cleanup.
+//! Route active execution handles and task event sources; transitions use mailboxes.
 
 use super::events::{ActiveExecution, ExecutionReceiver};
 use super::push_delivery::PushSubscriptions;
@@ -12,55 +12,15 @@ use tokio::sync::RwLock;
 
 #[derive(Default)]
 pub(super) struct ExecutionManager {
+    pub(super) coordinators: super::coordinator::TaskCoordinators,
     executions: RwLock<HashMap<TaskId, Arc<ActiveExecution>>>,
-    /// One writer lock per task, shared by whoever is mutating it. Held weakly
-    /// so a task nobody is touching costs nothing.
-    writers: std::sync::Mutex<TaskWriters>,
     sources: std::sync::Mutex<HashMap<TaskId, std::sync::Weak<TaskEvents>>>,
     /// The webhook deliveries of each task, in the order its events were
     /// published.
     pub(super) pushes: PushSubscriptions,
 }
 
-#[derive(Default)]
-struct TaskWriters {
-    locks: HashMap<TaskId, std::sync::Weak<tokio::sync::Mutex<()>>>,
-    calls: usize,
-}
-
 impl ExecutionManager {
-    /// The task's writer lock. Every mutation of a task takes it: executor
-    /// events, a cancel, a follow-up being prepared. Two callers asking for the
-    /// same task while either still holds it get the same lock.
-    pub(super) fn writer_for(&self, task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        Self::lock_for(&self.writers, task_id)
-    }
-
-    fn lock_for(
-        locks: &std::sync::Mutex<TaskWriters>,
-        task_id: &str,
-    ) -> Arc<tokio::sync::Mutex<()>> {
-        let mut writers = locks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writers.calls += 1;
-        if writers.calls % 256 == 0 {
-            writers.locks.retain(|_, lock| lock.strong_count() > 0);
-        }
-        if let Some(lock) = writers
-            .locks
-            .get(task_id)
-            .and_then(std::sync::Weak::upgrade)
-        {
-            return lock;
-        }
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        writers
-            .locks
-            .insert(task_id.to_string(), Arc::downgrade(&lock));
-        lock
-    }
-
     /// Sources survive turns while any response or webhook subscriber owns them.
     pub(super) fn events_for(&self, task_id: &str) -> Arc<TaskEvents> {
         let mut sources = self
@@ -71,19 +31,12 @@ impl ExecutionManager {
         if let Some(source) = sources.get(task_id).and_then(std::sync::Weak::upgrade) {
             return source;
         }
-        let source = TaskEvents::new(self.writer_for(task_id), None);
+        let source = TaskEvents::new(None);
         sources.insert(task_id.to_owned(), Arc::downgrade(&source));
         source
     }
 
-    /// Claims the task for one execution before anything reads it, so two
-    /// requests for the same task cannot both prepare from the same stored
-    /// state. The snapshot is filled in once the request has been applied.
-    ///
-    /// The task's writer is taken first and handed back with the reservation:
-    /// anyone who finds the execution registered (a subscriber, a cancel) then
-    /// waits on a lock that is already held, instead of slipping in between
-    /// the registration and the first write.
+    /// The task coordinator calls this while processing its input or handoff.
     pub(super) async fn reserve(
         &self,
         task_id: &str,
@@ -91,35 +44,14 @@ impl ExecutionManager {
         (
             Arc<ActiveExecution>,
             crate::ClientInputs,
-            tokio::sync::OwnedMutexGuard<()>,
-        ),
-        A2AError,
-    > {
-        let writer = self.writer_for(task_id);
-        let guard = Arc::clone(&writer).lock_owned().await;
-        self.reserve_held(task_id, guard).await
-    }
-
-    /// [`Self::reserve`] for a caller that already holds the task's writer.
-    pub(super) async fn reserve_held(
-        &self,
-        task_id: &str,
-        guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> Result<
-        (
-            Arc<ActiveExecution>,
-            crate::ClientInputs,
-            tokio::sync::OwnedMutexGuard<()>,
+            super::events::InvocationState,
         ),
         A2AError,
     > {
         let mut executions = self.executions.write().await;
         if let Some(existing) = executions.get(task_id) {
-            // A live reservation holds the writer until its snapshot is set,
-            // and this caller holds it now: an entry that still has no
-            // snapshot belongs to a request that was dropped, whose release is
-            // still on its way. It is replaced, not mistaken for a running
-            // execution.
+            // Mailbox admission cannot overlap. An entry with no snapshot is
+            // abandoned preparation whose panic cleanup may still be pending.
             if existing.snapshot().await.is_some() {
                 return Err(A2AError::invalid_request(format!(
                     "task execution is already in progress: {task_id}"
@@ -127,9 +59,12 @@ impl ExecutionManager {
             }
         }
 
-        let (active, inputs) = ActiveExecution::with_events(self.events_for(task_id));
+        let (mut active, inputs, state) = ActiveExecution::with_events(self.events_for(task_id));
+        Arc::get_mut(&mut active)
+            .expect("new invocation has one owner")
+            ._coordinator = Some(self.coordinators.for_task(task_id));
         executions.insert(task_id.to_string(), active.clone());
-        Ok((active, inputs, guard))
+        Ok((active, inputs, state))
     }
 
     pub(super) async fn get(&self, task_id: &str) -> Option<Arc<ActiveExecution>> {
@@ -215,10 +150,8 @@ impl Drop for ReservationGuard {
         if !self.armed {
             return;
         }
-        // Released now if the registry is free, so a request already waiting
-        // for the writer this future still holds finds the task released, not
-        // a stale registration. Only a registry that is busy at this instant
-        // falls back to releasing from a spawned task.
+        // Cleanup never removes a successor invocation: finish checks pointer
+        // identity. Avoid spawning unless the short routing lock is contended.
         if self.manager.try_finish(&self.task_id, &self.active) {
             return;
         }
@@ -233,9 +166,6 @@ impl Drop for ReservationGuard {
     }
 }
 
-/// Execution and delivery share the same immutable handler services.
-pub(super) type ExecutionRuntime = super::DefaultRequestHandler;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,10 +177,9 @@ mod tests {
     #[tokio::test]
     async fn test_reserve_replaces_a_dropped_requests_leftover() {
         let manager = ExecutionManager::default();
-        let (stale, _inputs, guard) = manager.reserve("t-stale").await.unwrap();
-        drop(guard); // the request goes away; nothing released its entry
+        let (stale, _inputs, _invocation) = manager.reserve("t-stale").await.unwrap();
 
-        let (fresh, _inputs, _guard) = manager
+        let (fresh, _inputs, _invocation) = manager
             .reserve("t-stale")
             .await
             .expect("the leftover is not a running execution");
@@ -325,74 +254,43 @@ mod tests {
         assert!(resumed.next().await.is_none());
     }
 
-    /// The reservation hands back the task's writer already held: whoever
-    /// finds the execution registered then waits on a lock that is taken, not
-    /// one that is still free between the registration and the first write.
     #[tokio::test]
-    async fn test_reserve_holds_the_writer_from_the_moment_it_registers() {
+    async fn a_prepared_execution_cannot_be_reserved_twice() {
         let manager = ExecutionManager::default();
-
-        let (active, _inputs, guard) = manager.reserve("t-reserved").await.unwrap();
-        assert!(manager.get("t-reserved").await.is_some());
-        assert!(
-            manager.writer_for("t-reserved").try_lock().is_err(),
-            "the writer is held at registration"
-        );
-        // It is the same lock the execution writes under.
-        assert!(Arc::ptr_eq(
-            &active.writer,
-            &manager.writer_for("t-reserved")
-        ));
-
-        drop(guard);
-        assert!(manager.writer_for("t-reserved").try_lock().is_ok());
-        // Once the execution has its snapshot a second reservation is refused,
-        // and does not leave the writer taken.
-        active
-            .set_snapshot(Task {
-                generation: 1,
-                timeline: None,
-                id: "t-reserved".into(),
-                context_id: "c-reserved".into(),
-                status: TaskStatus {
-                    state: TaskState::Working,
-                    message: None,
-                    timestamp: None,
-                },
-                artifacts: None,
-                history: None,
-                metadata: None,
-            })
-            .await;
-        assert!(manager.reserve("t-reserved").await.is_err());
-        assert!(manager.writer_for("t-reserved").try_lock().is_ok());
+        let (active, _inputs, _invocation) = manager.reserve("task").await.unwrap();
+        let task = task_with_history("task", "context", 0);
+        active.set_snapshot(task).await;
+        assert!(manager.reserve("task").await.is_err());
+        assert!(Arc::ptr_eq(&manager.get("task").await.unwrap(), &active));
     }
+
     #[test]
-    fn writer_map_recovers_from_poison_and_prunes_unused_locks() {
+    fn event_source_registry_recovers_from_poison_and_prunes_unused_sources() {
         let manager = ExecutionManager::default();
-        let held = manager.writer_for("held");
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _writers = manager.writers.lock().unwrap();
-            panic!("interrupted registry owner");
-        }));
-        assert!(poisoned.is_err());
+        let held = manager.events_for("held");
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _sources = manager.sources.lock().unwrap();
+                panic!("interrupted registry owner");
+            }))
+            .is_err()
+        );
         for id in 0..256 {
-            drop(manager.writer_for(&format!("abandoned-{id}")));
+            drop(manager.events_for(&format!("abandoned-{id}")));
         }
-        assert!(Arc::ptr_eq(&held, &manager.writer_for("held")));
-        let writers = manager
-            .writers
+        assert!(Arc::ptr_eq(&held, &manager.events_for("held")));
+        let sources = manager
+            .sources
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(!writers.locks.contains_key("abandoned-0"));
-        assert!(writers.locks.contains_key("held"));
+        assert!(!sources.contains_key("abandoned-0"));
+        assert!(sources.contains_key("held"));
     }
 
     #[tokio::test]
     async fn dropped_reservation_releases_after_a_contended_registry_is_unlocked() {
         let manager = Arc::new(ExecutionManager::default());
-        let (active, _inputs, writer) = manager.reserve("contended-drop").await.unwrap();
-        drop(writer);
+        let (active, _inputs, _invocation) = manager.reserve("contended-drop").await.unwrap();
         let reservation =
             ReservationGuard::new(manager.clone(), "contended-drop".into(), active.clone());
         let registry = manager.executions.write().await;
