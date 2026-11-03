@@ -546,3 +546,42 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod invalid_lifecycle_tests {
+    use super::*;
+    use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn duplicate_reservation_and_unstarted_cancellation_leave_the_owner_intact() {
+        let handler = make_handler();
+        let mut runtime = TaskRuntime::default();
+        let (active, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
+        let error = runtime.reserve(&handler, "task").await.err().unwrap();
+        assert_eq!(error.code, error_code::INVALID_REQUEST);
+        let event = StreamResponse::Task(task_with_history("task", "context", 0));
+        assert_eq!(
+            runtime
+                .cancel_update(&handler, event)
+                .await
+                .unwrap_err()
+                .message,
+            "no cancellation in progress"
+        );
+        assert_eq!(
+            runtime
+                .cancel_finished(&handler, "task", None)
+                .await
+                .unwrap_err()
+                .message,
+            "no cancellation in progress"
+        );
+        assert!(runtime.execution.is_current(&active));
+        assert!(Arc::ptr_eq(
+            &handler.execution_manager.get("task").await.unwrap(),
+            &active
+        ));
+        runtime.release(&handler, "task", &active).await;
+        assert!(handler.execution_manager.get("task").await.is_none());
+    }
+}

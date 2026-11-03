@@ -340,6 +340,26 @@ mod tests {
     async fn a_panicking_hook_still_records_cancellation_and_returns_a_sanitized_error() {
         let handler = DefaultRequestHandler::new(PanickingHook, InMemoryTaskStore::new());
         seed_task(&handler, "task", "context").await;
+        // Cancellation also works after an invocation returns without completing its Task.
+        let mut request = send_request();
+        request.message.task_id = Some("task".into());
+        request.configuration = Some(SendMessageConfiguration {
+            return_immediately: Some(true),
+            ..serde_json::from_value(serde_json::json!({})).unwrap()
+        });
+        let response = handler
+            .send_message(&ServiceParams::new(), request)
+            .await
+            .unwrap();
+        assert!(matches!(response, SendMessageResponse::Task(_)));
+        timeout(Duration::from_secs(2), async {
+            while handler.execution_manager.get("task").await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
         let error = timeout(
             Duration::from_secs(2),
             handler.cancel_task(
@@ -403,6 +423,26 @@ mod tests {
             InMemoryTaskStore::new(),
         );
         seed_task(&handler, "task", "context").await;
+        // Cancellation also works after an invocation returns without completing its Task.
+        let mut request = send_request();
+        request.message.task_id = Some("task".into());
+        request.configuration = Some(SendMessageConfiguration {
+            return_immediately: Some(true),
+            ..serde_json::from_value(serde_json::json!({})).unwrap()
+        });
+        let response = handler
+            .send_message(&ServiceParams::new(), request)
+            .await
+            .unwrap();
+        assert!(matches!(response, SendMessageResponse::Task(_)));
+        timeout(Duration::from_secs(2), async {
+            while handler.execution_manager.get("task").await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
         let cancel = || CancelTaskRequest {
             id: "task".into(),
             metadata: None,
