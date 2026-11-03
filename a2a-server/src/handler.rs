@@ -56,7 +56,6 @@ const DEFAULT_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// long-poll, so a task changed by another process is still noticed.
 const LONG_POLL_RECHECK: Duration = Duration::from_secs(1);
 
-
 /// Transport-agnostic request handler interface.
 ///
 /// This is the core interface consumed by all protocol bindings
@@ -1064,12 +1063,13 @@ impl RequestHandler for DefaultRequestHandler {
         self.authorize(params, request_task_id(&req).as_deref())?;
         self.require_streaming()?;
         let history_length = req.configuration.as_ref().and_then(|c| c.history_length);
+        let timeline_length = req.configuration.as_ref().and_then(|c| c.timeline_length);
         let (task, receiver) = self.start_execution(params, req, false).await?;
         let stream = with_opening_task(subscription_stream(receiver, None, 0, false), task);
         Ok(Box::pin(stream.map(move |item| {
             item.map(|mut event| {
                 if let StreamResponse::Task(task) = &mut event {
-                    apply_history_length(task, history_length);
+                    apply_lengths(task, history_length, timeline_length);
                 }
                 event
             })
@@ -3886,7 +3886,7 @@ mod upstream_regressions {
                     context_id: ctx.context_id.clone(),
                     artifact: Artifact {
                         role: None,
-                        start_generation: 0,
+                        start_generation: Some(0),
                         end_generation: None,
                         artifact_id: "unknown".into(),
                         name: None,
@@ -3913,6 +3913,7 @@ mod upstream_regressions {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -3947,6 +3948,7 @@ mod upstream_regressions {
         );
         let mut request = send_request();
         request.configuration = Some(SendMessageConfiguration {
+            if_generation_match: None,
             timeline_length: None,
             accepted_output_modes: None,
             // A loopback webhook is refused by the default URL validation.
@@ -3966,6 +3968,7 @@ mod upstream_regressions {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -4004,6 +4007,7 @@ mod upstream_regressions {
         );
         let mut request = send_request();
         request.configuration = Some(SendMessageConfiguration {
+            if_generation_match: None,
             timeline_length: None,
             accepted_output_modes: None,
             task_push_notification_config: None,
@@ -4018,6 +4022,7 @@ mod upstream_regressions {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -4093,6 +4098,7 @@ mod upstream_regressions {
             .list_tasks(
                 &params,
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -4212,6 +4218,7 @@ mod upstream_regressions {
             .list_tasks(
                 &params,
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -4295,6 +4302,7 @@ mod upstream_regressions {
         );
         let request = SendMessageRequest {
             configuration: Some(SendMessageConfiguration {
+                if_generation_match: None,
                 timeline_length: None,
                 accepted_output_modes: None,
                 task_push_notification_config: None,
