@@ -2667,6 +2667,129 @@ mod tests {
         assert_eq!(said, ["ask", "Which file?", "main.rs"]);
     }
 
+    /// An agent that asks "Which file?" on "ask" and completes on any other
+    /// message. With `in_history`, the question is already in the `history`
+    /// of the task snapshot it emits, as an agent that records it itself does.
+    fn asking_handler(in_history: bool) -> DefaultRequestHandler {
+        DefaultRequestHandler::new(
+            ScriptedExecutor(move |ctx: &ExecutorContext| {
+                let asked = ctx
+                    .message
+                    .as_ref()
+                    .and_then(Message::text)
+                    .is_some_and(|text| text == "ask");
+                let event = match (asked, &ctx.message) {
+                    (true, Some(ask)) if in_history => {
+                        let question = Message::new(Role::Agent, vec![Part::text("Which file?")]);
+                        StreamResponse::Task(Task {
+                            id: ctx.task_id.clone(),
+                            context_id: ctx.context_id.clone(),
+                            status: TaskStatus {
+                                state: TaskState::InputRequired,
+                                message: Some(question.clone()),
+                                timestamp: None,
+                            },
+                            artifacts: None,
+                            history: Some(vec![ask.clone(), question]),
+                            metadata: None,
+                        })
+                    }
+                    (true, _) => {
+                        let question = Message::new(Role::Agent, vec![Part::text("Which file?")]);
+                        status_event(ctx, TaskState::InputRequired, Some(question))
+                    }
+                    (false, _) => status_event(ctx, TaskState::Completed, None),
+                };
+                vec![(None, Ok(event))]
+            }),
+            InMemoryTaskStore::new(),
+        )
+    }
+
+    /// Sends "ask", then "main.rs" to the task it created, and returns the
+    /// task's history as text.
+    async fn answer_the_question(handler: &DefaultRequestHandler, streaming: bool) -> Vec<String> {
+        async fn turn(handler: &DefaultRequestHandler, streaming: bool, message: Message) {
+            let params = ServiceParams::new();
+            let request = SendMessageRequest {
+                message,
+                ..send_request()
+            };
+            if streaming {
+                let _: Vec<_> = handler
+                    .send_streaming_message(&params, request)
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await;
+            } else {
+                handler.send_message(&params, request).await.unwrap();
+            }
+        }
+
+        let params = ServiceParams::new();
+        turn(
+            handler,
+            streaming,
+            Message::new(Role::User, vec![Part::text("ask")]),
+        )
+        .await;
+        let task_id = handler
+            .list_tasks(
+                &params,
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap()
+            .tasks[0]
+            .id
+            .clone();
+        let answer = Message {
+            task_id: Some(task_id.clone()),
+            ..Message::new(Role::User, vec![Part::text("main.rs")])
+        };
+        turn(handler, streaming, answer).await;
+        let task = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        task.history
+            .unwrap()
+            .iter()
+            .map(|message| message.text().unwrap().to_owned())
+            .collect()
+    }
+
+    /// `send_streaming_message` continues a task through the same path.
+    #[tokio::test]
+    async fn test_streamed_continuation_keeps_the_question_in_history() {
+        let said = answer_the_question(&asking_handler(false), true).await;
+        assert_eq!(said, ["ask", "Which file?", "main.rs"]);
+    }
+
+    /// A question the agent already put in `history` is not added twice.
+    #[tokio::test]
+    async fn test_continuation_does_not_repeat_a_question_already_in_history() {
+        let said = answer_the_question(&asking_handler(true), false).await;
+        assert_eq!(said, ["ask", "Which file?", "main.rs"]);
+    }
+
     #[tokio::test]
     async fn test_active_execution_drops_errors_without_subscribers() {
         let task = Task {
