@@ -5,7 +5,7 @@
 
 use super::events::{ActiveExecution, EventKind};
 use super::protocol::is_terminal_event;
-use super::registry::{ExecutionManager, ExecutionRuntime};
+use super::registry::ExecutionRuntime;
 use super::turns::{
     end_turn, reject_unread_inputs, reject_unread_inputs_locked, release_execution,
     release_execution_locked, save_pending_push_config,
