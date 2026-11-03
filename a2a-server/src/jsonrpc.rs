@@ -9,14 +9,16 @@ use axum::{
     Json,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, Uri},
     response::IntoResponse,
 };
 use futures::{StreamExt, stream::BoxStream};
 use serde_json::Value;
 
 use crate::handler::RequestHandler;
-use crate::middleware::{ServiceParams, check_a2a_version, extract_service_params};
+use crate::middleware::{
+    ServiceParams, add_query_version, check_a2a_version, extract_service_params,
+};
 use crate::sse;
 
 /// Shared state for the JSON-RPC handler.
@@ -53,10 +55,12 @@ pub fn jsonrpc_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
 
 async fn handle_jsonrpc<H: RequestHandler>(
     State(state): State<JsonRpcState<H>>,
+    uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let params = extract_service_params(&headers);
+    let mut params = extract_service_params(&headers);
+    add_query_version(&mut params, &uri);
 
     // A `Json<JsonRpcRequest>` extractor would reject a malformed body with
     // axum's own error response before this handler runs at all, which is
@@ -958,6 +962,49 @@ mod tests {
             parsed.error.expect("expected an error").code,
             error_code::VERSION_NOT_SUPPORTED
         );
+    }
+
+    /// §3.6.1: the version may come as a query parameter instead of a header;
+    /// the header wins when both are present.
+    #[tokio::test]
+    async fn test_a2a_version_query_parameter_is_honored() {
+        let rpc = JsonRpcRequest::new(
+            JsonRpcId::Number(1),
+            methods::SEND_MESSAGE,
+            Some(serde_json::json!({
+                "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+            })),
+        );
+        for (uri, header, expected) in [
+            ("/?A2A-Version=1.0", None, None),
+            ("/?a2a-version=1.0", None, None),
+            (
+                "/?A2A-Version=99.0",
+                None,
+                Some(error_code::VERSION_NOT_SUPPORTED),
+            ),
+            (
+                "/?A2A-Version=1.0",
+                Some("99.0"),
+                Some(error_code::VERSION_NOT_SUPPORTED),
+            ),
+        ] {
+            let mut req = Request::builder()
+                .uri(uri)
+                .method("POST")
+                .header("content-type", "application/json");
+            if let Some(version) = header {
+                req = req.header("a2a-version", version);
+            }
+            let req = req
+                .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+                .unwrap();
+            let resp = make_app().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let parsed: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed.error.map(|e| e.code), expected, "{uri} {header:?}");
+        }
     }
 
     #[tokio::test]
