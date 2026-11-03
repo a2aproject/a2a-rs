@@ -22,7 +22,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::handler::RequestHandler;
-use crate::middleware::{ServiceParams, check_a2a_version, extract_service_params};
+use crate::middleware::{
+    ServiceParams, add_query_version, check_a2a_version, extract_service_params,
+};
 use crate::sse;
 
 const REST_SEND_MESSAGE_PATH: &str = "/message:send";
@@ -127,23 +129,10 @@ pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
         .with_state(state)
 }
 
-/// §3.6.2 for every REST operation, ahead of any handler. §3.6.1 lets a
-/// client send `A2A-Version` as a query parameter instead of a header, so
-/// the query form is honored when the header is absent.
+/// §3.6.2 for every REST operation, ahead of any handler.
 async fn validate_protocol_version(request: Request, next: Next) -> Response {
     let mut params = extract_service_params(request.headers());
-    if !params.contains_key("a2a-version") {
-        let from_query = Query::<HashMap<String, String>>::try_from_uri(request.uri())
-            .ok()
-            .and_then(|Query(query)| {
-                query
-                    .into_iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(SVC_PARAM_VERSION))
-            });
-        if let Some((_, version)) = from_query {
-            params.insert("a2a-version".to_owned(), vec![version]);
-        }
-    }
+    add_query_version(&mut params, request.uri());
     match check_a2a_version(&params) {
         Ok(()) => next.run(request).await,
         Err(error) => rest_error_response(error),
