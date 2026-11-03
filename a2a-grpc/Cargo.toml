@@ -30,7 +30,6 @@ rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
-rustls-pemfile = { workspace = true }
 
 [features]
 default = ["rustls-tls"]
