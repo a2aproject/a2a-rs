@@ -4749,7 +4749,10 @@ mod upstream_regressions {
                     last_chunk: None,
                     metadata: None,
                 });
-                vec![(None, Ok(append))]
+                vec![
+                    (None, Ok(status_event(ctx, TaskState::Working, None))),
+                    (None, Ok(append)),
+                ]
             }),
             InMemoryTaskStore::new(),
         );
@@ -4785,7 +4788,13 @@ mod upstream_regressions {
     async fn test_failed_push_leaves_the_task_failed() {
         let handler = upstream_handler(
             ScriptedExecutor(|ctx: &ExecutorContext| {
-                vec![(None, Ok(status_event(ctx, TaskState::Working, None)))]
+                vec![
+                    (None, Ok(status_event(ctx, TaskState::Working, None))),
+                    (
+                        Some(Arc::new(Notify::new())),
+                        Ok(status_event(ctx, TaskState::Working, None)),
+                    ),
+                ]
             }),
             InMemoryTaskStore::new(),
         )
@@ -4793,6 +4802,7 @@ mod upstream_regressions {
             InMemoryPushConfigStore::new(),
             crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
                 fail_on_error: true,
+                validate_urls: false,
                 ..Default::default()
             })),
         );
@@ -4801,7 +4811,7 @@ mod upstream_regressions {
             if_generation_match: None,
             timeline_length: None,
             accepted_output_modes: None,
-            // A loopback webhook is refused by the default URL validation.
+            // A valid local endpoint whose connection fails during delivery.
             task_push_notification_config: Some(TaskPushNotificationConfig {
                 url: "http://127.0.0.1:9/callback".into(),
                 ..push_config("")
@@ -5046,12 +5056,27 @@ mod upstream_regressions {
                 ..send_request()
             };
             if streaming {
-                let _: Vec<_> = handler
+                let mut events = handler
                     .send_streaming_message(&params, request)
                     .await
-                    .unwrap()
-                    .collect()
-                    .await;
+                    .unwrap();
+                timeout(Duration::from_secs(2), async {
+                    while let Some(event) = events.next().await {
+                        let state = match event.unwrap() {
+                            StreamResponse::Task(task) => Some(task.status.state),
+                            StreamResponse::StatusUpdate(update) => Some(update.status.state),
+                            _ => None,
+                        };
+                        if state.is_some_and(|state| {
+                            state == TaskState::InputRequired || state.is_terminal()
+                        }) {
+                            return;
+                        }
+                    }
+                    panic!("the turn must announce its result");
+                })
+                .await
+                .expect("streaming remains open at InputRequired; read the turn result instead");
             } else {
                 handler.send_message(&params, request).await.unwrap();
             }

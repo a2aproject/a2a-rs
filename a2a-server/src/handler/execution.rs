@@ -95,7 +95,9 @@ async fn poll_executor(
         }
         if let Ok(event) = &result {
             let message = matches!(event, StreamResponse::Message(_));
-            if answered || (message && tracked) { return TurnEnd::Failed(A2AError::invalid_agent_response()); }
+            if answered || (message && tracked) {
+                return TurnEnd::Failed(A2AError::invalid_agent_response());
+            }
             answered = message;
             tracked |= !message;
         }
@@ -184,10 +186,20 @@ async fn fail_execution(
     let failed = if creating {
         None
     } else {
-        fail_task(runtime, active.snapshot().await, error).await
+        fail_task(runtime.task_store.as_ref(), active.snapshot().await, error).await
     };
     release_execution_locked(&runtime.execution_manager, active, task_id).await;
-    active.publish(Err(error), failed).await;
+    active.publish(Err(error), failed.clone()).await;
+    if let Some(task) = failed {
+        let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: task.generation,
+            task_id: task.id,
+            context_id: task.context_id,
+            status: task.status,
+            metadata: None,
+        });
+        active.publish(Ok(&event), None).await;
+    }
 }
 
 /// Publishes an error to the subscribers in order with the events around it:
@@ -199,7 +211,7 @@ pub(super) async fn publish_error(active: &ActiveExecution, error: &A2AError) {
 }
 
 async fn fail_task(
-    runtime: &ExecutionRuntime,
+    task_store: &dyn crate::TaskStore,
     task: Option<Task>,
     error: &A2AError,
 ) -> Option<Task> {
@@ -216,18 +228,7 @@ async fn fail_task(
     };
     let status = task.status.clone();
     super::updates::record_status(&mut task, status);
-    let task = super::updates::save_task(runtime.task_store.as_ref(), task)
-        .await
-        .ok()?;
-    let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-        generation: task.generation,
-        task_id: task.id.clone(),
-        context_id: task.context_id.clone(),
-        status: task.status.clone(),
-        metadata: None,
-    });
-    runtime.execution_manager.pushes.push(runtime, &task.id, None, &event);
-    Some(task)
+    super::updates::save_task(task_store, task).await.ok()
 }
 
 /// Runs the execution and, if the executor panicked, fails the task: the
