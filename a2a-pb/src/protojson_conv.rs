@@ -61,18 +61,27 @@ pub fn to_value<T: ProtoJsonPayload>(value: &T) -> Result<Value, ProtoJsonPayloa
 /// JSON field names in `a2a.proto` whose value is a `google.protobuf.Timestamp`.
 const TIMESTAMP_FIELD_NAMES: &[&str] = &["timestamp", "statusTimestampAfter"];
 
+/// JSON field names in `a2a.proto` whose value is a `google.protobuf.Struct`
+/// or `google.protobuf.Value`. They carry caller content, so a `timestamp`
+/// key inside them is not a `google.protobuf.Timestamp`.
+const STRUCT_FIELD_NAMES: &[&str] = &["metadata", "data", "params", "header"];
+
 /// `pbjson_types::Timestamp`'s own `Serialize` emits an RFC 3339 string with
 /// a numeric `+00:00` offset (e.g. `"...846477544+00:00"`); the protobuf
 /// JSON canonical mapping requires the `Z` UTC designator instead
 /// (<https://protobuf.dev/programming-guides/proto3/#json>), and DM-SERIAL-001
-/// enforces exactly that. Recurses through the whole tree, keyed by field
+/// enforces exactly that. Recurses through the message tree, keyed by field
 /// name rather than a blind string match, so an unrelated string value that
 /// happens to end the same way (e.g. user-supplied message text) is never
-/// touched.
+/// touched. It does not descend into `Struct` or `Value` fields, whose keys
+/// belong to the caller.
 fn normalize_timestamp_strings(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (key, v) in map.iter_mut() {
+                if STRUCT_FIELD_NAMES.contains(&key.as_str()) {
+                    continue;
+                }
                 if TIMESTAMP_FIELD_NAMES.contains(&key.as_str()) {
                     if let Value::String(s) = v {
                         if let Some(prefix) = s.strip_suffix("+00:00") {
@@ -459,5 +468,36 @@ mod tests {
         normalize_timestamp_strings(&mut json);
         assert_eq!(json["notATimestamp"], "ends with +00:00");
         assert_eq!(json["nested"]["alsoNotATimestamp"], "also +00:00");
+    }
+
+    /// `metadata` and a data part's `data` hold caller content, where a
+    /// `timestamp` key is not a `google.protobuf.Timestamp` and must reach
+    /// the peer exactly as written.
+    #[test]
+    fn test_normalize_timestamp_strings_leaves_user_content_untouched() {
+        let offset = "2026-09-23T02:07:57+00:00";
+        let timestamp = "2026-09-23T02:07:57Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let mut task = sample_task_with_timestamp(timestamp);
+        task.metadata = Some(std::collections::HashMap::from([(
+            "timestamp".to_string(),
+            Value::String(offset.to_string()),
+        )]));
+        task.artifacts = Some(vec![a2a::Artifact {
+            artifact_id: "artifact-1".to_string(),
+            name: None,
+            description: None,
+            parts: vec![a2a::Part::data(serde_json::json!({ "timestamp": offset }))],
+            metadata: None,
+            extensions: None,
+        }]);
+        let json = to_value(&task).unwrap();
+        assert_eq!(json["status"]["timestamp"], "2026-09-23T02:07:57Z");
+        assert_eq!(json["metadata"]["timestamp"], offset);
+        assert_eq!(
+            json["artifacts"][0]["parts"][0]["data"]["timestamp"],
+            offset
+        );
     }
 }
