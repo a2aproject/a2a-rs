@@ -36,6 +36,7 @@ dependencies = [
  "auto_impl",
  "bytes",
  "futures",
+ "percent-encoding",
  "pin-project-lite",
  "rcgen",
  "reqwest",

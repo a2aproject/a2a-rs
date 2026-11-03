@@ -3,15 +3,25 @@
 // SPDX-License-Identifier: Apache-2.0
 use a2a::*;
 use async_trait::async_trait;
-use futures::{StreamExt, stream::BoxStream};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{RwLock, broadcast};
+use futures::{
+    StreamExt, future,
+    stream::{self, BoxStream},
+};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
+use tokio::sync::{RwLock, broadcast, oneshot};
 
 use crate::middleware::ServiceParams;
 use crate::pagination::resolve_page_size;
 use crate::task_store::apply_history_length;
 
 const EXECUTION_BUFFER_CAPACITY: usize = 32;
+
+/// What a subscription attaches to: the events to come, the task as of the
+/// last event already published, and that event's sequence.
+type Resubscription = (broadcast::Receiver<ExecutionEvent>, Option<Task>, u64);
 
 #[derive(Clone)]
 struct ExecutionEvent {
@@ -46,7 +56,7 @@ impl ActiveExecution {
         self.sender.subscribe()
     }
 
-    async fn resubscribe(&self) -> (broadcast::Receiver<ExecutionEvent>, Option<Task>, u64) {
+    async fn resubscribe(&self) -> Resubscription {
         let receiver = self.sender.subscribe();
         let state = self.state.read().await;
         (receiver, state.snapshot_task.clone(), state.sequence)
@@ -91,9 +101,18 @@ impl ActiveExecution {
 #[derive(Default)]
 struct ExecutionManager {
     executions: RwLock<HashMap<TaskId, Arc<ActiveExecution>>>,
+    /// Subscriptions to tasks with no registered execution, which `start`
+    /// attaches to the next one. Taken under `executions` by `start` and
+    /// `subscribe`, alone by `Waiter::drop` and `release`, never across an
+    /// await.
+    waiting: Mutex<HashMap<TaskId, Vec<oneshot::Sender<Resubscription>>>>,
 }
 
 impl ExecutionManager {
+    fn waiting(&self) -> MutexGuard<'_, HashMap<TaskId, Vec<oneshot::Sender<Resubscription>>>> {
+        self.waiting.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     async fn start(&self, task: Task) -> Result<Arc<ActiveExecution>, A2AError> {
         let mut executions = self.executions.write().await;
         if executions.contains_key(&task.id) {
@@ -105,6 +124,11 @@ impl ExecutionManager {
 
         let active = ActiveExecution::new(task.clone());
         executions.insert(task.id.clone(), active.clone());
+        // Subscribed before the executor runs, so they miss none of its events.
+        let waiting = self.waiting().remove(&task.id).unwrap_or_default();
+        for waiter in waiting {
+            let _ = waiter.send((active.subscribe(), Some(task.clone()), 0));
+        }
         Ok(active)
     }
 
@@ -113,13 +137,41 @@ impl ExecutionManager {
         executions.get(task_id).cloned()
     }
 
-    async fn resubscribe(
-        &self,
-        task_id: &str,
-    ) -> Option<(broadcast::Receiver<ExecutionEvent>, Option<Task>, u64)> {
-        let active = self.get(task_id).await?;
-        let (receiver, snapshot_task, sequence) = active.resubscribe().await;
-        Some((receiver, snapshot_task, sequence))
+    /// Subscribes to the task's registered execution or, when there is none,
+    /// to the next one `start` registers. Decided under the registry lock, so
+    /// an execution registering meanwhile is either found here or finds the
+    /// waiter.
+    async fn subscribe(self: &Arc<Self>, task_id: &str) -> Waiter {
+        let (sender, receiver) = oneshot::channel();
+        let executions = self.executions.read().await;
+        match executions.get(task_id) {
+            Some(active) => {
+                let _ = sender.send(active.resubscribe().await);
+            }
+            None => {
+                self.waiting()
+                    .entry(task_id.to_owned())
+                    .or_default()
+                    .push(sender);
+            }
+        }
+        drop(executions);
+        Waiter {
+            manager: Arc::clone(self),
+            task_id: task_id.to_owned(),
+            attached: Some(receiver),
+        }
+    }
+
+    /// Ends the subscriptions still waiting for the task's next execution
+    /// with its final snapshot: a canceled task has no execution for them to
+    /// follow, and a terminal snapshot closes their streams.
+    fn release(&self, task: &Task) {
+        let waiting = self.waiting().remove(&task.id).unwrap_or_default();
+        for waiter in waiting {
+            let (_, events) = broadcast::channel(1);
+            let _ = waiter.send((events, Some(task.clone()), 0));
+        }
     }
 
     async fn finish(&self, task_id: &str, active: &Arc<ActiveExecution>) {
@@ -129,6 +181,59 @@ impl ExecutionManager {
             .is_some_and(|current| Arc::ptr_eq(current, active));
         if should_remove {
             executions.remove(task_id);
+        }
+    }
+}
+
+/// Ends the subscriptions still waiting for a task when dropped, so a cancel
+/// that fails part-way leaves none of them behind.
+struct ReleaseOnDrop<'a> {
+    manager: &'a ExecutionManager,
+    task: Task,
+}
+
+impl Drop for ReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.manager.release(&self.task);
+    }
+}
+
+/// A subscription that `ExecutionManager::start` attaches to the task's next
+/// execution. Dropped first, it leaves nothing behind in the registry.
+struct Waiter {
+    manager: Arc<ExecutionManager>,
+    task_id: TaskId,
+    attached: Option<oneshot::Receiver<Resubscription>>,
+}
+
+impl Waiter {
+    /// The execution attached so far, if any.
+    fn attached(&mut self) -> Option<Resubscription> {
+        self.attached.as_mut()?.try_recv().ok()
+    }
+
+    /// The events of the execution once attached; none if the handler goes
+    /// away first.
+    fn into_stream(mut self) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        stream::once(async move { self.attached.as_mut()?.await.ok() })
+            .filter_map(future::ready)
+            .flat_map(|(receiver, snapshot_task, sequence)| {
+                subscription_stream(receiver, snapshot_task, sequence)
+            })
+            .boxed()
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        // Closing the receiver is what marks this waiter's own sender closed.
+        self.attached = None;
+        let mut waiting = self.manager.waiting();
+        if let Some(waiters) = waiting.get_mut(&self.task_id) {
+            waiters.retain(|waiter| !waiter.is_closed());
+            if waiters.is_empty() {
+                waiting.remove(&self.task_id);
+            }
         }
     }
 }
@@ -299,6 +404,29 @@ async fn apply_event_to_task(
     }
 }
 
+/// The task an execution that failed midway leaves behind: FAILED, so a
+/// caller polling `GetTask` or listing tasks sees it end. The status message
+/// is the sanitized error; the error itself still reaches the live
+/// subscribers. A task already terminal (canceled meanwhile) is left alone.
+async fn fail_task(
+    task_store: &dyn crate::TaskStore,
+    task: Option<Task>,
+    error: &A2AError,
+) -> Option<Task> {
+    let mut task = task.filter(|task| !task.status.state.is_terminal())?;
+    let text = crate::sanitized_internal_error(&error.message).message;
+    task.status = TaskStatus {
+        state: TaskState::Failed,
+        message: Some(Message {
+            task_id: Some(task.id.clone()),
+            context_id: Some(task.context_id.clone()),
+            ..Message::new(Role::Agent, vec![Part::text(text)])
+        }),
+        timestamp: Some(chrono::Utc::now()),
+    };
+    save_task(task_store, task).await.ok()
+}
+
 fn subscription_stream(
     receiver: broadcast::Receiver<ExecutionEvent>,
     snapshot_task: Option<Task>,
@@ -362,6 +490,7 @@ async fn drive_execution(
         state.snapshot_task.clone()
     };
     let mut stream = runtime.executor.execute(exec_ctx);
+    let mut failure = None;
 
     while let Some(result) = stream.next().await {
         if active.snapshot_is_terminal().await {
@@ -384,7 +513,7 @@ async fn drive_execution(
                         )
                         .await
                         {
-                            active.publish(Err(&error), None).await;
+                            failure = Some(error);
                             break;
                         }
                         active.publish(Ok(&event), updated_task).await;
@@ -393,16 +522,21 @@ async fn drive_execution(
                         }
                     }
                     Err(error) => {
-                        active.publish(Err(&error), None).await;
+                        failure = Some(error);
                         break;
                     }
                 }
             }
             Err(error) => {
-                active.publish(Err(&error), None).await;
+                failure = Some(error);
                 break;
             }
         }
+    }
+
+    if let Some(error) = failure {
+        let failed = fail_task(runtime.task_store.as_ref(), current_task, &error).await;
+        active.publish(Err(&error), failed).await;
     }
 
     runtime.execution_manager.finish(&task_id, &active).await;
@@ -948,6 +1082,10 @@ impl RequestHandler for DefaultRequestHandler {
         response.tasks.truncate(page_size);
         for task in &mut response.tasks {
             apply_history_length(task, req.history_length);
+            // §3.1.4: artifacts are omitted unless the caller asks for them.
+            if req.include_artifacts != Some(true) {
+                task.artifacts = None;
+            }
         }
         Ok(response)
     }
@@ -986,6 +1124,13 @@ impl RequestHandler for DefaultRequestHandler {
                 return Err(error);
             }
             Err(error) => return Err(error),
+        };
+
+        // The task is canceled in the store from here on, however the rest of
+        // this ends, so no subscription may stay waiting for its next turn.
+        let _release = ReleaseOnDrop {
+            manager: &self.execution_manager,
+            task: task.clone(),
         };
 
         let active_execution = self.execution_manager.get(&req.id).await;
@@ -1042,7 +1187,14 @@ impl RequestHandler for DefaultRequestHandler {
             self.execution_manager.finish(&req.id, &active).await;
         }
 
-        self.load_task(&req.id).await
+        // A subscription to a task between turns has no execution to follow
+        // into the cancel; the final snapshot ends it. Subscriptions register
+        // before reading the store, so one that read the task before
+        // `begin_cancel` is waiting now, and one that reads it later finds it
+        // terminal.
+        let task = self.load_task(&req.id).await?;
+        self.execution_manager.release(&task);
+        Ok(task)
     }
 
     async fn subscribe_to_task(
@@ -1052,9 +1204,10 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.authorize(params, Some(&req.id))?;
         self.require_streaming()?;
-        if let Some((receiver, snapshot_task, sequence)) =
-            self.execution_manager.resubscribe(&req.id).await
-        {
+        // Registered before the store is read: an execution that starts from
+        // here on attaches this subscription itself, so nothing is missed.
+        let mut waiter = self.execution_manager.subscribe(&req.id).await;
+        if let Some((receiver, snapshot_task, sequence)) = waiter.attached() {
             return Ok(subscription_stream(receiver, snapshot_task, sequence));
         }
 
@@ -1062,15 +1215,26 @@ impl RequestHandler for DefaultRequestHandler {
         // execution is cleaned up, so it doesn't by itself mean the task
         // never existed -- check the store to tell the two apart before
         // reporting TaskNotFoundError.
-        if let Some(task) = self.task_store.get(&req.id).await? {
-            if task.status.state.is_terminal() {
-                return Err(A2AError::unsupported_operation(format!(
-                    "task {} has already reached a terminal state",
-                    req.id
-                )));
-            }
+        let task = self.load_task(&req.id).await?;
+        // An execution that started while the store was read may have moved
+        // the task on already; the waiter has everything it published.
+        if let Some((receiver, snapshot_task, sequence)) = waiter.attached() {
+            return Ok(subscription_stream(receiver, snapshot_task, sequence));
         }
-        Err(A2AError::task_not_found(&req.id))
+        if task.status.state.is_terminal() {
+            return Err(A2AError::unsupported_operation(format!(
+                "task {} has already reached a terminal state",
+                req.id
+            )));
+        }
+
+        // The task is between turns, in an interrupted state; §3.1.6 allows
+        // subscribing to any non-terminal task. The stream opens with the
+        // task as stored, then follows the execution the next message starts
+        // to its end, as a resubscription would (TCK STREAM-SUB-002).
+        Ok(stream::once(async move { Ok(StreamResponse::Task(task)) })
+            .chain(waiter.into_stream())
+            .boxed())
     }
 
     async fn create_push_config(
@@ -1356,6 +1520,59 @@ mod tests {
         }
     }
 
+    /// Plays the events a test scripts for each call: `execute` gets the
+    /// context with the incoming message, `cancel` the one without. A step
+    /// can wait on a `Notify` first, so a test orders the executor against
+    /// its own calls without sleeping.
+    struct ScriptedExecutor<F>(F);
+
+    type Step = (Option<Arc<Notify>>, Result<StreamResponse, A2AError>);
+
+    impl<F> crate::AgentExecutor for ScriptedExecutor<F>
+    where
+        F: Fn(&ExecutorContext) -> Vec<Step> + Send + Sync + 'static,
+    {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            play((self.0)(&ctx))
+        }
+
+        fn cancel(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            play((self.0)(&ctx))
+        }
+    }
+
+    fn play(steps: Vec<Step>) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        Box::pin(stream::iter(steps).then(|(gate, event)| async move {
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            event
+        }))
+    }
+
+    fn status_event(
+        ctx: &ExecutorContext,
+        state: TaskState,
+        message: Option<Message>,
+    ) -> StreamResponse {
+        StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: ctx.task_id.clone(),
+            context_id: ctx.context_id.clone(),
+            status: TaskStatus {
+                state,
+                message,
+                timestamp: None,
+            },
+            metadata: None,
+        })
+    }
+
     /// Mirrors itk's own `tck-multi-turn` ACTS behavior: only ever emits a
     /// `StatusUpdate`, never a full `Task`, so a test against it exercises
     /// exactly the path a real executor that never touches `history` relies
@@ -1559,6 +1776,81 @@ mod tests {
         }
     }
 
+    /// How the cancel of an `InputRequiredExecutor` ends.
+    enum Cancel {
+        Cancels,
+        Fails,
+        /// Appends to an artifact the task does not have, which the handler
+        /// cannot apply to the task.
+        SendsAnInapplicableEvent,
+    }
+
+    /// Asks for input on the task's first turn and completes on the next;
+    /// its cancel reports the task canceled, or ends as asked to.
+    struct InputRequiredExecutor {
+        cancel: Cancel,
+    }
+
+    impl crate::AgentExecutor for InputRequiredExecutor {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let state = match ctx.stored_task.as_ref().map(|task| &task.status.state) {
+                Some(TaskState::InputRequired) => TaskState::Completed,
+                _ => TaskState::InputRequired,
+            };
+            let update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: ctx.task_id,
+                context_id: ctx.context_id,
+                status: TaskStatus {
+                    state,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            });
+            Box::pin(stream::once(async move { Ok(update) }))
+        }
+
+        fn cancel(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let event = match self.cancel {
+                Cancel::Fails => Err(A2AError::internal("cancel failed")),
+                Cancel::SendsAnInapplicableEvent => {
+                    Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                        task_id: ctx.task_id,
+                        context_id: ctx.context_id,
+                        artifact: Artifact {
+                            artifact_id: "missing".into(),
+                            name: None,
+                            description: None,
+                            parts: vec![Part::text("tail")],
+                            metadata: None,
+                            extensions: None,
+                        },
+                        append: Some(true),
+                        last_chunk: None,
+                        metadata: None,
+                    }))
+                }
+                Cancel::Cancels => Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: ctx.task_id,
+                    context_id: ctx.context_id,
+                    status: TaskStatus {
+                        state: TaskState::Canceled,
+                        message: None,
+                        timestamp: None,
+                    },
+                    metadata: None,
+                })),
+            };
+            Box::pin(stream::once(async move { event }))
+        }
+    }
+
     /// Pre-create a task so a message may legitimately reference it: A2A
     /// §3.4.2 forbids client-provided taskIds for *creating* tasks.
     async fn seed_task(handler: &DefaultRequestHandler, task_id: &str, context_id: &str) {
@@ -1613,6 +1905,40 @@ mod tests {
             ),
             release,
         )
+    }
+
+    fn make_input_required_handler() -> DefaultRequestHandler {
+        DefaultRequestHandler::new(
+            InputRequiredExecutor {
+                cancel: Cancel::Cancels,
+            },
+            InMemoryTaskStore::new(),
+        )
+    }
+
+    /// A task whose first turn ended asking for input: stored, but with no
+    /// execution registered any more.
+    async fn task_awaiting_input(handler: &DefaultRequestHandler) -> Task {
+        let response = handler
+            .send_message(
+                &ServiceParams::new(),
+                SendMessageRequest {
+                    message: make_message(),
+                    configuration: None,
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut task = None;
+        if let SendMessageResponse::Task(sent) = response {
+            task = Some(sent);
+        }
+        let task = task.expect("expected a task");
+        assert_eq!(task.status.state, TaskState::InputRequired);
+        assert!(handler.execution_manager.get(&task.id).await.is_none());
+        task
     }
 
     fn make_message() -> Message {
@@ -2035,6 +2361,227 @@ mod tests {
         let event = receiver.recv().await.unwrap();
         assert_eq!(event.sequence, 1);
         assert_eq!(event.result.unwrap_err().code, error.code);
+    }
+
+    /// An execution that fails midway leaves its task FAILED with a
+    /// sanitized status message; the error itself still reaches the caller.
+    #[tokio::test]
+    async fn test_execution_error_leaves_the_task_failed() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                vec![
+                    (None, Ok(status_event(ctx, TaskState::Working, None))),
+                    (None, Err(A2AError::internal("executor exploded"))),
+                ]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let events: Vec<_> = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(matches!(events.last(), Some(Err(error)) if error.message == "executor exploded"));
+        let task_id = task_id_for_event(events[0].as_ref().unwrap())
+            .unwrap()
+            .to_owned();
+
+        let task = handler
+            .get_task(
+                &ServiceParams::new(),
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.status.state, TaskState::Failed);
+        assert_eq!(
+            task.status.message.as_ref().and_then(Message::text),
+            Some("Internal error")
+        );
+    }
+
+    /// An event the server cannot apply fails the task the same way.
+    #[tokio::test]
+    async fn test_unappliable_event_leaves_the_task_failed() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                let append = StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    task_id: ctx.task_id.clone(),
+                    context_id: ctx.context_id.clone(),
+                    artifact: Artifact {
+                        artifact_id: "unknown".into(),
+                        name: None,
+                        description: None,
+                        parts: vec![Part::text("more")],
+                        metadata: None,
+                        extensions: None,
+                    },
+                    append: Some(true),
+                    last_chunk: None,
+                    metadata: None,
+                });
+                vec![(None, Ok(append))]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let error = handler
+            .send_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+
+        let listed = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.tasks[0].status.state, TaskState::Failed);
+    }
+
+    /// A push the sender cannot deliver, with `fail_on_error`, fails the task
+    /// as well.
+    #[tokio::test]
+    async fn test_failed_push_leaves_the_task_failed() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                vec![(None, Ok(status_event(ctx, TaskState::Working, None)))]
+            }),
+            InMemoryTaskStore::new(),
+        )
+        .with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                fail_on_error: true,
+                ..Default::default()
+            })),
+        );
+        let mut request = send_request();
+        request.configuration = Some(SendMessageConfiguration {
+            accepted_output_modes: None,
+            // A loopback webhook is refused by the default URL validation.
+            task_push_notification_config: Some(TaskPushNotificationConfig {
+                url: "http://127.0.0.1:9/callback".into(),
+                ..push_config("")
+            }),
+            history_length: None,
+            return_immediately: None,
+        });
+        handler
+            .send_message(&ServiceParams::new(), request)
+            .await
+            .unwrap_err();
+
+        let listed = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.tasks[0].status.state, TaskState::Failed);
+    }
+
+    /// Cancelling a running task leaves it CANCELED: the execution the cancel
+    /// stops is not a failure.
+    #[tokio::test]
+    async fn test_canceled_task_is_not_marked_failed() {
+        let gate = Arc::new(Notify::new());
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(move |ctx: &ExecutorContext| {
+                if ctx.message.is_some() {
+                    vec![
+                        (None, Ok(status_event(ctx, TaskState::Working, None))),
+                        (
+                            Some(gate.clone()),
+                            Ok(status_event(ctx, TaskState::Working, None)),
+                        ),
+                    ]
+                } else {
+                    vec![(None, Ok(status_event(ctx, TaskState::Canceled, None)))]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let mut request = send_request();
+        request.configuration = Some(SendMessageConfiguration {
+            accepted_output_modes: None,
+            task_push_notification_config: None,
+            history_length: None,
+            return_immediately: Some(true),
+        });
+        handler
+            .send_message(&ServiceParams::new(), request)
+            .await
+            .unwrap();
+        let task_id = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap()
+            .tasks[0]
+            .id
+            .clone();
+        let canceled = handler
+            .cancel_task(
+                &ServiceParams::new(),
+                CancelTaskRequest {
+                    id: task_id.clone(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(canceled.status.state, TaskState::Canceled);
+
+        let stored = handler
+            .get_task(
+                &ServiceParams::new(),
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.status.state, TaskState::Canceled);
     }
 
     #[tokio::test]
@@ -2476,6 +3023,61 @@ mod tests {
         assert!(resp.tasks.is_empty());
     }
 
+    /// ListTasks omits artifacts unless `includeArtifacts` is true (§3.1.4).
+    #[tokio::test]
+    async fn test_list_tasks_includes_artifacts_only_on_request() {
+        let store = InMemoryTaskStore::new();
+        store
+            .create(Task {
+                id: "t-artifact".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: Some(chrono::Utc::now()),
+                },
+                artifacts: Some(vec![Artifact {
+                    artifact_id: "a1".into(),
+                    name: None,
+                    description: None,
+                    parts: vec![Part::text("result")],
+                    metadata: None,
+                    extensions: None,
+                }]),
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let handler = DefaultRequestHandler::new(EchoExecutor, store);
+        let params = ServiceParams::new();
+        for (include_artifacts, expected) in
+            [(None, false), (Some(false), false), (Some(true), true)]
+        {
+            let resp = handler
+                .list_tasks(
+                    &params,
+                    ListTasksRequest {
+                        context_id: None,
+                        status: None,
+                        page_size: None,
+                        page_token: None,
+                        history_length: None,
+                        status_timestamp_after: None,
+                        include_artifacts,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.tasks[0].artifacts.is_some(),
+                expected,
+                "include_artifacts={include_artifacts:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_cancel_task_not_found() {
         let handler = make_handler();
@@ -2872,7 +3474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_subscribe_requires_active_execution() {
+    async fn test_subscribe_to_an_unknown_task_is_not_found() {
         let handler = make_handler();
         let params = ServiceParams::new();
         let req = SubscribeToTaskRequest {
@@ -2884,6 +3486,7 @@ mod tests {
             Ok(_) => panic!("expected subscribe_to_task to fail"),
             Err(error) => assert_eq!(error.code, error_code::TASK_NOT_FOUND),
         }
+        assert!(handler.execution_manager.waiting().is_empty());
     }
 
     #[tokio::test]
@@ -2918,6 +3521,216 @@ mod tests {
             Ok(_) => panic!("expected subscribe_to_task to fail"),
             Err(error) => assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION),
         }
+        assert!(handler.execution_manager.waiting().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_to_a_task_awaiting_input_opens_with_the_stored_task() {
+        let handler = make_input_required_handler();
+        let params = ServiceParams::new();
+        let task = task_awaiting_input(&handler).await;
+        let stored = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: task.id.clone(),
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.status.state, TaskState::InputRequired);
+
+        let mut subscription = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: task.id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        match subscription.next().await.unwrap().unwrap() {
+            StreamResponse::Task(first) => assert_eq!(first, stored),
+            other => panic!("expected the stored task first, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_ends_a_subscription_to_a_task_awaiting_input() {
+        let handler = make_input_required_handler();
+        let params = ServiceParams::new();
+        let task = task_awaiting_input(&handler).await;
+        let subscription = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: task.id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let canceled = handler
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: task.id.clone(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(canceled.status.state, TaskState::Canceled);
+
+        // The stored task, then the canceled one, and the stream ends.
+        let events: Vec<_> = timeout(Duration::from_secs(5), subscription.collect())
+            .await
+            .expect("the subscription outlived the canceled task");
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamResponse::Task(stored)), Ok(StreamResponse::Task(last))]
+                if stored.status.state == TaskState::InputRequired
+                    && last.status.state == TaskState::Canceled
+        ));
+        assert!(handler.execution_manager.waiting().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_failing_part_way_still_ends_a_waiting_subscription() {
+        for (cancel, code) in [
+            (Cancel::Fails, error_code::INTERNAL_ERROR),
+            (
+                Cancel::SendsAnInapplicableEvent,
+                error_code::INVALID_AGENT_RESPONSE,
+            ),
+        ] {
+            let handler = DefaultRequestHandler::new(
+                InputRequiredExecutor { cancel },
+                InMemoryTaskStore::new(),
+            );
+            let params = ServiceParams::new();
+            let task = task_awaiting_input(&handler).await;
+            let subscription = handler
+                .subscribe_to_task(
+                    &params,
+                    SubscribeToTaskRequest {
+                        id: task.id.clone(),
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let error = handler
+                .cancel_task(
+                    &params,
+                    CancelTaskRequest {
+                        id: task.id.clone(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, code);
+
+            // The store holds the task canceled before the executor ran.
+            let events: Vec<_> = timeout(Duration::from_secs(5), subscription.collect())
+                .await
+                .expect("the subscription outlived the canceled task");
+            assert!(matches!(
+                events.as_slice(),
+                [Ok(StreamResponse::Task(stored)), Ok(StreamResponse::Task(last))]
+                    if stored.status.state == TaskState::InputRequired
+                        && last.status.state == TaskState::Canceled
+            ));
+            assert!(handler.execution_manager.waiting().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subscriptions_to_a_task_awaiting_input_follow_its_next_turn() {
+        let handler = make_input_required_handler();
+        let params = ServiceParams::new();
+        let task = task_awaiting_input(&handler).await;
+        let subscribe = || SubscribeToTaskRequest {
+            id: task.id.clone(),
+            tenant: None,
+        };
+        let first = handler
+            .subscribe_to_task(&params, subscribe())
+            .await
+            .unwrap();
+        let second = handler
+            .subscribe_to_task(&params, subscribe())
+            .await
+            .unwrap();
+
+        // The whole next turn runs before either stream is polled: what it
+        // publishes must still reach both.
+        let mut follow_up = make_message();
+        follow_up.task_id = Some(task.id.clone());
+        let response = handler
+            .send_message(
+                &params,
+                SendMessageRequest {
+                    message: follow_up,
+                    configuration: None,
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            SendMessageResponse::Task(task) if task.status.state == TaskState::Completed
+        ));
+
+        // The stored task, the task as the turn found it, then the turn.
+        let follows_the_turn = |events: Vec<Result<StreamResponse, A2AError>>| {
+            matches!(
+                events.as_slice(),
+                [
+                    Ok(StreamResponse::Task(stored)),
+                    Ok(StreamResponse::Task(found)),
+                    Ok(StreamResponse::StatusUpdate(turn)),
+                ] if stored.status.state == TaskState::InputRequired
+                    && found.status.state == TaskState::InputRequired
+                    && turn.status.state == TaskState::Completed
+            )
+        };
+        assert!(follows_the_turn(first.collect().await));
+        assert!(follows_the_turn(second.collect().await));
+
+        // Over: a new subscription is refused as for any finished task.
+        let result = handler.subscribe_to_task(&params, subscribe()).await;
+        assert!(matches!(result, Err(error) if error.code == error_code::UNSUPPORTED_OPERATION));
+    }
+
+    #[tokio::test]
+    async fn test_a_dropped_subscription_to_a_task_awaiting_input_unregisters() {
+        let handler = make_input_required_handler();
+        let params = ServiceParams::new();
+        let task = task_awaiting_input(&handler).await;
+        let subscription = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: task.id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(handler.execution_manager.waiting().len(), 1);
+        drop(subscription);
+        assert!(handler.execution_manager.waiting().is_empty());
     }
 
     #[tokio::test]

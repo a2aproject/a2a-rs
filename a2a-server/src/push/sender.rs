@@ -104,6 +104,17 @@ impl HttpPushSender {
                         "push credentials must not contain CR/LF",
                     ));
                 }
+                // The scheme opens the Authorization header, so it must be a
+                // single HTTP auth-scheme token (RFC 9110 §11.1).
+                if auth.scheme.is_empty()
+                    || auth
+                        .scheme
+                        .contains(|c: char| c.is_whitespace() || c.is_control())
+                {
+                    return Err(A2AError::invalid_params(
+                        "push authentication scheme must be a single token",
+                    ));
+                }
             }
         }
 
@@ -124,15 +135,14 @@ impl HttpPushSender {
 
         if let Some(ref auth) = config.authentication {
             if let Some(ref creds) = auth.credentials {
-                match auth.scheme.to_lowercase().as_str() {
-                    "bearer" => {
-                        request = request.header("Authorization", format!("Bearer {creds}"));
-                    }
-                    "basic" => {
-                        request = request.header("Authorization", format!("Basic {creds}"));
-                    }
-                    _ => {}
-                }
+                // Any IANA scheme is sent as configured (§4.3.3); the two
+                // common ones keep their canonical spelling.
+                let scheme = match auth.scheme.to_lowercase().as_str() {
+                    "bearer" => "Bearer",
+                    "basic" => "Basic",
+                    _ => auth.scheme.as_str(),
+                };
+                request = request.header("Authorization", format!("{scheme} {creds}"));
             }
         }
 
@@ -463,26 +473,80 @@ mod tests {
         assert!(result.is_ok()); // fail_on_error=false
     }
 
+    /// Runs a webhook that records the Authorization header of each request.
+    async fn spawn_auth_recorder() -> (String, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().route(
+            "/callback",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let log = Arc::clone(&log);
+                async move {
+                    log.lock().unwrap().push(
+                        headers
+                            .get("authorization")
+                            .map(|value| value.to_str().unwrap().to_owned()),
+                    );
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (format!("http://{addr}/callback"), seen)
+    }
+
     #[tokio::test]
-    async fn test_send_push_with_unknown_auth_scheme() {
+    async fn test_send_push_sends_credentials_of_any_scheme() {
         install_crypto_provider();
         let sender = HttpPushSender::new(Some(HttpPushSenderConfig {
+            fail_on_error: true,
             validate_urls: false,
             ..Default::default()
         }));
-        let config = TaskPushNotificationConfig {
-            task_id: String::new(),
-            url: "http://127.0.0.1:1/callback".to_string(),
-            id: None,
-            token: None,
-            authentication: Some(AuthenticationInfo {
-                scheme: "custom".to_string(),
-                credentials: Some("cred".to_string()),
-            }),
-            tenant: None,
-        };
-        let result = sender.send_push(&config, sample_status_update()).await;
-        assert!(result.is_ok());
+        let (url, seen) = spawn_auth_recorder().await;
+        for (scheme, expected) in [
+            ("bearer", "Bearer tok"),
+            ("Basic", "Basic tok"),
+            ("DPoP", "DPoP tok"),
+        ] {
+            let config = TaskPushNotificationConfig {
+                authentication: Some(AuthenticationInfo {
+                    scheme: scheme.to_string(),
+                    credentials: Some("tok".to_string()),
+                }),
+                ..sample_config(&url)
+            };
+            sender
+                .send_push(&config, sample_status_update())
+                .await
+                .unwrap();
+            assert_eq!(
+                seen.lock().unwrap().last().unwrap().as_deref(),
+                Some(expected),
+                "scheme {scheme}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_push_rejects_a_scheme_that_is_not_one_token() {
+        install_crypto_provider();
+        let sender = HttpPushSender::new(None);
+        for scheme in ["", "Bearer x", "Bearer\r\nX-Injected: 1"] {
+            let config = TaskPushNotificationConfig {
+                authentication: Some(AuthenticationInfo {
+                    scheme: scheme.to_string(),
+                    credentials: Some("tok".to_string()),
+                }),
+                ..sample_config("https://example.com/callback")
+            };
+            let error = sender
+                .send_push(&config, sample_status_update())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, error_code::INVALID_PARAMS, "scheme {scheme:?}");
+        }
     }
 
     #[test]
