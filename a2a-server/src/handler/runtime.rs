@@ -7,8 +7,8 @@ use super::cancellation::CancellationStart;
 use super::delivery::{AuthorizedMessage, Delivery, StartMode, is_artifact_only, request_task_id};
 use super::events::{ActiveExecution, EventKind};
 use super::execution::TurnEnd;
+use super::lifecycle::{ExecutionState, Invocation};
 use super::protocol::Rejection;
-use super::registry::ReservationGuard;
 use super::turns::{self, reject_unread_inputs, release_execution, save_pending_push_config};
 use super::updates::{
     apply_and_publish, backfill_status_timestamp, persist_event, save_task_with,
@@ -18,12 +18,11 @@ use super::{DefaultRequestHandler, admission, cancellation, execution};
 use crate::User;
 use crate::middleware::ServiceParams;
 use a2a::*;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Default)]
 pub(super) struct TaskRuntime {
-    pub(super) cancellation: Option<cancellation::Cancellation>,
-    pub(super) invocations: HashMap<String, super::events::InvocationState>,
+    pub(super) execution: ExecutionState,
 }
 
 impl TaskRuntime {
@@ -34,30 +33,64 @@ impl TaskRuntime {
         mode: StartMode,
         reserved_id: TaskId,
     ) -> Result<Delivery, Rejection> {
-        // No task named: the message creates one, and there is nothing to join.
-        let Some(task_id) = request_task_id(&message.request) else {
-            return self.start(handler, message, mode, reserved_id).await;
-        };
-        // An entry with no snapshot is a request that was dropped before it
-        // began; it is no execution.
-        let running = match handler.execution_manager.get(&task_id).await {
-            Some(active) if active.snapshot().await.is_some() => Some(active),
-            _ => None,
-        };
-        match running {
-            Some(active) => {
-                admission::inject(
-                    handler,
-                    &message,
-                    &task_id,
-                    &active,
-                    self.invocations
-                        .entry(active.execution_id.clone())
-                        .or_default(),
-                )
-                .await
-            }
-            None => self.start(handler, message, mode, reserved_id).await,
+        if let (Some(task_id), ExecutionState::Running(invocation)) =
+            (request_task_id(&message.request), &mut self.execution)
+        {
+            return admission::inject(
+                handler,
+                &message,
+                &task_id,
+                &invocation.active,
+                &mut invocation.bookkeeping,
+            )
+            .await;
+        }
+        if matches!(self.execution, ExecutionState::Canceling { .. }) {
+            return Err(A2AError::unsupported_operation(format!(
+                "task {reserved_id} has already reached a terminal state"
+            ))
+            .into());
+        }
+        self.start(handler, message, mode, reserved_id).await
+    }
+
+    pub(super) async fn reserve(
+        &mut self,
+        handler: &DefaultRequestHandler,
+        task_id: &str,
+    ) -> Result<(Arc<ActiveExecution>, crate::ClientInputs), A2AError> {
+        if !matches!(self.execution, ExecutionState::Idle) {
+            return Err(A2AError::invalid_request(
+                "task execution is already in progress",
+            ));
+        }
+        let (active, inputs, bookkeeping) =
+            ActiveExecution::with_events(handler.execution_manager.events_for(task_id));
+        handler.execution_manager.register(task_id, &active).await?;
+        self.execution = ExecutionState::Running(Invocation {
+            active: active.clone(),
+            bookkeeping,
+        });
+        Ok((active, inputs))
+    }
+
+    pub(super) async fn release(
+        &mut self,
+        handler: &DefaultRequestHandler,
+        task_id: &str,
+        active: &Arc<ActiveExecution>,
+    ) {
+        self.execution.release(active);
+        handler.execution_manager.unregister(task_id, active).await;
+    }
+
+    /// A panicking preparation has not started a driver to clean up its inbox.
+    pub(super) fn recover_preparation(&mut self) {
+        if let ExecutionState::Running(invocation) = &self.execution
+            && !invocation.active.is_prepared()
+        {
+            invocation.active.inputs.close();
+            self.execution = ExecutionState::Idle;
         }
     }
 
@@ -82,16 +115,8 @@ impl TaskRuntime {
         let artifact_only = is_artifact_only(&req);
         let task_id = reserved_id;
 
-        // Claim before reading storage. The coordinator completes this command
-        // even after a caller disconnects; the guard cleans up a panic or error.
-        let (active, inputs, invocation) = handler.execution_manager.reserve(&task_id).await?;
-        self.invocations
-            .insert(active.execution_id.clone(), invocation);
-        let reservation = ReservationGuard::new(
-            Arc::clone(&handler.execution_manager),
-            task_id.clone(),
-            Arc::clone(&active),
-        );
+        // The mailbox owns preparation through completion or panic recovery.
+        let (active, inputs) = self.reserve(handler, &task_id).await?;
         let prepared = async {
             let input = admission::prepare(handler, &req, &task_id).await?;
             input
@@ -100,8 +125,8 @@ impl TaskRuntime {
                     params,
                     &req,
                     lazy,
-                    self.invocations
-                        .get_mut(&active.execution_id)
+                    self.execution
+                        .bookkeeping(&active)
                         .expect("reserved invocation"),
                 )
                 .await?;
@@ -119,8 +144,7 @@ impl TaskRuntime {
         } = match prepared {
             Ok(input) => input,
             Err(error) => {
-                self.invocations.remove(&active.execution_id);
-                reservation.release().await;
+                self.release(handler, &task_id, &active).await;
                 return Err(error.into());
             }
         };
@@ -145,7 +169,6 @@ impl TaskRuntime {
         let stored_task = (existed || include_task_snapshot_in_context).then(|| task.clone());
         let service_params = params.clone();
 
-        reservation.disarm();
         let exec_ctx = crate::ExecutorContext {
             execution_id: active.execution_id.clone(),
             message: (!artifact_only).then_some(req.message),
@@ -179,8 +202,64 @@ impl TaskRuntime {
         request: CancelTaskRequest,
         user: Option<User>,
     ) -> Result<CancellationStart, A2AError> {
-        cancellation::Cancellation::begin(handler, params, request, user, &mut self.cancellation)
-            .await
+        let active = self
+            .execution
+            .invocation()
+            .map(|invocation| invocation.active.clone());
+        let mut progress = None;
+        let plan = cancellation::Cancellation::begin(
+            handler,
+            params,
+            request,
+            user,
+            active,
+            &mut progress,
+        )
+        .await?;
+        if let Some(progress) = progress {
+            let previous = std::mem::take(&mut self.execution);
+            let invocation = match previous {
+                ExecutionState::Running(invocation) => Some(invocation),
+                ExecutionState::Idle => None,
+                ExecutionState::Canceling { .. } => {
+                    unreachable!("a committed cancellation returns unchanged")
+                }
+            };
+            self.execution = ExecutionState::Canceling {
+                invocation,
+                progress: Box::new(progress),
+            };
+        }
+        Ok(plan)
+    }
+
+    pub(super) async fn cancel_update(
+        &mut self,
+        handler: &DefaultRequestHandler,
+        event: StreamResponse,
+    ) -> Result<(), A2AError> {
+        let ExecutionState::Canceling { progress, .. } = &mut self.execution else {
+            return Err(A2AError::internal("no cancellation in progress"));
+        };
+        progress.apply(handler, event).await.map(|_| ())
+    }
+
+    pub(super) async fn cancel_finished(
+        &mut self,
+        handler: &DefaultRequestHandler,
+        task_id: &str,
+        failure: Option<A2AError>,
+    ) -> Result<(), A2AError> {
+        if !matches!(self.execution, ExecutionState::Canceling { .. }) {
+            return Err(A2AError::internal("no cancellation in progress"));
+        }
+        let ExecutionState::Canceling { progress, .. } = std::mem::take(&mut self.execution) else {
+            unreachable!()
+        };
+        let active = progress.active.clone();
+        let result = progress.finish(handler, failure).await;
+        handler.execution_manager.unregister(task_id, &active).await;
+        result
     }
 
     pub(super) async fn output(
@@ -190,7 +269,10 @@ impl TaskRuntime {
         active: Arc<ActiveExecution>,
         mut event: StreamResponse,
     ) -> Result<OutputAction, A2AError> {
-        if active.snapshot_is_terminal().await {
+        if !self.execution.is_current(&active)
+            || matches!(self.execution, ExecutionState::Canceling { .. })
+            || active.snapshot_is_terminal().await
+        {
             return Ok(OutputAction::Stopped);
         }
         if active.uncreated.load(std::sync::atomic::Ordering::SeqCst)
@@ -202,7 +284,7 @@ impl TaskRuntime {
             active
                 .publish_kind(Ok(&event), None, EventKind::Reply)
                 .await;
-            handler.execution_manager.finish(&task_id, &active).await;
+            self.release(handler, &task_id, &active).await;
             handler.changes.notify(&task_id);
             return Ok(OutputAction::Drain);
         }
@@ -241,6 +323,14 @@ impl TaskRuntime {
         active: Arc<ActiveExecution>,
         end: TurnEnd,
     ) {
+        if !self.execution.is_current(&active) {
+            return;
+        }
+        if matches!(self.execution, ExecutionState::Canceling { .. }) {
+            release_execution(handler, &active, &task_id, self).await;
+            handler.changes.notify(&task_id);
+            return;
+        }
         match end {
             TurnEnd::Finished => {
                 self.end_turn(handler, &active, &task_id).await;
@@ -255,7 +345,7 @@ impl TaskRuntime {
                         active.publish(Err(&error), None).await;
                     }
                 }
-                handler.execution_manager.finish(&task_id, &active).await;
+                self.release(handler, &task_id, &active).await;
             }
             TurnEnd::Failed(error) => {
                 active
@@ -265,13 +355,13 @@ impl TaskRuntime {
                 let failed = super::failure::persist_failure(handler, &active, &task_id, &error).await;
                 active.publish(Err(&error), failed.clone()).await;
                 if let Some(task) = failed { active.publish(Ok(&StreamResponse::Task(task)), None).await; }
-                release_execution(&handler.execution_manager, &active, &task_id, self).await;
+                release_execution(handler, &active, &task_id, self).await;
             }
             TurnEnd::Stopped => {
-                release_execution(&handler.execution_manager, &active, &task_id, self).await;
+                release_execution(handler, &active, &task_id, self).await;
             }
         }
-        self.invocations.remove(&active.execution_id);
+
         handler.changes.notify(&task_id);
     }
 
@@ -300,18 +390,18 @@ impl TaskRuntime {
             .as_ref()
             .is_some_and(|task| !task.status.state.is_terminal());
         let unread = if goes_on {
-            self.invocations
-                .entry(active.execution_id.clone())
-                .or_default()
-                .drain_inputs(&active.inputs)
+            self.execution
+                .bookkeeping(active)
+                .map(|invocation| invocation.drain_inputs(&active.inputs))
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
         let (Some(snapshot), false) = (snapshot, unread.is_empty()) else {
-            release_execution(&handler.execution_manager, active, task_id, self).await;
+            release_execution(handler, active, task_id, self).await;
             return;
         };
-        handler.execution_manager.finish(task_id, active).await;
+        self.release(handler, task_id, active).await;
         if let Err(unread) = turns::start_next_turn(handler, task_id, snapshot, unread, self).await
         {
             // Nothing could take them over: they are answered, as at any end.
@@ -326,11 +416,7 @@ impl TaskRuntime {
         task_id: TaskId,
     ) {
         tracing::error!(task_id = %task_id, "the agent executor panicked; failing the task");
-        let registered = handler
-            .execution_manager
-            .get(&task_id)
-            .await
-            .is_some_and(|current| Arc::ptr_eq(&current, &active));
+        let registered = self.execution.is_current(&active);
         if registered && active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
             active
                 .publish(
@@ -366,7 +452,7 @@ impl TaskRuntime {
             }
         }
         // Identity-checked cleanup cannot unregister a successor invocation.
-        release_execution(&handler.execution_manager, &active, &task_id, self).await;
+        release_execution(handler, &active, &task_id, self).await;
         handler.changes.notify(&task_id);
     }
 }
@@ -375,4 +461,85 @@ pub(super) enum OutputAction {
     Continue,
     Drain,
     Stopped,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn late_driver_commands_cannot_release_or_publish_into_a_successor() {
+        let handler = make_handler();
+        let mut runtime = TaskRuntime::default();
+        let (old, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
+        runtime.release(&handler, "task", &old).await;
+        let (next, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
+        let sequence = next.sequence().await;
+        runtime
+            .finished(&handler, "task".into(), old.clone(), TurnEnd::Stopped)
+            .await;
+        let action = runtime
+            .output(
+                &handler,
+                "task".into(),
+                old,
+                StreamResponse::Task(task_with_history("task", "context", 0)),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(action, OutputAction::Stopped));
+        assert!(runtime.execution.is_current(&next));
+        assert!(Arc::ptr_eq(
+            &handler.execution_manager.get("task").await.unwrap(),
+            &next
+        ));
+        assert_eq!(next.sequence().await, sequence);
+        assert!(handler.task_store.get("task").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn driver_completion_preserves_cancellation_until_the_hook_finishes() {
+        let handler = make_handler();
+        seed_task(&handler, "task", "context").await;
+        let mut runtime = TaskRuntime::default();
+        let (active, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
+        active
+            .set_snapshot(handler.load_task("task").await.unwrap())
+            .await;
+        let plan = runtime
+            .begin_cancel(
+                &handler,
+                &ServiceParams::new(),
+                CancelTaskRequest {
+                    id: "task".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(plan, CancellationStart::Started(_)));
+        runtime
+            .finished(&handler, "task".into(), active, TurnEnd::Stopped)
+            .await;
+        assert!(matches!(
+            runtime.execution,
+            ExecutionState::Canceling {
+                invocation: None,
+                ..
+            }
+        ));
+        assert!(handler.execution_manager.get("task").await.is_none());
+        runtime
+            .cancel_finished(&handler, "task", None)
+            .await
+            .unwrap();
+        assert!(matches!(runtime.execution, ExecutionState::Idle));
+        assert_eq!(
+            handler.load_task("task").await.unwrap().status.state,
+            TaskState::Canceled
+        );
+    }
 }

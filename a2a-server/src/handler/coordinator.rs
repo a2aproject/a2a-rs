@@ -65,6 +65,9 @@ impl TaskCoordinator {
                 let result = std::panic::AssertUnwindSafe(transition(state))
                     .catch_unwind()
                     .await;
+                if result.is_err() {
+                    state.recover_preparation();
+                }
                 let result = result.map_err(|_| {
                     A2AError::internal(match operation {
                         TaskOperation::Input => "message preparation failed unexpectedly",
@@ -131,15 +134,7 @@ impl TaskCoordinator {
         event: StreamResponse,
     ) -> Result<(), A2AError> {
         self.update(TaskOperation::Cancel, move |state| {
-            Box::pin(async move {
-                state
-                    .cancellation
-                    .as_mut()
-                    .ok_or_else(|| A2AError::internal("no cancellation in progress"))?
-                    .apply(&handler, event)
-                    .await
-                    .map(|_| ())
-            })
+            Box::pin(async move { state.cancel_update(&handler, event).await })
         })
         .await?
     }
@@ -151,16 +146,7 @@ impl TaskCoordinator {
     ) -> Result<(), A2AError> {
         let id = self.task_id.clone();
         self.update(TaskOperation::Cancel, move |state| {
-            Box::pin(async move {
-                let cancellation = state
-                    .cancellation
-                    .take()
-                    .ok_or_else(|| A2AError::internal("no cancellation in progress"))?;
-                let active = cancellation.active.clone();
-                let result = cancellation.finish(&handler, failure).await;
-                handler.execution_manager.finish(&id, &active).await;
-                result
-            })
+            Box::pin(async move { state.cancel_finished(&handler, &id, failure).await })
         })
         .await?
     }

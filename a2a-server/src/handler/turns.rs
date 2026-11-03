@@ -6,7 +6,6 @@
 use super::DefaultRequestHandler;
 use super::coordinator::TaskRuntime;
 use super::events::{ActiveExecution, EventKind};
-use super::registry::ExecutionManager;
 use a2a::*;
 use std::sync::Arc;
 
@@ -19,20 +18,17 @@ pub(super) async fn start_next_turn(
     mut unread: Vec<crate::executor::ClientInput>,
     state: &mut TaskRuntime,
 ) -> Result<(), Vec<crate::executor::ClientInput>> {
-    let Ok((next, inputs, invocation)) = handler.execution_manager.reserve(task_id).await else {
+    let Ok((next, inputs)) = state.reserve(handler, task_id).await else {
         return Err(unread);
     };
-    state
-        .invocations
-        .insert(next.execution_id.clone(), invocation);
     next.set_snapshot(snapshot.clone()).await;
     let first = unread.remove(0);
     for input in unread {
         if let Ok(permit) = next.inputs.sender.clone().try_reserve_owned() {
             permit.send(
                 state
-                    .invocations
-                    .get_mut(&next.execution_id)
+                    .execution
+                    .bookkeeping(&next)
                     .unwrap()
                     .track_input(input),
             );
@@ -59,14 +55,13 @@ pub(super) async fn start_next_turn(
 /// Close input delivery and unregister in one coordinator transition. Later
 /// input commands either join a successor or start a new invocation.
 pub(super) async fn release_execution(
-    manager: &ExecutionManager,
+    handler: &DefaultRequestHandler,
     active: &Arc<ActiveExecution>,
     task_id: &str,
     state: &mut TaskRuntime,
 ) {
     reject_unread_inputs(active, task_id, state).await;
-    state.invocations.remove(&active.execution_id);
-    manager.finish(task_id, active).await;
+    state.release(handler, task_id, active).await;
 }
 
 /// Saves the push configuration the request that started the execution
@@ -77,8 +72,8 @@ pub(super) async fn save_pending_push_config(
     state: &mut TaskRuntime,
 ) {
     let pending = state
-        .invocations
-        .get_mut(&active.execution_id)
+        .execution
+        .bookkeeping(active)
         .and_then(|invocation| invocation.pending_push.take());
     if let (Some(config), Some(store)) = (pending, handler.push_config_store.as_ref()) {
         if let Err(error) = store.save(config).await {
@@ -101,10 +96,10 @@ pub(super) async fn reject_unread_inputs(
         active,
         task_id,
         state
-            .invocations
-            .entry(active.execution_id.clone())
-            .or_default()
-            .drain_inputs(&active.inputs),
+            .execution
+            .bookkeeping(active)
+            .map(|invocation| invocation.drain_inputs(&active.inputs))
+            .unwrap_or_default(),
     )
     .await;
 }
@@ -219,14 +214,16 @@ mod tests {
         let mut state = TaskRuntime::default();
         let mut invocation = super::super::events::InvocationState::default();
         invocation.pending_push = Some(config(50));
-        state
-            .invocations
-            .insert(active.execution_id.clone(), invocation);
+        state.execution =
+            super::super::lifecycle::ExecutionState::Running(super::super::lifecycle::Invocation {
+                active: active.clone(),
+                bookkeeping: invocation,
+            });
         save_pending_push_config(&active, &runtime, &mut state).await;
         assert!(
             state
-                .invocations
-                .get(&active.execution_id)
+                .execution
+                .bookkeeping(&active)
                 .unwrap()
                 .pending_push
                 .is_none()
@@ -301,17 +298,23 @@ mod tests {
                 input
             })
             .collect();
-        assert!(
-            start_next_turn(
-                &runtime,
-                &task.id,
-                task.clone(),
-                inputs.clone(),
-                &mut TaskRuntime::default()
+        let coordinator = runtime.execution_manager.coordinators.for_task(&task.id);
+        let handler = runtime.clone();
+        let snapshot = task.clone();
+        let accepted = inputs.clone();
+        let started = coordinator
+            .update(
+                super::super::coordinator::TaskOperation::Finished,
+                move |state| {
+                    Box::pin(async move {
+                        start_next_turn(&handler, &snapshot.id, snapshot.clone(), accepted, state)
+                            .await
+                    })
+                },
             )
             .await
-            .is_ok()
-        );
+            .unwrap();
+        assert!(started.is_ok());
         let (context, queued) = timeout(Duration::from_secs(1), received.recv())
             .await
             .unwrap()

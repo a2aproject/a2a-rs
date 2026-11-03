@@ -18,6 +18,7 @@ mod events;
 mod exchange;
 mod execution;
 mod failure;
+mod lifecycle;
 mod output;
 mod protocol;
 mod push_delivery;

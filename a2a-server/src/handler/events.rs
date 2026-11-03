@@ -130,8 +130,6 @@ pub(super) struct ActiveExecution {
     pub(super) events: Arc<super::task_events::TaskEvents>,
     pub(super) finished: tokio_util::sync::CancellationToken,
     prepared: std::sync::atomic::AtomicBool,
-    /// Keep the coordinator alive until this invocation has released its state.
-    pub(super) _coordinator: Option<Arc<super::coordinator::TaskCoordinator>>,
     /// Where messages sent to this task go while the executor runs. The queue
     /// belongs to the execution turn and is handed off with unread inputs.
     pub(super) inputs: ClientInputSender,
@@ -166,7 +164,6 @@ impl ActiveExecution {
                 events,
                 finished: tokio_util::sync::CancellationToken::new(),
                 prepared: std::sync::atomic::AtomicBool::new(false),
-                _coordinator: None,
                 inputs,
                 inputs_drained: tokio_util::sync::CancellationToken::new(),
                 push_failure: tokio::sync::watch::channel(None).0,
@@ -183,6 +180,10 @@ impl ActiveExecution {
     /// The most recently published execution event, read under the state lock.
     pub(super) async fn sequence(&self) -> u64 {
         self.events.sequence().await
+    }
+
+    pub(super) fn is_prepared(&self) -> bool {
+        self.prepared.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(super) async fn snapshot(&self) -> Option<Task> {
@@ -759,7 +760,7 @@ mod tests {
             subscription_stream(receiver, None, sequence, false, true, false, None);
         let error = A2AError::internal("executor failed");
         first.publish(Err(&error), None).await;
-        manager.finish(&task.id, &first).await;
+        manager.unregister(&task.id, &first).await;
         drop(first);
 
         let (second, _inputs, _invocation) = manager.reserve(&task.id).await.unwrap();
@@ -793,6 +794,6 @@ mod tests {
             new_response.next().await,
             Some(Ok(StreamResponse::Task(snapshot))) if snapshot.generation == task.generation
         ));
-        manager.finish("handoff-error", &second).await;
+        manager.unregister("handoff-error", &second).await;
     }
 }

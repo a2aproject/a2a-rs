@@ -137,7 +137,7 @@ mod tests {
         first
             .publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()))
             .await;
-        manager.finish("task", &first).await;
+        manager.unregister("task", &first).await;
         drop(first);
 
         let (second, _inputs, _invocation) = manager.reserve("task").await.unwrap();
