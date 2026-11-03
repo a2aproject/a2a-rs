@@ -120,6 +120,7 @@ dependencies = [
  "futures",
  "http-body-util",
  "hyper",
+ "parking_lot",
  "reqwest",
  "rustls",
  "serde",

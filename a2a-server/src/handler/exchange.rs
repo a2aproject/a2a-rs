@@ -288,7 +288,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("exchange must accept queued input"));
         drop(exchange);
         assert!(
-            handler.live.lock().is_empty(),
+            handler.live.open.read().is_empty(),
             "the lease must remove the registry entry"
         );
         assert!(
@@ -322,7 +322,7 @@ mod tests {
             Some(Err(_))
         ));
         assert!(
-            handler.live.lock().is_empty(),
+            handler.live.open.read().is_empty(),
             "panic cleanup must unregister before sending an error"
         );
         assert!(output.next().await.is_none());
