@@ -11,16 +11,16 @@ use self::delivery::{
     validate_existing_task,
 };
 use self::events::{ActiveExecution, ExecutionReceiver, TaskChanges};
-use self::exchange::{ExchangeAdapter, OpenExchange};
+use self::exchange::{Exchange, ExchangeAdapter, OpenExchange};
 use self::execution::{drive_execution_guarded, publish_error};
 use self::protocol::{
     Rejection, apply_lengths, is_at_least_1_1, is_terminal_event, requested_protocol_version,
     unary_refusal,
 };
 use self::registry::{ExecutionManager, ReservationGuard};
-use self::response::{Run, RunCompletion};
+use self::response::{Events, Run, RunCompletion};
 use self::startup::{PreparedResponse, StartedResponse};
-use self::subscription::SubscriptionPolicy;
+use self::subscription::{SubscriptionAttachment, SubscriptionPolicy};
 use self::updates::{
     CancelEntry, apply_and_publish, apply_event_to_task, backfill_status_timestamp, save_task,
     validate_event_identity,
@@ -483,7 +483,7 @@ impl DefaultRequestHandler {
             self.require_streaming()?;
         }
         // Adapt routing and transport input into one exchange or an acknowledgement.
-        let mut exchange = match ExchangeAdapter::new(self, params).open(input, mode).await? {
+        let mut exchange = match ExchangeAdapter::new(self, params).open(input).await? {
             OpenExchange::Acknowledged(task) => return Ok(StartedResponse::Ack(task)),
             OpenExchange::Attached(exchange) => exchange,
         };
@@ -517,22 +517,35 @@ impl DefaultRequestHandler {
         })??;
         // Bind its lifetime to the task, then let the shared runner deliver events.
         exchange.bind(&prepared.task_id);
-        let run = Run::new(
+        let task_id = prepared.task_id.clone();
+        let events = self.response_stream(
+            params,
+            prepared,
+            (mode == StartMode::Bidi).then_some(exchange),
+        );
+        Ok(StartedResponse::Stream { task_id, events })
+    }
+
+    /// Every opening message or subscription starts exactly one response Run.
+    fn response_stream(
+        &self,
+        params: &ServiceParams,
+        prepared: PreparedResponse,
+        uplink: Option<Exchange>,
+    ) -> Events {
+        Run::new(
             self.clone(),
             params.clone(),
-            prepared.task_id.clone(),
+            prepared.task_id,
             prepared.completion,
+            prepared.policy,
         )
-        .with_response_id(response_id);
-        Ok(StartedResponse::Stream {
-            task_id: prepared.task_id,
-            events: run.start(
-                prepared.opening,
-                Some(prepared.events),
-                prepared.seen_generation,
-                (mode == StartMode::Bidi).then_some(exchange),
-            ),
-        })
+        .start(
+            prepared.opening,
+            prepared.events,
+            prepared.seen_generation,
+            uplink,
+        )
     }
 
     /// Admit the first message or subscription, then prepare its events and
@@ -545,6 +558,7 @@ impl DefaultRequestHandler {
         wants_message_updates: bool,
         response_id: Option<uuid::Uuid>,
     ) -> Result<PreparedResponse, A2AError> {
+        let policy = SubscriptionPolicy::new(mode, wants_message_updates).for_response(response_id);
         match request {
             input @ (IncomingRequest::Authorized(_)
             | IncomingRequest::Raw(StreamRequest {
@@ -559,22 +573,18 @@ impl DefaultRequestHandler {
                         StartMode::Bidi => rejection.into_error(),
                         _ => unary_refusal(rejection, &request),
                     })?;
-                Ok(PreparedResponse::message(
-                    request,
-                    delivery,
-                    mode,
-                    wants_message_updates,
-                    response_id,
-                ))
+                Ok(PreparedResponse::message(request, delivery, mode, policy))
             }
             IncomingRequest::Raw(StreamRequest {
                 payload: StreamRequestPayload::Subscribe(subscribe),
                 ..
             }) if mode == StartMode::Bidi => {
-                let events = self
-                    .subscribe_stream(params, subscribe.clone(), true, response_id)
-                    .await?;
-                Ok(PreparedResponse::subscription(subscribe, events))
+                let attachment = self.attach_subscription(params, subscribe).await?;
+                Ok(PreparedResponse::subscription(
+                    attachment,
+                    RunCompletion::Exchange,
+                    policy,
+                ))
             }
             _ => Err(A2AError::invalid_request(
                 "unrecognised StreamRequest payload",
@@ -802,15 +812,12 @@ impl DefaultRequestHandler {
     }
 
     // Subscriptions.
-    /// `SubscribeToTask`, for an ordinary stream or (`live`) for the downlink of
-    /// a live exchange, which is also told what only a live exchange is.
-    async fn subscribe_stream(
+    /// Validate and capture a task subscription without starting response delivery.
+    async fn attach_subscription(
         &self,
         params: &ServiceParams,
         req: SubscribeToTaskRequest,
-        live: bool,
-        response_id: Option<uuid::Uuid>,
-    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+    ) -> Result<SubscriptionAttachment, A2AError> {
         self.authorize(params, Some(&req.id))?;
         self.require_streaming()?;
         // An execution that is still being prepared has no snapshot to open
@@ -863,17 +870,13 @@ impl DefaultRequestHandler {
                 }
                 (_, snapshot) => snapshot,
             };
-            let mode = if live {
-                StartMode::Bidi
-            } else {
-                StartMode::Streaming
-            };
-            return Ok(SubscriptionPolicy::new(
-                mode,
-                is_at_least_1_1(&requested_protocol_version(params)),
-            )
-            .for_response(response_id)
-            .stream(receiver, snapshot_task, sequence));
+            return Ok(SubscriptionAttachment {
+                task_id: req.id,
+                receiver: Some(receiver),
+                opening: snapshot_task,
+                sequence,
+                seen_generation: req.last_seen_generation.unwrap_or(0),
+            });
         }
 
         // A registry miss also happens once a task finishes and its
@@ -888,10 +891,12 @@ impl DefaultRequestHandler {
                 )));
             }
             let current = req.last_seen_generation == Some(task.generation);
-            return Ok(if current {
-                futures::stream::empty().boxed()
-            } else {
-                futures::stream::once(async move { Ok(StreamResponse::Task(task)) }).boxed()
+            return Ok(SubscriptionAttachment {
+                task_id: req.id,
+                receiver: None,
+                opening: (!current).then_some(task),
+                sequence: 0,
+                seen_generation: req.last_seen_generation.unwrap_or(0),
             });
         }
         Err(A2AError::task_not_found(&req.id))
@@ -1648,7 +1653,7 @@ impl RequestHandler for DefaultRequestHandler {
         uplink: BoxStream<'static, StreamRequest>,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let (_, events) = self
-            .start_response(params, StartMode::Bidi, ResponseInput::Stream(uplink))
+            .start_response(params, StartMode::Bidi, ResponseInput::Duplex(uplink))
             .await?
             .into_stream()?;
         Ok(events)
@@ -1736,17 +1741,13 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let task_id = req.id.clone();
-        let seen_generation = req.last_seen_generation.unwrap_or(0);
-        let events = self.subscribe_stream(params, req, false, None).await?;
-        Ok(
-            Run::new(self.clone(), params.clone(), task_id, RunCompletion::Task).start(
-                None,
-                Some(events),
-                seen_generation,
-                None,
-            ),
-        )
+        let attachment = self.attach_subscription(params, req).await?;
+        let policy = SubscriptionPolicy::new(
+            StartMode::Streaming,
+            is_at_least_1_1(&requested_protocol_version(params)),
+        );
+        let prepared = PreparedResponse::subscription(attachment, RunCompletion::Task, policy);
+        Ok(self.response_stream(params, prepared, None))
     }
 
     async fn send_live_request(
@@ -1758,7 +1759,7 @@ impl RequestHandler for DefaultRequestHandler {
             .start_response(
                 params,
                 StartMode::Bidi,
-                ResponseInput::Request(Box::new(request)),
+                ResponseInput::HttpLive(Box::new(request)),
             )
             .await?
         {
@@ -5491,5 +5492,99 @@ mod upstream_regressions {
 
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod subscription_attachment_tests {
+    use super::*;
+    use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn standalone_and_live_subscriptions_preserve_resume_cursors_for_active_and_idle_tasks() {
+        for live in [false, true] {
+            for running in [false, true] {
+                for cursor in [None, Some(4), Some(5)] {
+                    let handler = make_handler();
+                    seed_task(&handler, "task", "context").await;
+                    let mut task = handler.load_task("task").await.unwrap();
+                    task.generation = 5;
+                    handler.task_store.update(task.clone()).await.unwrap();
+                    let execution = if running {
+                        let (active, inputs, writer) =
+                            handler.execution_manager.reserve("task").await.unwrap();
+                        active.set_snapshot(task.clone()).await;
+                        drop(writer);
+                        Some((active, inputs))
+                    } else {
+                        None
+                    };
+                    let request = SubscribeToTaskRequest {
+                        id: task.id.clone(),
+                        tenant: None,
+                        last_seen_generation: cursor,
+                    };
+                    let params =
+                        ServiceParams::from([(SVC_PARAM_VERSION.into(), vec!["1.1".into()])]);
+                    // Keep the live uplink open while observing the same Task.
+                    let mut events = if live {
+                        let opening = StreamRequest {
+                            tenant: None,
+                            payload: StreamRequestPayload::Subscribe(request),
+                        };
+                        handler
+                            .send_live_message(
+                                &params,
+                                stream::once(async move { opening })
+                                    .chain(stream::pending())
+                                    .boxed(),
+                            )
+                            .await
+                            .unwrap()
+                    } else {
+                        handler.subscribe_to_task(&params, request).await.unwrap()
+                    };
+                    assert_eq!(
+                        handler.execution_manager.get("task").await.is_some(),
+                        running,
+                        "subscribing must not start an executor"
+                    );
+                    if cursor == Some(5) {
+                        assert!(
+                            timeout(Duration::from_millis(10), events.next())
+                                .await
+                                .is_err(),
+                            "a current cursor must not replay the opening snapshot"
+                        );
+                    } else {
+                        let opening = timeout(Duration::from_secs(2), events.next())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap();
+                        assert!(
+                            matches!(opening, StreamResponse::Task(snapshot) if snapshot == task)
+                        );
+                    }
+                    task.generation = 6;
+                    task.status.state = TaskState::Completed;
+                    handler.task_store.update(task.clone()).await.unwrap();
+                    if let Some((active, _inputs)) = execution {
+                        active
+                            .publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()))
+                            .await;
+                        handler.execution_manager.finish("task", &active).await;
+                    }
+                    handler.changes.notify("task");
+                    let remaining = timeout(Duration::from_secs(2), events.collect::<Vec<_>>())
+                        .await
+                        .unwrap();
+                    assert!(
+                        matches!(remaining.as_slice(), [Ok(StreamResponse::Task(snapshot))] if snapshot == &task),
+                        "the shared runner must deliver completion once: {remaining:?}"
+                    );
+                }
+            }
+        }
     }
 }

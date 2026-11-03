@@ -134,19 +134,20 @@ impl Drop for Receipt {
     }
 }
 
-/// Input to the common send entry point. A single request in Bidi mode is
-/// an HTTP call; a stream supplies a native duplex uplink.
+/// Transport input to the common send entry point. Routing never infers the
+/// transport from the response completion mode.
 pub(super) enum ResponseInput {
-    Request(Box<StreamRequest>),
-    Stream(BoxStream<'static, StreamRequest>),
+    /// One unary or server-streaming send request.
+    Single(Box<SendMessageRequest>),
+    /// Native duplex input, including its opening request.
+    Duplex(BoxStream<'static, StreamRequest>),
+    /// An HTTP live opening or followup call, resolved by exchange routing.
+    HttpLive(Box<StreamRequest>),
 }
 
 impl ResponseInput {
     pub(super) fn message(request: SendMessageRequest) -> Self {
-        Self::Request(Box::new(StreamRequest {
-            tenant: request.tenant.clone(),
-            payload: StreamRequestPayload::SendMessage(request),
-        }))
+        Self::Single(Box::new(request))
     }
 }
 
