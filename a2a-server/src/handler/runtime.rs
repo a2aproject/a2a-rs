@@ -352,9 +352,12 @@ impl TaskRuntime {
                     .uncreated
                     .store(false, std::sync::atomic::Ordering::SeqCst);
                 reject_unread_inputs(&active, &task_id, self).await;
-                let failed = super::failure::persist_failure(handler, &active, &task_id, &error).await;
+                let failed =
+                    super::failure::persist_failure(handler, &active, &task_id, &error).await;
                 active.publish(Err(&error), failed.clone()).await;
-                if let Some(task) = failed { active.publish(Ok(&StreamResponse::Task(task)), None).await; }
+                if let Some(task) = failed {
+                    active.publish(Ok(&StreamResponse::Task(task)), None).await;
+                }
                 release_execution(handler, &active, &task_id, self).await;
             }
             TurnEnd::Stopped => {
