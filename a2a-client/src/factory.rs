@@ -161,10 +161,9 @@ impl A2AClientFactoryBuilder {
     fn new() -> Self {
         A2AClientFactoryBuilder {
             factories: HashMap::new(),
-            preferred_bindings: vec![
-                TRANSPORT_PROTOCOL_JSONRPC.to_string(),
-                TRANSPORT_PROTOCOL_HTTP_JSON.to_string(),
-            ],
+            // §8.3.2: the card's order is the preference order unless the
+            // caller states its own.
+            preferred_bindings: Vec::new(),
             interceptors: Vec::new(),
             include_defaults: true,
         }
@@ -177,7 +176,9 @@ impl A2AClientFactoryBuilder {
         self
     }
 
-    /// Set preferred binding order. First is most preferred.
+    /// Set preferred binding order. First is most preferred; a binding not
+    /// listed ranks after every listed one, in the card's order. Empty, the
+    /// default, follows the card's own order (§8.3.2).
     pub fn preferred_bindings(mut self, bindings: Vec<String>) -> Self {
         self.preferred_bindings = bindings;
         self
@@ -247,7 +248,39 @@ mod tests {
     fn test_builder_defaults() {
         let factory = A2AClientFactory::builder().build();
         assert_eq!(factory.factories.len(), 2); // jsonrpc + rest
-        assert_eq!(factory.preferred_bindings.len(), 2);
+        assert!(factory.preferred_bindings.is_empty());
+    }
+
+    fn card_with_interfaces(interfaces: Vec<AgentInterface>) -> AgentCard {
+        AgentCard {
+            supported_interfaces: interfaces,
+            ..card_with_tenant(None)
+        }
+    }
+
+    /// §8.3.2: the first supported interface the card lists is selected;
+    /// the client's own order applies only when it states one.
+    #[tokio::test]
+    async fn test_create_from_card_follows_the_card_order() {
+        let card = card_with_interfaces(vec![
+            AgentInterface::new("http://localhost/rest", TRANSPORT_PROTOCOL_HTTP_JSON),
+            AgentInterface::new("http://localhost/jsonrpc", TRANSPORT_PROTOCOL_JSONRPC),
+        ]);
+
+        let (_, selected) = A2AClientFactory::builder()
+            .build()
+            .create_from_card_with_interface(&card)
+            .await
+            .unwrap();
+        assert_eq!(selected.protocol_binding, TRANSPORT_PROTOCOL_HTTP_JSON);
+
+        let (_, selected) = A2AClientFactory::builder()
+            .preferred_bindings(vec![TRANSPORT_PROTOCOL_JSONRPC.to_string()])
+            .build()
+            .create_from_card_with_interface(&card)
+            .await
+            .unwrap();
+        assert_eq!(selected.protocol_binding, TRANSPORT_PROTOCOL_JSONRPC);
     }
 
     #[test]
