@@ -435,6 +435,7 @@ mod tests {
     #[cfg(feature = "rustls-tls")]
     mod tls_tests {
         use super::*;
+        use rustls::pki_types::pem::PemObject;
         use std::sync::Arc;
 
         fn self_signed_ca_pem() -> Vec<u8> {
@@ -450,10 +451,8 @@ mod tests {
 
         fn build_test_tls_config(ca_pem: &[u8]) -> Arc<rustls::ClientConfig> {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-            let ca_cert = rustls_pemfile::certs(&mut &ca_pem[..])
-                .next()
-                .expect("should have at least one cert in ca.pem")
-                .expect("cert should be valid");
+            let ca_cert = rustls::pki_types::CertificateDer::from_pem_slice(ca_pem)
+                .expect("ca.pem should hold a valid cert");
             let mut root_store = rustls::RootCertStore::empty();
             root_store.add(ca_cert).unwrap();
             let mut config = rustls::ClientConfig::builder()

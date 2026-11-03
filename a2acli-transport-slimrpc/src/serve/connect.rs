@@ -867,7 +867,7 @@ app:
     }
 
     fn minimal_config(client_endpoint: &str) -> PluginConfig {
-        serde_yaml::from_str(&minimal_config_yaml(client_endpoint)).unwrap()
+        serde_norway::from_str(&minimal_config_yaml(client_endpoint)).unwrap()
     }
 
     /// Binds an ephemeral loopback port and immediately drops the listener,

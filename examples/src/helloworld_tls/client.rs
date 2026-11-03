@@ -19,15 +19,13 @@ use a2a_client::rest::RestTransportFactory;
 use a2a_client::rustls;
 use a2a_grpc::GrpcTransportFactory;
 use examples_lib::exercise_client;
+use rustls::pki_types::pem::PemObject;
 
 const SERVER_URLS: &[&str] = &["https://localhost:3443"];
 const CA_PEM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ca.pem"));
 
 fn build_grpc_tls_config() -> Arc<rustls::ClientConfig> {
-    let ca_cert = rustls_pemfile::certs(&mut &CA_PEM[..])
-        .next()
-        .expect("no cert in ca.pem")
-        .expect("parse CA cert");
+    let ca_cert = rustls::pki_types::CertificateDer::from_pem_slice(CA_PEM).expect("parse CA cert");
 
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(ca_cert).expect("add CA cert");

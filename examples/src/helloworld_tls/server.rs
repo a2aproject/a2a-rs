@@ -15,6 +15,7 @@ use a2a_pb::proto::a2a_service_server::A2aServiceServer;
 use a2a_server::tls::{axum_server, rustls};
 use a2a_server::*;
 use examples_lib::{EchoExecutor, build_agent_card};
+use rustls::pki_types::pem::PemObject;
 use tonic::transport::Server as TonicServer;
 use tonic::transport::server::TcpIncoming;
 use tonic_tls::rustls::TlsIncoming;
@@ -26,12 +27,10 @@ fn load_cert_and_key() -> (
     Vec<rustls::pki_types::CertificateDer<'static>>,
     rustls::pki_types::PrivateKeyDer<'static>,
 ) {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut &SERVER_CERT_PEM[..])
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(SERVER_CERT_PEM)
         .collect::<Result<_, _>>()
         .expect("parse certs");
-    let key = rustls_pemfile::private_key(&mut &SERVER_KEY_PEM[..])
-        .expect("parse key")
-        .expect("no private key found");
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(SERVER_KEY_PEM).expect("parse key");
     (certs, key)
 }
 

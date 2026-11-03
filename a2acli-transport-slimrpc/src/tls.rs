@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::error::PluginError;
@@ -30,13 +31,12 @@ pub fn generate_loopback_tls() -> Result<LoopbackTls, PluginError> {
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
 
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<Result<_, _>>()
         .map_err(|e| PluginError::Tls(format!("parse cert: {e}")))?;
 
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-        .map_err(|e| PluginError::Tls(format!("parse key: {e}")))?
-        .ok_or_else(|| PluginError::Tls("no private key in PEM".to_string()))?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+        .map_err(|e| PluginError::Tls(format!("parse key: {e}")))?;
 
     let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
