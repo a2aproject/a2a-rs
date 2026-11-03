@@ -711,8 +711,32 @@ impl DefaultRequestHandler {
     }
 
     fn authorize(&self, params: &ServiceParams, task_id: Option<&str>) -> Result<(), A2AError> {
+        self.require_extensions(params)?;
         match &self.authorizer {
             Some(authorizer) => authorizer.authorize(params, task_id),
+            None => Ok(()),
+        }
+    }
+
+    /// §3.3.4: a request that does not activate every extension the card
+    /// marks `required` is refused. Activation is the `A2A-Extensions`
+    /// service parameter, comma-separated or repeated (§9.2, §10.2, §11.2).
+    fn require_extensions(&self, params: &ServiceParams) -> Result<(), A2AError> {
+        let Some(extensions) = &self.capabilities.extensions else {
+            return Ok(());
+        };
+        let activated: Vec<&str> = params
+            .get(&SVC_PARAM_EXTENSIONS.to_ascii_lowercase())
+            .into_iter()
+            .flatten()
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .collect();
+        match extensions
+            .iter()
+            .find(|ext| ext.required == Some(true) && !activated.contains(&ext.uri.as_str()))
+        {
+            Some(missing) => Err(A2AError::extension_support_required(&missing.uri)),
             None => Ok(()),
         }
     }
@@ -4405,6 +4429,87 @@ mod tests {
 
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
+    }
+
+    fn handler_with_extensions(extensions: Vec<(&str, Option<bool>)>) -> DefaultRequestHandler {
+        make_handler().with_capabilities(AgentCapabilities {
+            streaming: None,
+            push_notifications: None,
+            extensions: Some(
+                extensions
+                    .into_iter()
+                    .map(|(uri, required)| AgentExtension {
+                        uri: uri.into(),
+                        description: None,
+                        required,
+                        params: None,
+                    })
+                    .collect(),
+            ),
+            extended_agent_card: None,
+        })
+    }
+
+    /// §3.3.4: a request that does not activate an extension the card marks
+    /// `required` is refused with ExtensionSupportRequiredError, on every
+    /// operation.
+    #[tokio::test]
+    async fn test_required_extension_not_activated_is_refused() {
+        let handler = handler_with_extensions(vec![
+            ("urn:ext:optional", None),
+            ("urn:ext:required", Some(true)),
+        ]);
+        let mut params = ServiceParams::new();
+        params.insert("a2a-extensions".into(), vec!["urn:ext:optional".into()]);
+
+        let error = handler
+            .send_message(&params, send_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::EXTENSION_SUPPORT_REQUIRED);
+        assert!(
+            error.message.contains("urn:ext:required"),
+            "{}",
+            error.message
+        );
+
+        let error = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: "t1".into(),
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::EXTENSION_SUPPORT_REQUIRED);
+    }
+
+    /// The required extension may arrive comma-separated in one value or as
+    /// a repeated service parameter; an optional one need not arrive at all.
+    #[tokio::test]
+    async fn test_required_extension_activated_is_accepted() {
+        let handler = handler_with_extensions(vec![
+            ("urn:ext:optional", Some(false)),
+            ("urn:ext:required", Some(true)),
+        ]);
+        for activated in [
+            vec!["urn:ext:other, urn:ext:required".to_string()],
+            vec!["urn:ext:other".to_string(), "urn:ext:required".to_string()],
+        ] {
+            let mut params = ServiceParams::new();
+            params.insert("a2a-extensions".into(), activated);
+            handler.send_message(&params, send_request()).await.unwrap();
+        }
+
+        // Nothing required: no activation needed.
+        let handler = handler_with_extensions(vec![("urn:ext:optional", None)]);
+        handler
+            .send_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
