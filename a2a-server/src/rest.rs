@@ -1047,8 +1047,8 @@ mod tests {
             .await
             .unwrap()
             .to_bytes();
-        let frames: Vec<Value> = String::from_utf8(body.to_vec())
-            .unwrap()
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let frames: Vec<Value> = body
             .lines()
             .filter_map(|line| line.strip_prefix("data: "))
             .map(|data| serde_json::from_str(data).unwrap())
@@ -1058,6 +1058,13 @@ mod tests {
         assert_eq!(error["code"], 404);
         assert_eq!(error["status"], "NOT_FOUND");
         assert_eq!(error["details"][0]["reason"], "TASK_NOT_FOUND");
+        // The error frame alone is named: a2a-python's REST client reads an
+        // unnamed frame as a StreamResponse and drops the error.
+        let names: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("event: "))
+            .collect();
+        assert_eq!(names, vec!["error"], "{body}");
     }
 
     #[tokio::test]
