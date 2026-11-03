@@ -19,7 +19,7 @@ pub enum PluginError {
     ConfigParse {
         path: String,
         #[source]
-        source: serde_norway::Error,
+        source: yaml_serde::Error,
     },
 
     #[error("auth config error: {0}")]

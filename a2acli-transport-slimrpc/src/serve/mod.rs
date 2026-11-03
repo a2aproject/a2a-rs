@@ -115,7 +115,7 @@ fn load_config(path: &str) -> Result<PluginConfig, PluginError> {
         path: path.to_string(),
         source: e,
     })?;
-    serde_norway::from_slice(&config_bytes).map_err(|e| PluginError::ConfigParse {
+    yaml_serde::from_slice(&config_bytes).map_err(|e| PluginError::ConfigParse {
         path: path.to_string(),
         source: e,
     })
