@@ -33,7 +33,7 @@ pub struct HttpPushSenderConfig {
     /// string check, and the sender uses no system proxy, since either path
     /// would otherwise reach an address the guard never saw. Disable only when
     /// pushing to local webhooks in trusted test environments; that turns off
-    /// the whole guard.
+    /// the SSRF guard. Cross-origin redirects remain forbidden.
     pub validate_urls: bool,
 }
 
@@ -62,14 +62,15 @@ impl HttpPushSender {
         //     original URL;
         //   - no system proxy, since a proxy would resolve and reach the target
         //     itself, leaving only the proxy address screened.
-        // When validation is off (the single documented opt-out for local test
-        // webhooks), keep reqwest's defaults so loopback targets still work.
-        let mut builder = reqwest::Client::builder().timeout(config.timeout);
+        // Same-origin redirects are enforced independently of URL screening:
+        // custom notification tokens must never follow a different origin.
+        let mut builder = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .redirect(push_redirect_policy(config.validate_urls));
         if config.validate_urls {
             builder = builder
                 .dns_resolver(Arc::new(SsrfGuardedResolver))
-                .no_proxy()
-                .redirect(ssrf_guarded_redirect_policy());
+                .no_proxy();
         }
         let client = builder.build().expect("failed to create HTTP client");
         HttpPushSender {
@@ -331,20 +332,27 @@ impl Resolve for SsrfGuardedResolver {
     }
 }
 
-/// The redirect policy installed when `validate_urls` is set: re-screens
-/// each hop with [`validate_push_url`], since a redirect to a blocked
-/// literal IP skips DNS entirely and never reaches [`SsrfGuardedResolver`].
+/// Every redirect must keep the original scheme, host, and effective port.
+/// This protects the custom notification token and 307/308 request bodies.
+/// With URL screening enabled, each hop also passes the SSRF checks.
 ///
 /// Split out from [`HttpPushSender::new`] so a test can attach it to a
 /// client on its own, without the resolver -- `reqwest::redirect::Attempt`
 /// has no public constructor, so driving a real HTTP redirect through this
 /// policy is the only way to exercise it.
-fn ssrf_guarded_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
+fn push_redirect_policy(validate_urls: bool) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= 10 {
             return attempt.stop();
         }
-        if validate_push_url(attempt.url().as_str()).is_err() {
+        if attempt
+            .previous()
+            .first()
+            .is_some_and(|initial| initial.origin() != attempt.url().origin())
+        {
+            return attempt.error("cross-origin webhook redirects are not allowed");
+        }
+        if validate_urls && validate_push_url(attempt.url().as_str()).is_err() {
             attempt.error("push URL redirect target is blocked")
         } else {
             attempt.follow()
@@ -862,8 +870,8 @@ mod tests {
     fn test_redirect_hop_check_rejects_blocked_targets() {
         // The custom redirect policy re-runs validate_push_url on each hop, so a
         // redirect to a blocked literal IP (which skips DNS and never reaches
-        // SsrfGuardedResolver) is refused, while a public hop follows. This pins
-        // the per-hop check the policy relies on.
+        // SsrfGuardedResolver) fails URL validation. This pins
+        // the URL check used in addition to the same-origin redirect rule.
         assert!(validate_push_url("http://127.0.0.1/").is_err());
         assert!(validate_push_url("http://169.254.169.254/latest/meta-data/").is_err());
         assert!(validate_push_url("http://[::1]/").is_err());
@@ -871,7 +879,7 @@ mod tests {
     }
 
     /// Runs a local server that redirects `/` to `location`, so a real
-    /// `reqwest::redirect::Attempt` reaches [`ssrf_guarded_redirect_policy`]
+    /// `reqwest::redirect::Attempt` reaches [`push_redirect_policy`]
     /// -- the type has no public constructor, so this is the only way to
     /// drive it without faking reqwest's internals.
     async fn spawn_redirect_server(location: String) -> String {
@@ -895,7 +903,7 @@ mod tests {
         let server_url =
             spawn_redirect_server("http://169.254.169.254/latest/meta-data/".into()).await;
         let client = reqwest::Client::builder()
-            .redirect(ssrf_guarded_redirect_policy())
+            .redirect(push_redirect_policy(true))
             .build()
             .unwrap();
         let err = client
@@ -927,7 +935,7 @@ mod tests {
         });
 
         let client = reqwest::Client::builder()
-            .redirect(ssrf_guarded_redirect_policy())
+            .redirect(push_redirect_policy(true))
             .build()
             .unwrap();
         let err = client
@@ -936,6 +944,126 @@ mod tests {
             .await
             .expect_err("a loopback self-redirect must be refused, not followed");
         assert!(err.is_redirect(), "expected a redirect-policy error: {err}");
+    }
+
+    #[tokio::test]
+    async fn webhook_redirects_preserve_credentials_only_within_the_original_origin() {
+        use axum::{
+            body::Bytes,
+            http::{HeaderMap, StatusCode},
+            response::Redirect,
+            routing::post,
+        };
+        install_crypto_provider();
+        for validate_urls in [false, true] {
+            for permanent in [false, true] {
+                for destination in ["same", "other-host", "other-port"] {
+                    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let origin_addr = origin.local_addr().unwrap();
+                    let other_addr = other.local_addr().unwrap();
+                    let host = if validate_urls {
+                        "callback.test"
+                    } else {
+                        "127.0.0.1"
+                    };
+                    let target_host = if destination == "other-host" {
+                        if validate_urls {
+                            "elsewhere.test"
+                        } else {
+                            "localhost"
+                        }
+                    } else {
+                        host
+                    };
+                    let target_port = if destination == "other-port" {
+                        other_addr.port()
+                    } else {
+                        origin_addr.port()
+                    };
+                    let target = format!("http://{target_host}:{target_port}/capture");
+                    let (captured, mut received) = tokio::sync::mpsc::unbounded_channel();
+                    let app = axum::Router::new()
+                        .route(
+                            "/start",
+                            post(move || {
+                                let target = target.clone();
+                                async move {
+                                    if permanent {
+                                        Redirect::permanent(&target)
+                                    } else {
+                                        Redirect::temporary(&target)
+                                    }
+                                }
+                            }),
+                        )
+                        .route(
+                            "/capture",
+                            post(move |headers: HeaderMap, body: Bytes| {
+                                let captured = captured.clone();
+                                async move {
+                                    captured.send((headers, body)).unwrap();
+                                    StatusCode::NO_CONTENT
+                                }
+                            }),
+                        );
+                    let other_app = app.clone();
+                    let first =
+                        tokio::spawn(async move { axum::serve(origin, app).await.unwrap() });
+                    let second =
+                        tokio::spawn(async move { axum::serve(other, other_app).await.unwrap() });
+                    let mut sender = HttpPushSender::new(Some(HttpPushSenderConfig {
+                        validate_urls,
+                        fail_on_error: true,
+                        timeout: Duration::from_secs(2),
+                    }));
+                    if validate_urls {
+                        // Public-looking test names resolve only to our local fixture.
+                        // This isolates redirect policy from connect-time SSRF screening.
+                        sender.client = reqwest::Client::builder()
+                            .no_proxy()
+                            .resolve("callback.test", origin_addr)
+                            .resolve("elsewhere.test", origin_addr)
+                            .redirect(push_redirect_policy(true))
+                            .build()
+                            .unwrap();
+                    }
+                    let mut config =
+                        sample_config(&format!("http://{host}:{}/start", origin_addr.port()));
+                    config.token = Some("private-notification-token".into());
+                    config.authentication = Some(AuthenticationInfo {
+                        scheme: "bearer".into(),
+                        credentials: Some("private-credentials".into()),
+                    });
+                    let event = sample_status_update();
+                    let expected_body = serde_json::to_vec(&event).unwrap();
+                    let outcome = sender.send_push(&config, event).await;
+                    if destination == "same" {
+                        outcome.unwrap();
+                        let (headers, body) = received
+                            .try_recv()
+                            .expect("same-origin redirect delivers the notification");
+                        assert_eq!(
+                            headers["a2a-notification-token"],
+                            "private-notification-token"
+                        );
+                        assert_eq!(headers["authorization"], "Bearer private-credentials");
+                        assert_eq!(&body[..], expected_body);
+                    } else {
+                        assert!(
+                            outcome.is_err(),
+                            "origin changes must fail, even without URL screening"
+                        );
+                        assert!(
+                            received.try_recv().is_err(),
+                            "a redirected origin must receive neither tokens nor event bodies"
+                        );
+                    }
+                    first.abort();
+                    second.abort();
+                }
+            }
+        }
     }
 
     #[test]
