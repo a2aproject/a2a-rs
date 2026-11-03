@@ -262,7 +262,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
             },
         )));
-        let source = TaskEvents::new(Arc::new(tokio::sync::Mutex::new(())), None);
+        let source = TaskEvents::new(None);
         assert!(source.notifications.set(settings).is_ok());
         let receiver = source.sender.subscribe();
         let (tx, mut rx) = mpsc::channel(1);

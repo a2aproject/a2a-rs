@@ -2247,7 +2247,9 @@ async fn a_streaming_send_that_only_restates_the_task_still_opens_with_it() {
         .await
         .unwrap();
     assert!(matches!(
-        events.next().await,
+        tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("a repeated first event must still produce the opening Task"),
         Some(Ok(StreamResponse::Task(_)))
     ));
     assert!(

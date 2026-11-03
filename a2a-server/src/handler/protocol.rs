@@ -101,7 +101,7 @@ pub(super) fn unary_refusal(rejection: Rejection, request: &SendMessageRequest) 
             "task execution is already in progress: {} ({reason})",
             request_task_id(request).unwrap_or_default()
         )),
-        Rejection::Failed(error) => error,
+        Rejection::Failed(error) | Rejection::Interrupted(error) => error,
     }
 }
 
@@ -111,6 +111,9 @@ pub(super) enum Rejection {
     /// client may retry; this is not an error in the request.
     Declined(String),
     Failed(A2AError),
+    /// A transition panicked or lost its reply; storage must establish whether
+    /// it committed before an HTTP followup can receive an acknowledgement.
+    Interrupted(A2AError),
 }
 
 impl From<A2AError> for Rejection {
@@ -124,7 +127,7 @@ impl Rejection {
     pub(super) fn into_error(self) -> A2AError {
         match self {
             Rejection::Declined(reason) => A2AError::unsupported_operation(reason),
-            Rejection::Failed(error) => error,
+            Rejection::Failed(error) | Rejection::Interrupted(error) => error,
         }
     }
 
@@ -137,7 +140,9 @@ impl Rejection {
     ) -> StreamResponse {
         let (code, message) = match self {
             Rejection::Declined(reason) => ("UNAVAILABLE".to_string(), reason),
-            Rejection::Failed(error) => (stream_error_code(&error), error.message),
+            Rejection::Failed(error) | Rejection::Interrupted(error) => {
+                (stream_error_code(&error), error.message)
+            }
         };
         StreamResponse::Error(StreamError {
             task_id: task_id.to_string(),

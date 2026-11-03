@@ -199,6 +199,7 @@ pub(super) fn rebase_snapshot(task: &mut Task, previous: Task) {
 /// task's generation after the mutation (A2A 1.1 §3.2.7): every status or
 /// artifact update advances the generation by exactly one and maps to one
 /// event.
+#[cfg(test)]
 pub(super) async fn apply_event_to_task(
     task_store: &dyn crate::TaskStore,
     current_task: Option<Task>,
