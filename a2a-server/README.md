@@ -35,6 +35,31 @@ task operations. The response `Run` owns its input stream and optional HTTP
 registration lease, unregistering before releasing the stream on exit or panic.
 `AgentExecutor` and its owned `ctx.inputs` API are unchanged.
 
+## Startup Recovery
+
+After configuring a handler backed by a persistent `TaskStore`, call
+`handler.restart_tasks().await?` at application startup, before serving requests.
+It scans all pages of nonterminal tasks and returns the number whose executors
+accepted recovery. Tasks already running in this handler and terminal tasks are
+skipped. Nothing runs automatically from the synchronous handler constructor.
+
+Executors opt in by implementing `AgentExecutor::restart(ctx)` and returning
+`Some(event_stream)`. Typed agents can implement `Agent::restart(ctx)` instead.
+The default returns `None`, leaving the task idle. Recovery uses the normal
+executor driver, input delivery, event validation, persistence, and cancellation.
+
+The context contains the stored task, a fresh execution ID and a fresh input
+receiver. It has no triggering message, caller identity, credentials, request
+metadata, or tenant context. The SDK does not replay task history as new input.
+The hook must use application checkpoints stored in task metadata, artifacts,
+or another durable store to decide what work remains. In-memory input receipts
+and application worker state do not survive a process restart.
+
+This is recovery within one handler process, not a distributed worker lease or
+an exactly-once guarantee for external side effects. Multiple servers sharing
+a store need application-level ownership. The in-memory store cannot preserve
+tasks across a real process restart.
+
 ## Multiple Live Clients
 
 `ctx.execution_id` is a server-generated identifier for one execution. It stays

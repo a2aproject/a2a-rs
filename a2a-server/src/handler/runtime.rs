@@ -117,6 +117,41 @@ impl TaskRuntime {
         self.start(handler, message, mode, reserved_id).await
     }
 
+    /// Recover an existing snapshot without replaying a client message or changing its status.
+    pub(super) async fn restart(
+        &mut self,
+        handler: &DefaultRequestHandler,
+        task_id: &str,
+    ) -> Result<Option<tokio::sync::oneshot::Receiver<bool>>, A2AError> {
+        if !matches!(self.execution, ExecutionState::Idle) {
+            return Ok(None);
+        }
+        let Some(task) = handler.tasks.get(task_id).await? else {
+            return Ok(None);
+        };
+        if task.status.state.is_terminal() {
+            return Ok(None);
+        }
+        let (active, inputs) = self.reserve(handler, task_id).await?;
+        active.set_snapshot(task.clone()).await;
+        handler
+            .tasks
+            .pushes
+            .attach(handler, task_id, &active.events);
+        let mut context =
+            crate::ExecutorContext::new(task.id.clone(), task.context_id.clone(), inputs)
+                .with_stored_task(task);
+        context.execution_id = active.execution_id.clone();
+        let (accepted, started) = tokio::sync::oneshot::channel();
+        handler.tasks.spawn_execution(
+            handler.clone(),
+            task_id.to_owned(),
+            active,
+            execution::ExecutionRequest::Restart { context, accepted },
+        );
+        Ok(Some(started))
+    }
+
     pub(super) async fn reserve(
         &mut self,
         handler: &DefaultRequestHandler,
