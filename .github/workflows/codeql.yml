@@ -5,8 +5,8 @@ on:
   merge_group:
   push:
     branches: [main]
+  # Stacked PRs target another feature branch and need these checks too.
   pull_request:
-    branches: [main]
   schedule:
     # Offset from the Scorecard run so the two do not contend for runners.
     - cron: '30 3 * * 6'
