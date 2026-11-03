@@ -355,7 +355,11 @@ impl Transport for RestTransport {
             query_parts.push(("historyLength".to_string(), hl.to_string()));
         }
         if let Some(ref ts) = req.status_timestamp_after {
-            query_parts.push(("statusTimestampAfter".to_string(), ts.to_rfc3339()));
+            // §5.6.1: UTC with the `Z` designator, never an offset.
+            query_parts.push((
+                "statusTimestampAfter".to_string(),
+                ts.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string(),
+            ));
         }
         if let Some(ia) = req.include_artifacts {
             query_parts.push(("includeArtifacts".to_string(), ia.to_string()));
@@ -734,6 +738,34 @@ mod tests {
         };
         let _ = transport.get_task(&params, &req).await;
         assert_eq!(line.await.unwrap(), "GET /a2a/tasks/t1 HTTP/1.1");
+    }
+
+    /// §5.6.1: a timestamp on the wire is UTC with the `Z` designator and
+    /// MUST NOT carry another offset, as chrono's `to_rfc3339` (`+00:00`)
+    /// did.
+    #[tokio::test]
+    async fn test_status_timestamp_after_is_sent_with_z() {
+        let (url, line) = spawn_request_line_server().await;
+        let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), url);
+        let _ = transport
+            .list_tasks(
+                &ServiceParams::new(),
+                &ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: Some("2025-01-01T00:00:00.5Z".parse().unwrap()),
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            line.await.unwrap(),
+            "GET /a2a/tasks?statusTimestampAfter=2025-01-01T00%3A00%3A00.500Z HTTP/1.1"
+        );
     }
 
     #[test]
