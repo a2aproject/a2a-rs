@@ -26,16 +26,27 @@ fn next_event_id(counter: &mut u64) -> String {
 }
 
 /// Convert a boxed stream of serializable items into an SSE response.
-pub fn sse_from_stream<T: serde::Serialize + Send + 'static>(
-    stream: BoxStream<'static, Result<T, a2a::A2AError>>,
-) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+///
+/// An `Err` item is sent as it serializes, under the event name `error`:
+/// a2a-python's REST client only treats a frame as an error when it is
+/// named so, and reads any other frame as a `StreamResponse`.
+pub fn sse_from_stream<T, E>(
+    stream: BoxStream<'static, Result<T, E>>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>>
+where
+    T: serde::Serialize + Send + 'static,
+    E: serde::Serialize + Send + 'static,
+{
     let mut event_id = 0u64;
     let sse_stream = stream.map(move |item| {
-        let data = match item {
-            Ok(val) => serde_json::to_string(&val).unwrap_or_default(),
-            Err(err) => serde_json::to_string(&err.to_jsonrpc_error()).unwrap_or_default(),
+        let event = Event::default().id(next_event_id(&mut event_id));
+        let event = match item {
+            Ok(val) => event.data(serde_json::to_string(&val).unwrap_or_default()),
+            Err(err) => event
+                .event("error")
+                .data(serde_json::to_string(&err).unwrap_or_default()),
         };
-        Ok::<_, Infallible>(Event::default().id(next_event_id(&mut event_id)).data(data))
+        Ok::<_, Infallible>(event)
     });
     Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE_INTERVAL))
 }
@@ -73,7 +84,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sse_from_stream_ok() {
-        let s: BoxStream<'static, Result<serde_json::Value, A2AError>> =
+        let s: BoxStream<'static, Result<serde_json::Value, serde_json::Value>> =
             Box::pin(stream::once(async {
                 Ok(serde_json::json!({"key": "value"}))
             }));
@@ -88,16 +99,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_sse_from_stream_err() {
-        let s: BoxStream<'static, Result<serde_json::Value, A2AError>> =
-            Box::pin(stream::once(async { Err(A2AError::internal("fail")) }));
+        let s: BoxStream<'static, Result<serde_json::Value, serde_json::Value>> =
+            Box::pin(stream::once(async {
+                Err(serde_json::json!({"error": {"message": "fail"}}))
+            }));
         let sse = sse_from_stream(s);
         let resp = sse.into_response();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body_str.contains("data:"));
-        // The boundary no longer sanitizes: an error arriving on the
-        // executor's event stream keeps its own message.
-        assert!(body_str.contains("fail"));
+        // Named, so a client that dispatches on the event name sees an
+        // error frame; the body is the error as the caller serialized it.
+        assert!(body_str.contains("event: error\n"), "{body_str}");
+        assert!(
+            body_str.contains("data: {\"error\":{\"message\":\"fail\"}}"),
+            "{body_str}"
+        );
     }
 
     #[tokio::test]
@@ -161,11 +177,11 @@ mod tests {
     /// gap from a clean sequence and has something to put in `Last-Event-ID`.
     #[tokio::test]
     async fn test_sse_from_stream_assigns_monotonic_event_ids() {
-        let s: BoxStream<'static, Result<serde_json::Value, A2AError>> =
+        let s: BoxStream<'static, Result<serde_json::Value, serde_json::Value>> =
             Box::pin(stream::iter(vec![
                 Ok(serde_json::json!({"n": 1})),
                 Ok(serde_json::json!({"n": 2})),
-                Err(A2AError::internal("boom")),
+                Err(serde_json::json!({"error": "boom"})),
             ]));
 
         let body = sse_from_stream(s)
@@ -207,7 +223,7 @@ mod tests {
     /// two concurrent subscriptions do not share a numbering space.
     #[tokio::test]
     async fn test_event_ids_are_scoped_to_one_response() {
-        let make = || -> BoxStream<'static, Result<serde_json::Value, A2AError>> {
+        let make = || -> BoxStream<'static, Result<serde_json::Value, serde_json::Value>> {
             Box::pin(stream::once(async { Ok(serde_json::json!({"n": 1})) }))
         };
 
