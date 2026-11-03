@@ -620,13 +620,10 @@ fn protojson_stream<T: ProtoJsonPayload + 'static>(
 }
 
 /// Spec §11.6: an error inside an HTTP+JSON stream is an event carrying the
-/// same `{"error": google.rpc.Status}` body a non-streaming error has.
+/// same `{"error": google.rpc.Status}` body a non-streaming error has, named
+/// `error` as a2a-python's REST server names it and its client expects.
 fn rest_sse(stream: BoxStream<'static, Result<Value, A2AError>>) -> axum::response::Response {
-    let events = stream.map(|item| {
-        Ok(item.unwrap_or_else(|err| {
-            serde_json::to_value(rest_error_envelope(err).1).unwrap_or_default()
-        }))
-    });
+    let events = stream.map(|item| item.map_err(|err| rest_error_envelope(err).1));
     sse::sse_from_stream(Box::pin(events)).into_response()
 }
 
