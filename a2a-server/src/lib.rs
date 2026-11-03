@@ -85,6 +85,7 @@ pub(crate) mod test_util {
     /// stub responses so tests don't depend on `DefaultRequestHandler` behavior.
     pub(crate) struct CapturingHandler {
         captured: CapturedParams,
+        tenants: Mutex<HashMap<&'static str, Option<String>>>,
     }
 
     impl CapturingHandler {
@@ -92,12 +93,22 @@ pub(crate) mod test_util {
             let captured = Arc::new(Mutex::new(HashMap::new()));
             let handler = Arc::new(CapturingHandler {
                 captured: captured.clone(),
+                tenants: Mutex::new(HashMap::new()),
             });
             (handler, captured)
         }
 
-        fn record(&self, method: &'static str, params: &ServiceParams) {
+        fn record(&self, method: &'static str, params: &ServiceParams, tenant: Option<&str>) {
             self.captured.lock().unwrap().insert(method, params.clone());
+            self.tenants
+                .lock()
+                .unwrap()
+                .insert(method, tenant.map(str::to_owned));
+        }
+
+        /// The tenant of `method`'s last call; `None` if it was not called since.
+        pub fn take_tenant(&self, method: &str) -> Option<Option<String>> {
+            self.tenants.lock().unwrap().remove(method)
         }
     }
 
@@ -106,36 +117,36 @@ pub(crate) mod test_util {
         async fn send_message(
             &self,
             params: &ServiceParams,
-            _req: SendMessageRequest,
+            req: SendMessageRequest,
         ) -> Result<SendMessageResponse, A2AError> {
-            self.record("send_message", params);
+            self.record("send_message", params, req.tenant.as_deref());
             Err(A2AError::internal("stub"))
         }
 
         async fn send_streaming_message(
             &self,
             params: &ServiceParams,
-            _req: SendMessageRequest,
+            req: SendMessageRequest,
         ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-            self.record("send_streaming_message", params);
+            self.record("send_streaming_message", params, req.tenant.as_deref());
             Ok(Box::pin(futures::stream::empty()))
         }
 
         async fn get_task(
             &self,
             params: &ServiceParams,
-            _req: GetTaskRequest,
+            req: GetTaskRequest,
         ) -> Result<Task, A2AError> {
-            self.record("get_task", params);
+            self.record("get_task", params, req.tenant.as_deref());
             Err(A2AError::task_not_found("stub"))
         }
 
         async fn list_tasks(
             &self,
             params: &ServiceParams,
-            _req: ListTasksRequest,
+            req: ListTasksRequest,
         ) -> Result<ListTasksResponse, A2AError> {
-            self.record("list_tasks", params);
+            self.record("list_tasks", params, req.tenant.as_deref());
             Ok(ListTasksResponse {
                 tasks: Vec::new(),
                 next_page_token: String::new(),
@@ -147,18 +158,18 @@ pub(crate) mod test_util {
         async fn cancel_task(
             &self,
             params: &ServiceParams,
-            _req: CancelTaskRequest,
+            req: CancelTaskRequest,
         ) -> Result<Task, A2AError> {
-            self.record("cancel_task", params);
+            self.record("cancel_task", params, req.tenant.as_deref());
             Err(A2AError::task_not_found("stub"))
         }
 
         async fn subscribe_to_task(
             &self,
             params: &ServiceParams,
-            _req: SubscribeToTaskRequest,
+            req: SubscribeToTaskRequest,
         ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-            self.record("subscribe_to_task", params);
+            self.record("subscribe_to_task", params, req.tenant.as_deref());
             Ok(Box::pin(futures::stream::empty()))
         }
 
@@ -167,25 +178,25 @@ pub(crate) mod test_util {
             params: &ServiceParams,
             req: TaskPushNotificationConfig,
         ) -> Result<TaskPushNotificationConfig, A2AError> {
-            self.record("create_push_config", params);
+            self.record("create_push_config", params, req.tenant.as_deref());
             Ok(req)
         }
 
         async fn get_push_config(
             &self,
             params: &ServiceParams,
-            _req: GetTaskPushNotificationConfigRequest,
+            req: GetTaskPushNotificationConfigRequest,
         ) -> Result<TaskPushNotificationConfig, A2AError> {
-            self.record("get_push_config", params);
+            self.record("get_push_config", params, req.tenant.as_deref());
             Err(A2AError::internal("stub"))
         }
 
         async fn list_push_configs(
             &self,
             params: &ServiceParams,
-            _req: ListTaskPushNotificationConfigsRequest,
+            req: ListTaskPushNotificationConfigsRequest,
         ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-            self.record("list_push_configs", params);
+            self.record("list_push_configs", params, req.tenant.as_deref());
             Ok(ListTaskPushNotificationConfigsResponse {
                 configs: Vec::new(),
                 next_page_token: None,
@@ -195,18 +206,18 @@ pub(crate) mod test_util {
         async fn delete_push_config(
             &self,
             params: &ServiceParams,
-            _req: DeleteTaskPushNotificationConfigRequest,
+            req: DeleteTaskPushNotificationConfigRequest,
         ) -> Result<(), A2AError> {
-            self.record("delete_push_config", params);
+            self.record("delete_push_config", params, req.tenant.as_deref());
             Ok(())
         }
 
         async fn get_extended_agent_card(
             &self,
             params: &ServiceParams,
-            _req: GetExtendedAgentCardRequest,
+            req: GetExtendedAgentCardRequest,
         ) -> Result<AgentCard, A2AError> {
-            self.record("get_extended_agent_card", params);
+            self.record("get_extended_agent_card", params, req.tenant.as_deref());
             Err(A2AError::internal("stub"))
         }
     }
