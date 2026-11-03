@@ -19,7 +19,7 @@ use crate::middleware::{ServiceParams, User};
 use crate::pagination::resolve_page_size;
 use a2a::*;
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use futures::{StreamExt, stream::BoxStream};
 use std::{sync::Arc, time::Duration};
 
 use super::{
@@ -616,8 +616,18 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let history_length = req.configuration.as_ref().and_then(|c| c.history_length);
         let timeline_length = req.configuration.as_ref().and_then(|c| c.timeline_length);
-        let (_, events) = self.start_response(params, StartMode::Streaming, ResponseInput::message(req)).await?.into_stream()?;
-        Ok(Box::pin(events.map(move |item| item.map(|mut event| { if let StreamResponse::Task(task) = &mut event { apply_lengths(task, history_length, timeline_length); } event }))))
+        let (_, events) = self
+            .start_response(params, StartMode::Streaming, ResponseInput::message(req))
+            .await?
+            .into_stream()?;
+        Ok(Box::pin(events.map(move |item| {
+            item.map(|mut event| {
+                if let StreamResponse::Task(task) = &mut event {
+                    apply_lengths(task, history_length, timeline_length);
+                }
+                event
+            })
+        })))
     }
 
     async fn send_live_message(
