@@ -5,43 +5,34 @@
 
 use super::DefaultRequestHandler;
 use super::events::{EventKind, ExecutionEvent};
-use super::push_worker::deliver_notifications;
+use super::push_worker::{Notification, PushDispatcher, signal_failure};
 use super::task_events::TaskEvents;
 use a2a::*;
 use std::{
     sync::{Arc, MutexGuard},
     time::Duration,
 };
-use tokio::sync::{Semaphore, broadcast, mpsc};
+use tokio::sync::broadcast;
 
 pub(super) const PUSH_QUEUE_CAPACITY: usize = 1024;
 const PUSH_WORKER_IDLE: Duration = Duration::from_secs(60);
-const MAX_PUSH_DELIVERIES: usize = 16;
 
 #[derive(Clone)]
 pub(super) struct NotificationSettings {
     pub(super) task_id: TaskId,
     pub(super) store: Arc<dyn crate::PushConfigStore>,
     pub(super) sender: Arc<crate::HttpPushSender>,
-    pub(super) permits: Arc<Semaphore>,
+    pub(super) dispatcher: Arc<std::sync::OnceLock<PushDispatcher>>,
 }
 
 #[derive(Default)]
 pub(super) struct SubscriptionState {
     running: bool,
-    previous: Option<tokio_util::sync::CancellationToken>,
 }
 
+#[derive(Default)]
 pub(super) struct PushSubscriptions {
-    permits: Arc<Semaphore>,
-}
-
-impl Default for PushSubscriptions {
-    fn default() -> Self {
-        Self {
-            permits: Arc::new(Semaphore::new(MAX_PUSH_DELIVERIES)),
-        }
-    }
+    dispatcher: Arc<std::sync::OnceLock<PushDispatcher>>,
 }
 
 impl PushSubscriptions {
@@ -56,7 +47,7 @@ impl PushSubscriptions {
                 task_id: task_id.into(),
                 store: store.clone(),
                 sender: sender.clone(),
-                permits: self.permits.clone(),
+                dispatcher: self.dispatcher.clone(),
             });
         }
     }
@@ -71,20 +62,8 @@ pub(super) fn subscribe(events: &Arc<TaskEvents>) -> MutexGuard<'_, Subscription
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if events.notifications.get().is_some() && !state.running {
         let receiver = events.sender.subscribe();
-        let (tx, rx) = mpsc::channel(PUSH_QUEUE_CAPACITY);
-        let previous = state.previous.take();
-        let done = tokio_util::sync::CancellationToken::new();
-        state.previous = Some(done.clone());
         state.running = true;
-        let source = events.clone();
-        let settings = events.notifications.get().unwrap().clone();
-        tokio::spawn(async move {
-            deliver_notifications(settings, rx, previous, done).await;
-            // Keep the Task source (and its predecessor barrier) alive until
-            // every accepted HTTP delivery has drained, even after intake retires.
-            drop(source);
-        });
-        tokio::spawn(receive_events(events.clone(), receiver, tx));
+        tokio::spawn(receive_events(events.clone(), receiver));
     }
     state
 }
@@ -92,9 +71,8 @@ pub(super) fn subscribe(events: &Arc<TaskEvents>) -> MutexGuard<'_, Subscription
 async fn receive_events(
     events: Arc<TaskEvents>,
     mut receiver: broadcast::Receiver<ExecutionEvent>,
-    tx: mpsc::Sender<ExecutionEvent>,
 ) {
-    loop {
+    'events: loop {
         let result = match tokio::time::timeout(PUSH_WORKER_IDLE, receiver.recv()).await {
             Ok(result) => result,
             Err(_) => {
@@ -122,23 +100,40 @@ async fn receive_events(
                         .as_ref()
                         .is_ok_and(|event| super::protocol::task_id_for_event(event).is_some()) =>
             {
-                match tx.try_send(event) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(event)) => {
-                        tracing::warn!(task_id = %events.notifications.get().unwrap().task_id, "webhook queue full; dropping a notification");
-                        super::push_worker::signal_failure(
-                            events.notifications.get().unwrap(),
-                            &event,
-                            A2AError::internal("webhook queue full"),
-                        );
+                let settings = events.notifications.get().unwrap();
+                let configs = match settings.store.list(&settings.task_id).await {
+                    Ok(configs) => configs,
+                    Err(error) => {
+                        signal_failure(&settings.sender, &event, error.clone());
+                        tracing::warn!(task_id = %settings.task_id, %error, "could not load webhook configurations");
+                        continue;
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                };
+                let event = Arc::new(event);
+                for config in configs {
+                    if matches!(event.result, Ok(StreamResponse::MessageUpdate(_)))
+                        && !super::protocol::is_at_least_1_1(
+                            config.protocol_version.as_deref().unwrap_or("1.0"),
+                        )
+                    {
+                        continue;
+                    }
+                    if !settings
+                        .dispatcher
+                        .get_or_init(PushDispatcher::spawn)
+                        .submit(Notification {
+                            config,
+                            event: event.clone(),
+                            sender: settings.sender.clone(),
+                            source: events.clone(),
+                        })
+                    {
                         events
                             .webhook_subscribed
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .running = false;
-                        return;
+                        break 'events;
                     }
                 }
             }
@@ -155,6 +150,32 @@ async fn receive_events(
 mod tests {
     use super::*;
     use crate::handler::test_support::*;
+
+    async fn captured_source(
+        capacity: usize,
+        fail_on_error: bool,
+    ) -> (Arc<TaskEvents>, mpsc::Receiver<Notification>) {
+        let handler = make_push_delivery_handler();
+        let source = handler.execution_manager.events_for("task");
+        handler
+            .execution_manager
+            .pushes
+            .attach(&handler, "task", &source);
+        let mut settings = source.notifications.get().unwrap().clone();
+        settings.store.save(push_config("task")).await.unwrap();
+        settings.sender = Arc::new(crate::HttpPushSender::new(Some(
+            crate::HttpPushSenderConfig {
+                fail_on_error,
+                validate_urls: false,
+                ..Default::default()
+            },
+        )));
+        let (dispatcher, receiver) = PushDispatcher::channel(capacity);
+        settings.dispatcher = Arc::new(std::sync::OnceLock::from(dispatcher));
+        let source = TaskEvents::new(None);
+        assert!(source.notifications.set(settings).is_ok());
+        (source, receiver)
+    }
 
     #[tokio::test]
     async fn direct_replies_and_errors_do_not_start_webhook_workers() {
@@ -186,15 +207,9 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_intake_filters_private_repeated_and_non_task_events() {
-        let handler = make_push_delivery_handler();
-        let source = handler.execution_manager.events_for("task");
-        handler
-            .execution_manager
-            .pushes
-            .attach(&handler, "task", &source);
+        let (source, mut rx) = captured_source(8, false).await;
         let receiver = source.sender.subscribe();
-        let (tx, mut rx) = mpsc::channel(8);
-        let intake = tokio::spawn(receive_events(source.clone(), receiver, tx));
+        let intake = tokio::spawn(receive_events(source.clone(), receiver));
         let task = task_with_history("task", "context", 0);
         let mut events = vec![
             (EventKind::Repeated, Ok(StreamResponse::Task(task.clone()))),
@@ -238,6 +253,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
+                .event
                 .sequence,
             6
         );
@@ -247,26 +263,9 @@ mod tests {
 
     #[tokio::test]
     async fn full_intake_queue_signals_failure_without_blocking_publication() {
-        let handler = make_push_delivery_handler();
-        let source = handler.execution_manager.events_for("task");
-        handler
-            .execution_manager
-            .pushes
-            .attach(&handler, "task", &source);
-        // Explicit failure policy for queue overflow, independent of HTTP.
-        let mut settings = source.notifications.get().unwrap().clone();
-        settings.sender = Arc::new(crate::HttpPushSender::new(Some(
-            crate::HttpPushSenderConfig {
-                fail_on_error: true,
-                validate_urls: false,
-                timeout: Duration::from_secs(1),
-            },
-        )));
-        let source = TaskEvents::new(None);
-        assert!(source.notifications.set(settings).is_ok());
+        let (source, mut rx) = captured_source(1, true).await;
         let receiver = source.sender.subscribe();
-        let (tx, mut rx) = mpsc::channel(1);
-        let intake = tokio::spawn(receive_events(source.clone(), receiver, tx));
+        let intake = tokio::spawn(receive_events(source.clone(), receiver));
         let (failure, mut observed) = tokio::sync::watch::channel(None);
         for sequence in [1, 2] {
             source
@@ -293,7 +292,7 @@ mod tests {
                 .message
                 .contains("queue full")
         );
-        assert_eq!(rx.recv().await.unwrap().sequence, 1);
+        assert_eq!(rx.recv().await.unwrap().event.sequence, 1);
         intake.abort();
     }
 
@@ -879,12 +878,7 @@ mod tests {
     #[tokio::test]
     async fn a_lagging_webhook_subscriber_continues_and_a_closed_dispatcher_retires_it() {
         for closed in [false, true] {
-            let handler = make_push_delivery_handler();
-            let source = handler.execution_manager.events_for("task");
-            handler
-                .execution_manager
-                .pushes
-                .attach(&handler, "task", &source);
+            let (source, mut rx) = captured_source(2, false).await;
             source.webhook_subscribed.lock().unwrap().running = true;
             let receiver = source.sender.subscribe();
             for sequence in 0..super::super::EXECUTION_BUFFER_CAPACITY as u64 + 2 {
@@ -915,11 +909,10 @@ mod tests {
                     })
                     .is_ok()
             );
-            let (tx, mut rx) = mpsc::channel(2);
             if closed {
                 rx.close();
             }
-            let intake = tokio::spawn(receive_events(source.clone(), receiver, tx));
+            let intake = tokio::spawn(receive_events(source.clone(), receiver));
             if closed {
                 timeout(Duration::from_secs(1), intake)
                     .await
@@ -932,6 +925,7 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap()
+                        .event
                         .sequence,
                     999
                 );
