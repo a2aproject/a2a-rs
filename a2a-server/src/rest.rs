@@ -449,7 +449,12 @@ async fn handle_delete_push_config<H: RequestHandler>(
         tenant: None,
     };
     match state.handler.delete_push_config(&params, req).await {
-        Ok(()) => StatusCode::OK.into_response(),
+        // google.protobuf.Empty, as ProtoJSON spells it: a client that
+        // parses every success body (a2a-python) needs one.
+        Ok(()) => with_content_type(
+            Json(Value::Object(Default::default())).into_response(),
+            "application/a2a+json",
+        ),
         Err(e) => rest_error_response(e),
     }
 }
@@ -1231,6 +1236,17 @@ mod tests {
             .unwrap();
         let delete_resp = app.clone().oneshot(delete_req).await.unwrap();
         assert_eq!(delete_resp.status(), StatusCode::OK);
+        // google.protobuf.Empty in ProtoJSON: `{}`, typed like every other
+        // success, so a client that parses the body gets a document.
+        assert_eq!(
+            delete_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/a2a+json"
+        );
+        let body = delete_resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({})
+        );
 
         let list_req = Request::builder()
             .header("a2a-version", "1.0")
