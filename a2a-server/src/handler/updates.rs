@@ -4,7 +4,6 @@
 //! Persist task updates, record status changes, and rebase executor snapshots.
 
 use super::artifacts::{artifacts_differ, close_open_artifacts, merge_artifact};
-use super::events::ActiveExecution;
 use a2a::*;
 
 /// An execution may only publish or mutate its bound task and context.
@@ -35,13 +34,6 @@ pub(super) fn validate_event_identity(task: &Task, event: &StreamResponse) -> Re
         return Err(A2AError::invalid_agent_response());
     }
     Ok(())
-}
-
-pub(super) async fn save_task(
-    task_store: &dyn crate::TaskStore,
-    task: Task,
-) -> Result<Task, A2AError> {
-    save_task_with(task_store, task, false).await
 }
 
 /// Saves `task`: `creating` for the first save of a task, which is created
@@ -77,8 +69,8 @@ pub(super) async fn save_task_with(
 }
 
 /// DM-SERIAL-001: backfills a missing status timestamp on the event itself,
-/// before it is both persisted (via `apply_event_to_task`/`save_task`) and
-/// broadcast to any live subscriber -- `save_task`'s own backfill only
+/// before it is both persisted (via `apply_event_to_task`/`save_task_with`) and
+/// broadcast to any live subscriber -- `save_task_with`'s own backfill only
 /// covers what gets persisted; a subscriber watching `send_streaming_message`
 /// or `subscribe_to_task` receives the broadcast event directly, never a
 /// reload from the store, so backfilling only at persistence time still
@@ -280,39 +272,6 @@ pub(super) async fn apply_event_to_new_or_stored_task(
     }
 }
 
-/// Applies `event` to the task under the writer lock the caller holds and
-/// publishes it to the subscribers.
-///
-/// A `Task` snapshot that changed nothing keeps the generation it found. It
-/// is published marked as a repeat, which client-facing streams drop: the
-/// generation was already announced, and a second event at it would break
-/// A2A 1.1 §3.2.7. Returns whether the event is one clients should see (and
-/// be pushed).
-pub(super) async fn apply_and_publish(
-    task_store: &dyn crate::TaskStore,
-    active: &ActiveExecution,
-    base: Option<Task>,
-    event: &mut StreamResponse,
-) -> Result<bool, A2AError> {
-    apply_and_publish_with(task_store, active, base, event, false).await
-}
-
-/// [`apply_and_publish`], where `creating` says the event is the first of a
-/// task that is not in the store yet.
-pub(super) async fn apply_and_publish_with(
-    task_store: &dyn crate::TaskStore,
-    active: &ActiveExecution,
-    base: Option<Task>,
-    event: &mut StreamResponse,
-    creating: bool,
-) -> Result<bool, A2AError> {
-    let (updated_task, repeated) = persist_event(task_store, base, event, creating).await?;
-    active
-        .publish_marked(Ok(&*event), updated_task, repeated)
-        .await;
-    Ok(!repeated)
-}
-
 /// Persist first, leaving callers a chance to finalize newly created task
 /// configuration before the update becomes observable by any subscriber.
 pub(super) async fn persist_event(
@@ -398,7 +357,7 @@ mod tests {
         }
     }
 
-    /// DM-SERIAL-001: `save_task`'s backfill only covers what gets persisted
+    /// DM-SERIAL-001: `save_task_with`'s backfill only covers what gets persisted
     /// -- a live subscriber receives the broadcast event directly, never a
     /// reload from the store, so the timestamp must also be backfilled on
     /// the event itself before it is published.
@@ -557,7 +516,7 @@ mod tests {
         assert_eq!(updated.status.timestamp, Some(supplied));
     }
 
-    /// The task-snapshot arm persists through the same `save_task` chokepoint,
+    /// The task-snapshot arm persists through the same `save_task_with` chokepoint,
     /// so an executor `Task` event whose status omits a timestamp must also be
     /// backfilled (DM-SERIAL-001).
     #[tokio::test]
@@ -679,7 +638,7 @@ mod regression_tests {
         let mut canceled = task();
         canceled.status.state = TaskState::Canceled;
         store.create(canceled.clone()).await.unwrap();
-        let error = save_task(&store, task()).await.unwrap_err();
+        let error = save_task_with(&store, task(), false).await.unwrap_err();
         assert_eq!(error.code, error_code::INVALID_REQUEST);
         assert_eq!(store.get("task").await.unwrap(), Some(canceled));
     }

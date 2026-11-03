@@ -11,6 +11,30 @@ This crate is published as `a2a-server-lf` and imported in Rust as `a2a_server`.
 - A default handler and in-memory task store
 - SSE helpers for streaming task responses
 
+## Task Service
+
+`DefaultRequestHandler` automatically wraps your `TaskStore` in an internal
+`TaskService`, shared by handler clones. The service owns task coordination,
+subscriptions, executor routing, and change notifications. Unary, streaming,
+and live sends admit messages and artifact updates through this service;
+subscriptions attach to task events without starting execution.
+
+Unary sends first resolve to a direct message or a task response. A direct
+message returns immediately; task responses wait for completion or interruption
+when blocking is requested. Streaming and live sends share message admission,
+with their transport setup handled separately.
+
+Custom stores keep implementing the existing persistence trait. They do not
+need to implement subscriptions or manage channels. Changes made through the
+service are persisted before publication; writes made directly to a custom
+store outside the handler do not produce local subscription events. The
+default event routing remains process-local.
+
+HTTP live follow-up routing and acknowledgements are handled separately from
+task operations. The response `Run` owns its input stream and optional HTTP
+registration lease, unregistering before releasing the stream on exit or panic.
+`AgentExecutor` and its owned `ctx.inputs` API are unchanged.
+
 ## Multiple Live Clients
 
 `ctx.execution_id` is a server-generated identifier for one execution. It stays
@@ -25,7 +49,7 @@ context and is not added to protocol task objects or events.
 `BoxStream<'static, Result<StreamResponse, A2AError>>` for both `execute` and
 `cancel`. `ctx.inputs` is an owned receiver and may move into a Tokio worker.
 The server tracks receipt of queued messages using atomic delivery receipts;
-the Task coordinator owns the bookkeeping without a receiver mutex or an
+the task service owns the bookkeeping without a receiver mutex or an
 input worker task. At invocation end the old inbox is
 revoked: workers wake with `None`, and unread input is handed to the next
 invocation or rejected if the task ended. Application workers remain responsible
@@ -58,7 +82,7 @@ ID, user role and at least one part. Artifact-only input uses an empty
 `Role::Unspecified` message so it is omitted on the wire; its updates name the
 existing task.
 
-Message preparation is owned by its Task coordinator after enqueueing. A caller
+Message preparation is owned by its task service after enqueueing. A caller
 disconnecting while storage commits input cannot interrupt executor delivery.
 Inline push configuration is validated and admitted before input is persisted.
 This does not provide a durable outbox across process crashes or transactions

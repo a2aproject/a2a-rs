@@ -163,7 +163,8 @@ mod tests {
 
         for (task_id, artifact_id) in [("t-first", "a-1"), ("t-second", "a-2")] {
             handler
-                .task_store
+                .tasks
+                .store()
                 .create(Task {
                     generation: 0,
                     timeline: None,
@@ -182,7 +183,7 @@ mod tests {
                 .unwrap();
 
             apply_event_to_task(
-                handler.task_store.as_ref(),
+                handler.tasks.store(),
                 None,
                 &mut StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
                     generation: 0,
@@ -244,7 +245,8 @@ mod tests {
         });
         seed_task(&handler, "artifact-validation", "context").await;
         let before = handler
-            .task_store
+            .tasks
+            .store()
             .get("artifact-validation")
             .await
             .unwrap()
@@ -270,7 +272,8 @@ mod tests {
             assert_eq!(error.code, error_code::INVALID_PARAMS);
             assert_eq!(
                 handler
-                    .task_store
+                    .tasks
+                    .store()
                     .get("artifact-validation")
                     .await
                     .unwrap()

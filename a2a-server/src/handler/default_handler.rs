@@ -4,16 +4,15 @@
 //! Default request-handler state, configuration, operations, and tests.
 
 use super::delivery::{AuthorizedMessage, Delivery, StartMode, is_artifact_only, request_task_id};
-use super::events::TaskChanges;
-use super::exchange::{Exchange, ExchangeAdapter, OpenExchange};
+use super::http_exchange::{self, HttpOpening, RegistrationLease};
 use super::protocol::{
     Rejection, apply_lengths, is_at_least_1_1, requested_protocol_version, unary_refusal,
 };
-use super::registry::ExecutionManager;
 use super::response::{Events, Run, RunCompletion};
-use super::startup::{PreparedResponse, StartedResponse};
-use super::subscription::{SubscriptionAttachment, SubscriptionPolicy};
-use super::uplink::{IncomingRequest, LiveSessions, ResponseInput};
+use super::response_preparation::{MessageResponse, PreparedResponse};
+use super::response_preparation::{SubscriptionAttachment, SubscriptionPolicy};
+use super::task_service::TaskService;
+use super::uplink::{IncomingRequest, LiveSessions, Uplink};
 
 use crate::middleware::{ServiceParams, User};
 use crate::pagination::resolve_page_size;
@@ -22,9 +21,7 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use std::{sync::Arc, time::Duration};
 
-use super::{
-    ExtendedAgentCardResolver, LiveResponse, RequestAuthorizer, RequestHandler, cancellation,
-};
+use super::{ExtendedAgentCardResolver, LiveResponse, RequestAuthorizer, RequestHandler};
 
 /// How long a long-poll `GetTask` (`currentGeneration`) is held open when the
 /// task does not advance. The spec lets a server return earlier with the
@@ -34,26 +31,19 @@ const DEFAULT_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Deadline for waiting on the agent cancellation hook; finalization is separate.
 const DEFAULT_CANCEL_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Upper bound on the wait between two checks of the store during a
-/// long-poll, so a task changed by another process is still noticed.
-const LONG_POLL_RECHECK: Duration = Duration::from_secs(1);
-
 /// Default implementation of [`RequestHandler`] that orchestrates
 /// task lifecycle management, storage, and executor dispatch.
 ///
 /// Cheap to clone: everything it holds is shared.
 #[derive(Clone)]
 pub struct DefaultRequestHandler {
-    pub(super) executor: Arc<dyn crate::AgentExecutor>,
-    pub(super) task_store: Arc<dyn crate::TaskStore>,
-    pub(super) execution_manager: Arc<ExecutionManager>,
+    pub(super) tasks: Arc<TaskService>,
     pub(super) push_config_store: Option<Arc<dyn crate::PushConfigStore>>,
     pub(super) push_sender: Option<Arc<crate::HttpPushSender>>,
     pub(super) capabilities: AgentCapabilities,
     default_input_modes: Vec<String>,
     authorizer: Option<Arc<dyn RequestAuthorizer>>,
     extended_agent_card: Option<Arc<dyn ExtendedAgentCardResolver>>,
-    pub(super) changes: Arc<TaskChanges>,
     long_poll_timeout: Duration,
     pub(super) cancel_hook_timeout: Duration,
     pub(super) live: Arc<LiveSessions>,
@@ -63,16 +53,13 @@ impl DefaultRequestHandler {
     // Configuration.
     pub fn new(executor: impl crate::AgentExecutor, task_store: impl crate::TaskStore) -> Self {
         DefaultRequestHandler {
-            executor: Arc::new(executor),
-            task_store: Arc::new(task_store),
-            execution_manager: Arc::new(ExecutionManager::default()),
+            tasks: Arc::new(TaskService::new(executor, task_store)),
             push_config_store: None,
             push_sender: None,
             capabilities: AgentCapabilities::default(),
             default_input_modes: Vec::new(),
             authorizer: None,
             extended_agent_card: None,
-            changes: Arc::new(TaskChanges::default()),
             long_poll_timeout: DEFAULT_LONG_POLL_TIMEOUT,
             cancel_hook_timeout: DEFAULT_CANCEL_HOOK_TIMEOUT,
             live: Arc::new(LiveSessions::default()),
@@ -282,51 +269,65 @@ impl DefaultRequestHandler {
             .ok_or_else(A2AError::push_notification_not_supported)
     }
 
-    /// Common entry point for every send: route an existing HTTP exchange,
-    /// adapt its input, prepare the first response, then start the shared runner.
-    async fn start_response(
+    /// Ordinary sends resolve to a Message or a Task; transport setup stays outside.
+    async fn send(
         &self,
         params: &ServiceParams,
-        mode: StartMode,
-        input: ResponseInput,
-    ) -> Result<StartedResponse, A2AError> {
-        // Check that the agent supports the requested response mode.
-        if mode != StartMode::Blocking {
-            self.require_streaming()?;
-        }
-        // Adapt routing and transport input into one exchange or an acknowledgement.
-        let mut exchange = match ExchangeAdapter::new(self, params).open(input).await? {
-            OpenExchange::Acknowledged(task) => return Ok(StartedResponse::Ack(task)),
-            OpenExchange::Attached(exchange) => exchange,
-        };
-        // Every attached exchange supplies the same normalized requests.
-        let first = exchange
+        request: SendMessageRequest,
+    ) -> Result<MessageResponse, A2AError> {
+        let prepared = self
+            .prepare_message(
+                params,
+                IncomingRequest::message(request),
+                StartMode::Blocking,
+                None,
+            )
+            .await?;
+        let task_id = prepared.task_id.clone();
+        let events = self.response_stream(params, prepared, None, None);
+        MessageResponse::receive(self.tasks.clone(), task_id, events).await
+    }
+
+    /// Live transports supply an opening request and retain their input stream.
+    async fn start_live_response(
+        &self,
+        params: &ServiceParams,
+        mut uplink: Uplink,
+        registration: Option<RegistrationLease>,
+    ) -> Result<Events, A2AError> {
+        let first = uplink
             .next()
             .await
             .ok_or_else(|| A2AError::invalid_request("a response needs a first request"))?;
-        // Prepare the initial events and the condition that ends this response.
-        let wants_message_updates = is_at_least_1_1(&requested_protocol_version(params));
-        let response_id = (mode == StartMode::Bidi).then(uuid::Uuid::now_v7);
-        // Admission is owned by the coordinator after enqueueing. A caller
-        // disconnecting while it waits cannot interrupt persistence or delivery.
-        let prepared = self
-            .prepare_response(
-                params,
-                mode,
-                first.request,
-                wants_message_updates,
-                response_id,
-            )
-            .await?;
-        // Bind its lifetime to the task, then let the shared runner deliver events.
-        exchange.bind(&prepared.task_id);
-        let task_id = prepared.task_id.clone();
-        let events = self.response_stream(
-            params,
-            prepared,
-            (mode == StartMode::Bidi).then_some(exchange),
-        );
-        Ok(StartedResponse::Stream { task_id, events })
+        let response_id = Some(uuid::Uuid::now_v7());
+        let prepared = match first.request {
+            input @ (IncomingRequest::Authorized(_)
+            | IncomingRequest::Raw(StreamRequest {
+                payload: StreamRequestPayload::SendMessage(_),
+                ..
+            })) => {
+                self.prepare_message(params, input, StartMode::Bidi, response_id)
+                    .await?
+            }
+            IncomingRequest::Raw(StreamRequest {
+                payload: StreamRequestPayload::Subscribe(request),
+                ..
+            }) => {
+                let attachment = self.attach_subscription(params, request).await?;
+                let policy = SubscriptionPolicy::new(
+                    StartMode::Bidi,
+                    is_at_least_1_1(&requested_protocol_version(params)),
+                )
+                .for_response(response_id);
+                PreparedResponse::subscription(attachment, RunCompletion::Exchange, policy)
+            }
+            _ => {
+                return Err(A2AError::invalid_request(
+                    "unrecognised StreamRequest payload",
+                ));
+            }
+        };
+        Ok(self.response_stream(params, prepared, Some(uplink), registration))
     }
 
     /// Every opening message or subscription starts exactly one response Run.
@@ -334,7 +335,8 @@ impl DefaultRequestHandler {
         &self,
         params: &ServiceParams,
         prepared: PreparedResponse,
-        uplink: Option<Exchange>,
+        uplink: Option<Uplink>,
+        registration: Option<RegistrationLease>,
     ) -> Events {
         Run::new(
             self.clone(),
@@ -343,56 +345,33 @@ impl DefaultRequestHandler {
             prepared.completion,
             prepared.policy,
         )
-        .start(
-            prepared.opening,
-            prepared.events,
-            prepared.seen_generation,
-            uplink,
-        )
+        .with_uplink(uplink, registration)
+        .start(prepared.opening, prepared.events, prepared.seen_generation)
     }
 
-    /// Admit the first message or subscription, then prepare its events and
-    /// completion policy without starting a separate execution path per mode.
-    async fn prepare_response(
+    /// All message modes use the same authorization, validation, and task admission.
+    async fn prepare_message(
         &self,
         params: &ServiceParams,
+        input: IncomingRequest,
         mode: StartMode,
-        request: IncomingRequest,
-        wants_message_updates: bool,
         response_id: Option<uuid::Uuid>,
     ) -> Result<PreparedResponse, A2AError> {
-        let policy = SubscriptionPolicy::new(mode, wants_message_updates).for_response(response_id);
-        match request {
-            input @ (IncomingRequest::Authorized(_)
-            | IncomingRequest::Raw(StreamRequest {
-                payload: StreamRequestPayload::SendMessage(_),
-                ..
-            })) => {
-                let request = input.send_request().expect("matched a message").clone();
-                let delivery = self
-                    .receive_message(params, input, mode, None, response_id)
-                    .await
-                    .map_err(|rejection| match mode {
-                        StartMode::Bidi => rejection.into_error(),
-                        _ => unary_refusal(rejection, &request),
-                    })?;
-                Ok(PreparedResponse::message(request, delivery, mode, policy))
-            }
-            IncomingRequest::Raw(StreamRequest {
-                payload: StreamRequestPayload::Subscribe(subscribe),
-                ..
-            }) if mode == StartMode::Bidi => {
-                let attachment = self.attach_subscription(params, subscribe).await?;
-                Ok(PreparedResponse::subscription(
-                    attachment,
-                    RunCompletion::Exchange,
-                    policy,
-                ))
-            }
-            _ => Err(A2AError::invalid_request(
-                "unrecognised StreamRequest payload",
-            )),
-        }
+        let request = input
+            .send_request()
+            .ok_or_else(|| A2AError::invalid_request("expected a SendMessage request"))?
+            .clone();
+        let delivery = self
+            .receive_message(params, input, mode, None, response_id)
+            .await
+            .map_err(|rejection| match mode {
+                StartMode::Bidi => rejection.into_error(),
+                _ => unary_refusal(rejection, &request),
+            })?;
+        let policy =
+            SubscriptionPolicy::new(mode, is_at_least_1_1(&requested_protocol_version(params)))
+                .for_response(response_id);
+        Ok(PreparedResponse::message(request, delivery, mode, policy))
     }
 
     /// Bind and authorize each message once, using its caller rather than
@@ -478,12 +457,7 @@ impl DefaultRequestHandler {
             )
             .into());
         }
-        let task_id = request_task_id(&message.request).unwrap_or_else(new_task_id);
-        self.execution_manager
-            .coordinators
-            .for_task(&task_id)
-            .admit(self.clone(), message, mode)
-            .await
+        self.tasks.append_input(self.clone(), message, mode).await
     }
 
     // Subscriptions.
@@ -495,41 +469,7 @@ impl DefaultRequestHandler {
     ) -> Result<SubscriptionAttachment, A2AError> {
         self.authorize(params, Some(&req.id))?;
         self.require_streaming()?;
-        self.execution_manager
-            .coordinators
-            .for_task(&req.id)
-            .subscribe(self.clone(), req)
-            .await
-    }
-
-    /// Long-poll for `GetTaskRequest.currentGeneration` (A2A 1.1 §3.2.7):
-    /// returns once the task's generation exceeds `current`, or with the
-    /// current state when the timeout elapses or the task is terminal.
-    async fn wait_for_generation(&self, task_id: &str, current: i64) -> Result<Task, A2AError> {
-        let deadline = tokio::time::Instant::now() + self.long_poll_timeout;
-        // Watching before the store is read: a change landing in between is seen.
-        let mut watch = self.changes.watch(task_id);
-        loop {
-            let task = self.load_task(task_id).await?;
-            if task.generation > current || task.status.state.is_terminal() {
-                return Ok(task);
-            }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return Ok(task);
-            }
-            tokio::select! {
-                () = watch.changed() => {}
-                _ = tokio::time::sleep((deadline - now).min(LONG_POLL_RECHECK)) => {}
-            }
-        }
-    }
-
-    pub(super) async fn load_task(&self, task_id: &str) -> Result<Task, A2AError> {
-        self.task_store
-            .get(task_id)
-            .await?
-            .ok_or_else(|| A2AError::task_not_found(task_id))
+        self.tasks.subscribe(self.clone(), req).await
     }
 
     // Preparation.
@@ -584,29 +524,25 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        // ACTS CORE-HIST-003: configuration.historyLength governs this
-        // response's own inline task the same way it governs a later
-        // GetTask, so it has to be applied here too, not just there.
-        let history_length = req
-            .configuration
-            .as_ref()
-            .and_then(|configuration| configuration.history_length);
-        let timeline_length = req
-            .configuration
-            .as_ref()
-            .and_then(|configuration| configuration.timeline_length);
-        let (task_id, events) = self
-            .start_response(params, StartMode::Blocking, ResponseInput::message(req))
-            .await?
-            .into_stream()?;
-        Run::unary_response(
-            self.clone(),
-            task_id,
-            events,
-            history_length,
-            timeline_length,
-        )
-        .await
+        let config = req.configuration.as_ref();
+        let blocking = !config.and_then(|c| c.return_immediately).unwrap_or(false);
+        let history_length = config.and_then(|c| c.history_length);
+        let timeline_length = config.and_then(|c| c.timeline_length);
+
+        let mut response = match self.send(params, req).await? {
+            MessageResponse::Message(message) => SendMessageResponse::Message(message),
+            MessageResponse::Task(task) => {
+                if blocking {
+                    task.wait().await?
+                } else {
+                    SendMessageResponse::Task(task.snapshot().await?)
+                }
+            }
+        };
+        if let SendMessageResponse::Task(task) = &mut response {
+            apply_lengths(task, history_length, timeline_length);
+        }
+        Ok(response)
     }
 
     async fn send_streaming_message(
@@ -616,10 +552,16 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let history_length = req.configuration.as_ref().and_then(|c| c.history_length);
         let timeline_length = req.configuration.as_ref().and_then(|c| c.timeline_length);
-        let (_, events) = self
-            .start_response(params, StartMode::Streaming, ResponseInput::message(req))
-            .await?
-            .into_stream()?;
+        self.require_streaming()?;
+        let prepared = self
+            .prepare_message(
+                params,
+                IncomingRequest::message(req),
+                StartMode::Streaming,
+                None,
+            )
+            .await?;
+        let events = self.response_stream(params, prepared, None, None);
         Ok(Box::pin(events.map(move |item| {
             item.map(|mut event| {
                 if let StreamResponse::Task(task) = &mut event {
@@ -635,11 +577,9 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         uplink: BoxStream<'static, StreamRequest>,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let (_, events) = self
-            .start_response(params, StartMode::Bidi, ResponseInput::Duplex(uplink))
-            .await?
-            .into_stream()?;
-        Ok(events)
+        self.require_streaming()?;
+        self.start_live_response(params, Uplink::duplex(uplink), None)
+            .await
     }
 
     async fn get_task(
@@ -649,8 +589,12 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<Task, A2AError> {
         self.authorize(params, Some(&req.id))?;
         let mut task = match req.current_generation {
-            Some(current) => self.wait_for_generation(&req.id, current).await?,
-            None => self.load_task(&req.id).await?,
+            Some(current) => {
+                self.tasks
+                    .wait_for_generation(&req.id, current, self.long_poll_timeout)
+                    .await?
+            }
+            None => self.tasks.load(&req.id).await?,
         };
         apply_lengths(&mut task, req.history_length, req.timeline_length);
         Ok(task)
@@ -682,11 +626,14 @@ impl RequestHandler for DefaultRequestHandler {
         let mut response = if let Some(authorizer) = &self.authorizer {
             // Filter before counting and paging; post-filtering leaks counts
             // and creates pages whose continuation reveals inaccessible tasks.
-            self.task_store
-                .list_scoped(&req, &|id| authorizer.authorize(params, Some(id)).is_ok())
+            self.tasks
+                .list(
+                    &req,
+                    Some(&|id| authorizer.authorize(params, Some(id)).is_ok()),
+                )
                 .await?
         } else {
-            self.task_store.list(&req).await?
+            self.tasks.list(&req, None).await?
         };
         response.tasks.truncate(page_size);
         for task in &mut response.tasks {
@@ -705,18 +652,14 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<Task, A2AError> {
         self.authorize(params, Some(&req.id))?;
 
-        // The runtime owns cancellation after authorization. Dropping this
-        // caller's JoinHandle only stops waiting; the mutation still finishes.
-        let handler = self.clone();
-        let params = params.clone();
-        let task_id = req.id.clone();
-        let user = self.authenticated_user(&params)?;
-        tokio::spawn(async move { cancellation::cancel(handler, params, req, user).await })
+        self.tasks
+            .cancel(
+                self.clone(),
+                params.clone(),
+                req,
+                self.authenticated_user(params)?,
+            )
             .await
-            .map_err(|error| {
-                tracing::error!(%task_id, %error, "cancellation operation failed");
-                A2AError::internal("cancellation operation failed unexpectedly")
-            })?
     }
 
     async fn subscribe_to_task(
@@ -730,7 +673,7 @@ impl RequestHandler for DefaultRequestHandler {
             is_at_least_1_1(&requested_protocol_version(params)),
         );
         let prepared = PreparedResponse::subscription(attachment, RunCompletion::Task, policy);
-        Ok(self.response_stream(params, prepared, None))
+        Ok(self.response_stream(params, prepared, None, None))
     }
 
     async fn send_live_request(
@@ -738,16 +681,18 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         request: StreamRequest,
     ) -> Result<LiveResponse, A2AError> {
-        match self
-            .start_response(
-                params,
-                StartMode::Bidi,
-                ResponseInput::HttpLive(Box::new(request)),
-            )
-            .await?
-        {
-            StartedResponse::Stream { events, .. } => Ok(LiveResponse::Stream(events)),
-            StartedResponse::Ack(task) => Ok(LiveResponse::Ack(task)),
+        self.require_streaming()?;
+        match http_exchange::open(self, params, request).await? {
+            HttpOpening::Acknowledged(task) => Ok(LiveResponse::Ack(task)),
+            HttpOpening::Attached {
+                registration,
+                uplink,
+            } => {
+                let events = self
+                    .start_live_response(params, uplink, Some(registration))
+                    .await?;
+                Ok(LiveResponse::Stream(events))
+            }
         }
     }
 
@@ -761,7 +706,7 @@ impl RequestHandler for DefaultRequestHandler {
         req.protocol_version
             .get_or_insert_with(|| requested_protocol_version(params));
         let store = self.push_config_store_checked()?;
-        self.load_task(&req.task_id).await?;
+        self.tasks.load(&req.task_id).await?;
         if let Some(sender) = &self.push_sender {
             sender.validate_config(&req)?;
         }
@@ -847,7 +792,7 @@ impl RequestHandler for DefaultRequestHandler {
 mod tests {
     use crate::ClientInputs;
     use crate::handler::TASK_INPUT_CAPACITY;
-    use crate::handler::coordinator::TaskOperation;
+    use crate::handler::cancellation;
     use crate::handler::events::ActiveExecution;
     use crate::handler::protocol::is_terminal_event;
     use crate::handler::test_support::*;
@@ -973,7 +918,7 @@ mod tests {
         let task = task.expect("expected a task");
         assert_eq!(task.status.state, TaskState::InputRequired);
         timeout(Duration::from_secs(2), async {
-            while handler.execution_manager.get(&task.id).await.is_some() {
+            while handler.tasks.registry.get(&task.id).await.is_some() {
                 tokio::task::yield_now().await;
             }
         })
@@ -1436,21 +1381,23 @@ mod tests {
         let handler = Arc::new(make_handler());
         seed_task(&handler, "t-prep", "c-prep").await;
         let (active, _inputs, _invocation) =
-            handler.execution_manager.reserve("t-prep").await.unwrap();
-        let coordinator = handler.execution_manager.coordinators.for_task("t-prep");
+            handler.tasks.registry.reserve("t-prep").await.unwrap();
+        let _lease = handler.tasks.test_lease("t-prep");
         let (entered, began) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let preparing = {
             let handler = handler.clone();
-            let coordinator = coordinator.clone();
+            let tasks = handler.tasks.clone();
             tokio::spawn(async move {
-                coordinator
-                    .call(TaskOperation::Input, async move {
-                        entered.send(()).unwrap();
-                        released.await.unwrap();
-                        active
-                            .set_snapshot(handler.load_task("t-prep").await.unwrap())
-                            .await;
+                tasks
+                    .test_update("t-prep", move |_| {
+                        Box::pin(async move {
+                            entered.send(()).unwrap();
+                            released.await.unwrap();
+                            active
+                                .set_snapshot(handler.tasks.load("t-prep").await.unwrap())
+                                .await;
+                        })
                     })
                     .await
                     .unwrap();
@@ -1490,11 +1437,8 @@ mod tests {
     async fn test_subscribe_ignores_a_dropped_requests_leftover() {
         let handler = make_handler();
         seed_task(&handler, "t-leftover", "c-leftover").await;
-        let (_stale, _inputs, _invocation) = handler
-            .execution_manager
-            .reserve("t-leftover")
-            .await
-            .unwrap();
+        let (_stale, _inputs, _invocation) =
+            handler.tasks.registry.reserve("t-leftover").await.unwrap();
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(2),
@@ -1539,7 +1483,8 @@ mod tests {
     async fn test_subscribe_to_terminal_task_is_unsupported_not_not_found() {
         let handler = make_handler();
         handler
-            .task_store
+            .tasks
+            .store()
             .create(Task {
                 generation: 0,
                 timeline: None,
@@ -1707,7 +1652,12 @@ mod tests {
         };
         let mut canceled = canceled;
         canceled.status.timestamp = Some(chrono::Utc::now());
-        handler.task_store.create(canceled.clone()).await.unwrap();
+        handler
+            .tasks
+            .store()
+            .create(canceled.clone())
+            .await
+            .unwrap();
         let active = ActiveExecution::new(Some(canceled.clone()));
         let mut progress =
             cancellation::Cancellation::new(active.clone(), canceled.clone(), false, false);
@@ -1791,11 +1741,7 @@ mod tests {
             matches!(timeout(Duration::from_secs(2), events.next()).await.unwrap(),
             Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Working)
         );
-        let active = handler
-            .execution_manager
-            .get("detached-cancel")
-            .await
-            .unwrap();
+        let active = handler.tasks.registry.get("detached-cancel").await.unwrap();
         let caller = {
             let handler = handler.clone();
             tokio::spawn(async move {
@@ -1841,7 +1787,8 @@ mod tests {
         }));
         assert!(
             handler
-                .execution_manager
+                .tasks
+                .registry
                 .get("detached-cancel")
                 .await
                 .is_none()
@@ -1869,26 +1816,29 @@ mod tests {
             .with_cancel_hook_timeout(Duration::from_millis(10));
         seed_task(&handler, "timeout-cancel", "context").await;
         // Model a store that changes state without recording the generation.
-        let mut canceled = handler.load_task("timeout-cancel").await.unwrap();
+        let mut canceled = handler.tasks.load("timeout-cancel").await.unwrap();
         canceled.status.state = TaskState::Canceled;
-        handler.task_store.update(canceled.clone()).await.unwrap();
+        handler
+            .tasks
+            .store()
+            .update(canceled.clone())
+            .await
+            .unwrap();
         let inputs = ClientInputs::closed();
         let ctx = ExecutorContext::new("timeout-cancel", "context", inputs)
             .with_stored_task(canceled.clone());
-        let coordinator = handler
-            .execution_manager
-            .coordinators
-            .for_task("timeout-cancel");
+        let _lease = handler.tasks.test_lease("timeout-cancel");
         let progress = cancellation::Cancellation::new(
             ActiveExecution::new(Some(canceled.clone())),
             canceled.clone(),
             false,
             false,
         );
-        coordinator
-            .update(TaskOperation::Cancel, move |state| {
+        handler
+            .tasks
+            .test_update("timeout-cancel", move |state| {
                 Box::pin(async move {
-                    state.execution = crate::handler::lifecycle::ExecutionState::Canceling {
+                    state.execution = crate::handler::execution::ExecutionState::Canceling {
                         invocation: None,
                         progress: Box::new(progress),
                     };
@@ -1898,14 +1848,14 @@ mod tests {
             .unwrap();
         let result = timeout(
             Duration::from_secs(2),
-            cancellation::run(handler.clone(), ctx, coordinator.clone()),
+            cancellation::run(handler.clone(), ctx),
         )
         .await
         .expect("the hook deadline must bound the wait");
         assert!(
             matches!(result, Err(error) if error.message == "agent cancellation hook timed out")
         );
-        let recorded = handler.load_task("timeout-cancel").await.unwrap();
+        let recorded = handler.tasks.load("timeout-cancel").await.unwrap();
         assert_eq!(recorded.status.state, TaskState::Canceled);
         assert_eq!(recorded.generation, canceled.generation + 1);
         assert!(recorded.timeline.unwrap().iter().any(|entry| matches!(
@@ -1931,7 +1881,7 @@ mod tests {
             history: None,
             metadata: None,
         };
-        handler.task_store.create(task).await.unwrap();
+        handler.tasks.store().create(task).await.unwrap();
         let req = CancelTaskRequest {
             id: "t2".into(),
             metadata: None,
@@ -1959,7 +1909,7 @@ mod tests {
             history: None,
             metadata: None,
         };
-        handler.task_store.create(task).await.unwrap();
+        handler.tasks.store().create(task).await.unwrap();
 
         let handlers = vec![Arc::clone(&handler), Arc::clone(&handler)];
         let mut results = Vec::new();
@@ -1998,7 +1948,7 @@ mod tests {
             history: None,
             metadata: None,
         };
-        handler.task_store.create(task).await.unwrap();
+        handler.tasks.store().create(task).await.unwrap();
         let req = CancelTaskRequest {
             id: "t3".into(),
             metadata: None,
@@ -2029,7 +1979,7 @@ mod tests {
             history: None,
             metadata: None,
         };
-        handler.task_store.create(task).await.unwrap();
+        handler.tasks.store().create(task).await.unwrap();
         let req = CancelTaskRequest {
             id: "t-canceled".into(),
             metadata: None,
@@ -2048,7 +1998,8 @@ mod tests {
             ("t-rejected", TaskState::Rejected),
         ] {
             handler
-                .task_store
+                .tasks
+                .store()
                 .create(Task {
                     generation: 0,
                     timeline: None,
@@ -2086,9 +2037,9 @@ mod tests {
     async fn test_idle_subscription_follows_a_later_turn_to_completion() {
         let handler = make_handler();
         seed_task(&handler, "idle", "context").await;
-        let mut task = handler.load_task("idle").await.unwrap();
+        let mut task = handler.tasks.load("idle").await.unwrap();
         task.status.state = TaskState::InputRequired;
-        handler.task_store.update(task).await.unwrap();
+        handler.tasks.store().update(task).await.unwrap();
         let params = ServiceParams::new();
         let mut events = handler
             .subscribe_to_task(
@@ -2226,7 +2177,13 @@ mod tests {
             .expect_err("an unknown taskId must not create a task");
         assert_eq!(err.code, error_code::TASK_NOT_FOUND);
         assert!(
-            handler.task_store.get("t-absent").await.unwrap().is_none(),
+            handler
+                .tasks
+                .store()
+                .get("t-absent")
+                .await
+                .unwrap()
+                .is_none(),
             "the rejected id must not have been created"
         );
     }
@@ -2236,7 +2193,8 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler();
         handler
-            .task_store
+            .tasks
+            .store()
             .create(Task {
                 generation: 0,
                 timeline: None,
@@ -2346,7 +2304,7 @@ mod tests {
                 .unwrap();
         }
 
-        let task = handler.task_store.get(&task_id).await.unwrap().unwrap();
+        let task = handler.tasks.store().get(&task_id).await.unwrap().unwrap();
         let history = task.history.expect("history must accumulate across turns");
         let texts: Vec<_> = history.iter().map(|m| m.text()).collect();
         assert_eq!(
@@ -2409,7 +2367,7 @@ mod tests {
             .send_message(&ServiceParams::new(), send_req(Some("t-infer"), None))
             .await
             .unwrap();
-        let task = handler.task_store.get("t-infer").await.unwrap().unwrap();
+        let task = handler.tasks.store().get("t-infer").await.unwrap().unwrap();
         assert_eq!(task.context_id, "c-infer");
     }
 
@@ -2425,7 +2383,8 @@ mod tests {
             .expect("a message with no taskId must still create a task");
         let _ = resp;
         let listed = handler
-            .task_store
+            .tasks
+            .store()
             .list(&ListTasksRequest {
                 timeline_length: None,
                 context_id: Some("c-new".into()),
@@ -2480,7 +2439,8 @@ mod tests {
         let handler = make_handler();
         let params = ServiceParams::new();
         handler
-            .task_store
+            .tasks
+            .store()
             .create(task_with_history("hist", "c", 3))
             .await
             .unwrap();
@@ -2810,7 +2770,8 @@ mod tests {
             assert_eq!(canceled.status.state, TaskState::Canceled);
             assert_eq!(
                 handler
-                    .task_store
+                    .tasks
+                    .store()
                     .get("idle-cancel")
                     .await
                     .unwrap()
@@ -2881,9 +2842,9 @@ mod tests {
         ];
         for handler in handlers {
             seed_task(&handler, "idle-cancel", "context").await;
-            let mut task = handler.load_task("idle-cancel").await.unwrap();
+            let mut task = handler.tasks.load("idle-cancel").await.unwrap();
             task.status.state = TaskState::InputRequired;
-            handler.task_store.update(task).await.unwrap();
+            handler.tasks.store().update(task).await.unwrap();
             let canceled = handler
                 .cancel_task(
                     &ServiceParams::new(),
@@ -2899,7 +2860,13 @@ mod tests {
             assert_eq!(canceled.context_id, "context");
             assert_eq!(canceled.status.state, TaskState::Canceled);
             assert_eq!(
-                handler.load_task("idle-cancel").await.unwrap().status.state,
+                handler
+                    .tasks
+                    .load("idle-cancel")
+                    .await
+                    .unwrap()
+                    .status
+                    .state,
                 TaskState::Canceled
             );
         }
@@ -2940,19 +2907,24 @@ mod tests {
         for running in [false, true] {
             let handler = make_handler();
             seed_task(&handler, "legacy-cancel", "context").await;
-            let mut canceled = handler.load_task("legacy-cancel").await.unwrap();
+            let mut canceled = handler.tasks.load("legacy-cancel").await.unwrap();
             canceled.status.state = TaskState::Canceled;
-            handler.task_store.update(canceled.clone()).await.unwrap();
+            handler
+                .tasks
+                .store()
+                .update(canceled.clone())
+                .await
+                .unwrap();
             let active = ActiveExecution::new(Some(canceled.clone()));
             let progress =
                 cancellation::Cancellation::new(active.clone(), canceled.clone(), false, running);
             progress.record_if_missing(&handler).await.unwrap();
-            let task = handler.load_task("legacy-cancel").await.unwrap();
+            let task = handler.tasks.load("legacy-cancel").await.unwrap();
             assert_eq!(task.generation, canceled.generation + 1);
             assert_eq!(task.status.state, TaskState::Canceled);
             assert_eq!(task.timeline.as_ref().unwrap().len(), 1);
             progress.record_if_missing(&handler).await.unwrap();
-            assert_eq!(handler.load_task("legacy-cancel").await.unwrap(), task);
+            assert_eq!(handler.tasks.load("legacy-cancel").await.unwrap(), task);
         }
     }
 
@@ -3001,7 +2973,7 @@ mod tests {
                     .is_ok()
             );
         }
-        let before = handler.load_task(&task.id).await.unwrap();
+        let before = handler.tasks.load(&task.id).await.unwrap();
         let request = StreamRequest {
             tenant: None,
             payload: StreamRequestPayload::SendMessage(send_req(
@@ -3021,7 +2993,7 @@ mod tests {
             .err()
             .expect("full inbox must decline input");
         assert!(matches!(refusal, Rejection::Declined(_)));
-        assert_eq!(handler.load_task(&task.id).await.unwrap(), before);
+        assert_eq!(handler.tasks.load(&task.id).await.unwrap(), before);
         release.notify_one();
         timeout(Duration::from_secs(2), events.collect::<Vec<_>>())
             .await
@@ -3031,10 +3003,11 @@ mod tests {
     #[tokio::test]
     async fn prepared_but_uncreated_tasks_are_not_visible_to_other_requests() {
         let handler = make_handler();
-        let coordinator = handler.execution_manager.coordinators.for_task("uncreated");
+        let _lease = handler.tasks.test_lease("uncreated");
         let owned = handler.clone();
-        let (active, _inputs) = coordinator
-            .update(TaskOperation::Input, move |state| {
+        let (active, _inputs) = handler
+            .tasks
+            .test_update("uncreated", move |state| {
                 Box::pin(async move { state.reserve(&owned, "uncreated").await })
             })
             .await
@@ -3066,9 +3039,18 @@ mod tests {
                 .expect("uncreated tasks must stay private");
             assert_eq!(error.code, error_code::TASK_NOT_FOUND);
         }
-        assert!(handler.task_store.get("uncreated").await.unwrap().is_none());
+        assert!(
+            handler
+                .tasks
+                .store()
+                .get("uncreated")
+                .await
+                .unwrap()
+                .is_none()
+        );
         handler
-            .execution_manager
+            .tasks
+            .registry
             .unregister("uncreated", &active)
             .await;
     }
@@ -3180,7 +3162,7 @@ mod tests {
             },
         );
         seed_task(&handler, "panic", "context").await;
-        let coordinator = handler.execution_manager.coordinators.for_task("panic");
+        let _lease = handler.tasks.test_lease("panic");
         let error = handler
             .send_message(
                 &ServiceParams::new(),
@@ -3190,12 +3172,13 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, error_code::INTERNAL_ERROR);
         assert_eq!(error.message, "message preparation failed unexpectedly");
-        let idle = coordinator
-            .update(TaskOperation::Input, |state| {
+        let idle = handler
+            .tasks
+            .test_update("panic", |state| {
                 Box::pin(async move {
                     matches!(
                         state.execution,
-                        crate::handler::lifecycle::ExecutionState::Idle
+                        crate::handler::execution::ExecutionState::Idle
                     )
                 })
             })
@@ -3203,9 +3186,9 @@ mod tests {
             .unwrap();
         assert!(
             idle,
-            "panic recovery resets the resident coordinator before its next command"
+            "panic recovery resets the resident task state before its next command"
         );
-        assert!(handler.execution_manager.get("panic").await.is_none());
+        assert!(handler.tasks.registry.get("panic").await.is_none());
         assert_eq!(
             store.get("panic").await.unwrap().unwrap().status.state,
             TaskState::Submitted
@@ -3225,7 +3208,7 @@ mod tests {
                 last_seen_generation: None,
             }),
         };
-        let before = handler.load_task("task").await.unwrap();
+        let before = handler.tasks.load("task").await.unwrap();
         let mut events = handler
             .send_live_message(&params, stream::once(async move { request }).boxed())
             .await
@@ -3234,7 +3217,7 @@ mod tests {
             matches!(events.next().await.unwrap().unwrap(), StreamResponse::Task(task) if task == before)
         );
         drop(events);
-        assert_eq!(handler.load_task("task").await.unwrap(), before);
+        assert_eq!(handler.tasks.load("task").await.unwrap(), before);
         let request = StreamRequest {
             tenant: None,
             payload: StreamRequestPayload::Unrecognised,
@@ -3251,9 +3234,9 @@ mod tests {
     async fn terminal_active_snapshots_cannot_be_resubscribed() {
         let handler = make_handler();
         let task = task_with_history("finished", "context", 0);
-        handler.task_store.create(task.clone()).await.unwrap();
+        handler.tasks.store().create(task.clone()).await.unwrap();
         let (active, _inputs, _invocation) =
-            handler.execution_manager.reserve(&task.id).await.unwrap();
+            handler.tasks.registry.reserve(&task.id).await.unwrap();
         active.set_snapshot(task.clone()).await;
         let error = handler
             .subscribe_to_task(
@@ -3268,10 +3251,7 @@ mod tests {
             .err()
             .expect("task is terminal");
         assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
-        handler
-            .execution_manager
-            .unregister(&task.id, &active)
-            .await;
+        handler.tasks.registry.unregister(&task.id, &active).await;
     }
 
     #[tokio::test]
@@ -3290,7 +3270,7 @@ mod tests {
         let StreamResponse::Task(task) = events.next().await.unwrap().unwrap() else {
             panic!("expected Task");
         };
-        let active = handler.execution_manager.get(&task.id).await.unwrap();
+        let active = handler.tasks.registry.get(&task.id).await.unwrap();
         let capacity = active.inputs.sender.capacity();
         let mut request = send_req(None, None);
         request.message = Message::new(Role::Unspecified, Vec::new());
@@ -3307,7 +3287,7 @@ mod tests {
             metadata: None,
             generation: 0,
         }];
-        let before = handler.load_task(&task.id).await.unwrap();
+        let before = handler.tasks.load(&task.id).await.unwrap();
         assert!(
             handler
                 .receive_message(
@@ -3324,7 +3304,7 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(active.inputs.sender.capacity(), capacity);
-        let stored = handler.load_task(&task.id).await.unwrap();
+        let stored = handler.tasks.load(&task.id).await.unwrap();
         assert_eq!(stored.history, before.history);
         assert!(
             stored
@@ -3418,7 +3398,7 @@ mod tests {
             Ok(_) => panic!("expected subscribe_to_task to fail"),
             Err(error) => assert_eq!(error.code, error_code::TASK_NOT_FOUND),
         }
-        assert!(handler.changes.watcher_count() == 0);
+        assert!(handler.tasks.changes.watcher_count() == 0);
     }
 
     #[tokio::test]
@@ -3501,7 +3481,7 @@ mod tests {
                 if stored.status.state == TaskState::InputRequired
                     && last.status.state == TaskState::Canceled
         ));
-        assert!(handler.changes.watcher_count() == 0);
+        assert!(handler.tasks.changes.watcher_count() == 0);
     }
 
     #[tokio::test]
@@ -3559,7 +3539,7 @@ mod tests {
                     if stored.status.state == TaskState::InputRequired
                         && last.status.state == TaskState::Canceled
             ));
-            assert!(handler.changes.watcher_count() == 0);
+            assert!(handler.tasks.changes.watcher_count() == 0);
         }
     }
 
@@ -3650,10 +3630,10 @@ mod tests {
             subscription.next().await,
             Some(Ok(StreamResponse::Task(_)))
         ));
-        assert_eq!(handler.changes.watcher_count(), 1);
+        assert_eq!(handler.tasks.changes.watcher_count(), 1);
         drop(subscription);
         timeout(Duration::from_secs(2), async {
-            while handler.changes.watcher_count() != 0 {
+            while handler.tasks.changes.watcher_count() != 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -3674,12 +3654,12 @@ mod subscription_attachment_tests {
                 for cursor in [None, Some(4), Some(5)] {
                     let handler = make_handler();
                     seed_task(&handler, "task", "context").await;
-                    let mut task = handler.load_task("task").await.unwrap();
+                    let mut task = handler.tasks.load("task").await.unwrap();
                     task.generation = 5;
-                    handler.task_store.update(task.clone()).await.unwrap();
+                    handler.tasks.store().update(task.clone()).await.unwrap();
                     let execution = if running {
                         let (active, inputs, _invocation) =
-                            handler.execution_manager.reserve("task").await.unwrap();
+                            handler.tasks.registry.reserve("task").await.unwrap();
                         active.set_snapshot(task.clone()).await;
                         Some((active, inputs))
                     } else {
@@ -3711,7 +3691,7 @@ mod subscription_attachment_tests {
                         handler.subscribe_to_task(&params, request).await.unwrap()
                     };
                     assert_eq!(
-                        handler.execution_manager.get("task").await.is_some(),
+                        handler.tasks.registry.get("task").await.is_some(),
                         running,
                         "subscribing must not start an executor"
                     );
@@ -3734,14 +3714,14 @@ mod subscription_attachment_tests {
                     }
                     task.generation = 6;
                     task.status.state = TaskState::Completed;
-                    handler.task_store.update(task.clone()).await.unwrap();
+                    handler.tasks.store().update(task.clone()).await.unwrap();
                     if let Some((active, _inputs)) = execution {
                         active
                             .publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()))
                             .await;
-                        handler.execution_manager.unregister("task", &active).await;
+                        handler.tasks.registry.unregister("task", &active).await;
                     }
-                    handler.changes.notify("task");
+                    handler.tasks.changes.notify("task");
                     let remaining = timeout(Duration::from_secs(2), events.collect::<Vec<_>>())
                         .await
                         .unwrap();

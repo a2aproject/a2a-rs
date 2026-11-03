@@ -156,11 +156,8 @@ mod tests {
         fail_on_error: bool,
     ) -> (Arc<TaskEvents>, mpsc::Receiver<Notification>) {
         let handler = make_push_delivery_handler();
-        let source = handler.execution_manager.events_for("task");
-        handler
-            .execution_manager
-            .pushes
-            .attach(&handler, "task", &source);
+        let source = handler.tasks.registry.events_for("task");
+        handler.tasks.pushes.attach(&handler, "task", &source);
         let mut settings = source.notifications.get().unwrap().clone();
         settings.store.save(push_config("task")).await.unwrap();
         settings.sender = Arc::new(crate::HttpPushSender::new(Some(
@@ -180,11 +177,8 @@ mod tests {
     #[tokio::test]
     async fn direct_replies_and_errors_do_not_start_webhook_workers() {
         let handler = make_push_delivery_handler();
-        let source = handler.execution_manager.events_for("uncreated");
-        handler
-            .execution_manager
-            .pushes
-            .attach(&handler, "uncreated", &source);
+        let source = handler.tasks.registry.events_for("uncreated");
+        handler.tasks.pushes.attach(&handler, "uncreated", &source);
         source
             .publish(
                 Ok(&StreamResponse::Message(make_message())),
@@ -353,13 +347,7 @@ mod tests {
         .await
         .expect("webhook failure must wake the driver without another executor event");
         assert_eq!(error.code, error_code::INTERNAL_ERROR);
-        assert!(
-            handler
-                .execution_manager
-                .get("push-failure")
-                .await
-                .is_none()
-        );
+        assert!(handler.tasks.registry.get("push-failure").await.is_none());
         server.abort();
     }
 
@@ -848,11 +836,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_webhook_subscribers_retire_and_restart_without_changing_task_source() {
         let handler = make_push_delivery_handler();
-        let source = handler.execution_manager.events_for("task");
-        handler
-            .execution_manager
-            .pushes
-            .attach(&handler, "task", &source);
+        let source = handler.tasks.registry.events_for("task");
+        handler.tasks.pushes.attach(&handler, "task", &source);
         let event = StreamResponse::Task(task_with_history("task", "context", 0));
         source
             .publish(Ok(&event), None, EventKind::Normal, None)
@@ -871,7 +856,7 @@ mod tests {
         assert!(source.webhook_subscribed.lock().unwrap().running);
         assert!(Arc::ptr_eq(
             &source,
-            &handler.execution_manager.events_for("task")
+            &handler.tasks.registry.events_for("task")
         ));
     }
 

@@ -1,15 +1,12 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Cancellation progress owned by the Task coordinator, never shared by hooks.
+//! Cancellation progress owned by the task runtime, never shared by hooks.
 
 use super::DefaultRequestHandler;
-use super::coordinator::TaskCoordinator;
 use super::events::ActiveExecution;
 use super::protocol::is_terminal_event;
-use super::updates::{
-    CancelEntry, apply_and_publish, backfill_status_timestamp, save_task, validate_event_identity,
-};
+use super::updates::{CancelEntry, backfill_status_timestamp, validate_event_identity};
 use crate::middleware::ServiceParams;
 use crate::{ClientInputs, User};
 use a2a::*;
@@ -45,7 +42,7 @@ impl Cancellation {
     ) -> Result<CancellationStart, A2AError> {
         // State transition and snapshot publication are serialized with input
         // and executor output. The hook is scheduled only after this command.
-        let task = handler.load_task(&req.id).await?;
+        let task = handler.tasks.load(&req.id).await?;
         let generation_before = task.generation;
 
         // Idempotent: re-cancelling an already-canceled task is a no-op that
@@ -60,14 +57,14 @@ impl Cancellation {
 
         // Atomically transition the task to CANCELED so two concurrent cancel
         // requests cannot both pass the check-then-act window.
-        let task = match handler.task_store.begin_cancel(&req.id).await {
+        let task = match handler.tasks.mark_canceled(&req.id).await {
             Ok(task) => task,
             Err(error) if error.code == error_code::TASK_NOT_CANCELABLE => {
                 // Raced with another cancel or with task completion. Keep the
                 // same semantics as the upfront check: a task another cancel
                 // already moved to CANCELED is returned (idempotent); any
                 // other terminal state is still not cancelable.
-                let raced = handler.load_task(&req.id).await?;
+                let raced = handler.tasks.load(&req.id).await?;
                 if raced.status.state == TaskState::Canceled {
                     return Ok(CancellationStart::Unchanged(Box::new(raced)));
                 }
@@ -82,7 +79,7 @@ impl Cancellation {
             active.inputs.close();
         }
         // The task changed under every long-poll waiting on it.
-        handler.changes.notify(&req.id);
+        handler.tasks.changes.notify(&req.id);
 
         let cancel_inputs = ClientInputs::closed();
         let exec_ctx = crate::ExecutorContext {
@@ -108,13 +105,13 @@ impl Cancellation {
             Some(active) => active.clone(),
             None => {
                 let (active, _inputs, _state) =
-                    ActiveExecution::with_events(handler.execution_manager.events_for(&req.id));
+                    ActiveExecution::with_events(handler.tasks.registry.events_for(&req.id));
                 active.set_snapshot(task.clone()).await;
                 active
             }
         };
         handler
-            .execution_manager
+            .tasks
             .pushes
             .attach(handler, &req.id, &control.events);
         *slot = Some(Self::new(
@@ -182,24 +179,21 @@ impl Cancellation {
                 *status = update.status.clone();
             }
             update.generation = amended.generation;
-            let saved = save_task(handler.task_store.as_ref(), amended).await?;
+            let saved = handler.tasks.save(amended, false).await?;
             self.active
                 .publish_marked(Ok(&event), Some(saved), false)
                 .await;
             self.entry.announced = true;
             true
         } else {
-            let published = apply_and_publish(
-                handler.task_store.as_ref(),
-                &self.active,
-                Some(base),
-                &mut event,
-            )
-            .await?;
+            let published = handler
+                .tasks
+                .apply_and_publish(&self.active, Some(base), &mut event)
+                .await?;
             self.entry.note_published(published, &event);
             published
         };
-        handler.changes.notify_event(&event);
+        handler.tasks.changes.notify_event(&event);
         Ok(published)
     }
 
@@ -248,21 +242,18 @@ impl Cancellation {
             update.generation = base.generation;
             self.active.publish(Ok(&event), None).await;
         } else {
-            apply_and_publish(
-                handler.task_store.as_ref(),
-                &self.active,
-                Some(base),
-                &mut event,
-            )
-            .await?;
+            handler
+                .tasks
+                .apply_and_publish(&self.active, Some(base), &mut event)
+                .await?;
         }
-        handler.changes.notify_event(&event);
+        handler.tasks.changes.notify_event(&event);
         Ok(())
     }
 }
 
 /// The cancellation worker owns the workflow; it never polls a hook inside
-/// a coordinator command, so input cleanup and other operations can progress.
+/// a task operation, so input cleanup and other operations can progress.
 pub(super) async fn cancel(
     handler: DefaultRequestHandler,
     params: ServiceParams,
@@ -270,8 +261,8 @@ pub(super) async fn cancel(
     user: Option<User>,
 ) -> Result<Task, A2AError> {
     let task_id = request.id.clone();
-    let coordinator = handler.execution_manager.coordinators.for_task(&task_id);
-    let plan = match coordinator
+    let plan = match handler
+        .tasks
         .begin_cancel(handler.clone(), params, request, user)
         .await?
     {
@@ -281,19 +272,19 @@ pub(super) async fn cancel(
     if let Some(active) = &plan.active {
         active.inputs_drained.cancelled().await;
     }
-    run(handler.clone(), plan.context, coordinator).await?;
-    handler.load_task(&task_id).await
+    run(handler.clone(), plan.context).await?;
+    handler.tasks.load(&task_id).await
 }
 
 pub(super) async fn run(
     handler: DefaultRequestHandler,
     context: crate::ExecutorContext,
-    coordinator: Arc<TaskCoordinator>,
 ) -> Result<(), A2AError> {
     use futures::FutureExt;
     let deadline = tokio::time::Instant::now() + handler.cancel_hook_timeout;
+    let task_id = context.task_id.clone();
     let hook = async {
-        let mut stream = handler.executor.cancel(context);
+        let mut stream = handler.tasks.executor.cancel(context);
         loop {
             let event = match tokio::time::timeout_at(deadline, stream.next()).await {
                 Ok(Some(event)) => event?,
@@ -301,7 +292,10 @@ pub(super) async fn run(
                 Err(_) => return Err(A2AError::internal("agent cancellation hook timed out")),
             };
             let terminal = is_terminal_event(&event);
-            coordinator.cancel_update(handler.clone(), event).await?;
+            handler
+                .tasks
+                .cancel_update(handler.clone(), &task_id, event)
+                .await?;
             if terminal {
                 return Ok(());
             }
@@ -312,7 +306,10 @@ pub(super) async fn run(
         Ok(result) => result.err(),
         Err(_) => Some(A2AError::internal("agent cancellation hook panicked")),
     };
-    coordinator.cancel_finished(handler, failure).await
+    handler
+        .tasks
+        .cancel_finished(handler.clone(), &task_id, failure)
+        .await
 }
 
 #[cfg(test)]
@@ -353,7 +350,7 @@ mod tests {
             .unwrap();
         assert!(matches!(response, SendMessageResponse::Task(_)));
         timeout(Duration::from_secs(2), async {
-            while handler.execution_manager.get("task").await.is_some() {
+            while handler.tasks.registry.get("task").await.is_some() {
                 tokio::task::yield_now().await;
             }
         })
@@ -376,12 +373,12 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, error_code::INTERNAL_ERROR);
         assert_eq!(error.message, "agent cancellation hook panicked");
-        let task = handler.task_store.get("task").await.unwrap().unwrap();
+        let task = handler.tasks.store().get("task").await.unwrap().unwrap();
         assert_eq!(task.status.state, TaskState::Canceled);
         assert!(task.timeline.unwrap().iter().any(|entry| matches!(
             &entry.content, TimelineContent::Status(status) if status.state == TaskState::Canceled
         )));
-        assert!(handler.execution_manager.get("task").await.is_none());
+        assert!(handler.tasks.registry.get("task").await.is_none());
     }
 
     struct GatedHook {
@@ -436,7 +433,7 @@ mod tests {
             .unwrap();
         assert!(matches!(response, SendMessageResponse::Task(_)));
         timeout(Duration::from_secs(2), async {
-            while handler.execution_manager.get("task").await.is_some() {
+            while handler.tasks.registry.get("task").await.is_some() {
                 tokio::task::yield_now().await;
             }
         })

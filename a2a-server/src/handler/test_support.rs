@@ -455,7 +455,8 @@ impl crate::PushConfigStore for PagingPushConfigStore {
 /// §3.4.2 forbids client-provided taskIds for *creating* tasks.
 pub(super) async fn seed_task(handler: &DefaultRequestHandler, task_id: &str, context_id: &str) {
     handler
-        .task_store
+        .tasks
+        .store()
         .create(Task {
             generation: 0,
             timeline: None,

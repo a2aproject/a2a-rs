@@ -7,9 +7,7 @@ use super::DefaultRequestHandler;
 use super::delivery::{
     AuthorizedMessage, Delivery, is_artifact_only, record_client_input, validate_existing_task,
 };
-use super::events::{ActiveExecution, InvocationState};
-use super::protocol::Rejection;
-use super::updates::save_task;
+use super::{events::ActiveExecution, execution::InvocationState, protocol::Rejection};
 use crate::ClientInput;
 use a2a::*;
 use std::sync::Arc;
@@ -23,33 +21,6 @@ pub(super) struct PreparedInput {
     pub(super) events: Vec<StreamResponse>,
 }
 
-impl PreparedInput {
-    pub(super) async fn commit(
-        &self,
-        handler: &DefaultRequestHandler,
-        params: &crate::middleware::ServiceParams,
-        request: &SendMessageRequest,
-        lazy: bool,
-        invocation: &mut InvocationState,
-    ) -> Result<(), A2AError> {
-        if lazy && !self.existed {
-            invocation.pending_push =
-                handler.request_push_config(params, &self.task.id, request)?;
-        } else {
-            handler
-                .save_request_push_config(params, &self.task.id, request)
-                .await?;
-        }
-        // Configuration must be accepted before input becomes committed.
-        if self.existed {
-            handler.task_store.update(self.task.clone()).await?;
-        } else if !lazy {
-            handler.task_store.create(self.task.clone()).await?;
-        }
-        Ok(())
-    }
-}
-
 pub(super) async fn prepare(
     handler: &DefaultRequestHandler,
     req: &SendMessageRequest,
@@ -59,7 +30,7 @@ pub(super) async fn prepare(
     // A2A §3.4.2: a client-provided taskId MUST reference an existing task,
     // and client-provided ids for *creating* tasks are not supported. Only
     // an absent taskId may mint a new one.
-    let stored = handler.task_store.get(task_id).await?;
+    let stored = handler.tasks.get(task_id).await?;
     if stored.is_none() && (req.message.task_id.is_some() || artifact_only) {
         return Err(A2AError::task_not_found(task_id));
     }
@@ -107,7 +78,7 @@ pub(super) async fn prepare(
     })
 }
 
-pub(super) async fn inject(
+pub(super) async fn inject_input(
     handler: &DefaultRequestHandler,
     message: &AuthorizedMessage,
     task_id: &str,
@@ -137,7 +108,7 @@ pub(super) async fn inject(
                     mpsc::error::TrySendError::Full(_) => {
                         Rejection::Declined("the agent is busy with earlier input".to_string())
                     }
-                    // Closing and unregistering are one coordinator transition.
+                    // Closing and unregistering are one task operation.
                     mpsc::error::TrySendError::Closed(_) => Rejection::Failed(A2AError::internal(
                         "the input queue of a registered execution is closed",
                     )),
@@ -153,7 +124,7 @@ pub(super) async fn inject(
     handler
         .save_request_push_config(params, task_id, request)
         .await?;
-    let task = save_task(handler.task_store.as_ref(), task).await?;
+    let task = handler.tasks.save(task, false).await?;
 
     let sequence_before = active.sequence().await;
     let receiver = active.subscribe().await;
@@ -178,7 +149,7 @@ pub(super) async fn inject(
         );
         permit.send(invocation.track_input(input));
     }
-    handler.changes.notify(task_id);
+    handler.tasks.changes.notify(task_id);
 
     Ok(Delivery::Injected {
         task,
@@ -192,14 +163,17 @@ pub(super) async fn inject(
 mod tests {
     use super::*;
     use crate::handler::test_support::*;
+    use crate::handler::{
+        delivery::AuthorizedMessage, events::ActiveExecution, protocol::Rejection,
+    };
 
     #[tokio::test]
     async fn a_missing_snapshot_or_closed_inbox_rejects_input_before_persistence() {
         let handler = make_handler();
         seed_task(&handler, "task", "context").await;
-        let before = handler.load_task("task").await.unwrap();
+        let before = handler.tasks.load("task").await.unwrap();
         let (active, inputs, mut invocation) =
-            ActiveExecution::with_events(handler.execution_manager.events_for("task"));
+            ActiveExecution::with_events(handler.tasks.registry.events_for("task"));
         let mut inputs = Some(inputs);
         let mut request = send_request();
         request.message.task_id = Some("task".into());
@@ -215,7 +189,7 @@ mod tests {
                 assert!(inputs.as_mut().unwrap().close_and_drain().is_empty());
                 drop(inputs.take());
             }
-            let result = inject(&handler, &message, "task", &active, &mut invocation).await;
+            let result = inject_input(&handler, &message, "task", &active, &mut invocation).await;
             let Err(Rejection::Failed(error)) = result else {
                 panic!("an unavailable inbox must reject the input");
             };
@@ -225,7 +199,7 @@ mod tests {
             } else {
                 "is closed"
             }));
-            assert_eq!(handler.load_task("task").await.unwrap(), before);
+            assert_eq!(handler.tasks.load("task").await.unwrap(), before);
         }
     }
 }
