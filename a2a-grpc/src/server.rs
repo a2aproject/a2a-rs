@@ -283,6 +283,19 @@ mod tests {
         );
     }
 
+    /// A client that sends one entry per value, as the Go client does.
+    #[test]
+    fn test_extract_service_params_repeated_entries() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.append("a2a-extensions", "urn:a".parse().unwrap());
+        metadata.append("a2a-extensions", "urn:b".parse().unwrap());
+        let params = extract_service_params(&metadata);
+        assert_eq!(
+            params.get("a2a-extensions").unwrap(),
+            &vec!["urn:a".to_string(), "urn:b".to_string()]
+        );
+    }
+
     #[test]
     fn test_grpc_handler_new() {
         use a2a::*;

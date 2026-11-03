@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 use a2a::A2AError;
 use async_trait::async_trait;
-use axum::http::HeaderMap;
+use axum::extract::Query;
+use axum::http::{HeaderMap, Uri};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -56,6 +57,25 @@ pub(crate) fn extract_service_params(headers: &HeaderMap) -> ServiceParams {
         }
     }
     params
+}
+
+/// §3.6.1 lets a client send `A2A-Version` as a query parameter instead of a
+/// header, so the query form fills in when the header is absent. Every HTTP
+/// binding calls this before [`check_a2a_version`].
+pub(crate) fn add_query_version(params: &mut ServiceParams, uri: &Uri) {
+    if params.contains_key("a2a-version") {
+        return;
+    }
+    let from_query = Query::<HashMap<String, String>>::try_from_uri(uri)
+        .ok()
+        .and_then(|Query(query)| {
+            query
+                .into_iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(a2a::SVC_PARAM_VERSION))
+        });
+    if let Some((_, version)) = from_query {
+        params.insert("a2a-version".to_owned(), vec![version]);
+    }
 }
 
 /// Authenticated user information.
