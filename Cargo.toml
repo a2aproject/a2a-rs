@@ -86,6 +86,7 @@ slim_datapath = { package = "agntcy-slim-datapath", version = "0.19.14" }
 slim_auth = { package = "agntcy-slim-auth", version = "0.17.9" }
 
 # Utilities
+parking_lot = "0.12"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.23"

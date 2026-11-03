@@ -193,7 +193,7 @@ impl Uplink {
 /// the session whose downlink is already open.
 #[derive(Default)]
 pub(super) struct LiveSessions {
-    pub(super) open: std::sync::Mutex<HashMap<TaskId, Vec<LiveSession>>>,
+    pub(super) open: parking_lot::RwLock<HashMap<TaskId, Vec<LiveSession>>>,
 }
 
 pub(super) struct LiveSession {
@@ -228,7 +228,7 @@ pub(super) fn exchange_id(params: &ServiceParams) -> Result<Option<String>, A2AE
 impl LiveSessions {
     /// Recover the bound task before authorizing an HTTP uplink that omits it.
     pub(super) fn task_for_exchange(&self, id: &str) -> Result<Option<TaskId>, A2AError> {
-        let open = self.lock();
+        let open = self.open.read();
         let mut tasks = open.iter().filter_map(|(task, sessions)| {
             sessions
                 .iter()
@@ -245,12 +245,6 @@ impl LiveSessions {
         }
         Ok(task)
     }
-    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<TaskId, Vec<LiveSession>>> {
-        self.open
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     pub(super) fn register(
         &self,
         task_id: &str,
@@ -258,7 +252,8 @@ impl LiveSessions {
         exchange_id: Option<String>,
         user: Option<User>,
     ) {
-        self.lock()
+        self.open
+            .write()
             .entry(task_id.to_string())
             .or_default()
             .push(LiveSession {
@@ -276,7 +271,7 @@ impl LiveSessions {
         exchange_id: Option<&str>,
         user: &Option<User>,
     ) -> Result<Option<(TaskId, mpsc::Sender<Incoming>)>, A2AError> {
-        let open = self.lock();
+        let open = self.open.read();
         let mut candidates = open.iter().flat_map(|(task, sessions)| {
             sessions
                 .iter()
@@ -310,7 +305,7 @@ impl LiveSessions {
     }
 
     pub(super) fn unregister(&self, task_id: &str, sender: &mpsc::Sender<Incoming>) {
-        let mut open = self.lock();
+        let mut open = self.open.write();
         if let Some(senders) = open.get_mut(task_id) {
             senders.retain(|current| {
                 !current.sender.same_channel(sender) && !current.sender.is_closed()

@@ -25,8 +25,8 @@ context and is not added to protocol task objects or events.
 `BoxStream<'static, Result<StreamResponse, A2AError>>` for both `execute` and
 `cancel`. `ctx.inputs` is an owned receiver and may move into a Tokio worker.
 The server tracks receipt of queued messages using atomic delivery receipts;
-it reuses the existing execution-state lock for bookkeeping and adds neither
-a receiver mutex nor an input worker task. At invocation end the old inbox is
+the Task coordinator owns the bookkeeping without a receiver mutex or an
+input worker task. At invocation end the old inbox is
 revoked: workers wake with `None`, and unread input is handed to the next
 invocation or rejected if the task ended. Application workers remain responsible
 for finishing work on messages they already received.
@@ -58,11 +58,21 @@ ID, user role and at least one part. Artifact-only input uses an empty
 `Role::Unspecified` message so it is omitted on the wire; its updates name the
 existing task.
 
-Message preparation runs in an owned Tokio task. A caller disconnecting while
-storage is committing input cannot interrupt preparation before executor delivery.
+Message preparation is owned by its Task coordinator after enqueueing. A caller
+disconnecting while storage commits input cannot interrupt executor delivery.
 Inline push configuration is validated and admitted before input is persisted.
 This does not provide a durable outbox across process crashes or transactions
 across independent task and configuration stores.
+
+Task broadcast subscribers enqueue webhook deliveries into one handler-wide
+dispatcher. One Tokio task polls up to 16 concurrent HTTP request futures and
+preserves order per Task/URL. Its ingress queue and pending queue each hold at
+most 1024 deliveries; overflow drops the new delivery and follows `fail_on_error`.
+There are no per-endpoint worker tasks, and accepted deliveries keep their Task
+event source alive until they drain. All webhook redirects must keep the original
+scheme, host, and effective port, including when `validate_urls` is disabled for
+local testing. Configure the final HTTPS URL directly when an endpoint upgrades
+HTTP to HTTPS.
 
 Executor events must match their execution's task and context before persistence
 or publication. Snapshot rebasing preserves recorded message history and the
