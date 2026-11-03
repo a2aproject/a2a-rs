@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Task-scoped publication shared by executor invocations and subscribers.
 
+use super::events::FailureSignal;
 use super::events::{EventKind, ExecutionEvent};
-use super::output::FailureSignal;
 use a2a::*;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
@@ -78,7 +78,7 @@ impl TaskEvents {
         Ok((receiver, state.snapshot.clone(), state.sequence))
     }
 
-    /// The Task coordinator orders this publication after persistence. Every
+    /// The task runtime orders this publication after persistence. Every
     /// consumer sees the same publication order, regardless of execution turn.
     pub(super) async fn publish(
         self: &Arc<Self>,
@@ -123,12 +123,12 @@ impl TaskEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::registry::ExecutionManager;
+    use crate::handler::registry::ExecutionRegistry;
     use crate::handler::test_support::task_with_history;
 
     #[tokio::test]
     async fn task_subscription_and_sequence_survive_executor_handoff() {
-        let manager = ExecutionManager::default();
+        let manager = ExecutionRegistry::default();
         let (first, _inputs, _invocation) = manager.reserve("task").await.unwrap();
         let source = first.events.clone();
         let mut subscriber = source.sender.subscribe();
@@ -154,7 +154,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_does_not_retain_unused_task_sources() {
-        let manager = ExecutionManager::default();
+        let manager = ExecutionRegistry::default();
         let source = manager.events_for("unused");
         let weak = Arc::downgrade(&source);
         drop(source);

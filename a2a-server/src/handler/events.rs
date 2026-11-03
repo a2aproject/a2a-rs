@@ -6,19 +6,22 @@
 #[cfg(test)]
 use super::EXECUTION_BUFFER_CAPACITY;
 use super::TASK_INPUT_CAPACITY;
+use super::execution::InvocationState;
 use super::protocol::{is_terminal_event, task_id_for_event};
-use crate::executor::{ClientInput, ClientInputSender, ClientInputs, QueuedInput, ReturnedInputs};
+use crate::executor::{ClientInputSender, ClientInputs};
 use a2a::*;
 use futures::stream::BoxStream;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
+
+pub(super) type FailureSignal = watch::Sender<Option<A2AError>>;
 
 #[derive(Clone)]
 pub(super) struct ExecutionEvent {
     pub(super) sequence: u64,
     pub(super) result: Result<StreamResponse, A2AError>,
     pub(super) kind: EventKind,
-    pub(super) failure: Option<super::output::FailureSignal>,
+    pub(super) failure: Option<FailureSignal>,
 }
 
 /// How an event is meant to be delivered.
@@ -96,35 +99,8 @@ impl ExecutionReceiver {
     }
 }
 
-/// Mutable bookkeeping held in TaskRuntime, never behind a shared mutex.
-#[derive(Default)]
-pub(super) struct InvocationState {
-    pending_inputs: Vec<QueuedInput>,
-    returned_inputs: Option<ReturnedInputs>,
-    pub(super) pending_push: Option<TaskPushNotificationConfig>,
-}
-
-impl InvocationState {
-    pub(super) fn track_input(&mut self, input: ClientInput) -> QueuedInput {
-        let input = QueuedInput::new(input);
-        self.pending_inputs.retain(QueuedInput::pending);
-        self.pending_inputs.push(input.clone());
-        input
-    }
-
-    /// Revoke even a receiver moved into user work before reclaiming receipts.
-    pub(super) fn drain_inputs(&mut self, inputs: &ClientInputSender) -> Vec<ClientInput> {
-        inputs.revoke();
-        self.returned_inputs.take();
-        self.pending_inputs
-            .drain(..)
-            .filter_map(QueuedInput::reclaim)
-            .collect()
-    }
-}
-
 /// Shareable invocation controls and published-state projection. Mutable input
-/// bookkeeping is exclusively owned by the Task coordinator.
+/// bookkeeping is exclusively owned by the task runtime.
 pub(super) struct ActiveExecution {
     pub(super) execution_id: String,
     pub(super) events: Arc<super::task_events::TaskEvents>,
@@ -135,7 +111,7 @@ pub(super) struct ActiveExecution {
     pub(super) inputs: ClientInputSender,
     /// Completed after the runner has revoked the inbox and rejected unread input.
     pub(super) inputs_drained: tokio_util::sync::CancellationToken,
-    pub(super) push_failure: super::output::FailureSignal,
+    pub(super) push_failure: FailureSignal,
     /// Set while the task this execution is for has not been created: a new
     /// task is created by the executor's first event, and does not exist if
     /// the executor answers with a message alone.
@@ -170,10 +146,7 @@ impl ActiveExecution {
                 uncreated: std::sync::atomic::AtomicBool::new(false),
             }),
             receiver,
-            InvocationState {
-                returned_inputs: Some(returned_inputs),
-                ..Default::default()
-            },
+            InvocationState::new(returned_inputs),
         )
     }
 
@@ -748,9 +721,9 @@ mod tests {
     }
     #[tokio::test]
     async fn lagged_subscribers_recover_errors_across_executor_handoffs() {
-        use crate::handler::registry::ExecutionManager;
+        use crate::handler::registry::ExecutionRegistry;
         use futures::StreamExt;
-        let manager = ExecutionManager::default();
+        let manager = ExecutionRegistry::default();
         let mut task = task_with_history("handoff-error", "context", 0);
         task.status.state = TaskState::Working;
         let (first, _inputs, _invocation) = manager.reserve(&task.id).await.unwrap();

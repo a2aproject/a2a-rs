@@ -4,23 +4,18 @@
 //! Route active execution handles and task event sources; transitions use mailboxes.
 
 use super::events::{ActiveExecution, ExecutionReceiver};
-use super::push_delivery::PushSubscriptions;
 use super::task_events::TaskEvents;
 use a2a::*;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 #[derive(Default)]
-pub(super) struct ExecutionManager {
-    pub(super) coordinators: super::coordinator::TaskCoordinators,
+pub(super) struct ExecutionRegistry {
     executions: RwLock<HashMap<TaskId, std::sync::Weak<ActiveExecution>>>,
     sources: std::sync::Mutex<HashMap<TaskId, std::sync::Weak<TaskEvents>>>,
-    /// The webhook deliveries of each task, in the order its events were
-    /// published.
-    pub(super) pushes: PushSubscriptions,
 }
 
-impl ExecutionManager {
+impl ExecutionRegistry {
     /// Sources survive turns while any response or webhook subscriber owns them.
     pub(super) fn events_for(&self, task_id: &str) -> Arc<TaskEvents> {
         let mut sources = self
@@ -57,7 +52,7 @@ impl ExecutionManager {
         Ok(())
     }
 
-    /// Build a routing fixture without starting an executor or coordinator.
+    /// Build a routing fixture without starting an executor or task runtime.
     #[cfg(test)]
     pub(super) async fn reserve(
         &self,
@@ -66,7 +61,7 @@ impl ExecutionManager {
         (
             Arc<ActiveExecution>,
             crate::ClientInputs,
-            super::events::InvocationState,
+            super::execution::InvocationState,
         ),
         A2AError,
     > {
@@ -111,7 +106,7 @@ mod tests {
     /// execution.
     #[tokio::test]
     async fn test_reserve_replaces_a_dropped_requests_leftover() {
-        let manager = ExecutionManager::default();
+        let manager = ExecutionRegistry::default();
         let (stale, _inputs, _invocation) = manager.reserve("t-stale").await.unwrap();
 
         let (fresh, _inputs, _invocation) = manager
@@ -191,7 +186,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_prepared_execution_cannot_be_reserved_twice() {
-        let manager = ExecutionManager::default();
+        let manager = ExecutionRegistry::default();
         let (active, _inputs, _invocation) = manager.reserve("task").await.unwrap();
         let task = task_with_history("task", "context", 0);
         active.set_snapshot(task).await;
@@ -201,7 +196,7 @@ mod tests {
 
     #[test]
     fn event_source_registry_recovers_from_poison_and_prunes_unused_sources() {
-        let manager = ExecutionManager::default();
+        let manager = ExecutionRegistry::default();
         let held = manager.events_for("held");
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -224,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_owner_expires_the_route_even_while_the_registry_is_locked() {
-        let manager = ExecutionManager::default();
+        let manager = ExecutionRegistry::default();
         let (active, _inputs, _invocation) = manager.reserve("dropped-owner").await.unwrap();
         let registry = manager.executions.write().await;
         drop(active);

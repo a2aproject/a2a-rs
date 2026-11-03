@@ -57,7 +57,6 @@ impl IncomingRequest {
             _ => None,
         }
     }
-    #[cfg(test)]
     pub(super) fn message(request: SendMessageRequest) -> Self {
         Self::Raw(StreamRequest {
             tenant: request.tenant.clone(),
@@ -134,23 +133,6 @@ impl Drop for Receipt {
     }
 }
 
-/// Transport input to the common send entry point. Routing never infers the
-/// transport from the response completion mode.
-pub(super) enum ResponseInput {
-    /// One unary or server-streaming send request.
-    Single(Box<SendMessageRequest>),
-    /// Native duplex input, including its opening request.
-    Duplex(BoxStream<'static, StreamRequest>),
-    /// An HTTP live opening or followup call, resolved by exchange routing.
-    HttpLive(Box<StreamRequest>),
-}
-
-impl ResponseInput {
-    pub(super) fn message(request: SendMessageRequest) -> Self {
-        Self::Single(Box::new(request))
-    }
-}
-
 /// The client's side of an exchange as the session reads it.
 pub(super) enum Uplink {
     /// Calls arriving one at a time over HTTP, through a channel the session
@@ -161,6 +143,17 @@ pub(super) enum Uplink {
 }
 
 impl Uplink {
+    pub(super) fn duplex(requests: BoxStream<'static, StreamRequest>) -> Self {
+        Self::Stream(
+            requests
+                .map(|request| Incoming {
+                    request: IncomingRequest::Raw(request),
+                    receipt: None,
+                })
+                .boxed(),
+        )
+    }
+
     pub(super) async fn next(&mut self) -> Option<Incoming> {
         match self {
             Uplink::Http(receiver) => receiver.recv().await,

@@ -4,13 +4,12 @@
 //! Follow task output with a shared runner and an explicit completion policy.
 
 use super::delivery::StartMode;
-use super::exchange::Exchange;
-use super::output::{DeliveryEvent, DeliverySink, EventSource};
+use super::http_exchange::RegistrationLease;
 use super::protocol::{
-    Rejection, apply_lengths, generation_of, is_terminal_event, should_interrupt_non_streaming,
+    Rejection, generation_of, is_terminal_event, should_interrupt_non_streaming,
 };
-use super::subscription::{DeliveryAttachment, SubscriptionPolicy};
-use super::uplink::{Incoming, IncomingRequest, Receipt};
+use super::response_preparation::{DeliveryAttachment, SubscriptionPolicy};
+use super::uplink::{Incoming, IncomingRequest, Receipt, Uplink};
 use super::{DefaultRequestHandler, RESPONSE_BUFFER_CAPACITY};
 use crate::middleware::ServiceParams;
 use a2a::*;
@@ -28,6 +27,10 @@ enum Reattach {
 
 /// Follows task events and optionally accepts requests through an uplink.
 pub(super) struct Run {
+    // Rust drops fields in declaration order. Unregister before dropping the
+    // receiver, including when this run unwinds after a panic.
+    registration: Option<RegistrationLease>,
+    uplink: Option<Uplink>,
     pub(super) handler: DefaultRequestHandler,
     /// The caller's credentials and version. Uplink requests may carry their
     /// own parameters when another caller sends them.
@@ -49,6 +52,7 @@ pub(super) enum RunCompletion {
 }
 
 pub(super) type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
+type ResponseSender = mpsc::Sender<Result<StreamResponse, A2AError>>;
 
 impl Run {
     pub(super) fn new(
@@ -59,12 +63,27 @@ impl Run {
         policy: SubscriptionPolicy,
     ) -> Self {
         Self {
+            registration: None,
+            uplink: None,
             handler,
             params,
             task_id,
             completion,
             policy,
         }
+    }
+
+    pub(super) fn with_uplink(
+        mut self,
+        uplink: Option<Uplink>,
+        mut registration: Option<RegistrationLease>,
+    ) -> Self {
+        if let Some(registration) = &mut registration {
+            registration.bind(&self.task_id);
+        }
+        self.registration = registration;
+        self.uplink = uplink;
+        self
     }
 
     /// Owns response delivery independently of the executor task. Dropping the
@@ -74,17 +93,10 @@ impl Run {
         opening: Option<Task>,
         inner: Option<Events>,
         seen_generation: i64,
-        uplink: Option<Exchange>,
     ) -> Events {
         let (out, downlink) = mpsc::channel(RESPONSE_BUFFER_CAPACITY);
-        let source = self.handler.execution_manager.events_for(&self.task_id);
-        self.spawn(
-            opening,
-            inner.map(EventSource::Subscription),
-            seen_generation,
-            uplink,
-            DeliverySink::Stream(out),
-        );
+        let source = self.handler.tasks.registry.events_for(&self.task_id);
+        self.spawn(opening, inner, seen_generation, out);
         // Keep the authoritative snapshot until the response is consumed,
         // including when retention purges the task before unary delivery.
         futures::stream::unfold((downlink, source), |(mut downlink, source)| async move {
@@ -97,54 +109,22 @@ impl Run {
     fn spawn(
         self,
         opening: Option<Task>,
-        inner: Option<EventSource>,
+        inner: Option<Events>,
         seen_generation: i64,
-        uplink: Option<Exchange>,
-        out: DeliverySink,
+        out: ResponseSender,
     ) {
         let failure_sink = out.clone();
         tokio::spawn(async move {
-            let outcome = std::panic::AssertUnwindSafe(self.run(
-                opening,
-                inner,
-                seen_generation,
-                uplink,
-                out,
-            ))
-            .catch_unwind()
-            .await;
+            let outcome =
+                std::panic::AssertUnwindSafe(self.run(opening, inner, seen_generation, out))
+                    .catch_unwind()
+                    .await;
             if outcome.is_err() {
-                failure_sink.report_panic().await;
+                let _ = failure_sink
+                    .send(Err(A2AError::internal("the response runner failed")))
+                    .await;
             }
         });
-    }
-
-    /// Converts the shared runner's output into the single unary response.
-    pub(super) async fn unary_response(
-        handler: DefaultRequestHandler,
-        task_id: TaskId,
-        mut events: Events,
-        history_length: Option<i32>,
-        timeline_length: Option<i32>,
-    ) -> Result<SendMessageResponse, A2AError> {
-        let source = handler.execution_manager.events_for(&task_id);
-        while let Some(item) = events.next().await {
-            if let StreamResponse::Message(message) = item? {
-                return Ok(SendMessageResponse::Message(message));
-            }
-        }
-        let mut task = match handler.load_task(&task_id).await {
-            Ok(task) => task,
-            Err(error) if error.code == error_code::TASK_NOT_FOUND => {
-                match source.snapshot().await {
-                    Some(task) if task.status.state.is_terminal() => task,
-                    _ => return Err(error),
-                }
-            }
-            Err(error) => return Err(error),
-        };
-        apply_lengths(&mut task, history_length, timeline_length);
-        Ok(SendMessageResponse::Task(task))
     }
 
     fn completes(&self, event: &StreamResponse) -> bool {
@@ -162,49 +142,41 @@ impl Run {
     /// identical whether it arrives normally or while flushing queued output.
     /// Returns false after completion or when the downlink is closed.
     async fn forward(
-        &self,
-        item: DeliveryEvent,
+        &mut self,
+        item: Result<StreamResponse, A2AError>,
         last_generation: &mut i64,
-        out: &DeliverySink,
+        out: &ResponseSender,
     ) -> bool {
-        let ends = item
-            .result
-            .as_ref()
-            .map_or(true, |event| self.completes(event));
-        if let Some(generation) = item.result.as_ref().ok().and_then(generation_of) {
+        let ends = item.as_ref().map_or(true, |event| self.completes(event));
+        if let Some(generation) = item.as_ref().ok().and_then(generation_of) {
             *last_generation = (*last_generation).max(generation);
         }
-        out.send(item).await && !ends
+        out.send(item).await.is_ok() && !ends
     }
 
     fn run(
-        self,
+        mut self,
         opening: Option<Task>,
-        mut inner: Option<EventSource>,
+        mut inner: Option<Events>,
         seen_generation: i64,
-        mut uplink: Option<Exchange>,
-        out: DeliverySink,
+        out: ResponseSender,
     ) -> futures::future::BoxFuture<'static, ()> {
         Box::pin(async move {
             // Watched from here, so a change from now on is seen however it is
             // timed against the looks below.
-            let mut watch = self.handler.changes.watch(&self.task_id);
+            let mut watch = self.handler.tasks.changes.watch(&self.task_id);
             // The generation the client has been told of, so a change it was not
             // there for (an idle task, then another client's turn) is noticed.
             let mut last_generation = seen_generation;
             if let Some(task) = opening {
                 if !self
-                    .forward(
-                        Ok(StreamResponse::Task(task)).into(),
-                        &mut last_generation,
-                        &out,
-                    )
+                    .forward(Ok(StreamResponse::Task(task)), &mut last_generation, &out)
                     .await
                 {
-                    return self.finish(uplink).await;
+                    return self.finish().await;
                 }
             }
-            let mut uplink_open = uplink.is_some();
+            let mut uplink_open = self.uplink.is_some();
             // What happened between the opening and the watch is looked at once.
             if inner.is_none()
                 && matches!(
@@ -212,7 +184,7 @@ impl Run {
                     Reattach::End
                 )
             {
-                return self.finish(uplink).await;
+                return self.finish().await;
             }
             loop {
                 tokio::select! {
@@ -249,7 +221,7 @@ impl Run {
                     () = watch.changed(), if inner.is_none() ||
                         (matches!(self.completion, RunCompletion::Exchange) && !uplink_open) => {
                         if inner.is_some() && !uplink_open
-                            && self.handler.execution_manager.get(&self.task_id).await.is_none()
+                            && self.handler.tasks.registry.get(&self.task_id).await.is_none()
                         {
                             // The input half is closed and the invocation ended.
                             // Preserve all buffered Task events before closing.
@@ -264,7 +236,7 @@ impl Run {
                         }
                     },
                     item = async {
-                        match uplink.as_mut() {
+                        match self.uplink.as_mut() {
                             Some(uplink) => uplink.next().await,
                             None => std::future::pending().await,
                         }
@@ -279,7 +251,7 @@ impl Run {
                             if inner.is_none() {
                                 break;
                             }
-                            if self.handler.execution_manager.get(&self.task_id).await.is_none() {
+                            if self.handler.tasks.registry.get(&self.task_id).await.is_none() {
                                 self.flush(&mut inner, &mut last_generation, &out).await;
                                 break;
                             }
@@ -287,15 +259,16 @@ impl Run {
                     },
                 }
             }
-            self.finish(uplink).await;
+            self.finish().await;
         })
     }
     /// Ends the exchange: no more calls are routed to it, and a call that was
     /// queued but never reached is told so (it is delivered nowhere, so the
     /// caller may open a new exchange with it).
-    async fn finish(&self, uplink: Option<Exchange>) {
-        if let Some(exchange) = uplink {
-            exchange.close().await;
+    async fn finish(mut self) {
+        drop(self.registration.take());
+        if let Some(mut uplink) = self.uplink.take() {
+            uplink.close().await;
         }
     }
 
@@ -303,29 +276,26 @@ impl Run {
     /// one if it has started, tells the client of changes it was not there for
     /// (and that the task has ended). `false` when the exchange is over.
     async fn reattach(
-        &self,
-        inner: &mut Option<EventSource>,
+        &mut self,
+        inner: &mut Option<Events>,
         last_generation: &mut i64,
-        out: &DeliverySink,
+        out: &ResponseSender,
     ) -> Reattach {
-        if let Some((receiver, Some(snapshot), sequence)) = self
-            .handler
-            .execution_manager
-            .resubscribe(&self.task_id)
-            .await
+        if let Some((receiver, Some(snapshot), sequence)) =
+            self.handler.tasks.registry.resubscribe(&self.task_id).await
         {
             let event = StreamResponse::Task(snapshot.clone());
             let ends = self.completes(&event);
             let opening =
                 (snapshot.generation > *last_generation || ends).then_some(snapshot.clone());
             *last_generation = (*last_generation).max(snapshot.generation);
-            *inner = Some(self.policy.stream(receiver, opening, sequence).into());
+            *inner = Some(self.policy.stream(receiver, opening, sequence));
             return Reattach::Changed;
         }
-        let task = match self.handler.load_task(&self.task_id).await {
+        let task = match self.handler.tasks.load(&self.task_id).await {
             Ok(task) => task,
             Err(error) => {
-                self.forward(Err(error).into(), last_generation, out).await;
+                self.forward(Err(error), last_generation, out).await;
                 return Reattach::End;
             }
         };
@@ -333,7 +303,7 @@ impl Run {
         let changed = task.generation > *last_generation;
         if (ended || changed)
             && !self
-                .forward(Ok(StreamResponse::Task(task)).into(), last_generation, out)
+                .forward(Ok(StreamResponse::Task(task)), last_generation, out)
                 .await
         {
             return Reattach::End;
@@ -350,20 +320,18 @@ impl Run {
     /// Carries out one request that arrived after the exchange opened. Returns
     /// `false` when the downlink is gone.
     async fn handle(
-        &self,
+        &mut self,
         item: Incoming,
-        inner: &mut Option<EventSource>,
+        inner: &mut Option<Events>,
         last_generation: &mut i64,
-        out: &DeliverySink,
+        out: &ResponseSender,
     ) -> bool {
         let Incoming { request, receipt } = item;
         // Mark processing before delivery: a lost task now leaves an unknown
         // outcome instead of a receipt saying that nothing was handled.
         let receipt = receipt.map(Receipt::begin);
         let reference_id = request.reference_id();
-        let result = self
-            .deliver(&self.params, request, inner, last_generation, out)
-            .await;
+        let result = self.deliver(request, inner, last_generation, out).await;
         let interrupted = matches!(&result, Err(Rejection::Interrupted(_)));
         let mut downlink_open = *result.as_ref().unwrap_or(&true);
         if let Err(rejection) = result {
@@ -372,11 +340,11 @@ impl Run {
             downlink_open = self.flush(inner, last_generation, out).await;
             if downlink_open {
                 let event = rejection.into_stream_error(&self.task_id, reference_id);
-                downlink_open = self.forward(Ok(event).into(), last_generation, out).await;
+                downlink_open = self.forward(Ok(event), last_generation, out).await;
             }
         }
         if let Some(receipt) = receipt.filter(|_| !interrupted) {
-            receipt.complete(self.handler.load_task(&self.task_id).await);
+            receipt.complete(self.handler.tasks.load(&self.task_id).await);
         }
         // Dropping a begun, interrupted receipt makes the HTTP adapter verify
         // persistence. A readable Task alone does not prove this input committed.
@@ -387,10 +355,10 @@ impl Run {
     /// without waiting for more. `false` when the downlink is gone or the
     /// exchange ended with a terminal event.
     async fn flush(
-        &self,
-        inner: &mut Option<EventSource>,
+        &mut self,
+        inner: &mut Option<Events>,
         last_generation: &mut i64,
-        out: &DeliverySink,
+        out: &ResponseSender,
     ) -> bool {
         while let Some(events) = inner.as_mut() {
             match events.next().now_or_never() {
@@ -407,17 +375,16 @@ impl Run {
     }
 
     async fn deliver(
-        &self,
-        params: &ServiceParams,
+        &mut self,
         request: IncomingRequest,
-        inner: &mut Option<EventSource>,
+        inner: &mut Option<Events>,
         last_generation: &mut i64,
-        out: &DeliverySink,
+        out: &ResponseSender,
     ) -> Result<bool, Rejection> {
         let delivery = self
             .handler
             .receive_message(
-                params,
+                &self.params,
                 request,
                 StartMode::Bidi,
                 Some(&self.task_id),
@@ -431,7 +398,7 @@ impl Run {
             return Ok(true);
         }
         let subscription = self.policy.delivery(delivery, DeliveryAttachment::FollowUp);
-        *inner = Some(EventSource::Subscription(subscription.events));
+        *inner = Some(subscription.events);
         // This response was detached when input was published. Announce the
         // recorded input once; the newly attached receiver starts after it.
         for event in subscription.recorded {
@@ -440,7 +407,7 @@ impl Run {
             {
                 continue;
             }
-            if !self.forward(Ok(event).into(), last_generation, out).await {
+            if !self.forward(Ok(event), last_generation, out).await {
                 return Ok(false);
             }
         }
@@ -451,15 +418,16 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::response_preparation::MessageResponse;
     use crate::handler::test_support::*;
 
     #[tokio::test]
     async fn blocking_response_waits_after_a_working_turn_ends() {
         let handler = make_handler();
         seed_task(&handler, "working", "context").await;
-        let mut task = handler.load_task("working").await.unwrap();
+        let mut task = handler.tasks.load("working").await.unwrap();
         task.status.state = TaskState::Working;
-        handler.task_store.update(task.clone()).await.unwrap();
+        handler.tasks.store().update(task.clone()).await.unwrap();
         let drained = Arc::new(Notify::new());
         let signal = drained.clone();
         let events = Box::pin(async_stream::stream! {
@@ -473,14 +441,16 @@ mod tests {
             RunCompletion::Unary(Box::new(send_req(Some("working"), None))),
             SubscriptionPolicy::new(StartMode::Blocking, false),
         );
-        let events = run.start(None, Some(events), 0, None);
-        let mut response = tokio::spawn(Run::unary_response(
-            handler.clone(),
-            "working".into(),
-            events,
-            None,
-            None,
-        ));
+        let events = run.start(None, Some(events), 0);
+        let tasks = handler.tasks.clone();
+        let mut response = tokio::spawn(async move {
+            let MessageResponse::Task(task) =
+                MessageResponse::receive(tasks, "working".into(), events).await?
+            else {
+                panic!("expected a task response");
+            };
+            task.wait().await
+        });
         drained.notified().await;
         assert!(
             tokio::time::timeout(Duration::from_millis(30), &mut response)
@@ -513,7 +483,7 @@ mod tests {
     async fn queued_and_normal_events_obey_the_same_completion_policy() {
         let handler = make_handler();
         seed_task(&handler, "task", "context").await;
-        let task = handler.load_task("task").await.unwrap();
+        let task = handler.tasks.load("task").await.unwrap();
         for mode in [StartMode::Blocking, StartMode::Streaming, StartMode::Bidi] {
             let completion = || match mode {
                 StartMode::Blocking => RunCompletion::Unary(Box::new(send_req(Some("task"), None))),
@@ -546,11 +516,11 @@ mod tests {
                 completion(),
                 SubscriptionPolicy::new(mode, false),
             )
-            .start(None, Some(events()), 0, None);
+            .start(None, Some(events()), 0);
             let normal = tokio::time::timeout(Duration::from_secs(2), normal.collect::<Vec<_>>())
                 .await
                 .unwrap();
-            let run = Run::new(
+            let mut run = Run::new(
                 handler.clone(),
                 ServiceParams::new(),
                 "task".into(),
@@ -558,16 +528,8 @@ mod tests {
                 SubscriptionPolicy::new(mode, false),
             );
             let (out, mut received) = mpsc::channel(8);
-            let out = DeliverySink::Stream(out);
             let mut generation = 0;
-            assert!(
-                !run.flush(
-                    &mut Some(EventSource::Subscription(events())),
-                    &mut generation,
-                    &out
-                )
-                .await
-            );
+            assert!(!run.flush(&mut Some(events()), &mut generation, &out).await);
             let mut queued = Vec::new();
             while let Ok(item) = received.try_recv() {
                 queued.push(item);
@@ -584,14 +546,14 @@ mod tests {
 
     #[tokio::test]
     async fn flushing_a_direct_reply_does_not_forward_later_events() {
-        let run = Run::new(
+        let mut run = Run::new(
             make_handler(),
             ServiceParams::new(),
             "task".into(),
             RunCompletion::Exchange,
             SubscriptionPolicy::new(StartMode::Bidi, false),
         );
-        let mut events = Some(EventSource::Subscription(
+        let mut events = Some(
             futures::stream::iter([
                 Ok(StreamResponse::Message(Message::new(
                     Role::Agent,
@@ -600,9 +562,8 @@ mod tests {
                 Err(A2AError::internal("after the reply")),
             ])
             .boxed(),
-        ));
+        );
         let (out, mut received) = mpsc::channel(4);
-        let out = DeliverySink::Stream(out);
         assert!(!run.flush(&mut events, &mut 0, &out).await);
         assert!(matches!(
             received.try_recv(),
@@ -617,7 +578,7 @@ mod tests {
             let handler = make_handler();
             if exists {
                 let task = task_with_history("task", "context", 0);
-                handler.task_store.create(task).await.unwrap();
+                handler.tasks.store().create(task).await.unwrap();
             }
             let mut events = Run::new(
                 handler,
@@ -626,7 +587,7 @@ mod tests {
                 RunCompletion::Task,
                 SubscriptionPolicy::new(StartMode::Streaming, false),
             )
-            .start(None, None, 0, None);
+            .start(None, None, 0);
             let event = timeout(Duration::from_secs(1), events.next())
                 .await
                 .unwrap()
@@ -650,14 +611,17 @@ mod tests {
             async move { Ok(StreamResponse::Message(message)) }
         })
         .boxed();
-        let response = Run::unary_response(make_handler(), "missing".into(), events, None, None)
-            .await
-            .unwrap();
-        assert!(matches!(response, SendMessageResponse::Message(reply) if reply == message));
+        let response =
+            MessageResponse::receive(make_handler().tasks.clone(), "missing".into(), events)
+                .await
+                .unwrap();
+        assert!(matches!(response, MessageResponse::Message(reply) if reply == message));
         let events = stream::once(async { Err(A2AError::internal("executor error")) }).boxed();
-        let error = Run::unary_response(make_handler(), "missing".into(), events, None, None)
-            .await
-            .unwrap_err();
+        let error =
+            MessageResponse::receive(make_handler().tasks.clone(), "missing".into(), events)
+                .await
+                .err()
+                .expect("executor error");
         assert_eq!(error.message, "executor error");
     }
 
@@ -667,7 +631,7 @@ mod tests {
         let mut task = task_with_history("working", "context", 0);
         task.status.state = TaskState::Working;
         task.generation = 3;
-        handler.task_store.create(task.clone()).await.unwrap();
+        handler.tasks.store().create(task.clone()).await.unwrap();
         let mut events = Run::new(
             handler,
             ServiceParams::new(),
@@ -675,7 +639,7 @@ mod tests {
             RunCompletion::Task,
             SubscriptionPolicy::new(StartMode::Streaming, false),
         )
-        .start(None, None, 0, None);
+        .start(None, None, 0);
         assert!(
             matches!(timeout(Duration::from_secs(1), events.next()).await.unwrap().unwrap().unwrap(), StreamResponse::Task(snapshot) if snapshot == task)
         );
@@ -701,7 +665,51 @@ mod tests {
             panic!("expected the completed task");
         };
         assert_eq!(task.status.state, TaskState::Completed);
-        assert!(handler.task_store.get(&task.id).await.unwrap().is_none());
+        assert!(handler.tasks.store().get(&task.id).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn runner_panic_is_reported_and_a_disconnected_consumer_stops_delivery() {
+        let run = || {
+            Run::new(
+                make_handler(),
+                ServiceParams::new(),
+                "task".into(),
+                RunCompletion::Task,
+                SubscriptionPolicy::new(StartMode::Streaming, false),
+            )
+        };
+        let panic_stream = stream::once(async { panic!("private runner detail") }).boxed();
+        let mut events = run().start(None, Some(panic_stream), 0);
+        let error = timeout(Duration::from_secs(2), events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert_eq!(error.message, "the response runner failed");
+        assert!(events.next().await.is_none());
+
+        let (stopped, wait) = oneshot::channel::<()>();
+        let pending = stream::once(async move {
+            let _stopped = stopped;
+            futures::future::pending::<Result<StreamResponse, A2AError>>().await
+        })
+        .boxed();
+        let events = run().start(None, Some(pending), 0);
+        drop(events);
+        assert!(
+            timeout(Duration::from_secs(2), wait)
+                .await
+                .unwrap()
+                .is_err()
+        );
     }
 }
 

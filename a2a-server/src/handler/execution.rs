@@ -1,31 +1,102 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Poll agent code and submit output and completion to the Task coordinator.
+//! Drive executors, own invocation bookkeeping, and finish or hand off execution.
 
 use super::DefaultRequestHandler;
-use super::coordinator::TaskCoordinator;
-use super::events::ActiveExecution;
+use super::cancellation::Cancellation;
+use super::events::{ActiveExecution, EventKind};
 use super::protocol::is_terminal_event;
+use super::runtime::TaskRuntime;
+use crate::executor::{ClientInput, ClientInputSender, QueuedInput, ReturnedInputs};
 use a2a::*;
 use futures::StreamExt;
 use std::sync::Arc;
 
-/// Starting an invocation has the same cleanup contract for initial input and handoff.
-pub(super) fn spawn(
-    handler: DefaultRequestHandler,
-    task_id: TaskId,
-    active: Arc<ActiveExecution>,
-    context: crate::ExecutorContext,
-) {
-    // The driver retains its mailbox before it is polled. Keeping this lease
-    // outside the actor-owned invocation avoids a reference cycle.
-    let coordinator = handler.execution_manager.coordinators.for_task(&task_id);
-    let work: futures::future::BoxFuture<'static, ()> = Box::pin(async move {
-        let _lease = coordinator;
-        drive_execution_guarded(handler, task_id, active, context).await;
-    });
-    tokio::spawn(work);
+/// Mutable bookkeeping held in TaskRuntime, never behind a shared mutex.
+#[derive(Default)]
+pub(super) struct InvocationState {
+    pending_inputs: Vec<QueuedInput>,
+    returned_inputs: Option<ReturnedInputs>,
+    pub(super) pending_push: Option<TaskPushNotificationConfig>,
+}
+
+impl InvocationState {
+    pub(super) fn new(returned_inputs: ReturnedInputs) -> Self {
+        Self {
+            returned_inputs: Some(returned_inputs),
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn track_input(&mut self, input: ClientInput) -> QueuedInput {
+        let input = QueuedInput::new(input);
+        self.pending_inputs.retain(QueuedInput::pending);
+        self.pending_inputs.push(input.clone());
+        input
+    }
+
+    /// Revoke even a receiver moved into user work before reclaiming receipts.
+    pub(super) fn drain_inputs(&mut self, inputs: &ClientInputSender) -> Vec<ClientInput> {
+        inputs.revoke();
+        self.returned_inputs.take();
+        self.pending_inputs
+            .drain(..)
+            .filter_map(QueuedInput::reclaim)
+            .collect()
+    }
+}
+
+pub(super) struct Invocation {
+    pub(super) active: Arc<ActiveExecution>,
+    pub(super) bookkeeping: InvocationState,
+}
+
+#[derive(Default)]
+pub(super) enum ExecutionState {
+    #[default]
+    Idle,
+    Running(Invocation),
+    Canceling {
+        invocation: Option<Invocation>,
+        progress: Box<Cancellation>,
+    },
+}
+
+impl ExecutionState {
+    pub(super) fn invocation(&self) -> Option<&Invocation> {
+        match self {
+            Self::Running(invocation) => Some(invocation),
+            Self::Canceling { invocation, .. } => invocation.as_ref(),
+            Self::Idle => None,
+        }
+    }
+
+    pub(super) fn bookkeeping(&mut self, active: &ActiveExecution) -> Option<&mut InvocationState> {
+        let invocation = match self {
+            Self::Running(invocation) => invocation,
+            Self::Canceling { invocation, .. } => invocation.as_mut()?,
+            Self::Idle => return None,
+        };
+        (invocation.active.execution_id == active.execution_id)
+            .then_some(&mut invocation.bookkeeping)
+    }
+
+    pub(super) fn is_current(&self, active: &Arc<ActiveExecution>) -> bool {
+        self.invocation()
+            .is_some_and(|invocation| Arc::ptr_eq(&invocation.active, active))
+    }
+
+    pub(super) fn release(&mut self, active: &Arc<ActiveExecution>) {
+        if !self.is_current(active) {
+            return;
+        }
+        match self {
+            Self::Running(_) => *self = Self::Idle,
+            Self::Canceling { invocation, .. } => *invocation = None,
+            Self::Idle => {}
+        }
+    }
 }
 
 /// The output stream has been dropped before these reach the runner. Input
@@ -42,13 +113,13 @@ async fn drive_execution(
     task_id: TaskId,
     active: Arc<ActiveExecution>,
     exec_ctx: crate::ExecutorContext,
-    coordinator: &Arc<TaskCoordinator>,
 ) {
-    let end = poll_executor(&handler, &task_id, &active, exec_ctx, coordinator).await;
-    coordinator
-        .finished(handler, active, end)
+    let end = poll_executor(&handler, &task_id, &active, exec_ctx).await;
+    handler
+        .tasks
+        .finished(handler.clone(), &task_id, active, end)
         .await
-        .expect("execution completion must reach its coordinator");
+        .expect("execution completion must reach the task service");
 }
 
 /// Cancellation drops the owned output stream; input receipts can be reclaimed
@@ -58,9 +129,8 @@ async fn poll_executor(
     task_id: &TaskId,
     active: &Arc<ActiveExecution>,
     exec_ctx: crate::ExecutorContext,
-    coordinator: &Arc<TaskCoordinator>,
 ) -> TurnEnd {
-    let mut stream = handler.executor.execute(exec_ctx);
+    let mut stream = handler.tasks.executor.execute(exec_ctx);
     let mut push_failure = active.push_failure.subscribe();
     let (mut answered, mut tracked) = (false, false);
     loop {
@@ -98,8 +168,9 @@ async fn poll_executor(
         match result {
             Ok(event) if is_terminal_event(&event) => return TurnEnd::Terminal(Box::new(event)),
             Ok(event) => {
-                let action = coordinator
-                    .output(handler.clone(), active.clone(), event)
+                let action = handler
+                    .tasks
+                    .output(handler.clone(), task_id, active.clone(), event)
                     .await;
                 match action {
                     Ok(super::runtime::OutputAction::Continue) => {}
@@ -132,11 +203,10 @@ pub(super) async fn drive_execution_guarded(
     use futures::FutureExt;
 
     let _drained = active.inputs_drained.clone().drop_guard();
-    let coordinator = handler.execution_manager.coordinators.for_task(&task_id);
 
     let recovery = handler.clone();
     handler
-        .execution_manager
+        .tasks
         .pushes
         .attach(&handler, &task_id, &active.events);
     let outcome = std::panic::AssertUnwindSafe(drive_execution(
@@ -144,7 +214,6 @@ pub(super) async fn drive_execution_guarded(
         task_id.clone(),
         active.clone(),
         exec_ctx,
-        &coordinator,
     ))
     .catch_unwind()
     .await;
@@ -152,12 +221,171 @@ pub(super) async fn drive_execution_guarded(
         return;
     }
 
-    let _ = coordinator.panicked(recovery, active, task_id).await;
+    let _ = recovery
+        .tasks
+        .panicked(recovery.clone(), active, &task_id)
+        .await;
+}
+
+/// Starts the invocation that takes over `unread` inside the completion
+/// command. Gives the messages back if reservation fails.
+pub(super) async fn start_next_turn(
+    handler: &DefaultRequestHandler,
+    task_id: &TaskId,
+    snapshot: Task,
+    mut unread: Vec<crate::executor::ClientInput>,
+    state: &mut TaskRuntime,
+) -> Result<(), Vec<crate::executor::ClientInput>> {
+    let Ok((next, inputs)) = state.reserve(handler, task_id).await else {
+        return Err(unread);
+    };
+    next.set_snapshot(snapshot.clone()).await;
+    let first = unread.remove(0);
+    for input in unread {
+        if let Ok(permit) = next.inputs.sender.clone().try_reserve_owned() {
+            permit.send(
+                state
+                    .execution
+                    .bookkeeping(&next)
+                    .unwrap()
+                    .track_input(input),
+            );
+        }
+    }
+
+    let exec_ctx = crate::ExecutorContext {
+        execution_id: next.execution_id.clone(),
+        message: Some(first.message),
+        task_id: task_id.clone(),
+        stored_task: Some(snapshot.clone()),
+        context_id: snapshot.context_id.clone(),
+        metadata: first.metadata,
+        user: first.user,
+        service_params: first.service_params,
+        tenant: first.tenant,
+        inputs,
+        new_task: false,
+    };
+    handler
+        .tasks
+        .spawn_execution(handler.clone(), task_id.clone(), next, exec_ctx);
+    Ok(())
+}
+
+/// Close input delivery and unregister in one task operation. Later
+/// input commands either join a successor or start a new invocation.
+pub(super) async fn release_execution(
+    handler: &DefaultRequestHandler,
+    active: &Arc<ActiveExecution>,
+    task_id: &str,
+    state: &mut TaskRuntime,
+) {
+    reject_unread_inputs(active, task_id, state).await;
+    state.release(handler, task_id, active).await;
+}
+
+/// Saves the push configuration the request that started the execution
+/// carried, now that the task it is for exists.
+pub(super) async fn save_pending_push_config(
+    active: &ActiveExecution,
+    handler: &DefaultRequestHandler,
+    state: &mut TaskRuntime,
+) {
+    if let Some(invocation) = state.execution.bookkeeping(active) {
+        handler
+            .tasks
+            .save_pending_push(invocation, handler.push_config_store.as_deref())
+            .await;
+    }
+}
+
+/// Closes the task-input queue and tells the exchanges about each
+/// message the executor never read. Those messages were accepted, recorded and
+/// announced; the executor's turn ended without handling them, which the
+/// client that sent one is told by a `StreamError` naming it, rather than by
+/// silence.
+pub(super) async fn reject_unread_inputs(
+    active: &ActiveExecution,
+    task_id: &str,
+    state: &mut TaskRuntime,
+) {
+    reject_inputs(
+        active,
+        task_id,
+        state
+            .execution
+            .bookkeeping(active)
+            .map(|invocation| invocation.drain_inputs(&active.inputs))
+            .unwrap_or_default(),
+    )
+    .await;
+}
+
+/// Publishes unread-input errors inside the task completion operation.
+pub(super) async fn reject_inputs(
+    active: &ActiveExecution,
+    task_id: &str,
+    inputs: Vec<crate::executor::ClientInput>,
+) {
+    for input in inputs {
+        let event = StreamResponse::Error(StreamError {
+            task_id: task_id.to_string(),
+            code: "UNAVAILABLE".to_string(),
+            message: "the agent finished its turn before reading this message".to_string(),
+            reference_id: Some(input.message.message_id.clone()).filter(|id| !id.is_empty()),
+            metadata: None,
+        });
+        active
+            .publish_kind(Ok(&event), None, EventKind::LiveOnly(input.response_id))
+            .await;
+    }
+}
+
+/// Called only inside the task runtime. A failed lazy start leaves no Task.
+pub(super) async fn persist_failure(
+    handler: &DefaultRequestHandler,
+    active: &ActiveExecution,
+    task_id: &str,
+    error: &A2AError,
+) -> Option<Task> {
+    if active.snapshot_is_terminal().await {
+        return None;
+    }
+    let task = match handler.tasks.get(task_id).await {
+        Ok(Some(task)) if !task.status.state.is_terminal() => task,
+        Ok(_) => return None,
+        Err(cause) => {
+            tracing::warn!(%task_id, %cause, "could not load the failed Task");
+            return None;
+        }
+    };
+    let text = crate::sanitized_internal_error(&error.message).message;
+    let mut event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+        task_id: task.id.clone(),
+        context_id: task.context_id.clone(),
+        generation: 0,
+        metadata: None,
+        status: TaskStatus {
+            state: TaskState::Failed,
+            message: Some(Message {
+                task_id: Some(task.id.clone()),
+                context_id: Some(task.context_id.clone()),
+                ..Message::new(Role::Agent, vec![Part::text(text)])
+            }),
+            timestamp: Some(chrono::Utc::now()),
+        },
+    });
+    match handler.tasks.persist(Some(task), &mut event, false).await {
+        Ok((snapshot, _)) => snapshot,
+        Err(cause) => {
+            tracing::warn!(%task_id, %cause, "could not persist the failed Task");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::coordinator::TaskOperation;
+mod driver_tests {
     use super::super::events::EventKind;
     use super::*;
     use crate::handler::test_support::*;
@@ -281,13 +509,14 @@ mod tests {
     ) -> (
         Arc<ActiveExecution>,
         ExecutorContext,
-        Arc<super::super::coordinator::TaskCoordinator>,
+        Arc<super::super::runtime::TaskSender>,
     ) {
-        let coordinator = runtime.execution_manager.coordinators.for_task(&task.id);
+        let lease = runtime.tasks.test_lease(&task.id);
         let handler = runtime.clone();
         let task_id = task.id.clone();
-        let (active, inputs) = coordinator
-            .update(TaskOperation::Input, move |state| {
+        let (active, inputs) = runtime
+            .tasks
+            .test_update(&task.id, move |state| {
                 Box::pin(async move { state.reserve(&handler, &task_id).await })
             })
             .await
@@ -296,7 +525,7 @@ mod tests {
         active.set_snapshot(task.clone()).await;
         let context = ExecutorContext::new(task.id.clone(), task.context_id.clone(), inputs)
             .with_stored_task(task);
-        (active, context, coordinator)
+        (active, context, lease)
     }
 
     #[tokio::test]
@@ -304,7 +533,7 @@ mod tests {
         let runtime = make_handler();
         let mut task = task_with_history("save-fails", "context", 0);
         task.status.state = TaskState::Canceled;
-        runtime.task_store.create(task.clone()).await.unwrap();
+        runtime.tasks.store().create(task.clone()).await.unwrap();
         task.status.state = TaskState::Working;
         let (active, context, _lease) = registered(&runtime, task.clone()).await;
         let mut events = active.subscribe().await;
@@ -318,11 +547,12 @@ mod tests {
             events.recv().await.unwrap().result.unwrap_err().code,
             error_code::INVALID_REQUEST
         );
-        assert!(runtime.execution_manager.get(&task.id).await.is_none());
+        assert!(runtime.tasks.registry.get(&task.id).await.is_none());
         assert!(active.inputs_drained.is_cancelled());
         assert_eq!(
             runtime
-                .task_store
+                .tasks
+                .store()
                 .get(&task.id)
                 .await
                 .unwrap()
@@ -351,7 +581,7 @@ mod tests {
                 active.inputs.revoke();
             }
             assert!(matches!(
-                poll_executor(&runtime, &task.id, &active, context, &_lease).await,
+                poll_executor(&runtime, &task.id, &active, context).await,
                 TurnEnd::Stopped
             ));
             assert!(active.snapshot().await.is_some());
@@ -363,18 +593,21 @@ mod tests {
         let (runtime, release) = make_resumable_handler();
         let mut task = task_with_history("late-output", "context", 0);
         task.status.state = TaskState::Submitted;
-        runtime.task_store.create(task.clone()).await.unwrap();
+        runtime.tasks.store().create(task.clone()).await.unwrap();
         let (active, context, _lease) = registered(&runtime, task.clone()).await;
         let mut events = active.subscribe().await;
         let runner = tokio::spawn({
             let runtime = runtime.clone();
             let active = active.clone();
             let task_id = task.id.clone();
-            let coordinator = _lease.clone();
-            async move { poll_executor(&runtime, &task_id, &active, context, &coordinator).await }
+            let lease = _lease.clone();
+            async move {
+                let _lease = lease;
+                poll_executor(&runtime, &task_id, &active, context).await
+            }
         });
         events.recv().await.unwrap().result.unwrap();
-        let canceled = runtime.task_store.begin_cancel(&task.id).await.unwrap();
+        let canceled = runtime.tasks.store().begin_cancel(&task.id).await.unwrap();
         active.set_snapshot(canceled).await;
         release.notify_one();
         assert!(matches!(
@@ -386,7 +619,8 @@ mod tests {
         ));
         assert_eq!(
             runtime
-                .task_store
+                .tasks
+                .store()
                 .get(&task.id)
                 .await
                 .unwrap()
@@ -422,7 +656,7 @@ mod tests {
         let runtime = DefaultRequestHandler::new(Panics, InMemoryTaskStore::new());
         let mut task = task_with_history("panic-save-fails", "context", 0);
         task.status.state = TaskState::Canceled;
-        runtime.task_store.create(task.clone()).await.unwrap();
+        runtime.tasks.store().create(task.clone()).await.unwrap();
         task.status.state = TaskState::Working;
         let (active, context, _lease) = registered(&runtime, task.clone()).await;
         let mut events = active.subscribe().await;
@@ -437,10 +671,11 @@ mod tests {
             error_code::INVALID_REQUEST
         );
         assert!(active.inputs_drained.is_cancelled());
-        assert!(runtime.execution_manager.get(&task.id).await.is_none());
+        assert!(runtime.tasks.registry.get(&task.id).await.is_none());
         assert_eq!(
             runtime
-                .task_store
+                .tasks
+                .store()
                 .get(&task.id)
                 .await
                 .unwrap()
@@ -501,8 +736,8 @@ mod tests {
                 assert!(event.kind == EventKind::Reply);
                 assert!(matches!(event.result, Ok(StreamResponse::Message(_))));
             }
-            assert!(runtime.task_store.get(&task.id).await.unwrap().is_none());
-            assert!(runtime.execution_manager.get(&task.id).await.is_none());
+            assert!(runtime.tasks.store().get(&task.id).await.unwrap().is_none());
+            assert!(runtime.tasks.registry.get(&task.id).await.is_none());
             assert!(
                 events.try_recv().is_err(),
                 "outputs following a direct reply must be ignored"
@@ -519,17 +754,18 @@ mod tests {
             let mut task = task_with_history("empty", "context", 0);
             task.status.state = TaskState::Submitted;
             if collision {
-                runtime.task_store.create(task.clone()).await.unwrap();
+                runtime.tasks.store().create(task.clone()).await.unwrap();
             }
             let (active, context, _lease) = registered(&runtime, task.clone()).await;
             active
                 .uncreated
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            let coordinator = runtime.execution_manager.coordinators.for_task(&task.id);
+            let _lease = runtime.tasks.test_lease(&task.id);
             let control = active.clone();
             let config = push_config(&task.id);
-            coordinator
-                .update(TaskOperation::Input, move |state| {
+            runtime
+                .tasks
+                .test_update(&task.id, move |state| {
                     Box::pin(async move {
                         state.execution.bookkeeping(&control).unwrap().pending_push = Some(config);
                     })
@@ -539,10 +775,17 @@ mod tests {
             drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context)
                 .await;
             assert_eq!(
-                runtime.task_store.get(&task.id).await.unwrap().unwrap().id,
+                runtime
+                    .tasks
+                    .store()
+                    .get(&task.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
                 task.id
             );
-            assert!(runtime.execution_manager.get(&task.id).await.is_none());
+            assert!(runtime.tasks.registry.get(&task.id).await.is_none());
             let configs = runtime
                 .push_config_store
                 .as_ref()
@@ -569,8 +812,8 @@ mod tests {
             events.recv().await.unwrap().result.unwrap_err().code,
             error_code::INTERNAL_ERROR
         );
-        assert!(runtime.task_store.get(&task.id).await.unwrap().is_none());
-        assert!(runtime.execution_manager.get(&task.id).await.is_none());
+        assert!(runtime.tasks.store().get(&task.id).await.unwrap().is_none());
+        assert!(runtime.tasks.registry.get(&task.id).await.is_none());
     }
 
     #[tokio::test]
@@ -593,6 +836,334 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(task.status.state, TaskState::Canceled);
+        }
+    }
+}
+
+#[cfg(test)]
+mod turn_tests {
+    use super::*;
+    use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn a_busy_handoff_returns_input_with_its_caller_identity_intact() {
+        let runtime = make_handler();
+        let task = task_with_history("busy-handoff", "context", 0);
+        let (active, _inputs, _invocation) =
+            runtime.tasks.registry.reserve(&task.id).await.unwrap();
+        active.set_snapshot(task.clone()).await;
+        let mut input = crate::ClientInput::new(make_message(), 7);
+        input.user = Some(crate::User::authenticated("alice"));
+        input.tenant = Some("tenant-a".into());
+        input.metadata = Some(std::collections::HashMap::from([(
+            "trace".into(),
+            serde_json::json!(42),
+        )]));
+        let returned = start_next_turn(
+            &runtime,
+            &task.id,
+            task.clone(),
+            vec![input.clone()],
+            &mut TaskRuntime::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].message, input.message);
+        assert_eq!(returned[0].user, input.user);
+        assert_eq!(returned[0].metadata, input.metadata);
+        assert_eq!(returned[0].tenant, input.tenant);
+        assert!(runtime.tasks.registry.get(&task.id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn rejected_pending_push_configuration_does_not_replace_existing_endpoints() {
+        let runtime = make_handler_with_push_configs();
+        let config = |id: usize| TaskPushNotificationConfig {
+            task_id: "configured".into(),
+            id: Some(id.to_string()),
+            url: "https://example.com/push".into(),
+            token: None,
+            authentication: None,
+            tenant: None,
+            protocol_version: Some("1.1".into()),
+        };
+        let store = runtime.push_config_store.as_ref().unwrap();
+        for id in 0..50 {
+            store.save(config(id)).await.unwrap();
+        }
+        let active = ActiveExecution::new(None);
+        let mut state = TaskRuntime::default();
+        let invocation = InvocationState {
+            pending_push: Some(config(50)),
+            ..Default::default()
+        };
+        state.execution = ExecutionState::Running(Invocation {
+            active: active.clone(),
+            bookkeeping: invocation,
+        });
+        save_pending_push_config(&active, &runtime, &mut state).await;
+        assert!(
+            state
+                .execution
+                .bookkeeping(&active)
+                .unwrap()
+                .pending_push
+                .is_none()
+        );
+        assert_eq!(store.list("configured").await.unwrap().len(), 50);
+        assert!(store.get("configured", "50").await.is_err());
+        save_pending_push_config(&active, &runtime, &mut state).await;
+        assert_eq!(store.list("configured").await.unwrap().len(), 50);
+    }
+
+    #[tokio::test]
+    async fn artifact_only_unread_input_has_no_empty_message_reference() {
+        let active = ActiveExecution::new(None);
+        let mut events = active.subscribe().await;
+        let mut message = make_message();
+        message.message_id.clear();
+        reject_inputs(&active, "task", vec![crate::ClientInput::new(message, 3)]).await;
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event.kind, EventKind::LiveOnly(None)));
+        let StreamResponse::Error(error) = event.result.unwrap() else {
+            panic!("expected a rejection")
+        };
+        assert_eq!(error.task_id, "task");
+        assert_eq!(error.code, "UNAVAILABLE");
+        assert_eq!(error.reference_id, None);
+    }
+    struct CaptureTurn(
+        tokio::sync::mpsc::UnboundedSender<(crate::ExecutorContext, Vec<crate::ClientInput>)>,
+    );
+
+    impl crate::AgentExecutor for CaptureTurn {
+        fn execute(
+            &self,
+            mut context: crate::ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let queued = std::iter::from_fn(|| context.inputs.try_recv()).collect();
+            let mut task = context.stored_task.clone().unwrap();
+            task.status.state = TaskState::Completed;
+            self.0
+                .send((context, queued))
+                .unwrap_or_else(|_| panic!("observer dropped"));
+            Box::pin(stream::once(async move { Ok(StreamResponse::Task(task)) }))
+        }
+        fn cancel(
+            &self,
+            context: crate::ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            crate::AgentExecutor::cancel(&EchoExecutor, context)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handoff_preserves_the_trigger_and_queues_remaining_inputs_in_order() {
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = DefaultRequestHandler::new(CaptureTurn(sent), InMemoryTaskStore::new());
+        let mut task = task_with_history("next-turn", "context", 0);
+        task.status.state = TaskState::Working;
+        runtime.tasks.store().create(task.clone()).await.unwrap();
+        let inputs: Vec<_> = ["first", "second", "third"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut message = make_message();
+                message.message_id = id.into();
+                let mut input = crate::ClientInput::new(message, index as i64 + 1);
+                input.user = Some(crate::User::authenticated("alice"));
+                input.tenant = Some("tenant-a".into());
+                input.metadata = Some(std::collections::HashMap::from([(
+                    "trace".into(),
+                    serde_json::json!(id),
+                )]));
+                input
+            })
+            .collect();
+        let _lease = runtime.tasks.test_lease(&task.id);
+        let handler = runtime.clone();
+        let snapshot = task.clone();
+        let accepted = inputs.clone();
+        let started = runtime
+            .tasks
+            .test_update(&task.id, move |state| {
+                Box::pin(async move {
+                    start_next_turn(&handler, &snapshot.id, snapshot.clone(), accepted, state).await
+                })
+            })
+            .await
+            .unwrap();
+        assert!(started.is_ok());
+        let (context, queued) = timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.message, Some(inputs[0].message.clone()));
+        assert_eq!(context.metadata, inputs[0].metadata);
+        assert_eq!(context.user, inputs[0].user);
+        assert_eq!(context.tenant, inputs[0].tenant);
+        assert_eq!(
+            queued
+                .iter()
+                .map(|input| input.message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "third"]
+        );
+        assert_eq!(
+            queued
+                .iter()
+                .map(|input| input.generation)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        timeout(Duration::from_secs(1), async {
+            while runtime.tasks.registry.get(&task.id).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime
+                .tasks
+                .store()
+                .get(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .state,
+            TaskState::Completed
+        );
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use crate::handler::test_support::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone, Default)]
+    struct UnavailableStore {
+        inner: Arc<InMemoryTaskStore>,
+        fail_read: Arc<AtomicBool>,
+        fail_write: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl TaskStore for UnavailableStore {
+        async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.create(task).await
+        }
+        async fn update(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            if self.fail_write.load(Ordering::SeqCst) {
+                return Err(A2AError::internal("storage write unavailable"));
+            }
+            self.inner.update(task).await
+        }
+        async fn get(&self, id: &str) -> Result<Option<Task>, A2AError> {
+            if self.fail_read.load(Ordering::SeqCst) {
+                return Err(A2AError::internal("storage read unavailable"));
+            }
+            self.inner.get(id).await
+        }
+        async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+            self.inner.list(req).await
+        }
+        async fn begin_cancel(&self, id: &str) -> Result<Task, A2AError> {
+            self.inner.begin_cancel(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_outages_do_not_report_an_uncommitted_failure_or_corrupt_the_task() {
+        let store = UnavailableStore::default();
+        let handler = DefaultRequestHandler::new(EchoExecutor, store.clone());
+        seed_task(&handler, "task", "context").await;
+        let before = handler.tasks.load("task").await.unwrap();
+        let active = ActiveExecution::new(None);
+        active.set_snapshot(before.clone()).await;
+        let error = A2AError::internal("private executor detail");
+
+        store.fail_read.store(true, Ordering::SeqCst);
+        assert!(
+            persist_failure(&handler, &active, "task", &error)
+                .await
+                .is_none()
+        );
+        store.fail_read.store(false, Ordering::SeqCst);
+        store.fail_write.store(true, Ordering::SeqCst);
+        assert!(
+            persist_failure(&handler, &active, "task", &error)
+                .await
+                .is_none()
+        );
+        assert_eq!(handler.tasks.load("task").await.unwrap(), before);
+        assert_eq!(active.snapshot().await.unwrap(), before);
+
+        store.fail_write.store(false, Ordering::SeqCst);
+        let failed = persist_failure(&handler, &active, "task", &error)
+            .await
+            .unwrap();
+        assert_eq!(failed.status.state, TaskState::Failed);
+        assert_eq!(
+            failed.status.message.unwrap().parts,
+            vec![Part::text("Internal error")]
+        );
+        let listed = store
+            .list(&serde_json::from_value(serde_json::json!({})).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(listed.tasks.len(), 1);
+        assert_eq!(listed.tasks[0].status.state, TaskState::Failed);
+        assert_eq!(
+            store.begin_cancel("task").await.unwrap_err().code,
+            error_code::TASK_NOT_CANCELABLE
+        );
+
+        active
+            .set_snapshot(handler.tasks.load("task").await.unwrap())
+            .await;
+        assert!(
+            persist_failure(&handler, &active, "task", &error)
+                .await
+                .is_none()
+        );
+        assert_eq!(handler.tasks.load("task").await.unwrap(), listed.tasks[0]);
+    }
+    #[tokio::test]
+    async fn an_executor_failure_releases_its_owner_even_when_failure_persistence_is_down() {
+        use crate::handler::{execution::TurnEnd, runtime::TaskRuntime};
+        for read_outage in [true, false] {
+            let store = UnavailableStore::default();
+            let handler = DefaultRequestHandler::new(EchoExecutor, store.clone());
+            seed_task(&handler, "task", "context").await;
+            let before = handler.tasks.load("task").await.unwrap();
+            let mut runtime = TaskRuntime::default();
+            let (active, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
+            active.set_snapshot(before.clone()).await;
+            let mut events = active.subscribe().await;
+            store.fail_read.store(read_outage, Ordering::SeqCst);
+            store.fail_write.store(!read_outage, Ordering::SeqCst);
+            runtime
+                .finished(
+                    &handler,
+                    "task".into(),
+                    active.clone(),
+                    TurnEnd::Failed(A2AError::internal("agent failed")),
+                )
+                .await;
+            assert!(events.recv().await.unwrap().result.is_err());
+            assert!(handler.tasks.registry.get("task").await.is_none());
+            assert!(runtime.execution.invocation().is_none());
+            assert_eq!(active.snapshot().await.unwrap(), before);
+            store.fail_read.store(false, Ordering::SeqCst);
+            assert_eq!(handler.tasks.load("task").await.unwrap(), before);
+            let (successor, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
+            assert_ne!(successor.execution_id, active.execution_id);
+            runtime.release(&handler, "task", &successor).await;
         }
     }
 }
