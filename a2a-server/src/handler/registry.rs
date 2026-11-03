@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 #[derive(Default)]
 pub(super) struct ExecutionManager {
     pub(super) coordinators: super::coordinator::TaskCoordinators,
-    executions: RwLock<HashMap<TaskId, Arc<ActiveExecution>>>,
+    executions: RwLock<HashMap<TaskId, std::sync::Weak<ActiveExecution>>>,
     sources: std::sync::Mutex<HashMap<TaskId, std::sync::Weak<TaskEvents>>>,
     /// The webhook deliveries of each task, in the order its events were
     /// published.
@@ -36,7 +36,29 @@ impl ExecutionManager {
         source
     }
 
-    /// The task coordinator calls this while processing its input or handoff.
+    /// Publish a weak routing handle; the TaskRuntime owns the invocation.
+    pub(super) async fn register(
+        &self,
+        task_id: &str,
+        active: &Arc<ActiveExecution>,
+    ) -> Result<(), A2AError> {
+        let mut executions = self.executions.write().await;
+        if executions
+            .get(task_id)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|active| active.is_prepared())
+        {
+            return Err(A2AError::invalid_request(format!(
+                "task execution is already in progress: {task_id}"
+            )));
+        }
+        executions.retain(|_, execution| execution.strong_count() > 0);
+        executions.insert(task_id.to_owned(), Arc::downgrade(active));
+        Ok(())
+    }
+
+    /// Build a routing fixture without starting an executor or coordinator.
+    #[cfg(test)]
     pub(super) async fn reserve(
         &self,
         task_id: &str,
@@ -48,28 +70,14 @@ impl ExecutionManager {
         ),
         A2AError,
     > {
-        let mut executions = self.executions.write().await;
-        if let Some(existing) = executions.get(task_id) {
-            // Mailbox admission cannot overlap. An entry with no snapshot is
-            // abandoned preparation whose panic cleanup may still be pending.
-            if existing.snapshot().await.is_some() {
-                return Err(A2AError::invalid_request(format!(
-                    "task execution is already in progress: {task_id}"
-                )));
-            }
-        }
-
-        let (mut active, inputs, state) = ActiveExecution::with_events(self.events_for(task_id));
-        Arc::get_mut(&mut active)
-            .expect("new invocation has one owner")
-            ._coordinator = Some(self.coordinators.for_task(task_id));
-        executions.insert(task_id.to_string(), active.clone());
+        let (active, inputs, state) = ActiveExecution::with_events(self.events_for(task_id));
+        self.register(task_id, &active).await?;
         Ok((active, inputs, state))
     }
 
     pub(super) async fn get(&self, task_id: &str) -> Option<Arc<ActiveExecution>> {
         let executions = self.executions.read().await;
-        executions.get(task_id).cloned()
+        executions.get(task_id).and_then(std::sync::Weak::upgrade)
     }
 
     pub(super) async fn resubscribe(
@@ -81,87 +89,14 @@ impl ExecutionManager {
         Some((receiver, snapshot_task, sequence))
     }
 
-    /// [`Self::finish`] without waiting: `false` when the registry is busy.
-    pub(super) fn try_finish(&self, task_id: &str, active: &Arc<ActiveExecution>) -> bool {
-        let Ok(mut executions) = self.executions.try_write() else {
-            return false;
-        };
-        if executions
-            .get(task_id)
-            .is_some_and(|current| Arc::ptr_eq(current, active))
-        {
-            executions.remove(task_id);
-        }
-        true
-    }
-
-    pub(super) async fn finish(&self, task_id: &str, active: &Arc<ActiveExecution>) {
+    pub(super) async fn unregister(&self, task_id: &str, active: &Arc<ActiveExecution>) {
         let mut executions = self.executions.write().await;
         let should_remove = executions
             .get(task_id)
-            .is_some_and(|current| Arc::ptr_eq(current, active));
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|current| Arc::ptr_eq(&current, active));
         if should_remove {
             executions.remove(task_id);
-        }
-    }
-}
-
-/// Releases a task's execution reservation when dropped, unless disarmed.
-///
-/// The reservation is taken before several awaits, so a request future that is
-/// dropped part-way (a client that disconnects) or an executor that panics
-/// would otherwise leave the task "already in progress" for good.
-pub(super) struct ReservationGuard {
-    manager: Arc<ExecutionManager>,
-    task_id: TaskId,
-    active: Arc<ActiveExecution>,
-    armed: bool,
-}
-
-impl ReservationGuard {
-    pub(super) fn new(
-        manager: Arc<ExecutionManager>,
-        task_id: TaskId,
-        active: Arc<ActiveExecution>,
-    ) -> Self {
-        Self {
-            manager,
-            task_id,
-            active,
-            armed: true,
-        }
-    }
-
-    /// Hands responsibility for the reservation to the spawned execution.
-    pub(super) fn disarm(mut self) {
-        self.armed = false;
-    }
-
-    /// Gives the task back now, so the next request already finds it free.
-    /// Dropping the guard does the same, but only after the fact.
-    pub(super) async fn release(mut self) {
-        self.armed = false;
-        self.manager.finish(&self.task_id, &self.active).await;
-    }
-}
-
-impl Drop for ReservationGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Cleanup never removes a successor invocation: finish checks pointer
-        // identity. Avoid spawning unless the short routing lock is contended.
-        if self.manager.try_finish(&self.task_id, &self.active) {
-            return;
-        }
-        // `finish` is async; without a runtime to run it on (the process is
-        // shutting down) there is nothing left to release.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let manager = Arc::clone(&self.manager);
-            let task_id = self.task_id.clone();
-            let active = Arc::clone(&self.active);
-            runtime.spawn(async move { manager.finish(&task_id, &active).await });
         }
     }
 }
@@ -187,8 +122,8 @@ mod tests {
         assert!(!Arc::ptr_eq(&stale, &fresh));
         let registered = manager.get("t-stale").await.unwrap();
         assert!(Arc::ptr_eq(&registered, &fresh));
-        // The old guard's late release must not remove the new reservation.
-        manager.finish("t-stale", &stale).await;
+        // A stale routing handle must not remove its successor.
+        manager.unregister("t-stale", &stale).await;
         assert!(manager.get("t-stale").await.is_some());
     }
 
@@ -288,21 +223,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropped_reservation_releases_after_a_contended_registry_is_unlocked() {
-        let manager = Arc::new(ExecutionManager::default());
-        let (active, _inputs, _invocation) = manager.reserve("contended-drop").await.unwrap();
-        let reservation =
-            ReservationGuard::new(manager.clone(), "contended-drop".into(), active.clone());
+    async fn dropping_the_owner_expires_the_route_even_while_the_registry_is_locked() {
+        let manager = ExecutionManager::default();
+        let (active, _inputs, _invocation) = manager.reserve("dropped-owner").await.unwrap();
         let registry = manager.executions.write().await;
-        drop(reservation);
-        assert!(registry.contains_key("contended-drop"));
+        drop(active);
+        assert!(registry.get("dropped-owner").unwrap().upgrade().is_none());
         drop(registry);
-        timeout(Duration::from_secs(1), async {
-            while manager.get("contended-drop").await.is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(manager.get("dropped-owner").await.is_none());
     }
 }

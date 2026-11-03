@@ -40,11 +40,11 @@ impl Cancellation {
         params: &ServiceParams,
         req: CancelTaskRequest,
         user: Option<User>,
+        active_execution: Option<Arc<ActiveExecution>>,
         slot: &mut Option<Self>,
     ) -> Result<CancellationStart, A2AError> {
         // State transition and snapshot publication are serialized with input
         // and executor output. The hook is scheduled only after this command.
-        let active_execution = handler.execution_manager.get(&req.id).await;
         let task = handler.load_task(&req.id).await?;
         let generation_before = task.generation;
 

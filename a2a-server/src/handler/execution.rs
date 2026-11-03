@@ -4,9 +4,9 @@
 //! Poll agent code and submit output and completion to the Task coordinator.
 
 use super::DefaultRequestHandler;
+use super::coordinator::TaskCoordinator;
 use super::events::ActiveExecution;
 use super::protocol::is_terminal_event;
-use super::registry::ReservationGuard;
 use a2a::*;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -18,14 +18,12 @@ pub(super) fn spawn(
     active: Arc<ActiveExecution>,
     context: crate::ExecutorContext,
 ) {
-    let release = ReservationGuard::new(
-        handler.execution_manager.clone(),
-        task_id.clone(),
-        active.clone(),
-    );
+    // The driver retains its mailbox before it is polled. Keeping this lease
+    // outside the actor-owned invocation avoids a reference cycle.
+    let coordinator = handler.execution_manager.coordinators.for_task(&task_id);
     let work: futures::future::BoxFuture<'static, ()> = Box::pin(async move {
+        let _lease = coordinator;
         drive_execution_guarded(handler, task_id, active, context).await;
-        release.disarm();
     });
     tokio::spawn(work);
 }
@@ -44,12 +42,10 @@ async fn drive_execution(
     task_id: TaskId,
     active: Arc<ActiveExecution>,
     exec_ctx: crate::ExecutorContext,
+    coordinator: &Arc<TaskCoordinator>,
 ) {
-    let end = poll_executor(&handler, &task_id, &active, exec_ctx).await;
-    handler
-        .execution_manager
-        .coordinators
-        .for_task(&task_id)
+    let end = poll_executor(&handler, &task_id, &active, exec_ctx, coordinator).await;
+    coordinator
         .finished(handler, active, end)
         .await
         .expect("execution completion must reach its coordinator");
@@ -62,6 +58,7 @@ async fn poll_executor(
     task_id: &TaskId,
     active: &Arc<ActiveExecution>,
     exec_ctx: crate::ExecutorContext,
+    coordinator: &Arc<TaskCoordinator>,
 ) -> TurnEnd {
     let mut stream = handler.executor.execute(exec_ctx);
     let mut push_failure = active.push_failure.subscribe();
@@ -101,10 +98,7 @@ async fn poll_executor(
         match result {
             Ok(event) if is_terminal_event(&event) => return TurnEnd::Terminal(Box::new(event)),
             Ok(event) => {
-                let action = handler
-                    .execution_manager
-                    .coordinators
-                    .for_task(task_id)
+                let action = coordinator
                     .output(handler.clone(), active.clone(), event)
                     .await;
                 match action {
@@ -150,6 +144,7 @@ pub(super) async fn drive_execution_guarded(
         task_id.clone(),
         active.clone(),
         exec_ctx,
+        &coordinator,
     ))
     .catch_unwind()
     .await;
@@ -283,23 +278,25 @@ mod tests {
     async fn registered(
         runtime: &DefaultRequestHandler,
         task: Task,
-    ) -> (Arc<ActiveExecution>, ExecutorContext) {
-        let (active, inputs, _invocation) =
-            runtime.execution_manager.reserve(&task.id).await.unwrap();
+    ) -> (
+        Arc<ActiveExecution>,
+        ExecutorContext,
+        Arc<super::super::coordinator::TaskCoordinator>,
+    ) {
         let coordinator = runtime.execution_manager.coordinators.for_task(&task.id);
-        let id = active.execution_id.clone();
-        coordinator
+        let handler = runtime.clone();
+        let task_id = task.id.clone();
+        let (active, inputs) = coordinator
             .update(TaskOperation::Input, move |state| {
-                Box::pin(async move {
-                    state.invocations.insert(id, _invocation);
-                })
+                Box::pin(async move { state.reserve(&handler, &task_id).await })
             })
             .await
+            .unwrap()
             .unwrap();
         active.set_snapshot(task.clone()).await;
         let context = ExecutorContext::new(task.id.clone(), task.context_id.clone(), inputs)
             .with_stored_task(task);
-        (active, context)
+        (active, context, coordinator)
     }
 
     #[tokio::test]
@@ -309,7 +306,7 @@ mod tests {
         task.status.state = TaskState::Canceled;
         runtime.task_store.create(task.clone()).await.unwrap();
         task.status.state = TaskState::Working;
-        let (active, context) = registered(&runtime, task.clone()).await;
+        let (active, context, _lease) = registered(&runtime, task.clone()).await;
         let mut events = active.subscribe().await;
         timeout(
             Duration::from_secs(1),
@@ -346,7 +343,7 @@ mod tests {
             } else {
                 TaskState::Canceled
             };
-            let (active, context) = registered(&runtime, task.clone()).await;
+            let (active, context, _lease) = registered(&runtime, task.clone()).await;
             active
                 .push_failure
                 .send_replace(Some(A2AError::internal("late delivery failure")));
@@ -354,7 +351,7 @@ mod tests {
                 active.inputs.revoke();
             }
             assert!(matches!(
-                poll_executor(&runtime, &task.id, &active, context).await,
+                poll_executor(&runtime, &task.id, &active, context, &_lease).await,
                 TurnEnd::Stopped
             ));
             assert!(active.snapshot().await.is_some());
@@ -367,13 +364,14 @@ mod tests {
         let mut task = task_with_history("late-output", "context", 0);
         task.status.state = TaskState::Submitted;
         runtime.task_store.create(task.clone()).await.unwrap();
-        let (active, context) = registered(&runtime, task.clone()).await;
+        let (active, context, _lease) = registered(&runtime, task.clone()).await;
         let mut events = active.subscribe().await;
         let runner = tokio::spawn({
             let runtime = runtime.clone();
             let active = active.clone();
             let task_id = task.id.clone();
-            async move { poll_executor(&runtime, &task_id, &active, context).await }
+            let coordinator = _lease.clone();
+            async move { poll_executor(&runtime, &task_id, &active, context, &coordinator).await }
         });
         events.recv().await.unwrap().result.unwrap();
         let canceled = runtime.task_store.begin_cancel(&task.id).await.unwrap();
@@ -426,7 +424,7 @@ mod tests {
         task.status.state = TaskState::Canceled;
         runtime.task_store.create(task.clone()).await.unwrap();
         task.status.state = TaskState::Working;
-        let (active, context) = registered(&runtime, task.clone()).await;
+        let (active, context, _lease) = registered(&runtime, task.clone()).await;
         let mut events = active.subscribe().await;
         timeout(
             Duration::from_secs(1),
@@ -485,7 +483,7 @@ mod tests {
                 ]),
                 InMemoryTaskStore::new(),
             );
-            let (active, mut context) = registered(&runtime, task.clone()).await;
+            let (active, mut context, _lease) = registered(&runtime, task.clone()).await;
             active
                 .uncreated
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -523,17 +521,17 @@ mod tests {
             if collision {
                 runtime.task_store.create(task.clone()).await.unwrap();
             }
-            let (active, context) = registered(&runtime, task.clone()).await;
+            let (active, context, _lease) = registered(&runtime, task.clone()).await;
             active
                 .uncreated
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let coordinator = runtime.execution_manager.coordinators.for_task(&task.id);
-            let id = active.execution_id.clone();
+            let control = active.clone();
             let config = push_config(&task.id);
             coordinator
                 .update(TaskOperation::Input, move |state| {
                     Box::pin(async move {
-                        state.invocations.get_mut(&id).unwrap().pending_push = Some(config);
+                        state.execution.bookkeeping(&control).unwrap().pending_push = Some(config);
                     })
                 })
                 .await
@@ -561,7 +559,7 @@ mod tests {
         let runtime = DefaultRequestHandler::new(Panics, InMemoryTaskStore::new());
         let mut task = task_with_history("panic-before-create", "context", 0);
         task.status.state = TaskState::Submitted;
-        let (active, context) = registered(&runtime, task.clone()).await;
+        let (active, context, _lease) = registered(&runtime, task.clone()).await;
         active
             .uncreated
             .store(true, std::sync::atomic::Ordering::SeqCst);

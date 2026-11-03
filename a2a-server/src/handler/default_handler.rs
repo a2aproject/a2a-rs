@@ -1878,7 +1878,10 @@ mod tests {
         coordinator
             .update(TaskOperation::Cancel, move |state| {
                 Box::pin(async move {
-                    state.cancellation = Some(progress);
+                    state.execution = crate::handler::lifecycle::ExecutionState::Canceling {
+                        invocation: None,
+                        progress: Box::new(progress),
+                    };
                 })
             })
             .await
@@ -3018,10 +3021,14 @@ mod tests {
     #[tokio::test]
     async fn prepared_but_uncreated_tasks_are_not_visible_to_other_requests() {
         let handler = make_handler();
-        let (active, _inputs, _invocation) = handler
-            .execution_manager
-            .reserve("uncreated")
+        let coordinator = handler.execution_manager.coordinators.for_task("uncreated");
+        let owned = handler.clone();
+        let (active, _inputs) = coordinator
+            .update(TaskOperation::Input, move |state| {
+                Box::pin(async move { state.reserve(&owned, "uncreated").await })
+            })
             .await
+            .unwrap()
             .unwrap();
         let mut task = task_with_history("uncreated", "context", 0);
         task.status.state = TaskState::Submitted;
@@ -3050,7 +3057,10 @@ mod tests {
             assert_eq!(error.code, error_code::TASK_NOT_FOUND);
         }
         assert!(handler.task_store.get("uncreated").await.unwrap().is_none());
-        handler.execution_manager.finish("uncreated", &active).await;
+        handler
+            .execution_manager
+            .unregister("uncreated", &active)
+            .await;
     }
 
     #[test]
@@ -3160,6 +3170,7 @@ mod tests {
             },
         );
         seed_task(&handler, "panic", "context").await;
+        let coordinator = handler.execution_manager.coordinators.for_task("panic");
         let error = handler
             .send_message(
                 &ServiceParams::new(),
@@ -3169,6 +3180,21 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, error_code::INTERNAL_ERROR);
         assert_eq!(error.message, "message preparation failed unexpectedly");
+        let idle = coordinator
+            .update(TaskOperation::Input, |state| {
+                Box::pin(async move {
+                    matches!(
+                        state.execution,
+                        crate::handler::lifecycle::ExecutionState::Idle
+                    )
+                })
+            })
+            .await
+            .unwrap();
+        assert!(
+            idle,
+            "panic recovery resets the resident coordinator before its next command"
+        );
         assert!(handler.execution_manager.get("panic").await.is_none());
         assert_eq!(
             store.get("panic").await.unwrap().unwrap().status.state,
@@ -3232,7 +3258,10 @@ mod tests {
             .err()
             .expect("task is terminal");
         assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
-        handler.execution_manager.finish(&task.id, &active).await;
+        handler
+            .execution_manager
+            .unregister(&task.id, &active)
+            .await;
     }
 
     #[tokio::test]
@@ -3700,7 +3729,7 @@ mod subscription_attachment_tests {
                         active
                             .publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()))
                             .await;
-                        handler.execution_manager.finish("task", &active).await;
+                        handler.execution_manager.unregister("task", &active).await;
                     }
                     handler.changes.notify("task");
                     let remaining = timeout(Duration::from_secs(2), events.collect::<Vec<_>>())
