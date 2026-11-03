@@ -187,3 +187,45 @@ pub(super) async fn inject(
         sequence_after,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn a_missing_snapshot_or_closed_inbox_rejects_input_before_persistence() {
+        let handler = make_handler();
+        seed_task(&handler, "task", "context").await;
+        let before = handler.load_task("task").await.unwrap();
+        let (active, inputs, mut invocation) =
+            ActiveExecution::with_events(handler.execution_manager.events_for("task"));
+        let mut inputs = Some(inputs);
+        let mut request = send_request();
+        request.message.task_id = Some("task".into());
+        let message = AuthorizedMessage {
+            request,
+            params: ServiceParams::new(),
+            user: None,
+            response_id: None,
+        };
+        for missing_snapshot in [true, false] {
+            if !missing_snapshot {
+                active.set_snapshot(before.clone()).await;
+                assert!(inputs.as_mut().unwrap().close_and_drain().is_empty());
+                drop(inputs.take());
+            }
+            let result = inject(&handler, &message, "task", &active, &mut invocation).await;
+            let Err(Rejection::Failed(error)) = result else {
+                panic!("an unavailable inbox must reject the input");
+            };
+            assert_eq!(error.code, error_code::INTERNAL_ERROR);
+            assert!(error.message.contains(if missing_snapshot {
+                "has no task"
+            } else {
+                "is closed"
+            }));
+            assert_eq!(handler.load_task("task").await.unwrap(), before);
+        }
+    }
+}
