@@ -7,8 +7,7 @@ use super::delivery::StartMode;
 use super::exchange::Exchange;
 use super::output::{DeliveryEvent, DeliverySink, EventSource};
 use super::protocol::{
-    Rejection, apply_lengths, generation_of, is_at_least_1_1, is_terminal_event,
-    requested_protocol_version, should_interrupt_non_streaming,
+    Rejection, apply_lengths, generation_of, is_terminal_event, should_interrupt_non_streaming,
 };
 use super::subscription::{DeliveryAttachment, SubscriptionPolicy};
 use super::uplink::{Incoming, IncomingRequest, Receipt};
@@ -35,9 +34,8 @@ pub(super) struct Run {
     pub(super) params: ServiceParams,
     /// The task whose execution and updates this response follows.
     pub(super) task_id: TaskId,
-    pub(super) wants_message_updates: bool,
     pub(super) completion: RunCompletion,
-    response_id: Option<uuid::Uuid>,
+    policy: SubscriptionPolicy,
 }
 
 /// When a response has observed enough of the task to finish.
@@ -58,21 +56,15 @@ impl Run {
         params: ServiceParams,
         task_id: TaskId,
         completion: RunCompletion,
+        policy: SubscriptionPolicy,
     ) -> Self {
-        let wants_message_updates = is_at_least_1_1(&requested_protocol_version(&params));
         Self {
             handler,
             params,
             task_id,
-            wants_message_updates,
             completion,
-            response_id: None,
+            policy,
         }
-    }
-
-    pub(super) fn with_response_id(mut self, response_id: Option<uuid::Uuid>) -> Self {
-        self.response_id = response_id;
-        self
     }
 
     /// Owns response delivery independently of the executor task. Dropping the
@@ -164,15 +156,6 @@ impl Run {
                 }
                 _ => false,
             }
-    }
-
-    fn subscription_policy(&self) -> SubscriptionPolicy {
-        let mode = match self.completion {
-            RunCompletion::Unary(_) => StartMode::Blocking,
-            RunCompletion::Task => StartMode::Streaming,
-            RunCompletion::Exchange => StartMode::Bidi,
-        };
-        SubscriptionPolicy::new(mode, self.wants_message_updates).for_response(self.response_id)
     }
 
     /// Forward one event, keeping generation tracking and response completion
@@ -323,11 +306,7 @@ impl Run {
             let opening =
                 (snapshot.generation > *last_generation || ends).then_some(snapshot.clone());
             *last_generation = (*last_generation).max(snapshot.generation);
-            *inner = Some(
-                self.subscription_policy()
-                    .stream(receiver, opening, sequence)
-                    .into(),
-            );
+            *inner = Some(self.policy.stream(receiver, opening, sequence).into());
             return Reattach::Changed;
         }
         let task = match self.handler.load_task(&self.task_id).await {
@@ -426,7 +405,7 @@ impl Run {
                 request,
                 StartMode::Bidi,
                 Some(&self.task_id),
-                self.response_id,
+                self.policy.response_id(),
             )
             .await?;
         // The source belongs to the Task, so this subscription also receives
@@ -435,14 +414,14 @@ impl Run {
         if inner.is_some() {
             return Ok(true);
         }
-        let subscription = self
-            .subscription_policy()
-            .delivery(delivery, DeliveryAttachment::FollowUp);
+        let subscription = self.policy.delivery(delivery, DeliveryAttachment::FollowUp);
         *inner = Some(EventSource::Subscription(subscription.events));
         // This response was detached when input was published. Announce the
         // recorded input once; the newly attached receiver starts after it.
         for event in subscription.recorded {
-            if matches!(event, StreamResponse::MessageUpdate(_)) && !self.wants_message_updates {
+            if matches!(event, StreamResponse::MessageUpdate(_))
+                && !self.policy.wants_message_updates()
+            {
                 continue;
             }
             if !self.forward(Ok(event).into(), last_generation, out).await {
@@ -476,6 +455,7 @@ mod tests {
             ServiceParams::new(),
             "working".into(),
             RunCompletion::Unary(Box::new(send_req(Some("working"), None))),
+            SubscriptionPolicy::new(StartMode::Blocking, false),
         );
         let events = run.start(None, Some(events), 0, None);
         let mut response = tokio::spawn(Run::unary_response(
@@ -548,6 +528,7 @@ mod tests {
                 ServiceParams::new(),
                 "task".into(),
                 completion(),
+                SubscriptionPolicy::new(mode, false),
             )
             .start(None, Some(events()), 0, None);
             let normal = tokio::time::timeout(Duration::from_secs(2), normal.collect::<Vec<_>>())
@@ -558,6 +539,7 @@ mod tests {
                 ServiceParams::new(),
                 "task".into(),
                 completion(),
+                SubscriptionPolicy::new(mode, false),
             );
             let (out, mut received) = mpsc::channel(8);
             let out = DeliverySink::Stream(out);
@@ -591,6 +573,7 @@ mod tests {
             ServiceParams::new(),
             "task".into(),
             RunCompletion::Exchange,
+            SubscriptionPolicy::new(StartMode::Bidi, false),
         );
         let mut events = Some(EventSource::Subscription(
             futures::stream::iter([
@@ -625,6 +608,7 @@ mod tests {
                 ServiceParams::new(),
                 "task".into(),
                 RunCompletion::Task,
+                SubscriptionPolicy::new(StartMode::Streaming, false),
             )
             .start(None, None, 0, None);
             let event = timeout(Duration::from_secs(1), events.next())
@@ -673,6 +657,7 @@ mod tests {
             ServiceParams::new(),
             task.id.clone(),
             RunCompletion::Task,
+            SubscriptionPolicy::new(StartMode::Streaming, false),
         )
         .start(None, None, 0, None);
         assert!(

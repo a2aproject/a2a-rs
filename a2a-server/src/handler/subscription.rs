@@ -9,6 +9,16 @@ use super::response::Events;
 use a2a::*;
 use futures::StreamExt;
 
+/// Validated task attachment before choosing how a response delivers it.
+/// The receiver and snapshot share the cursor captured during lookup.
+pub(super) struct SubscriptionAttachment {
+    pub(super) task_id: TaskId,
+    pub(super) receiver: Option<ExecutionReceiver>,
+    pub(super) opening: Option<Task>,
+    pub(super) sequence: u64,
+    pub(super) seen_generation: i64,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct SubscriptionPolicy {
     mode: StartMode,
@@ -42,6 +52,14 @@ impl SubscriptionPolicy {
     pub(super) fn for_response(mut self, response_id: Option<uuid::Uuid>) -> Self {
         self.response_id = response_id;
         self
+    }
+
+    pub(super) fn wants_message_updates(self) -> bool {
+        self.wants_message_updates
+    }
+
+    pub(super) fn response_id(self) -> Option<uuid::Uuid> {
+        self.response_id
     }
 
     pub(super) fn stream(

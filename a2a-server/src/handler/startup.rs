@@ -5,7 +5,7 @@
 
 use super::delivery::{Delivery, StartMode};
 use super::response::{Events, RunCompletion};
-use super::subscription::{DeliveryAttachment, SubscriptionPolicy};
+use super::subscription::{DeliveryAttachment, SubscriptionAttachment, SubscriptionPolicy};
 use a2a::*;
 use futures::{StreamExt, stream::BoxStream};
 
@@ -29,9 +29,11 @@ impl StartedResponse {
 
 pub(super) struct PreparedResponse {
     pub(super) task_id: TaskId,
-    pub(super) events: Events,
+    pub(super) events: Option<Events>,
     pub(super) opening: Option<Task>,
     pub(super) completion: RunCompletion,
+    /// Reused for the opening, followups, and later executor invocations.
+    pub(super) policy: SubscriptionPolicy,
     pub(super) seen_generation: i64,
 }
 
@@ -43,17 +45,15 @@ impl PreparedResponse {
         request: SendMessageRequest,
         delivery: Delivery,
         mode: StartMode,
-        wants_message_updates: bool,
-        response_id: Option<uuid::Uuid>,
+        policy: SubscriptionPolicy,
     ) -> Self {
         let return_immediately = request
             .configuration
             .as_ref()
             .and_then(|config| config.return_immediately)
             .unwrap_or(false);
-        let subscription = SubscriptionPolicy::new(mode, wants_message_updates)
-            .for_response(response_id)
-            .delivery(delivery, DeliveryAttachment::Opening { return_immediately });
+        let subscription =
+            policy.delivery(delivery, DeliveryAttachment::Opening { return_immediately });
         let (task, events) = (subscription.task, subscription.events);
         let task_id = task.id.clone();
         let (opening, events, completion) = match mode {
@@ -63,20 +63,28 @@ impl PreparedResponse {
         };
         Self {
             task_id,
-            events,
+            events: Some(events),
             opening,
             completion,
+            policy,
             seen_generation: 0,
         }
     }
 
-    pub(super) fn subscription(request: SubscribeToTaskRequest, events: Events) -> Self {
+    pub(super) fn subscription(
+        attachment: SubscriptionAttachment,
+        completion: RunCompletion,
+        policy: SubscriptionPolicy,
+    ) -> Self {
         Self {
-            task_id: request.id,
-            events,
-            opening: None,
-            completion: RunCompletion::Exchange,
-            seen_generation: request.last_seen_generation.unwrap_or(0),
+            task_id: attachment.task_id,
+            events: attachment
+                .receiver
+                .map(|receiver| policy.stream(receiver, None, attachment.sequence)),
+            opening: attachment.opening,
+            completion,
+            policy,
+            seen_generation: attachment.seen_generation,
         }
     }
 }

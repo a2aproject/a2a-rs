@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Adapt transport calls to an exchange with owned routing and receipt lifetimes.
 
-use super::delivery::{StartMode, request_task_id};
+use super::delivery::request_task_id;
 use super::protocol::{Rejection, records_message};
 use super::uplink::{
     Incoming, IncomingRequest, LiveSessions, Receipt, ResponseInput, Uplink, exchange_id,
@@ -86,13 +86,9 @@ impl<'a> ExchangeAdapter<'a> {
         Self { handler, params }
     }
 
-    pub(super) async fn open(
-        self,
-        input: ResponseInput,
-        mode: StartMode,
-    ) -> Result<OpenExchange, A2AError> {
+    pub(super) async fn open(self, input: ResponseInput) -> Result<OpenExchange, A2AError> {
         let exchange = match input {
-            ResponseInput::Request(mut request) if mode == StartMode::Bidi => {
+            ResponseInput::HttpLive(mut request) => {
                 let exchange_id = exchange_id(self.params)?;
                 let bound_task = match exchange_id.as_deref() {
                     Some(id) => self.handler.live.task_for_exchange(id),
@@ -161,9 +157,12 @@ impl<'a> ExchangeAdapter<'a> {
                     uplink: Uplink::Http(receiver),
                 }
             }
-            ResponseInput::Request(request) => {
+            ResponseInput::Single(request) => {
                 let item = Incoming {
-                    request: IncomingRequest::Raw(*request),
+                    request: IncomingRequest::Raw(StreamRequest {
+                        tenant: request.tenant.clone(),
+                        payload: StreamRequestPayload::SendMessage(*request),
+                    }),
                     receipt: None,
                 };
                 Exchange {
@@ -171,7 +170,7 @@ impl<'a> ExchangeAdapter<'a> {
                     uplink: Uplink::Stream(futures::stream::once(async move { item }).boxed()),
                 }
             }
-            ResponseInput::Stream(stream) => {
+            ResponseInput::Duplex(stream) => {
                 let input = stream
                     .map(|request| Incoming {
                         request: IncomingRequest::Raw(request),
@@ -257,14 +256,15 @@ mod tests {
     use super::*;
     use crate::handler::response::{Events, Run, RunCompletion};
     use crate::handler::test_support::*;
+    use crate::handler::{delivery::StartMode, subscription::SubscriptionPolicy};
 
     async fn bound_exchange(handler: &DefaultRequestHandler) -> Exchange {
         let params = ServiceParams::new();
         let OpenExchange::Attached(mut exchange) = ExchangeAdapter::new(handler, &params)
-            .open(
-                ResponseInput::message(send_req(None, None)),
-                StartMode::Bidi,
-            )
+            .open(ResponseInput::HttpLive(Box::new(StreamRequest {
+                tenant: None,
+                payload: StreamRequestPayload::SendMessage(send_req(None, None)),
+            })))
             .await
             .unwrap()
         else {
@@ -314,6 +314,7 @@ mod tests {
             ServiceParams::new(),
             "task".into(),
             RunCompletion::Exchange,
+            SubscriptionPolicy::new(StartMode::Bidi, false),
         )
         .start(None, Some(events), 0, Some(exchange));
         assert!(matches!(
@@ -336,7 +337,7 @@ mod tests {
         let params =
             ServiceParams::from([(a2a::SDK_LIVE_EXCHANGE_HEADER.into(), vec!["shared".into()])]);
         let subscribe = || {
-            ResponseInput::Request(Box::new(StreamRequest {
+            ResponseInput::HttpLive(Box::new(StreamRequest {
                 tenant: None,
                 payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
                     id: "task".into(),
@@ -346,7 +347,7 @@ mod tests {
             }))
         };
         let OpenExchange::Attached(mut first) = ExchangeAdapter::new(&handler, &params)
-            .open(subscribe(), StartMode::Bidi)
+            .open(subscribe())
             .await
             .unwrap()
         else {
@@ -354,7 +355,7 @@ mod tests {
         };
         first.bind("task");
         let error = ExchangeAdapter::new(&handler, &params)
-            .open(subscribe(), StartMode::Bidi)
+            .open(subscribe())
             .await
             .err()
             .expect("identifier is already bound");
