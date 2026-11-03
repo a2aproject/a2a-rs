@@ -624,7 +624,7 @@ fn protojson_stream<T: ProtoJsonPayload + 'static>(
 /// `error` as a2a-python's REST server names it and its client expects.
 fn rest_sse(stream: BoxStream<'static, Result<Value, A2AError>>) -> axum::response::Response {
     let events = stream.map(|item| item.map_err(|err| rest_error_envelope(err).1));
-    sse::sse_from_stream(Box::pin(events)).into_response()
+    sse::sse_from_rest_stream(Box::pin(events)).into_response()
 }
 
 fn parse_create_push_config_request(
