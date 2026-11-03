@@ -319,18 +319,6 @@ impl LiveSessions {
     }
 }
 
-/// The answer to one `SendLiveMessage` call over a transport that has no
-/// native duplex (A2A 1.1 §3.1.12): the call that opens the exchange is the
-/// downlink, and a later call for the same task only gets the task state back.
-#[non_exhaustive]
-pub enum LiveResponse {
-    /// This call is the downlink: the events, until the exchange ends.
-    Stream(BoxStream<'static, Result<StreamResponse, A2AError>>),
-    /// This call was input for an exchange that is already open; here is the
-    /// task as it stands. Its events arrive on the downlink, never here.
-    Ack(Box<Task>),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
