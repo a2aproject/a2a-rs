@@ -1681,6 +1681,7 @@ mod tests {
         message: Option<Message>,
     ) -> StreamResponse {
         StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: ctx.task_id.clone(),
             context_id: ctx.context_id.clone(),
             status: TaskStatus {
@@ -2553,6 +2554,8 @@ mod tests {
             .get_task(
                 &ServiceParams::new(),
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: task_id,
                     history_length: None,
                     tenant: None,
@@ -2573,9 +2576,13 @@ mod tests {
         let handler = DefaultRequestHandler::new(
             ScriptedExecutor(|ctx: &ExecutorContext| {
                 let append = StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    generation: 0,
                     task_id: ctx.task_id.clone(),
                     context_id: ctx.context_id.clone(),
                     artifact: Artifact {
+                        end_generation: None,
+                        role: None,
+                        start_generation: Some(0),
                         artifact_id: "unknown".into(),
                         name: None,
                         description: None,
@@ -2601,6 +2608,7 @@ mod tests {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -2635,6 +2643,8 @@ mod tests {
         );
         let mut request = send_request();
         request.configuration = Some(SendMessageConfiguration {
+            if_generation_match: None,
+            timeline_length: None,
             accepted_output_modes: None,
             // A loopback webhook is refused by the default URL validation.
             task_push_notification_config: Some(TaskPushNotificationConfig {
@@ -2653,6 +2663,7 @@ mod tests {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -2691,6 +2702,8 @@ mod tests {
         );
         let mut request = send_request();
         request.configuration = Some(SendMessageConfiguration {
+            if_generation_match: None,
+            timeline_length: None,
             accepted_output_modes: None,
             task_push_notification_config: None,
             history_length: None,
@@ -2704,6 +2717,7 @@ mod tests {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -2736,6 +2750,8 @@ mod tests {
             .get_task(
                 &ServiceParams::new(),
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: task_id,
                     history_length: None,
                     tenant: None,
@@ -2777,6 +2793,7 @@ mod tests {
             .list_tasks(
                 &params,
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -2805,6 +2822,8 @@ mod tests {
             .get_task(
                 &params,
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: task_id,
                     history_length: None,
                     tenant: None,
@@ -2836,6 +2855,8 @@ mod tests {
                     (true, Some(ask)) if in_history => {
                         let question = Message::new(Role::Agent, vec![Part::text("Which file?")]);
                         StreamResponse::Task(Task {
+                            generation: 0,
+                            timeline: None,
                             id: ctx.task_id.clone(),
                             context_id: ctx.context_id.clone(),
                             status: TaskStatus {
@@ -2892,6 +2913,7 @@ mod tests {
             .list_tasks(
                 &params,
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -2916,6 +2938,8 @@ mod tests {
             .get_task(
                 &params,
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: task_id,
                     history_length: None,
                     tenant: None,
@@ -2954,6 +2978,8 @@ mod tests {
                     .map(|text| Message::new(Role::User, vec![Part::text(text)]))
                     .to_vec();
                 let task = Task {
+                    generation: 0,
+                    timeline: None,
                     id: ctx.task_id.clone(),
                     context_id: ctx.context_id.clone(),
                     status: TaskStatus {
@@ -2971,6 +2997,8 @@ mod tests {
         );
         let request = SendMessageRequest {
             configuration: Some(SendMessageConfiguration {
+                if_generation_match: None,
+                timeline_length: None,
                 accepted_output_modes: None,
                 task_push_notification_config: None,
                 history_length: Some(1),

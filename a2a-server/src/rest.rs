@@ -1965,6 +1965,7 @@ mod tests {
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             *self.0.lock().unwrap() = ctx.metadata.clone();
             let update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: ctx.task_id,
                 context_id: ctx.context_id,
                 status: TaskStatus {
