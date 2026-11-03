@@ -384,6 +384,20 @@ pub(super) async fn persist_failure(
     }
 }
 
+/// Report any failed output through the same persisted-task failure path.
+pub(super) async fn publish_failure(
+    handler: &DefaultRequestHandler,
+    active: &ActiveExecution,
+    task_id: &str,
+    error: &A2AError,
+) {
+    let failed = persist_failure(handler, active, task_id, error).await;
+    active.publish(Err(error), failed.clone()).await;
+    if let Some(task) = failed {
+        active.publish(Ok(&StreamResponse::Task(task)), None).await;
+    }
+}
+
 #[cfg(test)]
 mod driver_tests {
     use super::super::events::EventKind;

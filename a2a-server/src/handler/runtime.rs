@@ -409,7 +409,7 @@ impl TaskRuntime {
                         .apply_output(handler, &task_id, &active, &mut event)
                         .await
                     {
-                        active.publish(Err(&error), None).await;
+                        execution::publish_failure(handler, &active, &task_id, &error).await;
                     }
                 }
                 self.release(handler, &task_id, &active).await;
@@ -419,12 +419,7 @@ impl TaskRuntime {
                     .uncreated
                     .store(false, std::sync::atomic::Ordering::SeqCst);
                 reject_unread_inputs(&active, &task_id, self).await;
-                let failed =
-                    super::execution::persist_failure(handler, &active, &task_id, &error).await;
-                active.publish(Err(&error), failed.clone()).await;
-                if let Some(task) = failed {
-                    active.publish(Ok(&StreamResponse::Task(task)), None).await;
-                }
+                execution::publish_failure(handler, &active, &task_id, &error).await;
                 release_execution(handler, &active, &task_id, self).await;
             }
             TurnEnd::Stopped => {
