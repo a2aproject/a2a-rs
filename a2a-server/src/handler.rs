@@ -409,10 +409,8 @@ async fn apply_event_to_task(
 /// is the sanitized error; the error itself still reaches the live
 /// subscribers. A task already terminal (canceled meanwhile) is left alone.
 ///
-/// §4.3.3: the FAILED state is a task update like any other, so it is pushed
-/// to the task's webhooks. A push that fails here is not raised: the sender
-/// logs it unless `fail_on_error` is set, and then it is the very error that
-/// failed the task.
+/// The FAILED state is pushed to the task's webhooks (§4.3.3); a failed push
+/// is dropped, as the task is already FAILED.
 async fn fail_task(
     runtime: &ExecutionRuntime,
     task: Option<Task>,
@@ -1257,6 +1255,17 @@ impl RequestHandler for DefaultRequestHandler {
                 Err(error) => {
                     if let Some(active) = &active_execution {
                         active.publish(Err(&error), None).await;
+                    }
+                    // CANCELED is committed: push it before the error returns,
+                    // without letting a failed push replace that error.
+                    if let Ok(task) = self.load_task(&req.id).await {
+                        let _ = send_push_notifications(
+                            &req.id,
+                            self.push_config_store.as_deref(),
+                            self.push_sender.as_deref(),
+                            &status_update(&task),
+                        )
+                        .await;
                     }
                     return Err(error);
                 }
@@ -4994,6 +5003,54 @@ mod tests {
             shutdown_tx.send(()).unwrap();
             server.await.unwrap();
         }
+    }
+
+    /// A cancel stream that fails still leaves the task CANCELED, so the
+    /// webhook gets that state and the caller still gets the error.
+    #[tokio::test]
+    async fn test_failed_cancel_still_pushes_the_canceled_state() {
+        install_crypto_provider();
+        let (url, mut receiver, shutdown_tx, server) = start_push_webhook().await;
+        let handler = push_delivery_handler(ScriptedExecutor(|_ctx: &ExecutorContext| {
+            vec![(None, Err(A2AError::internal("boom")))]
+        }));
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-cancel-error", "c-cancel-error").await;
+        handler
+            .create_push_config(
+                &params,
+                TaskPushNotificationConfig {
+                    url: url.clone(),
+                    ..push_config("t-cancel-error")
+                },
+            )
+            .await
+            .unwrap();
+
+        handler
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: "t-cancel-error".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        let pushed = next_push(&mut receiver).await.event;
+        assert!(
+            matches!(
+                pushed,
+                StreamResponse::StatusUpdate(ref update)
+                    if update.task_id == "t-cancel-error" && update.status.state == TaskState::Canceled
+            ),
+            "{pushed:?}"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
