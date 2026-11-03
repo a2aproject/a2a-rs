@@ -96,6 +96,44 @@ async fn working(
     .unwrap();
     stream
 }
+async fn finish_execution(handler: &DefaultRequestHandler, failed: bool) {
+    if failed {
+        let task = handler
+            .get_task(
+                &ServiceParams::new(),
+                GetTaskRequest {
+                    id: "task".into(),
+                    tenant: None,
+                    history_length: None,
+                    timeline_length: None,
+                    current_generation: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.status.state, TaskState::Failed);
+        assert_eq!(
+            task.status.message.as_ref().and_then(Message::text),
+            Some("Internal error")
+        );
+    }
+    let canceled = handler
+        .cancel_task(
+            &ServiceParams::new(),
+            CancelTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                metadata: None,
+            },
+        )
+        .await;
+    if failed {
+        assert_eq!(canceled.unwrap_err().code, error_code::TASK_NOT_CANCELABLE);
+    } else {
+        assert_eq!(canceled.unwrap().status.state, TaskState::Canceled);
+    }
+}
+
 #[tokio::test]
 async fn invalid_legacy_webhook_only_stops_execution_when_configured_to_fail() {
     for fail_on_error in [false, true] {
@@ -136,17 +174,7 @@ async fn invalid_legacy_webhook_only_stops_execution_when_configured_to_fail() {
                 "invalid webhook must not end an execution by default"
             );
         }
-        handler
-            .cancel_task(
-                &ServiceParams::new(),
-                CancelTaskRequest {
-                    id: "task".into(),
-                    tenant: None,
-                    metadata: None,
-                },
-            )
-            .await
-            .unwrap();
+        finish_execution(&handler, fail_on_error).await;
     }
 }
 
@@ -277,17 +305,7 @@ async fn invalid_configuration_does_not_skip_a_later_healthy_webhook() {
             );
         }
         release.notify_one();
-        handler
-            .cancel_task(
-                &ServiceParams::new(),
-                CancelTaskRequest {
-                    id: "task".into(),
-                    tenant: None,
-                    metadata: None,
-                },
-            )
-            .await
-            .unwrap();
+        finish_execution(&handler, fail_on_error).await;
         server.abort();
     }
 }

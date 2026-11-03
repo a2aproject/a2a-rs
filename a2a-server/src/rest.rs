@@ -315,7 +315,7 @@ async fn handle_live_message<H: RequestHandler>(
     let params = extract_service_params(&headers);
     match state.handler.send_live_request(&params, req).await {
         Ok(LiveResponse::Stream(stream)) => {
-            sse::sse_from_stream(protojson_stream(stream)).into_response()
+            rest_sse(protojson_stream(stream))
         }
         Ok(LiveResponse::Ack(task)) => protojson_json_response(&*task),
         Err(e) => rest_error_response(e),

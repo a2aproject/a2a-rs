@@ -5369,8 +5369,8 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
- "libc",
  "futures-util",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]
