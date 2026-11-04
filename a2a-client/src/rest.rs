@@ -275,9 +275,10 @@ impl RestTransport {
         let payload = protojson_conv::to_value(body).map_err(|e| {
             A2AError::internal(format!("failed to serialize request as ProtoJSON: {e}"))
         })?;
+        let path = tenant_path(body.tenant.as_deref(), REST_LIVE_MESSAGE_PATH);
         let resp = self
             .send(
-                self.build_request(reqwest::Method::POST, REST_LIVE_MESSAGE_PATH, params)
+                self.build_request(reqwest::Method::POST, &path, params)
                     .header("Accept", "text/event-stream, application/json")
                     .json(&payload),
             )
@@ -848,6 +849,28 @@ mod tests {
     /// A request that names a tenant goes to the proto's `/{tenant}/…`
     /// binding, its tenant percent-encoded like an id.
     #[tokio::test]
+    async fn live_openings_and_followups_use_the_encoded_tenant_path() {
+        for task_id in [None, Some("task")] {
+            let (url, line) = spawn_request_line_server().await;
+            let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), url);
+            let request: StreamRequest = serde_json::from_value(json!({
+                "tenant": "acme eu",
+                "sendMessage": {
+                    "tenant": "acme eu",
+                    "message": { "messageId": "m1", "taskId": task_id,
+                        "role": "ROLE_USER", "parts": [{"text": "hello"}] }
+                }
+            }))
+            .unwrap();
+            let _ = transport.post_live(&ServiceParams::new(), &request).await;
+            assert_eq!(
+                line.await.unwrap(),
+                "POST /a2a/acme%20eu/message:live HTTP/1.1"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_requests_with_a_tenant_use_the_tenant_path() {
         let params = ServiceParams::new();
         let tenant = Some("acme eu".to_string());
@@ -1234,7 +1257,7 @@ mod tests {
                     assert!(raw.starts_with(if rpc {
                         "POST /rpc HTTP/1.1"
                     } else {
-                        "POST /message:live HTTP/1.1"
+                        "POST /tenant-a/message:live HTTP/1.1"
                     }));
                     let routing = raw[..boundary]
                         .lines()
