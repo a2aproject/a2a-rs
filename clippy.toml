@@ -1,0 +1,4 @@
+# chrono writes a UTC timestamp as +00:00; the wire form is Z (spec §5.6.1).
+disallowed-methods = [
+    { path = "chrono::DateTime::to_rfc3339", reason = "writes a +00:00 offset; use a2a::format_timestamp" },
+]

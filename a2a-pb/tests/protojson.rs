@@ -163,10 +163,7 @@ fn task_protojson_roundtrip_serializes_protojson_primitives() {
     let json = serde_json::to_value(&task).unwrap();
     let timestamp = json["status"]["timestamp"].as_str().unwrap();
     assert_eq!(json["status"]["state"], json!("TASK_STATE_COMPLETED"));
-    assert!(matches!(
-        timestamp,
-        "2023-11-14T22:13:20Z" | "2023-11-14T22:13:20+00:00"
-    ));
+    assert_eq!(timestamp, "2023-11-14T22:13:20Z");
     assert_eq!(json["artifacts"][0]["parts"][0]["raw"], json!("AAECAw=="));
     assert_eq!(json["history"][0]["parts"][0]["data"]["score"], json!(0.98));
     assert_eq!(json["metadata"]["source"], json!("protojson-test"));
