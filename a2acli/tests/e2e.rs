@@ -117,6 +117,9 @@ const SUBSCRIBE_RESUBSCRIBE_FAILS_ONCE_ID: &str = "task-subscribe-resubscribe-fa
 /// again) and then settles. The file has to come out as the complete one.
 const SUBSCRIBE_CUT_FILE_ID: &str = "task-subscribe-cut-file";
 
+/// Like [`SUBSCRIBE_CUT_FILE_ID`], but nothing is written before the cut.
+const SUBSCRIBE_CUT_FILE_LATE_ID: &str = "task-subscribe-cut-file-late";
+
 fn raw_file_part(bytes: &[u8], filename: Option<&str>) -> Part {
     Part {
         content: PartContent::Raw(bytes.to_vec()),
@@ -214,6 +217,7 @@ fn subscribe_resumption_events(
         SUBSCRIBE_STUCK_ID,
         SUBSCRIBE_RESUBSCRIBE_FAILS_ONCE_ID,
         SUBSCRIBE_CUT_FILE_ID,
+        SUBSCRIBE_CUT_FILE_LATE_ID,
     ]
     .contains(&task_id)
     {
@@ -250,13 +254,14 @@ fn subscribe_resumption_events(
                 task_event(task_id, TaskState::Completed),
             ]
         }
+        SUBSCRIBE_CUT_FILE_LATE_ID if attempt == 1 => vec![working_status_update(task_id)],
         SUBSCRIBE_CUT_FILE_ID if attempt == 1 => {
             vec![
                 file_chunk(task_id, b"first ", false),
                 working_status_update(task_id),
             ]
         }
-        SUBSCRIBE_CUT_FILE_ID => {
+        SUBSCRIBE_CUT_FILE_ID | SUBSCRIBE_CUT_FILE_LATE_ID => {
             vec![
                 task_with_file(task_id, TaskState::Working, b"first and second"),
                 task_event(task_id, TaskState::Completed),
@@ -4175,4 +4180,43 @@ async fn a_part_that_cannot_be_written_fails_after_the_result_is_printed() {
     );
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(response["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+}
+
+/// A part that cannot be written while saving from the reconciling event
+/// ends the command with the write error, not a reconnect or a timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_fails_when_the_reconciling_event_cannot_be_saved() {
+    let server = TestServer::spawn().await;
+    let out = ScratchDir::new("cut-late-out");
+    // A directory where the file should go.
+    std::fs::create_dir_all(out.join("log.txt")).unwrap();
+
+    let output = run_cli_output(
+        &server,
+        &[
+            "--output",
+            "json",
+            "--compact",
+            "--poll-interval",
+            "10ms",
+            "task",
+            "subscribe",
+            SUBSCRIBE_CUT_FILE_LATE_ID,
+            "--save-fileparts",
+            out.arg(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    // The reconnect warning comes first; the envelope is the last line.
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let envelope = parse_error_envelope(stderr.lines().last().unwrap());
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_INTERNAL");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("log.txt"),
+        "{envelope}"
+    );
 }

@@ -177,9 +177,7 @@ impl FilePartSource for StreamResponse {
 }
 
 fn write_file(path: &Path, data: &[u8], append: bool) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
     let mut options = OpenOptions::new();
     options.create(true).write(true);
     if append {
@@ -222,6 +220,10 @@ fn resolve_name(part: &Part, fallback: &str) -> String {
 /// One safe file name out of an agent-supplied one. A name never picks the
 /// directory: only the last component under either separator is kept.
 fn clean_name(raw: &str) -> Option<String> {
+    clean_name_for(raw, cfg!(windows))
+}
+
+fn clean_name_for(raw: &str, windows: bool) -> Option<String> {
     let base = raw
         .rsplit(['/', '\\'])
         .map(str::trim)
@@ -233,11 +235,7 @@ fn clean_name(raw: &str) -> Option<String> {
         .chars()
         .map(|c| if c.is_control() { '_' } else { c })
         .collect();
-    let name = if cfg!(windows) {
-        windows_safe(&name)
-    } else {
-        name
-    };
+    let name = if windows { windows_safe(&name) } else { name };
     (!name.is_empty()).then_some(name)
 }
 
@@ -297,6 +295,7 @@ fn extension_for(media_type: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use a2a::event::{TaskArtifactUpdateEvent, TaskStatusUpdateEvent};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A fresh directory per test: runs in parallel, and across processes.
@@ -622,6 +621,69 @@ mod tests {
         assert_eq!(clean_name("   ").as_deref(), None);
         assert_eq!(clean_name("").as_deref(), None);
         assert_eq!(clean_name("bad\0name").as_deref(), Some("bad_name"));
+    }
+
+    #[test]
+    fn test_clean_name_for_windows_also_replaces_what_windows_refuses() {
+        assert_eq!(clean_name_for("a:b.txt", true).as_deref(), Some("a_b.txt"));
+        assert_eq!(clean_name_for("a:b.txt", false).as_deref(), Some("a:b.txt"));
+        assert_eq!(clean_name_for("NUL", true).as_deref(), Some("_NUL"));
+        assert_eq!(clean_name_for("...", true).as_deref(), None);
+    }
+
+    #[test]
+    fn test_every_kind_of_response_is_saved() {
+        let scratch = Scratch::new();
+        let mut saver = scratch.saver();
+        let part = |body: &[u8], name: &str| vec![raw(body, Some(name), None)];
+        let status_update = |message: Option<Message>| {
+            StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: "t1".to_string(),
+                context_id: "c1".to_string(),
+                status: a2a::TaskStatus {
+                    state: a2a::TaskState::Working,
+                    message,
+                    timestamp: None,
+                },
+                metadata: None,
+            })
+        };
+
+        message("m1", part(b"1", "message.txt"))
+            .save_to(&mut saver)
+            .unwrap();
+        SendMessageResponse::Message(message("m2", part(b"2", "reply.txt")))
+            .save_to(&mut saver)
+            .unwrap();
+        StreamResponse::Message(message("m3", part(b"3", "streamed.txt")))
+            .save_to(&mut saver)
+            .unwrap();
+        status_update(Some(message("m4", part(b"4", "status.txt"))))
+            .save_to(&mut saver)
+            .unwrap();
+        status_update(None).save_to(&mut saver).unwrap();
+        StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            task_id: "t1".to_string(),
+            context_id: "c1".to_string(),
+            artifact: artifact("a1", Some("chunk.txt"), vec![raw(b"5", None, None)]),
+            append: None,
+            last_chunk: None,
+            metadata: None,
+        })
+        .save_to(&mut saver)
+        .unwrap();
+
+        assert_eq!(
+            scratch.files(),
+            vec![
+                "chunk.txt",
+                "message.txt",
+                "reply.txt",
+                "status.txt",
+                "streamed.txt"
+            ]
+        );
+        assert_eq!(scratch.read("reply.txt"), b"2");
     }
 
     #[test]

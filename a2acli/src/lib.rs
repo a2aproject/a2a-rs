@@ -4090,7 +4090,8 @@ mod tests {
     #[tokio::test]
     async fn test_print_or_destroy_succeeds_in_text_mode() {
         let client = make_test_client(None);
-        print_or_destroy(&client, &FailingSerialize, &text_cli(), &mut None)
+        let mut saver = Some(FilePartSaver::new(PathBuf::from("unused")));
+        print_or_destroy(&client, &FailingSerialize, &text_cli(), &mut saver)
             .await
             .unwrap();
     }
