@@ -1,12 +1,16 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Prepare response subscriptions, initial events, and completion policy.
+//! Prepare response subscriptions, initial events, and completion settings.
 
 use super::delivery::{Delivery, StartMode};
 use super::events::{ExecutionReceiver, subscription_stream};
-use super::response::{Events, RunCompletion};
+use super::protocol::{
+    is_at_least_1_1, is_terminal_event, requested_protocol_version, should_interrupt_non_streaming,
+};
+use super::response::Events;
 use super::{task_handle::TaskHandle, task_service::TaskService};
+use crate::middleware::ServiceParams;
 use a2a::*;
 use futures::{StreamExt, stream::BoxStream};
 use std::sync::Arc;
@@ -92,9 +96,8 @@ pub(super) struct PreparedResponse {
     pub(super) task: TaskHandle,
     pub(super) events: Option<Events>,
     pub(super) opening: Option<Task>,
-    pub(super) completion: RunCompletion,
     /// Reused for the opening, followups, and later executor invocations.
-    pub(super) policy: SubscriptionPolicy,
+    pub(super) settings: ResponseSettings,
     pub(super) seen_generation: i64,
 }
 
@@ -102,45 +105,35 @@ impl PreparedResponse {
     /// Translate delivery into one initial subscription. A caller joining a
     /// running turn starts before or after its own input events according to
     /// the response mode; a new turn starts at its first event.
-    pub(super) fn message(
-        options: ResponseOptions,
-        delivery: Delivery,
-        mode: StartMode,
-        policy: SubscriptionPolicy,
-    ) -> Self {
+    pub(super) fn message(delivery: Delivery, settings: ResponseSettings) -> Self {
         let handle = delivery.handle();
-        let return_immediately = options.return_immediately;
-        let subscription =
-            policy.delivery(delivery, DeliveryAttachment::Opening { return_immediately });
+        let subscription = settings.delivery(delivery, DeliveryAttachment::Opening);
         let (task, events) = (subscription.task, subscription.events);
-        let (opening, events, completion) = match mode {
-            StartMode::Blocking => (None, events, RunCompletion::Unary { return_immediately }),
-            StartMode::Streaming => (None, with_opening_task(events, task), RunCompletion::Task),
-            StartMode::Bidi => (Some(task), events, RunCompletion::Exchange),
+        let (opening, events) = match settings.mode() {
+            StartMode::Blocking => (None, events),
+            StartMode::Streaming => (None, with_opening_task(events, task)),
+            StartMode::Bidi => (Some(task), events),
         };
         Self {
             task: handle,
             events: Some(events),
             opening,
-            completion,
-            policy,
+            settings,
             seen_generation: 0,
         }
     }
 
     pub(super) fn subscription(
         attachment: SubscriptionAttachment,
-        completion: RunCompletion,
-        policy: SubscriptionPolicy,
+        settings: ResponseSettings,
     ) -> Self {
         Self {
             task: attachment.task,
             events: attachment
                 .receiver
-                .map(|receiver| policy.stream(receiver, None, attachment.sequence)),
+                .map(|receiver| settings.stream(receiver, None, attachment.sequence)),
             opening: attachment.opening,
-            completion,
-            policy,
+            settings,
             seen_generation: attachment.seen_generation,
         }
     }
@@ -185,15 +178,16 @@ pub(super) struct SubscriptionAttachment {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct SubscriptionPolicy {
+pub(super) struct ResponseSettings {
     mode: StartMode,
     wants_message_updates: bool,
+    options: ResponseOptions,
     response_id: Option<uuid::Uuid>,
 }
 
 pub(super) enum DeliveryAttachment {
     /// Start a response; streaming modes announce the input in their opening snapshot.
-    Opening { return_immediately: bool },
+    Opening,
     /// An existing response must observe the follow-up's input events.
     FollowUp,
 }
@@ -205,18 +199,56 @@ pub(super) struct DeliverySubscription {
     pub(super) recorded: Vec<StreamResponse>,
 }
 
-impl SubscriptionPolicy {
+impl ResponseSettings {
     pub(super) fn new(mode: StartMode, wants_message_updates: bool) -> Self {
         Self {
             mode,
             wants_message_updates,
+            options: ResponseOptions::default(),
             response_id: None,
         }
     }
 
-    pub(super) fn for_response(mut self, response_id: Option<uuid::Uuid>) -> Self {
-        self.response_id = response_id;
-        self
+    /// Resolve response behavior once, before admitting the opening message.
+    pub(super) fn message(
+        mode: StartMode,
+        params: &ServiceParams,
+        request: &SendMessageRequest,
+    ) -> Self {
+        Self {
+            options: ResponseOptions::from_request(request),
+            ..Self::subscription(mode, params)
+        }
+    }
+
+    pub(super) fn subscription(mode: StartMode, params: &ServiceParams) -> Self {
+        Self {
+            response_id: (mode == StartMode::Bidi).then(uuid::Uuid::now_v7),
+            ..Self::new(mode, is_at_least_1_1(&requested_protocol_version(params)))
+        }
+    }
+
+    pub(super) fn mode(self) -> StartMode {
+        self.mode
+    }
+
+    pub(super) fn is_live(self) -> bool {
+        self.mode == StartMode::Bidi
+    }
+
+    pub(super) fn return_immediately(self) -> bool {
+        self.options.return_immediately
+    }
+
+    pub(super) fn trim(self, task: &mut Task) {
+        self.options.trim(task);
+    }
+
+    pub(super) fn completes(self, event: &StreamResponse) -> bool {
+        is_terminal_event(event)
+            || matches!(event, StreamResponse::Message(_))
+            || (self.mode == StartMode::Blocking
+                && should_interrupt_non_streaming(self.return_immediately(), event).is_some())
     }
 
     pub(super) fn wants_message_updates(self) -> bool {
@@ -278,12 +310,8 @@ impl SubscriptionPolicy {
                 sequence_after,
             } => {
                 let immediate = self.mode == StartMode::Blocking
-                    && matches!(
-                        attachment,
-                        DeliveryAttachment::Opening {
-                            return_immediately: true
-                        }
-                    );
+                    && self.return_immediately()
+                    && matches!(attachment, DeliveryAttachment::Opening);
                 let sequence = if self.mode == StartMode::Blocking
                     || matches!(attachment, DeliveryAttachment::FollowUp)
                 {
@@ -297,7 +325,7 @@ impl SubscriptionPolicy {
         let events = match receiver {
             Some(receiver)
                 if self.mode == StartMode::Streaming
-                    && matches!(attachment, DeliveryAttachment::Opening { .. }) =>
+                    && matches!(attachment, DeliveryAttachment::Opening) =>
             {
                 self.event_stream(receiver.opening_message(), None, sequence)
             }
@@ -359,12 +387,14 @@ mod subscription_tests {
             sequence_before: 0,
             sequence_after: 0,
         };
-        let mut subscription = SubscriptionPolicy::new(StartMode::Blocking, false).delivery(
-            delivery,
-            DeliveryAttachment::Opening {
+        let settings = ResponseSettings {
+            options: ResponseOptions {
                 return_immediately: true,
+                ..ResponseOptions::default()
             },
-        );
+            ..ResponseSettings::new(StartMode::Blocking, false)
+        };
+        let mut subscription = settings.delivery(delivery, DeliveryAttachment::Opening);
         assert!(
             matches!(subscription.events.next().await.unwrap().unwrap(), StreamResponse::Task(snapshot) if snapshot == task)
         );

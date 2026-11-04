@@ -39,6 +39,28 @@ pub(super) struct AuthorizedMessage {
     pub(super) response_id: Option<uuid::Uuid>,
 }
 
+/// Message-only input. HTTP routing can retain the original caller's authorization.
+pub(super) enum MessageInput {
+    Raw(SendMessageRequest),
+    Authorized(AuthorizedMessage),
+}
+
+impl MessageInput {
+    pub(super) fn request(&self) -> &SendMessageRequest {
+        match self {
+            Self::Raw(request) => request,
+            Self::Authorized(message) => &message.request,
+        }
+    }
+
+    pub(super) fn request_mut(&mut self) -> &mut SendMessageRequest {
+        match self {
+            Self::Raw(request) => request,
+            Self::Authorized(message) => &mut message.request,
+        }
+    }
+}
+
 /// Checks against the authoritative task while its writer is held, whether
 /// the request joins a running turn or starts a continuation.
 pub(super) fn validate_existing_task(

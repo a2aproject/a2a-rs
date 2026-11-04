@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! HTTP-only exchange routing, acknowledgements, and caller binding.
 
-use super::delivery::request_task_id;
+use super::delivery::{AuthorizedMessage, MessageInput, request_task_id};
 use super::protocol::{Rejection, records_message};
-use super::uplink::{Incoming, IncomingRequest, LiveSessions, Receipt, Uplink, exchange_id};
+use super::uplink::{HttpLiveResponses, Incoming, IncomingRequest, Receipt, Uplink, exchange_id};
 use super::{DefaultRequestHandler, LIVE_UPLINK_CAPACITY};
 use crate::middleware::ServiceParams;
 use a2a::*;
@@ -23,7 +23,7 @@ pub(super) enum HttpOpening {
 /// Registers only once the opening request has established the task. The
 /// lease is not cloned: normal exit, cancellation, and unwinding all drop it.
 pub(super) struct RegistrationLease {
-    sessions: Arc<LiveSessions>,
+    responses: Arc<HttpLiveResponses>,
     sender: mpsc::Sender<Incoming>,
     task_id: Option<TaskId>,
     exchange_id: Option<String>,
@@ -33,7 +33,7 @@ pub(super) struct RegistrationLease {
 impl RegistrationLease {
     pub(super) fn bind(&mut self, task_id: &str) {
         if self.task_id.is_none() {
-            self.sessions.register(
+            self.responses.register(
                 task_id,
                 self.sender.clone(),
                 self.exchange_id.clone(),
@@ -47,7 +47,7 @@ impl RegistrationLease {
 impl Drop for RegistrationLease {
     fn drop(&mut self) {
         if let Some(task_id) = &self.task_id {
-            self.sessions.unregister(task_id, &self.sender);
+            self.responses.unregister(task_id, &self.sender);
         }
     }
 }
@@ -55,53 +55,49 @@ impl Drop for RegistrationLease {
 pub(super) async fn open(
     handler: &DefaultRequestHandler,
     params: &ServiceParams,
-    mut request: StreamRequest,
+    request: StreamRequest,
 ) -> Result<HttpOpening, A2AError> {
     let exchange_id = exchange_id(params)?;
     let bound_task = match exchange_id.as_deref() {
-        Some(id) => handler.live.task_for_exchange(id),
+        Some(id) => handler.http_live_responses.task_for_exchange(id),
         None => Ok(None),
     };
-    if let (Ok(Some(task)), StreamRequestPayload::SendMessage(message)) =
-        (&bound_task, &mut request.payload)
-        && request_task_id(message).is_none()
-    {
-        message.message.task_id = Some(task.clone());
-    }
-    let (request, user) = match &request.payload {
-        StreamRequestPayload::SendMessage(_) => {
+    let (request, user) = match IncomingRequest::from(request) {
+        IncomingRequest::Message(mut input) => {
+            if let Ok(Some(task)) = &bound_task
+                && request_task_id(input.request()).is_none()
+            {
+                input.request_mut().message.task_id = Some(task.clone());
+            }
             let message = handler
-                .authorize_message(params, IncomingRequest::Raw(request), None)
+                .authorize_message(params, *input, None)
                 .map_err(Rejection::into_error)?;
             let user = message.user.clone();
-            (IncomingRequest::Authorized(message), user)
+            (
+                IncomingRequest::Message(Box::new(MessageInput::Authorized(message))),
+                user,
+            )
         }
-        _ => {
+        request => {
             // Subscription authorization precedes identity resolution.
-            let task = match &request.payload {
-                StreamRequestPayload::Subscribe(request) => Some(request.id.as_str()),
+            let task = match &request {
+                IncomingRequest::Subscribe(request) => Some(request.id.as_str()),
                 _ => None,
             };
             handler.authorize(params, task)?;
-            let user = handler.authenticated_user(params)?;
-            (IncomingRequest::Raw(request), user)
+            (request, handler.authenticated_user(params)?)
         }
     };
     // Report registry conflicts only after checking credentials.
-    if bound_task?.is_some()
-        && matches!(
-            &request,
-            IncomingRequest::Raw(StreamRequest {
-                payload: StreamRequestPayload::Subscribe(_),
-                ..
-            })
-        )
-    {
+    if bound_task?.is_some() && matches!(request, IncomingRequest::Subscribe(_)) {
         return Err(A2AError::invalid_request(
             "live exchange identifier is already in use",
         ));
     }
-    if let Some(task) = route(handler, &request, exchange_id.as_deref(), &user).await? {
+    if let IncomingRequest::Message(input) = &request
+        && let MessageInput::Authorized(message) = input.as_ref()
+        && let Some(task) = route(handler, message, exchange_id.as_deref()).await?
+    {
         return Ok(HttpOpening::Acknowledged(task));
     }
     let (sender, receiver) = mpsc::channel(LIVE_UPLINK_CAPACITY);
@@ -113,7 +109,7 @@ pub(super) async fn open(
         .await;
     Ok(HttpOpening::Attached {
         registration: RegistrationLease {
-            sessions: handler.live.clone(),
+            responses: handler.http_live_responses.clone(),
             sender,
             task_id: None,
             exchange_id,
@@ -126,21 +122,19 @@ pub(super) async fn open(
 /// None means processing never started, so opening a new exchange is safe.
 async fn route(
     handler: &DefaultRequestHandler,
-    request: &IncomingRequest,
+    authorized: &AuthorizedMessage,
     exchange_id: Option<&str>,
-    user: &Option<crate::middleware::User>,
 ) -> Result<Option<Box<Task>>, A2AError> {
-    let Some(message) = request.send_request() else {
-        return Ok(None);
-    };
+    let message = &authorized.request;
     let Some(task_id) = request_task_id(message) else {
         return Ok(None);
     };
-    let Some((bound_task, session)) = handler.live.route(&task_id, exchange_id, user)? else {
+    let Some((bound_task, session)) =
+        handler
+            .http_live_responses
+            .route(&task_id, exchange_id, &authorized.user)?
+    else {
         return Ok(None);
-    };
-    let IncomingRequest::Authorized(authorized) = request else {
-        unreachable!("HTTP input was authorized before routing")
     };
     // An exchange identifier selects its bound task, independently of
     // the task named in this input. Its ACK must never disclose a task
@@ -151,12 +145,14 @@ async fn route(
     let (sender, acknowledged) = oneshot::channel();
     let sent = session
         .send(Incoming {
-            request: IncomingRequest::Authorized(super::delivery::AuthorizedMessage {
-                request: authorized.request.clone(),
-                params: authorized.params.clone(),
-                user: authorized.user.clone(),
-                response_id: None,
-            }),
+            request: IncomingRequest::Message(Box::new(MessageInput::Authorized(
+                AuthorizedMessage {
+                    request: authorized.request.clone(),
+                    params: authorized.params.clone(),
+                    user: authorized.user.clone(),
+                    response_id: None,
+                },
+            ))),
             receipt: Some(Receipt::new(sender)),
         })
         .await
@@ -188,10 +184,10 @@ async fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::response::{Events, Run, RunCompletion};
+    use crate::handler::response::{Events, Run};
     use crate::handler::test_support::*;
     use crate::handler::uplink::Receipt;
-    use crate::handler::{delivery::StartMode, response_preparation::SubscriptionPolicy};
+    use crate::handler::{delivery::StartMode, response_preparation::ResponseSettings};
     use tokio::sync::oneshot;
 
     async fn bound_run(handler: &DefaultRequestHandler) -> Run {
@@ -217,8 +213,7 @@ mod tests {
             handler.clone(),
             params,
             handler.tasks.task("task"),
-            RunCompletion::Exchange,
-            SubscriptionPolicy::new(StartMode::Bidi, false),
+            ResponseSettings::new(StartMode::Bidi, false),
         )
         .with_uplink(Some(uplink), Some(registration))
     }
@@ -227,7 +222,11 @@ mod tests {
     async fn dropping_a_run_unregisters_it_and_releases_queued_callers() {
         let handler = make_handler();
         let run = bound_run(&handler).await;
-        let (_, sender) = handler.live.route("task", None, &None).unwrap().unwrap();
+        let (_, sender) = handler
+            .http_live_responses
+            .route("task", None, &None)
+            .unwrap()
+            .unwrap();
         let (receipt, result) = oneshot::channel();
         sender
             .send(Incoming {
@@ -238,7 +237,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("exchange must accept queued input"));
         drop(run);
         assert!(
-            handler.live.open.read().is_empty(),
+            handler.http_live_responses.open.read().is_empty(),
             "the lease must remove the registry entry"
         );
         assert!(
@@ -265,7 +264,7 @@ mod tests {
             Some(Err(_))
         ));
         assert!(
-            handler.live.open.read().is_empty(),
+            handler.http_live_responses.open.read().is_empty(),
             "panic cleanup must unregister before sending an error"
         );
         assert!(output.next().await.is_none());
@@ -299,7 +298,11 @@ mod tests {
             .expect("identifier is already bound");
         assert_eq!(error.code, a2a::error_code::INVALID_REQUEST);
         assert_eq!(
-            handler.live.task_for_exchange("shared").unwrap().as_deref(),
+            handler
+                .http_live_responses
+                .task_for_exchange("shared")
+                .unwrap()
+                .as_deref(),
             Some("task")
         );
         drop(registration);

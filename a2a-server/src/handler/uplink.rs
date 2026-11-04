@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Adapt duplex streams and HTTP requests into the shared runner uplink.
 
+use super::delivery::MessageInput;
 use crate::middleware::{ServiceParams, User};
 use a2a::*;
 use futures::{FutureExt, StreamExt, stream::BoxStream};
@@ -40,42 +41,49 @@ use tokio::sync::{mpsc, oneshot};
 //   `fail_on_error`, a failed delivery wakes its execution driver with an error;
 //   an event that was already published is not rolled back.
 
-/// Raw protocol input, or an HTTP message already authorized before routing.
+/// Protocol payload classified once at the native-stream or HTTP boundary.
 pub(super) enum IncomingRequest {
-    Raw(StreamRequest),
-    Authorized(super::delivery::AuthorizedMessage),
+    Message(Box<MessageInput>),
+    Subscribe(SubscribeToTaskRequest),
+    Invalid,
+}
+
+impl From<StreamRequest> for IncomingRequest {
+    fn from(request: StreamRequest) -> Self {
+        match request.payload {
+            StreamRequestPayload::SendMessage(request) => {
+                Self::Message(Box::new(MessageInput::Raw(request)))
+            }
+            StreamRequestPayload::Subscribe(request) => Self::Subscribe(request),
+            _ => Self::Invalid,
+        }
+    }
 }
 
 impl IncomingRequest {
-    pub(super) fn send_request(&self) -> Option<&SendMessageRequest> {
+    /// Only the opening accepts subscriptions; follow-ups must be messages.
+    pub(super) fn into_message(self) -> Result<MessageInput, A2AError> {
         match self {
-            Self::Authorized(message) => Some(&message.request),
-            Self::Raw(StreamRequest {
-                payload: StreamRequestPayload::SendMessage(message),
-                ..
-            }) => Some(message),
-            _ => None,
+            Self::Message(message) => Ok(*message),
+            Self::Subscribe(_) => Err(A2AError::invalid_request(
+                "subscribe is only valid as the first request of a stream",
+            )),
+            Self::Invalid => Err(A2AError::invalid_request(
+                "unrecognised StreamRequest payload",
+            )),
         }
     }
+
+    #[cfg(test)]
     pub(super) fn message(request: SendMessageRequest) -> Self {
-        Self::Raw(StreamRequest {
-            tenant: request.tenant.clone(),
-            payload: StreamRequestPayload::SendMessage(request),
-        })
+        Self::Message(Box::new(MessageInput::Raw(request)))
     }
 
     pub(super) fn reference_id(&self) -> Option<String> {
         let message = match self {
-            Self::Authorized(message) => &message.request,
-            Self::Raw(StreamRequest {
-                payload: StreamRequestPayload::SendMessage(message),
-                ..
-            }) => message,
-            Self::Raw(StreamRequest {
-                payload: StreamRequestPayload::Subscribe(subscribe),
-                ..
-            }) => return Some(subscribe.id.clone()),
-            _ => return None,
+            Self::Message(input) => input.request(),
+            Self::Subscribe(subscribe) => return Some(subscribe.id.clone()),
+            Self::Invalid => return None,
         };
         message
             .message
@@ -150,7 +158,7 @@ impl Uplink {
         Self::Stream(
             requests
                 .map(|request| Incoming {
-                    request: IncomingRequest::Raw(request),
+                    request: IncomingRequest::from(request),
                     receipt: None,
                 })
                 .boxed(),
@@ -182,14 +190,14 @@ impl Uplink {
     }
 }
 
-/// The open live sessions, by task, so a short-lived HTTP call can be routed to
-/// the session whose downlink is already open.
+/// Open HTTP live responses, grouped by task. Follow-up calls are routed to
+/// the input queue of a response whose downlink is already open.
 #[derive(Default)]
-pub(super) struct LiveSessions {
-    pub(super) open: parking_lot::RwLock<HashMap<TaskId, Vec<LiveSession>>>,
+pub(super) struct HttpLiveResponses {
+    pub(super) open: parking_lot::RwLock<HashMap<TaskId, Vec<HttpLiveResponse>>>,
 }
 
-pub(super) struct LiveSession {
+pub(super) struct HttpLiveResponse {
     exchange_id: Option<String>,
     user: Option<User>,
     sender: mpsc::Sender<Incoming>,
@@ -218,15 +226,15 @@ pub(super) fn exchange_id(params: &ServiceParams) -> Result<Option<String>, A2AE
     Ok(Some(value.clone()))
 }
 
-impl LiveSessions {
+impl HttpLiveResponses {
     /// Recover the bound task before authorizing an HTTP uplink that omits it.
     pub(super) fn task_for_exchange(&self, id: &str) -> Result<Option<TaskId>, A2AError> {
         let open = self.open.read();
-        let mut tasks = open.iter().filter_map(|(task, sessions)| {
-            sessions
+        let mut tasks = open.iter().filter_map(|(task, responses)| {
+            responses
                 .iter()
-                .any(|session| {
-                    !session.sender.is_closed() && session.exchange_id.as_deref() == Some(id)
+                .any(|response| {
+                    !response.sender.is_closed() && response.exchange_id.as_deref() == Some(id)
                 })
                 .then_some(task)
         });
@@ -249,7 +257,7 @@ impl LiveSessions {
             .write()
             .entry(task_id.to_string())
             .or_default()
-            .push(LiveSession {
+            .push(HttpLiveResponse {
                 sender,
                 exchange_id,
                 user,
@@ -265,23 +273,23 @@ impl LiveSessions {
         user: &Option<User>,
     ) -> Result<Option<(TaskId, mpsc::Sender<Incoming>)>, A2AError> {
         let open = self.open.read();
-        let mut candidates = open.iter().flat_map(|(task, sessions)| {
-            sessions
+        let mut candidates = open.iter().flat_map(|(task, responses)| {
+            responses
                 .iter()
-                .filter(move |session| {
-                    !session.sender.is_closed()
+                .filter(move |response| {
+                    !response.sender.is_closed()
                         && match exchange_id {
-                            Some(id) => session.exchange_id.as_deref() == Some(id),
+                            Some(id) => response.exchange_id.as_deref() == Some(id),
                             None => {
                                 task == task_id
-                                    && session.exchange_id.is_none()
-                                    && &session.user == user
+                                    && response.exchange_id.is_none()
+                                    && &response.user == user
                             }
                         }
                 })
-                .map(move |session| (task, session))
+                .map(move |response| (task, response))
         });
-        let Some((bound_task, session)) = candidates.next() else {
+        let Some((bound_task, response)) = candidates.next() else {
             return Ok(None);
         };
         if candidates.next().is_some() {
@@ -289,12 +297,12 @@ impl LiveSessions {
                 "ambiguous live exchange; use a distinct exchange routing identifier",
             ));
         }
-        if &session.user != user {
+        if &response.user != user {
             return Err(A2AError::invalid_request(
                 "live exchange belongs to a different caller",
             ));
         }
-        Ok(Some((bound_task.clone(), session.sender.clone())))
+        Ok(Some((bound_task.clone(), response.sender.clone())))
     }
 
     pub(super) fn unregister(&self, task_id: &str, sender: &mpsc::Sender<Incoming>) {
@@ -316,17 +324,17 @@ mod tests {
 
     #[test]
     fn concurrent_registrations_cannot_route_an_ambiguous_exchange_identifier() {
-        let sessions = LiveSessions::default();
+        let responses = HttpLiveResponses::default();
         let (first, _rx1) = mpsc::channel(1);
         let (second, _rx2) = mpsc::channel(1);
-        sessions.register("first", first.clone(), Some("shared".into()), None);
-        sessions.register("second", second, Some("shared".into()), None);
-        let error = sessions.task_for_exchange("shared").unwrap_err();
+        responses.register("first", first.clone(), Some("shared".into()), None);
+        responses.register("second", second, Some("shared".into()), None);
+        let error = responses.task_for_exchange("shared").unwrap_err();
         assert_eq!(error.code, a2a::error_code::INVALID_REQUEST);
         assert!(error.message.contains("ambiguous"));
-        sessions.unregister("first", &first);
+        responses.unregister("first", &first);
         assert_eq!(
-            sessions.task_for_exchange("shared").unwrap().as_deref(),
+            responses.task_for_exchange("shared").unwrap().as_deref(),
             Some("second")
         );
     }
