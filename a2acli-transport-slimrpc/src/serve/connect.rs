@@ -373,6 +373,7 @@ mod tests {
     use futures::stream;
     use futures::stream::StreamExt;
 
+    use super::super::scratch::ScratchFile;
     use super::*;
 
     /// A [`Transport`] test double: records the params of the last call it
@@ -909,18 +910,20 @@ app:
         // Guarded so this can't race main.rs's test of the same env var.
         let _guard = crate::ENV_LOCK.lock().await;
 
-        let path = std::env::temp_dir().join("a2acli-slimrpc-test-run-reads-env-var.yaml");
-        std::fs::write(&path, minimal_config_yaml("http://127.0.0.1:1")).unwrap();
+        let file = ScratchFile::new(
+            "a2acli-slimrpc-test-run-reads-env-var.yaml",
+            &minimal_config_yaml("http://127.0.0.1:1"),
+        );
 
         // SAFETY: guarded by ENV_LOCK above.
         unsafe {
-            std::env::set_var("A2A_SLIMRPC_PLUGIN_CONFIG", &path);
+            std::env::set_var("A2A_SLIMRPC_PLUGIN_CONFIG", file.as_path());
         }
         let err = run("not-a-valid-target").await.unwrap_err();
         unsafe {
             std::env::remove_var("A2A_SLIMRPC_PLUGIN_CONFIG");
         }
-        let _ = std::fs::remove_file(&path);
+        drop(file);
 
         // Reaching the InvalidEndpoint error (from run_with_config, past the
         // env var read and load_config call) proves run() actually loaded
