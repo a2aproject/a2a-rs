@@ -69,6 +69,8 @@ the provenance do that.
 - Full configuration precedence (flag > environment variable > local `.env`
   > global `.env` > built-in default) with a read-only `config show` to
   inspect it
+- `--save-fileparts <dir>` on `send`, `task get` and `task subscribe`, which
+  writes the raw file parts of artifacts and messages to disk
 - Shell completion scripts for bash, zsh, fish, PowerShell, and elvish via
   `completion <shell>`
 - `card get --validate` against the A2A JSON schema, reporting every
@@ -242,6 +244,32 @@ an inline JSON string. `--media-type` sets the media type of the part flag
 immediately preceding it. The plain positional form (`send "hello"`) is
 shorthand for a single `--text-part` and cannot be combined with the part
 flags above.
+
+### Saving file parts
+
+A file part in a response is reported by name, media type and size. To get
+its bytes, pass `--save-fileparts <dir>` to `send`, `task get` or
+`task subscribe`; the output is unchanged, and stderr names each file the
+first time it is written:
+
+```sh
+cargo run --bin a2acli -- task get task-123 --save-fileparts out
+# saved file part: out/report.pdf
+```
+
+The directory is created when the first file is written. Only inline bytes are
+saved: a file part carried by URL is never fetched. A file is named after the
+part's `filename`, else the artifact's name or id, else `status-msg` for a
+message, with an extension from the media type when the name has none. Only
+the last path component of a name is used, so an agent cannot write outside
+`<dir>`.
+
+Parts of one message or artifact that share a name are joined into one file.
+A file that already exists is overwritten the first time it is written. A
+second artifact with the same name is kept as `name (1).ext`, and the chunks
+of a streamed artifact marked `append` extend its file. A failure to write
+exits `1` with `A2ACLI_ERR_INTERNAL`, after the result itself has been
+printed.
 
 ### Output and errors
 
