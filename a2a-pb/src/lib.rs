@@ -20,5 +20,6 @@ pub mod protojson {
 
 pub mod pbconv;
 pub mod protojson_conv;
+mod timestamp;
 
 pub use proto::*;
