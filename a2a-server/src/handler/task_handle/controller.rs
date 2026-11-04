@@ -446,6 +446,43 @@ mod tests {
     use crate::handler::test_support::*;
 
     #[tokio::test]
+    async fn terminal_turn_cleanup_rejects_unread_input_even_after_creation_fails() {
+        for deferred in [false, true] {
+            let handler = make_handler();
+            let mut task = task_with_history("terminal", "context", 0);
+            task.status.state = TaskState::Canceled;
+            handler.tasks.store().create(task.clone()).await.unwrap();
+            let mut controller = TaskController::default();
+            let (active, _inbox) = controller.reserve(&handler, &task.id).await.unwrap();
+            active.set_snapshot(task.clone());
+            active
+                .uncreated
+                .store(deferred, std::sync::atomic::Ordering::SeqCst);
+            let input = crate::ClientInput::new(make_message(), 1);
+            let reference = input.message.message_id.clone();
+            let queued = controller
+                .execution
+                .bookkeeping(&active)
+                .unwrap()
+                .track_input(input);
+            active.inputs.sender.try_send(queued).unwrap();
+            let mut events = active.subscribe();
+            controller.end_turn(&handler, &active, &task.id).await;
+            let event = events.recv().await.unwrap().result.unwrap();
+            assert!(matches!(event, StreamResponse::Error(ref error)
+                if error.code == "UNAVAILABLE" && error.reference_id.as_deref() == Some(reference.as_str())));
+            assert!(active.inputs.closed.is_cancelled());
+            assert!(matches!(controller.execution, ExecutionState::Idle));
+            assert!(handler.tasks.task(&task.id).active().is_none());
+            assert_eq!(
+                handler.tasks.store().get(&task.id).await.unwrap().unwrap(),
+                task
+            );
+            handler.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn late_driver_commands_cannot_release_or_publish_into_a_successor() {
         let handler = make_handler();
         let mut runtime = TaskController::default();
