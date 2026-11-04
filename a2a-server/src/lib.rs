@@ -205,6 +205,23 @@ pub(crate) mod test_util {
             Ok(Box::pin(futures::stream::empty()))
         }
 
+        async fn send_live_request(
+            &self,
+            params: &ServiceParams,
+            request: StreamRequest,
+        ) -> Result<crate::handler::LiveResponse, A2AError> {
+            self.record("send_live_request", params, request.tenant.as_deref());
+            let tenant = match &request.payload {
+                StreamRequestPayload::SendMessage(message) => message.tenant.as_deref(),
+                StreamRequestPayload::Subscribe(request) => request.tenant.as_deref(),
+                _ => None,
+            };
+            self.record("live_payload", params, tenant);
+            Ok(crate::handler::LiveResponse::Stream(Box::pin(
+                futures::stream::empty(),
+            )))
+        }
+
         async fn get_task(
             &self,
             params: &ServiceParams,

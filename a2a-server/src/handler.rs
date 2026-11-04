@@ -5467,6 +5467,4 @@ mod upstream_regressions {
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
     }
-
-
 }
