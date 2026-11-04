@@ -678,6 +678,95 @@ mod delivery_tests {
     use crate::handler::test_support::*;
 
     #[tokio::test]
+    async fn detached_followups_announce_persisted_inputs_once_and_respect_disconnects() {
+        for wants_messages in [false, true] {
+            for disconnected in [false, true] {
+                let handler = make_handler().with_capabilities(AgentCapabilities {
+                    streaming: Some(true),
+                    user_artifacts: Some(true),
+                    ..Default::default()
+                });
+                seed_task(&handler, "task", "context").await;
+                let mut run = Run::new(
+                    handler.clone(),
+                    ServiceParams::from([(SVC_PARAM_VERSION.into(), vec!["1.1".into()])]),
+                    handler.tasks.task("task"),
+                    ResponseSettings::new(StartMode::Bidi, wants_messages),
+                );
+                let mut request = send_request();
+                let message_id = request.message.message_id.clone();
+                request.message.task_id = Some("task".into());
+                request.artifact_updates.push(TaskArtifactUpdateEvent {
+                    task_id: "task".into(),
+                    context_id: "context".into(),
+                    artifact: Artifact {
+                        artifact_id: "upload".into(),
+                        parts: vec![Part::text("client input")],
+                        role: Some(Role::User),
+                        name: None,
+                        description: None,
+                        metadata: None,
+                        extensions: None,
+                        start_generation: None,
+                        end_generation: None,
+                    },
+                    generation: 0,
+                    append: None,
+                    last_chunk: None,
+                    metadata: None,
+                });
+                let (out, received) = mpsc::channel(8);
+                let mut received = (!disconnected).then_some(received);
+                let mut inner = None;
+                let mut generation = 0;
+                let keep_open = run
+                    .deliver(
+                        IncomingRequest::message(request),
+                        &mut inner,
+                        &mut generation,
+                        &out,
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "a valid followup must be admitted: {:?}",
+                            error.into_error()
+                        )
+                    });
+                assert_eq!(keep_open, !disconnected);
+                assert!(inner.is_some(), "the followup must attach task output");
+                if let Some(received) = &mut received {
+                    let mut updates = Vec::new();
+                    while let Ok(event) = received.try_recv() {
+                        updates.push(event.unwrap());
+                    }
+                    assert_eq!(updates.len(), if wants_messages { 2 } else { 1 });
+                    assert!(
+                        matches!(updates.last(), Some(StreamResponse::ArtifactUpdate(update)) if update.artifact.artifact_id == "upload")
+                    );
+                    if wants_messages {
+                        assert!(
+                            matches!(&updates[0], StreamResponse::MessageUpdate(update) if update.message.message_id == message_id)
+                        );
+                    }
+                    assert_eq!(generation, 2);
+                }
+                let task = handler.tasks.load("task").await.unwrap();
+                assert_eq!(
+                    task.history
+                        .unwrap()
+                        .iter()
+                        .filter(|m| m.message_id == message_id)
+                        .count(),
+                    1
+                );
+                assert_eq!(task.artifacts.unwrap()[0].artifact_id, "upload");
+                handler.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn runner_panic_is_reported_and_a_disconnected_consumer_stops_delivery() {
         let run = || {
             let handler = make_handler();
