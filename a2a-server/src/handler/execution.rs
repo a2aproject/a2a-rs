@@ -392,7 +392,14 @@ pub(super) async fn publish_failure(
     let failed = persist_failure(handler, active, task_id, error).await;
     active.publish(Err(error), failed.clone());
     if let Some(task) = failed {
-        active.publish(Ok(&StreamResponse::Task(task)), None);
+        let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: task.generation,
+            task_id: task.id,
+            context_id: task.context_id,
+            status: task.status,
+            metadata: None,
+        });
+        active.publish(Ok(&event), None);
     }
 }
 
