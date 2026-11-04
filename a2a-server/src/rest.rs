@@ -620,14 +620,11 @@ fn protojson_stream<T: ProtoJsonPayload + 'static>(
 }
 
 /// Spec §11.6: an error inside an HTTP+JSON stream is an event carrying the
-/// same `{"error": google.rpc.Status}` body a non-streaming error has.
+/// same `{"error": google.rpc.Status}` body a non-streaming error has, named
+/// `error` as a2a-python's REST server names it and its client expects.
 fn rest_sse(stream: BoxStream<'static, Result<Value, A2AError>>) -> axum::response::Response {
-    let events = stream.map(|item| {
-        Ok(item.unwrap_or_else(|err| {
-            serde_json::to_value(rest_error_envelope(err).1).unwrap_or_default()
-        }))
-    });
-    sse::sse_from_stream(Box::pin(events)).into_response()
+    let events = stream.map(|item| item.map_err(|err| rest_error_envelope(err).1));
+    sse::sse_from_rest_stream(Box::pin(events)).into_response()
 }
 
 fn parse_create_push_config_request(
@@ -1165,8 +1162,8 @@ mod tests {
             .await
             .unwrap()
             .to_bytes();
-        let frames: Vec<Value> = String::from_utf8(body.to_vec())
-            .unwrap()
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let frames: Vec<Value> = body
             .lines()
             .filter_map(|line| line.strip_prefix("data: "))
             .map(|data| serde_json::from_str(data).unwrap())
@@ -1176,6 +1173,13 @@ mod tests {
         assert_eq!(error["code"], 404);
         assert_eq!(error["status"], "NOT_FOUND");
         assert_eq!(error["details"][0]["reason"], "TASK_NOT_FOUND");
+        // The error frame alone is named: a2a-python's REST client reads an
+        // unnamed frame as a StreamResponse and drops the error.
+        let names: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("event: "))
+            .collect();
+        assert_eq!(names, vec!["error"], "{body}");
     }
 
     #[tokio::test]
