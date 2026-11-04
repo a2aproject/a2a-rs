@@ -1283,6 +1283,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_live_stream_errors_use_rest_error_frames() {
+        for path in ["/message:live", "/acme/message:live"] {
+            let (handler, _) = CapturingHandler::new();
+            *handler.live_stream_error.lock().unwrap() = Some(A2AError::task_not_found("t1"));
+            let response = rest_router(handler)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("A2A-Version", "1.1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"subscribe": {"id": "t1"}}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("event: error"), "{body}");
+            let data = body
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            let frame: Value = serde_json::from_str(data).unwrap();
+            assert_eq!(frame["error"]["code"], 404);
+            assert_eq!(frame["error"]["status"], "NOT_FOUND");
+            assert_eq!(frame["error"]["details"][0]["reason"], "TASK_NOT_FOUND");
+        }
+    }
+
+    #[tokio::test]
     async fn test_stream_error_event_is_a_google_rpc_status() {
         let stream: BoxStream<'static, Result<Value, A2AError>> =
             Box::pin(futures::stream::iter(vec![

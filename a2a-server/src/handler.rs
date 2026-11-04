@@ -5366,13 +5366,14 @@ mod upstream_regressions {
         install_crypto_provider();
         for executor_emits_canceled in [false, true] {
             let (url, mut receiver, shutdown_tx, server) = start_push_webhook().await;
-            let handler = push_delivery_handler(PushScriptedExecutor(move |ctx: &ExecutorContext| {
-                if executor_emits_canceled {
-                    vec![(None, Ok(push_status_event(ctx, TaskState::Canceled, None)))]
-                } else {
-                    Vec::<PushStep>::new()
-                }
-            }));
+            let handler =
+                push_delivery_handler(PushScriptedExecutor(move |ctx: &ExecutorContext| {
+                    if executor_emits_canceled {
+                        vec![(None, Ok(push_status_event(ctx, TaskState::Canceled, None)))]
+                    } else {
+                        Vec::<PushStep>::new()
+                    }
+                }));
             let params = ServiceParams::new();
             seed_task(&handler, "t-cancel-push", "c-cancel-push").await;
             handler
