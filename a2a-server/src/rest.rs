@@ -354,6 +354,9 @@ async fn handle_list_tasks<H: RequestHandler>(
     let params = extract_service_params(&headers);
     let status = match query.status {
         Some(s) => match serde_json::from_value::<TaskState>(serde_json::Value::String(s)) {
+            // The proto's default: no filter, as the JSON-RPC and gRPC
+            // bindings already read it.
+            Ok(TaskState::Unspecified) => None,
             Ok(state) => Some(state),
             Err(_) => {
                 return rest_error_response(A2AError::invalid_params("invalid status filter"));
@@ -557,7 +560,12 @@ async fn handle_delete_push_config<H: RequestHandler>(
         tenant,
     };
     match state.handler.delete_push_config(&params, req).await {
-        Ok(()) => StatusCode::OK.into_response(),
+        // google.protobuf.Empty, as ProtoJSON spells it: a client that
+        // parses every success body (a2a-python) needs one.
+        Ok(()) => with_content_type(
+            Json(Value::Object(Default::default())).into_response(),
+            "application/a2a+json",
+        ),
         Err(e) => rest_error_response(e),
     }
 }
@@ -612,14 +620,11 @@ fn protojson_stream<T: ProtoJsonPayload + 'static>(
 }
 
 /// Spec §11.6: an error inside an HTTP+JSON stream is an event carrying the
-/// same `{"error": google.rpc.Status}` body a non-streaming error has.
+/// same `{"error": google.rpc.Status}` body a non-streaming error has, named
+/// `error` as a2a-python's REST server names it and its client expects.
 fn rest_sse(stream: BoxStream<'static, Result<Value, A2AError>>) -> axum::response::Response {
-    let events = stream.map(|item| {
-        Ok(item.unwrap_or_else(|err| {
-            serde_json::to_value(rest_error_envelope(err).1).unwrap_or_default()
-        }))
-    });
-    sse::sse_from_stream(Box::pin(events)).into_response()
+    let events = stream.map(|item| item.map_err(|err| rest_error_envelope(err).1));
+    sse::sse_from_rest_stream(Box::pin(events)).into_response()
 }
 
 fn parse_create_push_config_request(
@@ -674,7 +679,8 @@ fn rest_error_envelope(err: A2AError) -> (StatusCode, RestErrorEnvelope) {
     let reason = error_reason(err.code);
     let grpc_status = rest_grpc_status(err.code);
 
-    let mut metadata = HashMap::from([("timestamp".to_string(), Utc::now().to_rfc3339())]);
+    let mut metadata =
+        HashMap::from([("timestamp".to_string(), a2a::format_timestamp(&Utc::now()))]);
     let mut details = Vec::new();
 
     if let Some(extra) = err.details {
@@ -1157,8 +1163,8 @@ mod tests {
             .await
             .unwrap()
             .to_bytes();
-        let frames: Vec<Value> = String::from_utf8(body.to_vec())
-            .unwrap()
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let frames: Vec<Value> = body
             .lines()
             .filter_map(|line| line.strip_prefix("data: "))
             .map(|data| serde_json::from_str(data).unwrap())
@@ -1168,6 +1174,13 @@ mod tests {
         assert_eq!(error["code"], 404);
         assert_eq!(error["status"], "NOT_FOUND");
         assert_eq!(error["details"][0]["reason"], "TASK_NOT_FOUND");
+        // The error frame alone is named: a2a-python's REST client reads an
+        // unnamed frame as a StreamResponse and drops the error.
+        let names: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("event: "))
+            .collect();
+        assert_eq!(names, vec!["error"], "{body}");
     }
 
     #[tokio::test]
@@ -1191,6 +1204,20 @@ mod tests {
         // Merged metadata should contain both taskId and timestamp
         assert_eq!(details[0]["metadata"]["taskId"], "t99");
         assert!(details[0]["metadata"]["timestamp"].is_string());
+    }
+
+    /// The ErrorInfo timestamp is a wire timestamp (§5.6.1): `Z`, not the
+    /// `+00:00` that chrono's `to_rfc3339` writes.
+    #[tokio::test]
+    async fn test_rest_error_info_timestamp_uses_the_z_designator() {
+        let resp = rest_error_response(A2AError::task_not_found("t1"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let timestamp = payload["error"]["details"][0]["metadata"]["timestamp"]
+            .as_str()
+            .unwrap();
+        assert!(timestamp.ends_with('Z'), "{timestamp}");
+        assert!(timestamp.parse::<DateTime<Utc>>().is_ok());
     }
 
     #[tokio::test]
@@ -1341,6 +1368,17 @@ mod tests {
             .unwrap();
         let delete_resp = app.clone().oneshot(delete_req).await.unwrap();
         assert_eq!(delete_resp.status(), StatusCode::OK);
+        // google.protobuf.Empty in ProtoJSON: `{}`, typed like every other
+        // success, so a client that parses the body gets a document.
+        assert_eq!(
+            delete_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/a2a+json"
+        );
+        let body = delete_resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({})
+        );
 
         let list_req = Request::builder()
             .header("a2a-version", "1.0")
@@ -1367,6 +1405,40 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `TASK_STATE_UNSPECIFIED` is the proto's default for an unset
+    /// `status`: no filter, as the other bindings treat it, not a filter
+    /// no task can match.
+    #[tokio::test]
+    async fn test_list_tasks_status_unspecified_is_no_filter() {
+        let app = make_app();
+        let body = serde_json::json!({
+            "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hello"}]}
+        });
+        let req = Request::builder()
+            .header("a2a-version", "1.0")
+            .uri(REST_SEND_MESSAGE_PATH)
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let req = Request::builder()
+            .header("a2a-version", "1.0")
+            .uri("/tasks?status=TASK_STATE_UNSPECIFIED")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["totalSize"], 1, "{payload}");
     }
 
     #[tokio::test]

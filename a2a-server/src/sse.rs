@@ -40,6 +40,28 @@ pub fn sse_from_stream<T: serde::Serialize + Send + 'static>(
     Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE_INTERVAL))
 }
 
+/// Like `sse_from_stream`, but an `Err` item is sent as it serializes under
+/// the event name `error`, which a2a-python's REST client dispatches on.
+pub(crate) fn sse_from_rest_stream<T, E>(
+    stream: BoxStream<'static, Result<T, E>>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>>
+where
+    T: serde::Serialize + Send + 'static,
+    E: serde::Serialize + Send + 'static,
+{
+    let mut event_id = 0u64;
+    let sse_stream = stream.map(move |item| {
+        let event = Event::default().id(next_event_id(&mut event_id));
+        Ok::<_, Infallible>(match item {
+            Ok(val) => event.data(serde_json::to_string(&val).unwrap_or_default()),
+            Err(err) => event
+                .event("error")
+                .data(serde_json::to_string(&err).unwrap_or_default()),
+        })
+    });
+    Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE_INTERVAL))
+}
+
 /// Convert a boxed stream of JSON-RPC responses into an SSE response.
 pub fn sse_jsonrpc_stream<T: serde::Serialize + Send + 'static>(
     request_id: a2a::JsonRpcId,
@@ -222,5 +244,37 @@ mod tests {
             let body = String::from_utf8(body.to_vec()).unwrap();
             assert_eq!(event_ids(&body), vec!["1"], "{body}");
         }
+    }
+
+    /// Only the error frame is named, with the body as the caller built it,
+    /// and it is numbered like the others.
+    #[tokio::test]
+    async fn test_sse_from_rest_stream_names_the_error_frame() {
+        let s: BoxStream<'static, Result<serde_json::Value, serde_json::Value>> =
+            Box::pin(stream::iter(vec![
+                Ok(serde_json::json!({"n": 1})),
+                Err(serde_json::json!({"error": {"message": "fail"}})),
+            ]));
+
+        let body = sse_from_rest_stream(s)
+            .into_response()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        let names: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("event:"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(names, vec!["error"], "{body}");
+        assert!(
+            body.contains("data: {\"error\":{\"message\":\"fail\"}}"),
+            "{body}"
+        );
+        assert_eq!(event_ids(&body), vec!["1", "2"], "{body}");
     }
 }

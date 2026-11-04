@@ -8,6 +8,7 @@ pub mod errordetails;
 pub mod errors;
 pub mod event;
 pub mod jsonrpc;
+pub mod timestamp;
 pub mod types;
 
 pub use agent_card::*;
@@ -15,6 +16,7 @@ pub use errordetails::*;
 pub use errors::*;
 pub use event::*;
 pub use jsonrpc::*;
+pub use timestamp::*;
 pub use types::*;
 
 /// The A2A protocol version this SDK implements.
