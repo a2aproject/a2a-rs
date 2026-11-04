@@ -355,10 +355,9 @@ impl Transport for RestTransport {
             query_parts.push(("historyLength".to_string(), hl.to_string()));
         }
         if let Some(ref ts) = req.status_timestamp_after {
-            // §5.6.1: UTC with the `Z` designator, never an offset.
             query_parts.push((
                 "statusTimestampAfter".to_string(),
-                ts.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string(),
+                a2a::format_timestamp(ts),
             ));
         }
         if let Some(ia) = req.include_artifacts {
