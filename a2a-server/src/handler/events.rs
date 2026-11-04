@@ -655,9 +655,9 @@ mod tests {
     }
     #[tokio::test]
     async fn lagged_subscribers_recover_errors_across_executor_handoffs() {
-        use crate::handler::task_registry::TaskRegistry;
+        use crate::handler::test_support::make_handler;
         use futures::StreamExt;
-        let manager = TaskRegistry::default();
+        let manager = make_handler().tasks;
         let mut task = task_with_history("handoff-error", "context", 0);
         task.status.state = TaskState::Working;
         let (first, _inputs, _invocation) = manager.task(&task.id).reserve().unwrap();

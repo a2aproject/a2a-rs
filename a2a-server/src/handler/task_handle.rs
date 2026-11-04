@@ -29,7 +29,7 @@ pub(super) struct TaskHandle {
     changes: watch::Sender<u64>,
     pub(super) sender: broadcast::Sender<ExecutionEvent>,
     state: RwLock<State>,
-    pub(super) notifications: std::sync::OnceLock<super::push_delivery::NotificationSettings>,
+    pub(super) notifications: std::sync::OnceLock<Arc<super::push_delivery::PushService>>,
     pub(super) webhook_subscribed: std::sync::Mutex<super::push_delivery::SubscriptionState>,
 }
 
@@ -274,7 +274,7 @@ impl TaskWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::task_registry::TaskRegistry;
+    use crate::handler::test_support::make_handler;
     use crate::handler::test_support::task_with_history;
 
     #[tokio::test]
@@ -358,7 +358,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_subscription_and_sequence_survive_executor_handoff() {
-        let manager = TaskRegistry::default();
+        let manager = make_handler().tasks;
         let (first, _inputs, _invocation) = manager.task("task").reserve().unwrap();
         let source = first.task.clone();
         let mut subscriber = source.sender.subscribe();
@@ -382,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_does_not_retain_unused_task_sources() {
-        let manager = TaskRegistry::default();
+        let manager = make_handler().tasks;
         let source = manager.task("unused");
         let weak = Arc::downgrade(&source);
         drop(source);

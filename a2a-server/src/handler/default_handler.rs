@@ -8,9 +8,11 @@ use super::http_exchange::{self, HttpOpening, RegistrationLease};
 use super::protocol::{
     Rejection, apply_lengths, is_at_least_1_1, requested_protocol_version, unary_refusal,
 };
+use super::push_delivery::PushService;
 use super::response::{Events, Run, RunCompletion};
 use super::response_preparation::{MessageResponse, PreparedResponse, ResponseOptions};
 use super::response_preparation::{SubscriptionAttachment, SubscriptionPolicy};
+use super::task_handle::TaskHandle;
 use super::task_service::TaskService;
 use super::uplink::{IncomingRequest, LiveSessions, Uplink};
 
@@ -38,8 +40,7 @@ const DEFAULT_CANCEL_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct DefaultRequestHandler {
     pub(super) tasks: Arc<TaskService>,
-    pub(super) push_config_store: Option<Arc<dyn crate::PushConfigStore>>,
-    pub(super) push_sender: Option<Arc<crate::HttpPushSender>>,
+    pub(super) pushes: Option<Arc<PushService>>,
     pub(super) capabilities: AgentCapabilities,
     default_input_modes: Vec<String>,
     authorizer: Option<Arc<dyn RequestAuthorizer>>,
@@ -54,8 +55,7 @@ impl DefaultRequestHandler {
     pub fn new(executor: impl crate::AgentExecutor, task_store: impl crate::TaskStore) -> Self {
         DefaultRequestHandler {
             tasks: Arc::new(TaskService::new(executor, task_store)),
-            push_config_store: None,
-            push_sender: None,
+            pushes: None,
             capabilities: AgentCapabilities::default(),
             default_input_modes: Vec::new(),
             authorizer: None,
@@ -193,17 +193,8 @@ impl DefaultRequestHandler {
         Ok(())
     }
 
-    pub fn with_push_config_store(
-        mut self,
-        push_config_store: impl crate::PushConfigStore,
-    ) -> Self {
-        self.push_sender = Some(Arc::new(crate::HttpPushSender::new(None)));
-        self.push_config_store = Some(Arc::new(push_config_store));
-        // Only a default: an explicit `Some(false)` from `with_capabilities`
-        // stands, so the result no longer depends on which builder method was
-        // called last.
-        self.capabilities.push_notifications.get_or_insert(true);
-        self
+    pub fn with_push_config_store(self, push_config_store: impl crate::PushConfigStore) -> Self {
+        self.with_push_notifications(push_config_store, crate::HttpPushSender::new(None))
     }
 
     pub fn with_push_notifications(
@@ -211,8 +202,7 @@ impl DefaultRequestHandler {
         push_config_store: impl crate::PushConfigStore,
         push_sender: crate::HttpPushSender,
     ) -> Self {
-        self.push_config_store = Some(Arc::new(push_config_store));
-        self.push_sender = Some(Arc::new(push_sender));
+        self.pushes = Some(PushService::new(push_config_store, push_sender));
         self.capabilities.push_notifications.get_or_insert(true);
         self
     }
@@ -287,19 +277,18 @@ impl DefaultRequestHandler {
         )
     }
 
-    /// The push-config store, refusing first when the card declares that the
-    /// agent does not support push notifications (§13.3). Distinct from
-    /// [`Self::push_config_store`], which reports the *deployment* state — a
-    /// store that was never supplied — with the same error code.
-    fn push_config_store_checked(&self) -> Result<&dyn crate::PushConfigStore, A2AError> {
+    /// Require the advertised capability and a fully configured webhook service.
+    fn push_service_checked(&self) -> Result<&PushService, A2AError> {
         self.require_push_notifications()?;
-        self.push_config_store()
-    }
-
-    fn push_config_store(&self) -> Result<&dyn crate::PushConfigStore, A2AError> {
-        self.push_config_store
+        self.pushes
             .as_deref()
             .ok_or_else(A2AError::push_notification_not_supported)
+    }
+
+    pub(super) fn attach_pushes(&self, task: &TaskHandle) {
+        if let Some(pushes) = &self.pushes {
+            pushes.attach(task);
+        }
     }
 
     /// Ordinary sends resolve to a Message or a Task; transport setup stays outside.
@@ -535,7 +524,7 @@ impl DefaultRequestHandler {
             return Ok(None);
         };
         // Refused up front when the handler has nowhere to keep it.
-        self.push_config_store_checked()?;
+        let pushes = self.push_service_checked()?;
         config.task_id = task_id.to_string();
         if config.tenant.is_none() {
             config.tenant = req.tenant.clone();
@@ -543,9 +532,7 @@ impl DefaultRequestHandler {
         config
             .protocol_version
             .get_or_insert_with(|| requested_protocol_version(params));
-        if let Some(sender) = &self.push_sender {
-            sender.validate_config(&config)?;
-        }
+        pushes.validate_config(&config)?;
         Ok(Some(config))
     }
 
@@ -556,7 +543,7 @@ impl DefaultRequestHandler {
         req: &SendMessageRequest,
     ) -> Result<(), A2AError> {
         if let Some(config) = self.request_push_config(params, task_id, req)? {
-            self.push_config_store_checked()?.save(config).await?;
+            self.push_service_checked()?.store().save(config).await?;
         }
         Ok(())
     }
@@ -746,12 +733,10 @@ impl RequestHandler for DefaultRequestHandler {
         let mut req = req;
         req.protocol_version
             .get_or_insert_with(|| requested_protocol_version(params));
-        let store = self.push_config_store_checked()?;
+        let pushes = self.push_service_checked()?;
         self.tasks.load(&req.task_id).await?;
-        if let Some(sender) = &self.push_sender {
-            sender.validate_config(&req)?;
-        }
-        store.save(req).await
+        pushes.validate_config(&req)?;
+        pushes.store().save(req).await
     }
 
     async fn get_push_config(
@@ -760,7 +745,8 @@ impl RequestHandler for DefaultRequestHandler {
         req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         self.authorize(params, Some(&req.task_id))?;
-        self.push_config_store_checked()?
+        self.push_service_checked()?
+            .store()
             .get(&req.task_id, &req.id)
             .await
     }
@@ -771,7 +757,11 @@ impl RequestHandler for DefaultRequestHandler {
         req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
         self.authorize(params, Some(&req.task_id))?;
-        let mut configs = self.push_config_store_checked()?.list(&req.task_id).await?;
+        let mut configs = self
+            .push_service_checked()?
+            .store()
+            .list(&req.task_id)
+            .await?;
         configs.sort_by(|left, right| left.id.cmp(&right.id));
 
         // Paging for push configs is done here, not in the store: the store
@@ -802,7 +792,8 @@ impl RequestHandler for DefaultRequestHandler {
         req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
         self.authorize(params, Some(&req.task_id))?;
-        self.push_config_store_checked()?
+        self.push_service_checked()?
+            .store()
             .delete(&req.task_id, &req.id)
             .await
     }
