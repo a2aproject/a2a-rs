@@ -159,6 +159,7 @@ pub(crate) mod test_util {
     pub(crate) struct CapturingHandler {
         captured: CapturedParams,
         tenants: Mutex<HashMap<&'static str, Option<String>>>,
+        pub(crate) live_stream_error: Mutex<Option<A2AError>>,
     }
 
     impl CapturingHandler {
@@ -167,6 +168,7 @@ pub(crate) mod test_util {
             let handler = Arc::new(CapturingHandler {
                 captured: captured.clone(),
                 tenants: Mutex::new(HashMap::new()),
+                live_stream_error: Mutex::new(None),
             });
             (handler, captured)
         }
@@ -217,8 +219,9 @@ pub(crate) mod test_util {
                 _ => None,
             };
             self.record("live_payload", params, tenant);
+            let error = self.live_stream_error.lock().unwrap().take();
             Ok(crate::handler::LiveResponse::Stream(Box::pin(
-                futures::stream::empty(),
+                futures::stream::iter(error.map(Err)),
             )))
         }
 
