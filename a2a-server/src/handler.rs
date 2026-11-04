@@ -491,6 +491,8 @@ async fn drive_execution(
     };
     let mut stream = runtime.executor.execute(exec_ctx);
     let mut failure = None;
+    // §3.1.2: a response is one Message, or a Task and its updates, not both.
+    let (mut answered, mut tracked) = (false, false);
 
     while let Some(result) = stream.next().await {
         if active.snapshot_is_terminal().await {
@@ -499,6 +501,13 @@ async fn drive_execution(
 
         match result {
             Ok(mut event) => {
+                let message = matches!(event, StreamResponse::Message(_));
+                if answered || (message && tracked) {
+                    failure = Some(A2AError::invalid_agent_response());
+                    break;
+                }
+                answered = message;
+                tracked |= !message;
                 backfill_status_timestamp(&mut event);
                 match apply_event_to_task(runtime.task_store.as_ref(), current_task.clone(), &event)
                     .await
@@ -711,8 +720,32 @@ impl DefaultRequestHandler {
     }
 
     fn authorize(&self, params: &ServiceParams, task_id: Option<&str>) -> Result<(), A2AError> {
+        self.require_extensions(params)?;
         match &self.authorizer {
             Some(authorizer) => authorizer.authorize(params, task_id),
+            None => Ok(()),
+        }
+    }
+
+    /// §3.3.4: a request that does not activate every extension the card
+    /// marks `required` is refused. Activation is the `A2A-Extensions`
+    /// service parameter, comma-separated or repeated (§9.2, §10.2, §11.2).
+    fn require_extensions(&self, params: &ServiceParams) -> Result<(), A2AError> {
+        let Some(extensions) = &self.capabilities.extensions else {
+            return Ok(());
+        };
+        let activated: Vec<&str> = params
+            .get(&SVC_PARAM_EXTENSIONS.to_ascii_lowercase())
+            .into_iter()
+            .flatten()
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .collect();
+        match extensions
+            .iter()
+            .find(|ext| ext.required == Some(true) && !activated.contains(&ext.uri.as_str()))
+        {
+            Some(missing) => Err(A2AError::extension_support_required(&missing.uri)),
             None => Ok(()),
         }
     }
@@ -876,11 +909,19 @@ impl DefaultRequestHandler {
             // for deciding this turn's behavior, and `apply_event_to_task`
             // only ever merges status/artifact deltas onto the snapshot
             // started here, never anything content-derived. Append it so
-            // `history` actually accumulates across turns.
-            existing
-                .history
-                .get_or_insert_with(Vec::new)
-                .push(req.message.clone());
+            // `history` actually accumulates across turns. The agent's last
+            // word (an INPUT_REQUIRED question) lives only in `status.message`
+            // and the next status replaces it, so it goes in first.
+            let asked = existing.status.message.clone();
+            let history = existing.history.get_or_insert_with(Vec::new);
+            if let Some(asked) = asked.filter(|asked| {
+                history
+                    .iter()
+                    .all(|seen| seen.message_id != asked.message_id)
+            }) {
+                history.push(asked);
+            }
+            history.push(req.message.clone());
             existing
         } else {
             let task = Task {
@@ -1036,8 +1077,20 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.authorize(params, req.message.task_id.as_deref())?;
         self.require_streaming()?;
+        // The history cap binds every Task in the response, streamed ones too.
+        let history_length = req
+            .configuration
+            .as_ref()
+            .and_then(|configuration| configuration.history_length);
         let (_, stream) = self.start_execution(params, req, false).await?;
-        Ok(stream)
+        Ok(Box::pin(stream.map(move |item| {
+            item.map(|mut event| {
+                if let StreamResponse::Task(task) = &mut event {
+                    apply_history_length(task, history_length);
+                }
+                event
+            })
+        })))
     }
 
     async fn get_task(
@@ -2582,6 +2635,306 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.status.state, TaskState::Canceled);
+    }
+
+    /// The agent's INPUT_REQUIRED question stays in history between the
+    /// turn that asked it and the answer.
+    #[tokio::test]
+    async fn test_continuation_keeps_the_question_in_history() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                let asked = ctx
+                    .message
+                    .as_ref()
+                    .and_then(Message::text)
+                    .is_some_and(|text| text == "ask");
+                let event = if asked {
+                    let question = Message::new(Role::Agent, vec![Part::text("Which file?")]);
+                    status_event(ctx, TaskState::InputRequired, Some(question))
+                } else {
+                    status_event(ctx, TaskState::Completed, None)
+                };
+                vec![(None, Ok(event))]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let params = ServiceParams::new();
+        let ask = SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("ask")]),
+            ..send_request()
+        };
+        handler.send_message(&params, ask).await.unwrap();
+        let task_id = handler
+            .list_tasks(
+                &params,
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap()
+            .tasks[0]
+            .id
+            .clone();
+        let answer = SendMessageRequest {
+            message: Message {
+                task_id: Some(task_id.clone()),
+                ..Message::new(Role::User, vec![Part::text("main.rs")])
+            },
+            ..send_request()
+        };
+        handler.send_message(&params, answer).await.unwrap();
+
+        let task = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        let said: Vec<_> = task
+            .history
+            .unwrap()
+            .iter()
+            .map(|message| message.text().unwrap().to_owned())
+            .collect();
+        assert_eq!(said, ["ask", "Which file?", "main.rs"]);
+    }
+
+    /// An agent that asks "Which file?" on "ask" and completes on any other
+    /// message. With `in_history`, the question is already in the `history`
+    /// of the task snapshot it emits, as an agent that records it itself does.
+    fn asking_handler(in_history: bool) -> DefaultRequestHandler {
+        DefaultRequestHandler::new(
+            ScriptedExecutor(move |ctx: &ExecutorContext| {
+                let asked = ctx
+                    .message
+                    .as_ref()
+                    .and_then(Message::text)
+                    .is_some_and(|text| text == "ask");
+                let event = match (asked, &ctx.message) {
+                    (true, Some(ask)) if in_history => {
+                        let question = Message::new(Role::Agent, vec![Part::text("Which file?")]);
+                        StreamResponse::Task(Task {
+                            id: ctx.task_id.clone(),
+                            context_id: ctx.context_id.clone(),
+                            status: TaskStatus {
+                                state: TaskState::InputRequired,
+                                message: Some(question.clone()),
+                                timestamp: None,
+                            },
+                            artifacts: None,
+                            history: Some(vec![ask.clone(), question]),
+                            metadata: None,
+                        })
+                    }
+                    (true, _) => {
+                        let question = Message::new(Role::Agent, vec![Part::text("Which file?")]);
+                        status_event(ctx, TaskState::InputRequired, Some(question))
+                    }
+                    (false, _) => status_event(ctx, TaskState::Completed, None),
+                };
+                vec![(None, Ok(event))]
+            }),
+            InMemoryTaskStore::new(),
+        )
+    }
+
+    /// Sends "ask", then "main.rs" to the task it created, and returns the
+    /// task's history as text.
+    async fn answer_the_question(handler: &DefaultRequestHandler, streaming: bool) -> Vec<String> {
+        async fn turn(handler: &DefaultRequestHandler, streaming: bool, message: Message) {
+            let params = ServiceParams::new();
+            let request = SendMessageRequest {
+                message,
+                ..send_request()
+            };
+            if streaming {
+                let _: Vec<_> = handler
+                    .send_streaming_message(&params, request)
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await;
+            } else {
+                handler.send_message(&params, request).await.unwrap();
+            }
+        }
+
+        let params = ServiceParams::new();
+        turn(
+            handler,
+            streaming,
+            Message::new(Role::User, vec![Part::text("ask")]),
+        )
+        .await;
+        let task_id = handler
+            .list_tasks(
+                &params,
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap()
+            .tasks[0]
+            .id
+            .clone();
+        let answer = Message {
+            task_id: Some(task_id.clone()),
+            ..Message::new(Role::User, vec![Part::text("main.rs")])
+        };
+        turn(handler, streaming, answer).await;
+        let task = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        task.history
+            .unwrap()
+            .iter()
+            .map(|message| message.text().unwrap().to_owned())
+            .collect()
+    }
+
+    /// `send_streaming_message` continues a task through the same path.
+    #[tokio::test]
+    async fn test_streamed_continuation_keeps_the_question_in_history() {
+        let said = answer_the_question(&asking_handler(false), true).await;
+        assert_eq!(said, ["ask", "Which file?", "main.rs"]);
+    }
+
+    /// A question the agent already put in `history` is not added twice.
+    #[tokio::test]
+    async fn test_continuation_does_not_repeat_a_question_already_in_history() {
+        let said = answer_the_question(&asking_handler(true), false).await;
+        assert_eq!(said, ["ask", "Which file?", "main.rs"]);
+    }
+
+    /// `configuration.historyLength` caps the Task snapshots of a stream as
+    /// it caps the task a blocking send returns.
+    #[tokio::test]
+    async fn test_streamed_task_snapshots_respect_history_length() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                let history = ["one", "two", "three"]
+                    .map(|text| Message::new(Role::User, vec![Part::text(text)]))
+                    .to_vec();
+                let task = Task {
+                    id: ctx.task_id.clone(),
+                    context_id: ctx.context_id.clone(),
+                    status: TaskStatus {
+                        state: TaskState::Completed,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: Some(history),
+                    metadata: None,
+                };
+                vec![(None, Ok(StreamResponse::Task(task)))]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let request = SendMessageRequest {
+            configuration: Some(SendMessageConfiguration {
+                accepted_output_modes: None,
+                task_push_notification_config: None,
+                history_length: Some(1),
+                return_immediately: None,
+            }),
+            ..send_request()
+        };
+        let events: Vec<_> = handler
+            .send_streaming_message(&ServiceParams::new(), request)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(matches!(
+            &events[..],
+            [Ok(StreamResponse::Task(task))] if task.history.as_ref().map(Vec::len) == Some(1)
+        ));
+    }
+
+    /// A Message after the task's own events is an invalid agent response,
+    /// not the answer (§3.1.2), and the task fails.
+    #[tokio::test]
+    async fn test_message_after_task_events_is_an_invalid_agent_response() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                vec![
+                    (None, Ok(status_event(ctx, TaskState::Working, None))),
+                    (
+                        None,
+                        Ok(StreamResponse::Message(Message::new(
+                            Role::Agent,
+                            vec![Part::text("late")],
+                        ))),
+                    ),
+                ]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let error = handler
+            .send_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+    }
+
+    /// Nothing may follow a Message that answered the request.
+    #[tokio::test]
+    async fn test_event_after_an_answering_message_is_an_invalid_agent_response() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                vec![
+                    (
+                        None,
+                        Ok(StreamResponse::Message(Message::new(
+                            Role::Agent,
+                            vec![Part::text("answer")],
+                        ))),
+                    ),
+                    (None, Ok(status_event(ctx, TaskState::Completed, None))),
+                ]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let events: Vec<_> = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(matches!(events[0], Ok(StreamResponse::Message(_))));
+        assert!(
+            matches!(&events[1], Err(error) if error.code == error_code::INVALID_AGENT_RESPONSE)
+        );
     }
 
     #[tokio::test]
@@ -4405,6 +4758,87 @@ mod tests {
 
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
+    }
+
+    fn handler_with_extensions(extensions: Vec<(&str, Option<bool>)>) -> DefaultRequestHandler {
+        make_handler().with_capabilities(AgentCapabilities {
+            streaming: None,
+            push_notifications: None,
+            extensions: Some(
+                extensions
+                    .into_iter()
+                    .map(|(uri, required)| AgentExtension {
+                        uri: uri.into(),
+                        description: None,
+                        required,
+                        params: None,
+                    })
+                    .collect(),
+            ),
+            extended_agent_card: None,
+        })
+    }
+
+    /// §3.3.4: a request that does not activate an extension the card marks
+    /// `required` is refused with ExtensionSupportRequiredError, on every
+    /// operation.
+    #[tokio::test]
+    async fn test_required_extension_not_activated_is_refused() {
+        let handler = handler_with_extensions(vec![
+            ("urn:ext:optional", None),
+            ("urn:ext:required", Some(true)),
+        ]);
+        let mut params = ServiceParams::new();
+        params.insert("a2a-extensions".into(), vec!["urn:ext:optional".into()]);
+
+        let error = handler
+            .send_message(&params, send_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::EXTENSION_SUPPORT_REQUIRED);
+        assert!(
+            error.message.contains("urn:ext:required"),
+            "{}",
+            error.message
+        );
+
+        let error = handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: "t1".into(),
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::EXTENSION_SUPPORT_REQUIRED);
+    }
+
+    /// The required extension may arrive comma-separated in one value or as
+    /// a repeated service parameter; an optional one need not arrive at all.
+    #[tokio::test]
+    async fn test_required_extension_activated_is_accepted() {
+        let handler = handler_with_extensions(vec![
+            ("urn:ext:optional", Some(false)),
+            ("urn:ext:required", Some(true)),
+        ]);
+        for activated in [
+            vec!["urn:ext:other, urn:ext:required".to_string()],
+            vec!["urn:ext:other".to_string(), "urn:ext:required".to_string()],
+        ] {
+            let mut params = ServiceParams::new();
+            params.insert("a2a-extensions".into(), activated);
+            handler.send_message(&params, send_request()).await.unwrap();
+        }
+
+        // Nothing required: no activation needed.
+        let handler = handler_with_extensions(vec![("urn:ext:optional", None)]);
+        handler
+            .send_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

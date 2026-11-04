@@ -9,14 +9,16 @@ use axum::{
     Json,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, Uri},
     response::IntoResponse,
 };
 use futures::{StreamExt, stream::BoxStream};
 use serde_json::Value;
 
 use crate::handler::RequestHandler;
-use crate::middleware::{ServiceParams, check_a2a_version, extract_service_params};
+use crate::middleware::{
+    ServiceParams, add_query_version, check_a2a_version, extract_service_params,
+};
 use crate::sse;
 
 /// Shared state for the JSON-RPC handler.
@@ -53,10 +55,12 @@ pub fn jsonrpc_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
 
 async fn handle_jsonrpc<H: RequestHandler>(
     State(state): State<JsonRpcState<H>>,
+    uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let params = extract_service_params(&headers);
+    let mut params = extract_service_params(&headers);
+    add_query_version(&mut params, &uri);
 
     // A `Json<JsonRpcRequest>` extractor would reject a malformed body with
     // axum's own error response before this handler runs at all, which is
@@ -118,7 +122,7 @@ async fn handle_unary_request<H: RequestHandler>(
     request: &JsonRpcRequest,
 ) -> axum::response::Response {
     let id = request.id.clone();
-    let raw_params = request.params.clone().unwrap_or(Value::Null);
+    let raw_params = params_or_empty(request);
 
     let result: Result<Value, A2AError> = match request.method.as_str() {
         methods::SEND_MESSAGE => match protojson_conv::from_value::<SendMessageRequest>(raw_params)
@@ -222,7 +226,7 @@ async fn handle_streaming_request<H: RequestHandler>(
     request: &JsonRpcRequest,
 ) -> axum::response::Response {
     let id = request.id.clone();
-    let raw_params = request.params.clone().unwrap_or(Value::Null);
+    let raw_params = params_or_empty(request);
 
     match request.method.as_str() {
         methods::SEND_STREAMING_MESSAGE => {
@@ -271,6 +275,16 @@ fn protojson_stream(
             })
         })
     }))
+}
+
+/// JSON-RPC 2.0 §4: `params` MAY be omitted, and §9.4.8's own
+/// `GetExtendedAgentCard` request has none. Omitted or `null` is the
+/// request with no parameters, which ProtoJSON spells `{}`.
+fn params_or_empty(request: &JsonRpcRequest) -> Value {
+    match &request.params {
+        Some(params) if !params.is_null() => params.clone(),
+        _ => Value::Object(Default::default()),
+    }
 }
 
 fn parse_create_push_config_request(
@@ -713,6 +727,29 @@ mod tests {
         assert!(resp.error.is_some() || resp.result.is_some());
     }
 
+    /// JSON-RPC 2.0 §4: `params` MAY be omitted; §9.4.8's own request has
+    /// none. Omitted or `null`, it is the request with no parameters.
+    #[tokio::test]
+    async fn test_omitted_or_null_params_are_no_params() {
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":null}"#,
+        ] {
+            let req = Request::builder()
+                .uri("/")
+                .method("POST")
+                .header("content-type", "application/json")
+                .header("a2a-version", "1.0")
+                .body(Body::from(body))
+                .unwrap();
+            let resp = make_app().oneshot(req).await.unwrap();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let resp: JsonRpcResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(resp.error, None, "{body}");
+            assert_eq!(resp.result.unwrap()["tasks"], serde_json::json!([]));
+        }
+    }
+
     #[tokio::test]
     async fn test_get_extended_agent_card() {
         let app = make_app();
@@ -925,6 +962,49 @@ mod tests {
             parsed.error.expect("expected an error").code,
             error_code::VERSION_NOT_SUPPORTED
         );
+    }
+
+    /// §3.6.1: the version may come as a query parameter instead of a header;
+    /// the header wins when both are present.
+    #[tokio::test]
+    async fn test_a2a_version_query_parameter_is_honored() {
+        let rpc = JsonRpcRequest::new(
+            JsonRpcId::Number(1),
+            methods::SEND_MESSAGE,
+            Some(serde_json::json!({
+                "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+            })),
+        );
+        for (uri, header, expected) in [
+            ("/?A2A-Version=1.0", None, None),
+            ("/?a2a-version=1.0", None, None),
+            (
+                "/?A2A-Version=99.0",
+                None,
+                Some(error_code::VERSION_NOT_SUPPORTED),
+            ),
+            (
+                "/?A2A-Version=1.0",
+                Some("99.0"),
+                Some(error_code::VERSION_NOT_SUPPORTED),
+            ),
+        ] {
+            let mut req = Request::builder()
+                .uri(uri)
+                .method("POST")
+                .header("content-type", "application/json");
+            if let Some(version) = header {
+                req = req.header("a2a-version", version);
+            }
+            let req = req
+                .body(Body::from(serde_json::to_string(&rpc).unwrap()))
+                .unwrap();
+            let resp = make_app().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let parsed: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed.error.map(|e| e.code), expected, "{uri} {header:?}");
+        }
     }
 
     #[tokio::test]

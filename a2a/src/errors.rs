@@ -146,6 +146,15 @@ impl A2AError {
         A2AError::new(error_code::INVALID_AGENT_RESPONSE, "invalid agent response")
     }
 
+    /// The request did not activate an extension the agent card marks
+    /// `required` (§3.3.4).
+    pub fn extension_support_required(uri: &str) -> Self {
+        A2AError::new(
+            error_code::EXTENSION_SUPPORT_REQUIRED,
+            format!("extension support required: {uri}"),
+        )
+    }
+
     pub fn version_not_supported(version: &str) -> Self {
         A2AError::new(
             error_code::VERSION_NOT_SUPPORTED,
