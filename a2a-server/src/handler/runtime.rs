@@ -135,7 +135,7 @@ impl TaskRuntime {
         }
         let (active, inputs) = self.reserve(handler, task_id).await?;
         active.set_snapshot(task.clone());
-        handler.tasks.pushes.attach(handler, task_id, &active.task);
+        handler.attach_pushes(&active.task);
         let mut context =
             crate::ExecutorContext::new(task.id.clone(), task.context_id.clone(), inputs)
                 .with_stored_task(task);
@@ -240,7 +240,7 @@ impl TaskRuntime {
             ..
         } = message;
         let params = &params;
-        handler.tasks.pushes.attach(handler, &task_id, &active.task);
+        handler.attach_pushes(&active.task);
         if existed || !lazy {
             // Existing subscribers and webhooks observe persisted client input
             // through the same publication path as executor output. The new
@@ -396,12 +396,7 @@ impl TaskRuntime {
             .expect("current invocation");
         handler
             .tasks
-            .update(
-                active,
-                event,
-                invocation,
-                handler.push_config_store.as_deref(),
-            )
+            .update(active, event, invocation, handler.pushes.as_deref())
             .await
     }
 

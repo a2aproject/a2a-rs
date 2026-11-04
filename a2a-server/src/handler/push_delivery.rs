@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Subscribe to the task broadcast without awaiting webhook network I/O.
 
-use super::DefaultRequestHandler;
 use super::events::{EventKind, ExecutionEvent};
 use super::push_worker::{Notification, PushDispatcher, signal_failure};
 use super::task_handle::TaskHandle;
@@ -18,40 +17,53 @@ pub(super) const PUSH_QUEUE_CAPACITY: usize = 1024;
 const PUSH_CONFIG_TIMEOUT: Duration = Duration::from_secs(30);
 const PUSH_WORKER_IDLE: Duration = Duration::from_secs(60);
 
+/// One configured webhook service, shared by handler clones and task handles.
 #[derive(Clone)]
-pub(super) struct NotificationSettings {
-    pub(super) task_id: TaskId,
-    pub(super) store: Arc<dyn crate::PushConfigStore>,
-    pub(super) sender: Arc<crate::HttpPushSender>,
-    pub(super) dispatcher: Arc<std::sync::OnceLock<PushDispatcher>>,
+pub(super) struct PushService {
+    store: Arc<dyn crate::PushConfigStore>,
+    sender: Arc<crate::HttpPushSender>,
+    dispatcher: Arc<std::sync::OnceLock<PushDispatcher>>,
+}
+
+impl PushService {
+    pub(super) fn new(
+        store: impl crate::PushConfigStore,
+        sender: crate::HttpPushSender,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store: Arc::new(store),
+            sender: Arc::new(sender),
+            dispatcher: Arc::default(),
+        })
+    }
+
+    pub(super) fn store(&self) -> &dyn crate::PushConfigStore {
+        self.store.as_ref()
+    }
+
+    pub(super) fn validate_config(
+        &self,
+        config: &TaskPushNotificationConfig,
+    ) -> Result<(), A2AError> {
+        self.sender.validate_config(config)
+    }
+
+    pub(super) async fn save_pending(&self, pending: &mut Option<TaskPushNotificationConfig>) {
+        if let Some(config) = pending.take() {
+            if let Err(error) = self.store.save(config).await {
+                tracing::warn!(%error, "could not save the push configuration of a new task");
+            }
+        }
+    }
+
+    pub(super) fn attach(self: &Arc<Self>, task: &TaskHandle) {
+        let _ = task.notifications.set(self.clone());
+    }
 }
 
 #[derive(Default)]
 pub(super) struct SubscriptionState {
     running: bool,
-}
-
-#[derive(Default)]
-pub(super) struct PushSubscriptions {
-    dispatcher: Arc<std::sync::OnceLock<PushDispatcher>>,
-}
-
-impl PushSubscriptions {
-    pub(super) fn attach(
-        &self,
-        handler: &DefaultRequestHandler,
-        task_id: &str,
-        events: &TaskHandle,
-    ) {
-        if let (Some(store), Some(sender)) = (&handler.push_config_store, &handler.push_sender) {
-            let _ = events.notifications.set(NotificationSettings {
-                task_id: task_id.into(),
-                store: store.clone(),
-                sender: sender.clone(),
-                dispatcher: self.dispatcher.clone(),
-            });
-        }
-    }
 }
 
 /// Called immediately before broadcast send. Holding the returned guard closes
@@ -108,19 +120,17 @@ async fn receive_events(
                         .is_ok_and(|event| super::protocol::task_id_for_event(event).is_some()) =>
             {
                 let settings = events.notifications.get().unwrap();
-                let lookup = tokio::time::timeout(
-                    PUSH_CONFIG_TIMEOUT,
-                    settings.store.list(&settings.task_id),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(A2AError::internal("webhook configuration lookup timed out"))
-                });
+                let lookup =
+                    tokio::time::timeout(PUSH_CONFIG_TIMEOUT, settings.store.list(&events.id))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(A2AError::internal("webhook configuration lookup timed out"))
+                        });
                 let configs = match lookup {
                     Ok(configs) => configs,
                     Err(error) => {
                         signal_failure(&settings.sender, &event, error.clone());
-                        tracing::warn!(task_id = %settings.task_id, %error, "could not load webhook configurations");
+                        tracing::warn!(task_id = %events.id, %error, "could not load webhook configurations");
                         continue;
                     }
                 };
@@ -154,7 +164,7 @@ async fn receive_events(
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(task_id = %events.notifications.get().unwrap().task_id, skipped, "webhook subscriber lagged; notifications were lost");
+                tracing::warn!(task_id = %events.id, skipped, "webhook subscriber lagged; notifications were lost");
             }
             Err(broadcast::error::RecvError::Closed) => return,
         }
@@ -204,7 +214,7 @@ mod tests {
     async fn hanging_configuration_lookups_expire_and_shutdown_drops_them_immediately() {
         for shutdown in [false, true] {
             let (configured, _queue) = captured_source(8, true).await;
-            let mut settings = configured.notifications.get().unwrap().clone();
+            let mut settings = (**configured.notifications.get().unwrap()).clone();
             let entered = Arc::new(Notify::new());
             let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
             settings.store = Arc::new(HangingStore {
@@ -212,7 +222,7 @@ mod tests {
                 dropped: dropped.clone(),
             });
             let source = TaskHandle::new("task".into(), None);
-            assert!(source.notifications.set(settings).is_ok());
+            assert!(source.notifications.set(Arc::new(settings)).is_ok());
             let (failure, mut observed) = tokio::sync::watch::channel(None);
             source.publish(
                 Ok(&StreamResponse::Task(task_with_history(
@@ -254,8 +264,8 @@ mod tests {
     ) -> (Arc<TaskHandle>, mpsc::Receiver<Notification>) {
         let handler = make_push_delivery_handler();
         let source = handler.tasks.task("task");
-        handler.tasks.pushes.attach(&handler, "task", &source);
-        let mut settings = source.notifications.get().unwrap().clone();
+        handler.attach_pushes(&source);
+        let mut settings = (**source.notifications.get().unwrap()).clone();
         settings.store.save(push_config("task")).await.unwrap();
         settings.sender = Arc::new(crate::HttpPushSender::new(Some(
             crate::HttpPushSenderConfig {
@@ -267,7 +277,7 @@ mod tests {
         let (dispatcher, receiver) = PushDispatcher::channel(capacity);
         settings.dispatcher = Arc::new(std::sync::OnceLock::from(dispatcher));
         let source = TaskHandle::new("task".into(), None);
-        assert!(source.notifications.set(settings).is_ok());
+        assert!(source.notifications.set(Arc::new(settings)).is_ok());
         (source, receiver)
     }
 
@@ -275,7 +285,7 @@ mod tests {
     async fn direct_replies_and_errors_do_not_start_webhook_workers() {
         let handler = make_push_delivery_handler();
         let source = handler.tasks.task("uncreated");
-        handler.tasks.pushes.attach(&handler, "uncreated", &source);
+        handler.attach_pushes(&source);
         source.publish(
             Ok(&StreamResponse::Message(make_message())),
             None,
@@ -930,7 +940,7 @@ mod tests {
     async fn idle_webhook_subscribers_retire_and_restart_without_changing_task_source() {
         let handler = make_push_delivery_handler();
         let source = handler.tasks.task("task");
-        handler.tasks.pushes.attach(&handler, "task", &source);
+        handler.attach_pushes(&source);
         let event = StreamResponse::Task(task_with_history("task", "context", 0));
         source.publish(Ok(&event), None, EventKind::Normal, None);
         while !source.sender.is_empty() {

@@ -23,7 +23,6 @@ mod response;
 mod response_preparation;
 mod runtime;
 mod task_handle;
-mod task_registry;
 mod task_service;
 mod updates;
 mod uplink;

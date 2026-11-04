@@ -210,7 +210,6 @@ async fn poll_executor(
 /// stops, and the stored task does not stay `WORKING` for good.
 pub(super) async fn drive_execution_guarded(
     handler: DefaultRequestHandler,
-    task_id: TaskId,
     active: Arc<ActiveExecution>,
     request: impl Into<ExecutionRequest> + Send,
 ) {
@@ -219,10 +218,7 @@ pub(super) async fn drive_execution_guarded(
     let _drained = active.inputs_drained.clone().drop_guard();
 
     let recovery = handler.clone();
-    handler
-        .tasks
-        .pushes
-        .attach(&handler, &task_id, &active.task);
+    handler.attach_pushes(&active.task);
     let outcome =
         std::panic::AssertUnwindSafe(drive_execution(handler, active.clone(), request.into()))
             .catch_unwind()
@@ -297,11 +293,9 @@ pub(super) async fn save_pending_push_config(
     handler: &DefaultRequestHandler,
     state: &mut TaskRuntime,
 ) {
-    if let Some(invocation) = state.execution.bookkeeping(active) {
-        handler
-            .tasks
-            .save_pending_push(invocation, handler.push_config_store.as_deref())
-            .await;
+    if let (Some(invocation), Some(pushes)) = (state.execution.bookkeeping(active), &handler.pushes)
+    {
+        pushes.save_pending(&mut invocation.pending_push).await;
     }
 }
 
@@ -499,7 +493,7 @@ mod driver_tests {
             panic!("expected the final task notification");
         };
         // Deferred creation must leave an ordinary, manageable push configuration.
-        let configs = handler.push_config_store.as_ref().unwrap();
+        let configs = handler.pushes.as_ref().unwrap().store();
         let saved = configs.list(&task.id).await.unwrap();
         assert_eq!(saved.len(), 1);
         let id = saved[0].id.as_deref().unwrap();
@@ -557,7 +551,7 @@ mod driver_tests {
         let mut events = active.subscribe();
         timeout(
             Duration::from_secs(1),
-            drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context),
+            drive_execution_guarded(runtime.clone(), active.clone(), context),
         )
         .await
         .unwrap();
@@ -679,7 +673,7 @@ mod driver_tests {
         let mut events = active.subscribe();
         timeout(
             Duration::from_secs(1),
-            drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context),
+            drive_execution_guarded(runtime.clone(), active.clone(), context),
         )
         .await
         .unwrap();
@@ -844,8 +838,7 @@ mod driver_tests {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             context.new_task = true;
             let mut events = active.subscribe();
-            drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context)
-                .await;
+            drive_execution_guarded(runtime.clone(), active.clone(), context).await;
             let event = events.recv().await.unwrap();
             if foreign {
                 assert_eq!(
@@ -892,8 +885,7 @@ mod driver_tests {
                 })
                 .await
                 .unwrap();
-            drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context)
-                .await;
+            drive_execution_guarded(runtime.clone(), active.clone(), context).await;
             assert_eq!(
                 runtime
                     .tasks
@@ -907,9 +899,10 @@ mod driver_tests {
             );
             assert!(runtime.tasks.task(&task.id).active().is_none());
             let configs = runtime
-                .push_config_store
+                .pushes
                 .as_ref()
                 .unwrap()
+                .store()
                 .list(&task.id)
                 .await
                 .unwrap();
@@ -927,7 +920,7 @@ mod driver_tests {
             .uncreated
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut events = active.subscribe();
-        drive_execution_guarded(runtime.clone(), task.id.clone(), active, context).await;
+        drive_execution_guarded(runtime.clone(), active, context).await;
         assert_eq!(
             events.recv().await.unwrap().result.unwrap_err().code,
             error_code::INTERNAL_ERROR
@@ -1007,7 +1000,7 @@ mod turn_tests {
             tenant: None,
             protocol_version: Some("1.1".into()),
         };
-        let store = runtime.push_config_store.as_ref().unwrap();
+        let store = runtime.pushes.as_ref().unwrap().store();
         for id in 0..50 {
             store.save(config(id)).await.unwrap();
         }

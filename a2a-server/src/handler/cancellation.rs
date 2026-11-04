@@ -110,7 +110,7 @@ impl Cancellation {
                 active
             }
         };
-        handler.tasks.pushes.attach(handler, &req.id, &control.task);
+        handler.attach_pushes(&control.task);
         *slot = Some(Self::new(
             control,
             task,
