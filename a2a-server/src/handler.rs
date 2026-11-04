@@ -4997,6 +4997,7 @@ mod tests {
 
     fn handler_with_extensions(extensions: Vec<(&str, Option<bool>)>) -> DefaultRequestHandler {
         make_handler().with_capabilities(AgentCapabilities {
+            user_artifacts: None,
             streaming: None,
             push_notifications: None,
             extensions: Some(
@@ -5041,6 +5042,8 @@ mod tests {
             .get_task(
                 &params,
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: "t1".into(),
                     history_length: None,
                     tenant: None,
