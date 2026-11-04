@@ -34,7 +34,8 @@ pub(super) enum TaskOperation {
 
 pub(super) fn spawn_task(task: Arc<super::task_handle::TaskHandle>) -> Arc<TaskSender> {
     let (sender, mut commands) = tokio::sync::mpsc::channel::<TaskTransition>(TASK_QUEUE_CAPACITY);
-    tokio::spawn(async move {
+    let workers = task.workers.clone();
+    workers.spawn(async move {
         let mut state = TaskRuntime::default();
         while let Some(transition) = commands.recv().await {
             tracing::trace!(task_id = %task.id, "processing task operation");
@@ -363,16 +364,21 @@ impl TaskRuntime {
         {
             return Ok(OutputAction::Stopped);
         }
-        if active.uncreated.load(std::sync::atomic::Ordering::SeqCst)
-            && matches!(event, StreamResponse::Message(_))
-        {
+        if matches!(event, StreamResponse::Message(_)) {
             if let Some(task) = active.snapshot() {
                 validate_event_identity(&task, &event)?;
             }
-            active.publish_kind(Ok(&event), None, EventKind::Reply);
+            if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
+                active.publish_kind(Ok(&event), None, EventKind::Reply);
+            } else {
+                // A reply closes response streams. Reject unread input first,
+                // then finish this invocation even if its Task is nonterminal.
+                reject_unread_inputs(&active, &active.task.id, self).await;
+                self.apply_output(handler, &active, &mut event).await?;
+            }
             self.release(&active);
             active.task.notify();
-            return Ok(OutputAction::Drain);
+            return Ok(OutputAction::Stopped);
         }
         self.apply_output(handler, &active, &mut event).await?;
         Ok(OutputAction::Continue)
@@ -537,7 +543,6 @@ impl TaskRuntime {
 
 pub(super) enum OutputAction {
     Continue,
-    Drain,
     Stopped,
 }
 

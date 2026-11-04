@@ -62,9 +62,9 @@ pub(super) struct PushDispatcher {
 }
 
 impl PushDispatcher {
-    pub(super) fn spawn() -> Self {
+    pub(super) fn spawn(workers: &super::workers::Workers) -> Self {
         let (queue, receiver) = mpsc::channel(PUSH_QUEUE_CAPACITY);
-        tokio::spawn(dispatch(receiver, MAX_PUSH_DELIVERIES, PUSH_QUEUE_CAPACITY));
+        workers.spawn(dispatch(receiver, MAX_PUSH_DELIVERIES, PUSH_QUEUE_CAPACITY));
         Self { queue }
     }
 
@@ -204,6 +204,37 @@ mod tests {
             sender: sender.clone(),
             source: source.clone(),
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_in_flight_http_and_releases_queued_task_handles() {
+        let workers = Arc::new(super::super::workers::Workers::default());
+        let sender = sender();
+        let (url, mut seen, server) = endpoint(true).await;
+        let source = TaskHandle::with_workers("task".into(), None, workers.clone());
+        let weak = Arc::downgrade(&source);
+        let dispatcher = PushDispatcher::spawn(&workers);
+        assert!(dispatcher.submit(notification("task", 1, &url, &sender, &source)));
+        assert!(dispatcher.submit(notification("task", 2, &url, &sender, &source)));
+        let (_, _, release) = timeout(Duration::from_secs(2), seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(source);
+        assert!(
+            weak.upgrade().is_some(),
+            "in-flight and queued notifications retain their Task"
+        );
+        timeout(Duration::from_secs(1), workers.shutdown())
+            .await
+            .expect("shutdown must not wait for the HTTP request timeout");
+        assert!(
+            weak.upgrade().is_none(),
+            "shutdown drops both HTTP futures and queued notifications"
+        );
+        assert!(dispatcher.queue.is_closed());
+        drop(release);
+        server.abort();
     }
 
     #[tokio::test]

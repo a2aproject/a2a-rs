@@ -25,6 +25,7 @@ struct State {
 /// channels; receivers and active workers retain it across executor invocations.
 pub(super) struct TaskHandle {
     pub(super) id: TaskId,
+    pub(super) workers: Arc<super::workers::Workers>,
     changes: watch::Sender<u64>,
     pub(super) sender: broadcast::Sender<ExecutionEvent>,
     state: RwLock<State>,
@@ -33,9 +34,19 @@ pub(super) struct TaskHandle {
 }
 
 impl TaskHandle {
+    #[cfg(test)]
     pub(super) fn new(id: TaskId, snapshot: Option<Task>) -> Arc<Self> {
+        Self::with_workers(id, snapshot, Arc::default())
+    }
+
+    pub(super) fn with_workers(
+        id: TaskId,
+        snapshot: Option<Task>,
+        workers: Arc<super::workers::Workers>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id,
+            workers,
             changes: watch::channel(0).0,
             sender: broadcast::channel(super::EXECUTION_BUFFER_CAPACITY).0,
             state: RwLock::new(State {

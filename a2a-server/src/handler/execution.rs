@@ -124,11 +124,10 @@ pub(super) enum TurnEnd {
 
 async fn drive_execution(
     handler: DefaultRequestHandler,
-    task_id: TaskId,
     active: Arc<ActiveExecution>,
     request: ExecutionRequest,
 ) {
-    let end = poll_executor(&handler, &task_id, &active, request).await;
+    let end = poll_executor(&handler, &active, request).await;
     handler
         .tasks
         .finished(handler.clone(), active, end)
@@ -140,7 +139,6 @@ async fn drive_execution(
 /// even when an executor moved its receiver into a separate worker task.
 async fn poll_executor(
     handler: &DefaultRequestHandler,
-    task_id: &TaskId,
     active: &Arc<ActiveExecution>,
     request: impl Into<ExecutionRequest> + Send,
 ) -> TurnEnd {
@@ -199,14 +197,6 @@ async fn poll_executor(
                 match action {
                     Ok(super::runtime::OutputAction::Continue) => {}
                     Ok(super::runtime::OutputAction::Stopped) => return TurnEnd::Stopped,
-                    Ok(super::runtime::OutputAction::Drain) => {
-                        while let Some(rest) = stream.next().await {
-                            if rest.is_ok() {
-                                tracing::warn!(%task_id, "the executor emitted an event after a direct reply; ignored");
-                            }
-                        }
-                        return TurnEnd::Stopped;
-                    }
                     Err(error) => return TurnEnd::Failed(error),
                 }
             }
@@ -233,14 +223,10 @@ pub(super) async fn drive_execution_guarded(
         .tasks
         .pushes
         .attach(&handler, &task_id, &active.task);
-    let outcome = std::panic::AssertUnwindSafe(drive_execution(
-        handler,
-        task_id.clone(),
-        active.clone(),
-        request.into(),
-    ))
-    .catch_unwind()
-    .await;
+    let outcome =
+        std::panic::AssertUnwindSafe(drive_execution(handler, active.clone(), request.into()))
+            .catch_unwind()
+            .await;
     if outcome.is_ok() {
         return;
     }
@@ -613,7 +599,7 @@ mod driver_tests {
                 active.inputs.revoke();
             }
             assert!(matches!(
-                poll_executor(&runtime, &task.id, &active, context).await,
+                poll_executor(&runtime, &active, context).await,
                 TurnEnd::Stopped
             ));
             assert!(active.snapshot().is_some());
@@ -631,11 +617,10 @@ mod driver_tests {
         let runner = tokio::spawn({
             let runtime = runtime.clone();
             let active = active.clone();
-            let task_id = task.id.clone();
             let lease = _lease.clone();
             async move {
                 let _lease = lease;
-                poll_executor(&runtime, &task_id, &active, context).await
+                poll_executor(&runtime, &active, context).await
             }
         });
         events.recv().await.unwrap().result.unwrap();
@@ -716,6 +701,109 @@ mod driver_tests {
                 .state,
             TaskState::Canceled
         );
+    }
+
+    #[tokio::test]
+    async fn direct_reply_drops_a_nonterminating_stream_and_releases_its_queue() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        struct Reply(Arc<AtomicBool>);
+        impl crate::AgentExecutor for Reply {
+            fn execute(
+                &self,
+                _: ExecutorContext,
+            ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+                let guard = DropFlag(self.0.clone());
+                Box::pin(async_stream::stream! {
+                    let _guard = guard;
+                    yield Ok(StreamResponse::Message(Message::new(Role::Agent, vec![Part::text("done")])));
+                    std::future::pending::<()>().await;
+                })
+            }
+            fn cancel(
+                &self,
+                _: ExecutorContext,
+            ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+                stream::empty().boxed()
+            }
+        }
+        for mode in [
+            super::super::delivery::StartMode::Blocking,
+            super::super::delivery::StartMode::Streaming,
+            super::super::delivery::StartMode::Bidi,
+        ] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let handler =
+                DefaultRequestHandler::new(Reply(dropped.clone()), InMemoryTaskStore::new())
+                    .with_capabilities(AgentCapabilities {
+                        streaming: Some(true),
+                        ..Default::default()
+                    });
+            let service = Arc::downgrade(&handler.tasks);
+            let request = send_req(None, None);
+            if mode == super::super::delivery::StartMode::Blocking {
+                let response = timeout(
+                    Duration::from_secs(1),
+                    handler.send_message(&ServiceParams::new(), request),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(matches!(response, SendMessageResponse::Message(_)));
+            } else {
+                let mut events = if mode == super::super::delivery::StartMode::Streaming {
+                    handler
+                        .send_streaming_message(&ServiceParams::new(), request)
+                        .await
+                        .unwrap()
+                } else {
+                    handler
+                        .send_live_message(
+                            &ServiceParams::new(),
+                            stream::once(async move {
+                                StreamRequest {
+                                    tenant: None,
+                                    payload: StreamRequestPayload::SendMessage(request),
+                                }
+                            })
+                            .chain(stream::pending())
+                            .boxed(),
+                        )
+                        .await
+                        .unwrap()
+                };
+                timeout(Duration::from_secs(1), async {
+                    while let Some(event) = events.next().await {
+                        if matches!(event.unwrap(), StreamResponse::Message(_)) {
+                            return;
+                        }
+                    }
+                    panic!("expected direct reply");
+                })
+                .await
+                .unwrap();
+                assert!(
+                    timeout(Duration::from_secs(1), events.next())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            drop(handler);
+            timeout(Duration::from_secs(1), async {
+                while service.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("a completed direct reply must not retain the handler");
+            assert!(dropped.load(Ordering::SeqCst));
+        }
     }
 
     struct Scripted(Vec<Result<StreamResponse, A2AError>>);

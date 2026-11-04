@@ -133,8 +133,7 @@ impl ExecutorContext {
 /// For a new task its first event decides whether a task exists (A2A §3.1.1):
 /// a task, status or artifact event creates it, and the server saves it then;
 /// a [`Message`] is a direct reply, nothing is saved, and whatever the
-/// executor emits afterwards is ignored (it may keep working until it
-/// returns). An executor that fails or panics before it has said anything
+/// executor's output stream is dropped immediately after that reply. An executor that fails or panics before it has said anything
 /// leaves no task; one that ends without an event leaves the task as the
 /// request prepared it. Opening a live exchange is the exception: that task
 /// is created up front. See [`Agent`] for the same contract as a typed return

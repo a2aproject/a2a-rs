@@ -27,6 +27,7 @@ mod task_registry;
 mod task_service;
 mod updates;
 mod uplink;
+mod workers;
 
 pub use default_handler::DefaultRequestHandler;
 
