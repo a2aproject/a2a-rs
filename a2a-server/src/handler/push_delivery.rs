@@ -6,7 +6,7 @@
 use super::DefaultRequestHandler;
 use super::events::{EventKind, ExecutionEvent};
 use super::push_worker::{Notification, PushDispatcher, signal_failure};
-use super::task_events::TaskEvents;
+use super::task_handle::TaskHandle;
 use a2a::*;
 use std::{
     sync::{Arc, MutexGuard},
@@ -40,7 +40,7 @@ impl PushSubscriptions {
         &self,
         handler: &DefaultRequestHandler,
         task_id: &str,
-        events: &TaskEvents,
+        events: &TaskHandle,
     ) {
         if let (Some(store), Some(sender)) = (&handler.push_config_store, &handler.push_sender) {
             let _ = events.notifications.set(NotificationSettings {
@@ -55,7 +55,7 @@ impl PushSubscriptions {
 
 /// Called immediately before broadcast send. Holding the returned guard closes
 /// the retirement race: the receiver is registered until this send completes.
-pub(super) fn subscribe(events: &Arc<TaskEvents>) -> MutexGuard<'_, SubscriptionState> {
+pub(super) fn subscribe(events: &Arc<TaskHandle>) -> MutexGuard<'_, SubscriptionState> {
     let mut state = events
         .webhook_subscribed
         .lock()
@@ -69,7 +69,7 @@ pub(super) fn subscribe(events: &Arc<TaskEvents>) -> MutexGuard<'_, Subscription
 }
 
 async fn receive_events(
-    events: Arc<TaskEvents>,
+    events: Arc<TaskHandle>,
     mut receiver: broadcast::Receiver<ExecutionEvent>,
 ) {
     'events: loop {
@@ -154,9 +154,9 @@ mod tests {
     async fn captured_source(
         capacity: usize,
         fail_on_error: bool,
-    ) -> (Arc<TaskEvents>, mpsc::Receiver<Notification>) {
+    ) -> (Arc<TaskHandle>, mpsc::Receiver<Notification>) {
         let handler = make_push_delivery_handler();
-        let source = handler.tasks.registry.events_for("task");
+        let source = handler.tasks.task("task");
         handler.tasks.pushes.attach(&handler, "task", &source);
         let mut settings = source.notifications.get().unwrap().clone();
         settings.store.save(push_config("task")).await.unwrap();
@@ -169,7 +169,7 @@ mod tests {
         )));
         let (dispatcher, receiver) = PushDispatcher::channel(capacity);
         settings.dispatcher = Arc::new(std::sync::OnceLock::from(dispatcher));
-        let source = TaskEvents::new(None);
+        let source = TaskHandle::new("task".into(), None);
         assert!(source.notifications.set(settings).is_ok());
         (source, receiver)
     }
@@ -177,24 +177,20 @@ mod tests {
     #[tokio::test]
     async fn direct_replies_and_errors_do_not_start_webhook_workers() {
         let handler = make_push_delivery_handler();
-        let source = handler.tasks.registry.events_for("uncreated");
+        let source = handler.tasks.task("uncreated");
         handler.tasks.pushes.attach(&handler, "uncreated", &source);
-        source
-            .publish(
-                Ok(&StreamResponse::Message(make_message())),
-                None,
-                EventKind::Reply,
-                None,
-            )
-            .await;
-        source
-            .publish(
-                Err(&A2AError::internal("no task created")),
-                None,
-                EventKind::Normal,
-                None,
-            )
-            .await;
+        source.publish(
+            Ok(&StreamResponse::Message(make_message())),
+            None,
+            EventKind::Reply,
+            None,
+        );
+        source.publish(
+            Err(&A2AError::internal("no task created")),
+            None,
+            EventKind::Normal,
+            None,
+        );
         assert!(!source.webhook_subscribed.lock().unwrap().running);
         assert_eq!(source.sender.receiver_count(), 0);
     }
@@ -347,7 +343,7 @@ mod tests {
         .await
         .expect("webhook failure must wake the driver without another executor event");
         assert_eq!(error.code, error_code::INTERNAL_ERROR);
-        assert!(handler.tasks.registry.get("push-failure").await.is_none());
+        assert!(handler.tasks.task("push-failure").active().is_none());
         server.abort();
     }
 
@@ -836,12 +832,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_webhook_subscribers_retire_and_restart_without_changing_task_source() {
         let handler = make_push_delivery_handler();
-        let source = handler.tasks.registry.events_for("task");
+        let source = handler.tasks.task("task");
         handler.tasks.pushes.attach(&handler, "task", &source);
         let event = StreamResponse::Task(task_with_history("task", "context", 0));
-        source
-            .publish(Ok(&event), None, EventKind::Normal, None)
-            .await;
+        source.publish(Ok(&event), None, EventKind::Normal, None);
         while !source.sender.is_empty() {
             tokio::task::yield_now().await;
         }
@@ -850,14 +844,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(!source.webhook_subscribed.lock().unwrap().running);
-        source
-            .publish(Ok(&event), None, EventKind::Normal, None)
-            .await;
+        source.publish(Ok(&event), None, EventKind::Normal, None);
         assert!(source.webhook_subscribed.lock().unwrap().running);
-        assert!(Arc::ptr_eq(
-            &source,
-            &handler.tasks.registry.events_for("task")
-        ));
+        assert!(Arc::ptr_eq(&source, &handler.tasks.task("task")));
     }
 
     #[tokio::test]

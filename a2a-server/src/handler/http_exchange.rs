@@ -216,7 +216,7 @@ mod tests {
         Run::new(
             handler.clone(),
             params,
-            "task".into(),
+            handler.tasks.task("task"),
             RunCompletion::Exchange,
             SubscriptionPolicy::new(StartMode::Bidi, false),
         )

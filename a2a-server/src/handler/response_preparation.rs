@@ -6,10 +6,34 @@
 use super::delivery::{Delivery, StartMode};
 use super::events::{ExecutionReceiver, subscription_stream};
 use super::response::{Events, RunCompletion};
-use super::{task_events::TaskEvents, task_service::TaskService};
+use super::{task_handle::TaskHandle, task_service::TaskService};
 use a2a::*;
 use futures::{StreamExt, stream::BoxStream};
 use std::sync::Arc;
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct ResponseOptions {
+    pub(super) return_immediately: bool,
+    history_length: Option<i32>,
+    timeline_length: Option<i32>,
+}
+
+impl ResponseOptions {
+    pub(super) fn from_request(request: &SendMessageRequest) -> Self {
+        let config = request.configuration.as_ref();
+        Self {
+            return_immediately: config
+                .and_then(|config| config.return_immediately)
+                .unwrap_or(false),
+            history_length: config.and_then(|config| config.history_length),
+            timeline_length: config.and_then(|config| config.timeline_length),
+        }
+    }
+
+    pub(super) fn trim(self, task: &mut Task) {
+        super::protocol::apply_lengths(task, self.history_length, self.timeline_length);
+    }
+}
 
 /// A direct reply has no task to wait for. Task replies retain their completion stream.
 pub(super) enum MessageResponse {
@@ -20,28 +44,25 @@ pub(super) enum MessageResponse {
 impl MessageResponse {
     pub(super) async fn receive(
         tasks: Arc<TaskService>,
-        task_id: TaskId,
+        task: Arc<TaskHandle>,
         mut events: Events,
     ) -> Result<Self, A2AError> {
         // Retention may remove a terminal task before the caller reads its response.
-        let source = tasks.registry.events_for(&task_id);
         if let Some(StreamResponse::Message(message)) = events.next().await.transpose()? {
             return Ok(Self::Message(message));
         }
         Ok(Self::Task(TaskResponse {
             tasks,
-            task_id,
+            task,
             events,
-            source,
         }))
     }
 }
 
 pub(super) struct TaskResponse {
     tasks: Arc<TaskService>,
-    task_id: TaskId,
+    task: Arc<TaskHandle>,
     events: Events,
-    source: Arc<TaskEvents>,
 }
 
 impl TaskResponse {
@@ -56,21 +77,19 @@ impl TaskResponse {
     }
 
     pub(super) async fn snapshot(self) -> Result<Task, A2AError> {
-        match self.tasks.load(&self.task_id).await {
+        match self.tasks.load(&self.task.id).await {
             Ok(task) => Ok(task),
-            Err(error) if error.code == error_code::TASK_NOT_FOUND => {
-                match self.source.snapshot().await {
-                    Some(task) if task.status.state.is_terminal() => Ok(task),
-                    _ => Err(error),
-                }
-            }
+            Err(error) if error.code == error_code::TASK_NOT_FOUND => match self.task.snapshot() {
+                Some(task) if task.status.state.is_terminal() => Ok(task),
+                _ => Err(error),
+            },
             Err(error) => Err(error),
         }
     }
 }
 
 pub(super) struct PreparedResponse {
-    pub(super) task_id: TaskId,
+    pub(super) task: Arc<TaskHandle>,
     pub(super) events: Option<Events>,
     pub(super) opening: Option<Task>,
     pub(super) completion: RunCompletion,
@@ -84,27 +103,23 @@ impl PreparedResponse {
     /// running turn starts before or after its own input events according to
     /// the response mode; a new turn starts at its first event.
     pub(super) fn message(
-        request: SendMessageRequest,
+        options: ResponseOptions,
         delivery: Delivery,
         mode: StartMode,
         policy: SubscriptionPolicy,
     ) -> Self {
-        let return_immediately = request
-            .configuration
-            .as_ref()
-            .and_then(|config| config.return_immediately)
-            .unwrap_or(false);
+        let handle = delivery.handle();
+        let return_immediately = options.return_immediately;
         let subscription =
             policy.delivery(delivery, DeliveryAttachment::Opening { return_immediately });
         let (task, events) = (subscription.task, subscription.events);
-        let task_id = task.id.clone();
         let (opening, events, completion) = match mode {
-            StartMode::Blocking => (None, events, RunCompletion::Unary(Box::new(request))),
+            StartMode::Blocking => (None, events, RunCompletion::Unary { return_immediately }),
             StartMode::Streaming => (None, with_opening_task(events, task), RunCompletion::Task),
             StartMode::Bidi => (Some(task), events, RunCompletion::Exchange),
         };
         Self {
-            task_id,
+            task: handle,
             events: Some(events),
             opening,
             completion,
@@ -119,7 +134,7 @@ impl PreparedResponse {
         policy: SubscriptionPolicy,
     ) -> Self {
         Self {
-            task_id: attachment.task_id,
+            task: attachment.task,
             events: attachment
                 .receiver
                 .map(|receiver| policy.stream(receiver, None, attachment.sequence)),
@@ -162,7 +177,7 @@ pub(super) fn with_opening_task(
 /// Validated task attachment before choosing how a response delivers it.
 /// The receiver and snapshot share the cursor captured during lookup.
 pub(super) struct SubscriptionAttachment {
-    pub(super) task_id: TaskId,
+    pub(super) task: Arc<TaskHandle>,
     pub(super) receiver: Option<ExecutionReceiver>,
     pub(super) opening: Option<Task>,
     pub(super) sequence: u64,
@@ -316,7 +331,7 @@ mod task_response_tests {
         ])
         .boxed();
         let MessageResponse::Task(task) =
-            MessageResponse::receive(handler.tasks.clone(), "task".into(), events)
+            MessageResponse::receive(handler.tasks.clone(), handler.tasks.task("task"), events)
                 .await
                 .unwrap()
         else {
@@ -340,7 +355,7 @@ mod subscription_tests {
         let active = super::super::events::ActiveExecution::new(Some(task.clone()));
         let delivery = Delivery::Injected {
             task: task.clone(),
-            receiver: active.subscribe().await,
+            receiver: active.subscribe(),
             sequence_before: 0,
             sequence_after: 0,
         };

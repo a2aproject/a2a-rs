@@ -167,6 +167,14 @@ pub(super) enum Delivery {
 }
 
 /// How a request reaches `start_execution`.
+impl Delivery {
+    pub(super) fn handle(&self) -> std::sync::Arc<super::task_handle::TaskHandle> {
+        match self {
+            Self::Started { receiver, .. } | Self::Injected { receiver, .. } => receiver.task(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StartMode {
     /// `SendMessage`, with completion controlled by its request configuration.

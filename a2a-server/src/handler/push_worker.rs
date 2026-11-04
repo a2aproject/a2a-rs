@@ -5,7 +5,7 @@
 
 use super::events::ExecutionEvent;
 use super::push_delivery::PUSH_QUEUE_CAPACITY;
-use super::task_events::TaskEvents;
+use super::task_handle::TaskHandle;
 use a2a::*;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use std::{collections::VecDeque, sync::Arc};
@@ -19,7 +19,7 @@ pub(super) struct Notification {
     pub(super) event: Arc<ExecutionEvent>,
     pub(super) sender: Arc<crate::HttpPushSender>,
     // Retain the source across intake retirement until accepted work drains.
-    pub(super) source: Arc<TaskEvents>,
+    pub(super) source: Arc<TaskHandle>,
 }
 
 impl Notification {
@@ -187,7 +187,7 @@ mod tests {
         generation: i64,
         url: &str,
         sender: &Arc<crate::HttpPushSender>,
-        source: &Arc<TaskEvents>,
+        source: &Arc<TaskHandle>,
     ) -> Notification {
         let mut task = task_with_history(task_id, "context", 0);
         task.generation = generation;
@@ -210,7 +210,7 @@ mod tests {
     async fn one_dispatcher_preserves_task_url_order_while_other_keys_progress() {
         let sender = sender();
         let (url, mut seen, server) = endpoint(false).await;
-        let source = TaskEvents::new(None);
+        let source = TaskHandle::new("task".into(), None);
         let retained = Arc::downgrade(&source);
         let (queue, receiver) = PushDispatcher::channel(8);
         for (task, generation, path) in [
@@ -274,7 +274,7 @@ mod tests {
     async fn the_http_concurrency_limit_applies_across_tasks_and_drains_on_close() {
         let sender = sender();
         let (url, mut seen, server) = endpoint(true).await;
-        let source = TaskEvents::new(None);
+        let source = TaskHandle::new("task".into(), None);
         let (queue, receiver) = PushDispatcher::channel(8);
         for task in ["a", "b", "c", "d"] {
             queue.submit(notification(task, 1, &url, &sender, &source));
@@ -318,7 +318,7 @@ mod tests {
     async fn pending_work_is_bounded_and_overflow_signals_the_execution() {
         let sender = sender();
         let (url, mut seen, server) = endpoint(true).await;
-        let source = TaskEvents::new(None);
+        let source = TaskHandle::new("task".into(), None);
         let (failure, mut observed) = tokio::sync::watch::channel(None);
         let (queue, receiver) = PushDispatcher::channel(8);
         for generation in 1..=3 {

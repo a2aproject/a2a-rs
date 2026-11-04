@@ -40,6 +40,7 @@ impl Cancellation {
         active_execution: Option<Arc<ActiveExecution>>,
         slot: &mut Option<Self>,
     ) -> Result<CancellationStart, A2AError> {
+        let handle = handler.tasks.task(&req.id);
         // State transition and snapshot publication are serialized with input
         // and executor output. The hook is scheduled only after this command.
         let task = handler.tasks.load(&req.id).await?;
@@ -75,11 +76,11 @@ impl Cancellation {
         if let Some(active) = &active_execution {
             // Wake the driver. Its completion command returns unread inputs
             // before the hook publishes the cancellation event.
-            active.set_snapshot(task.clone()).await;
+            active.set_snapshot(task.clone());
             active.inputs.close();
         }
         // The task changed under every long-poll waiting on it.
-        handler.tasks.changes.notify(&req.id);
+        handle.notify();
 
         let cancel_inputs = ClientInputs::closed();
         let exec_ctx = crate::ExecutorContext {
@@ -104,16 +105,12 @@ impl Cancellation {
         let control = match &active_execution {
             Some(active) => active.clone(),
             None => {
-                let (active, _inputs, _state) =
-                    ActiveExecution::with_events(handler.tasks.registry.events_for(&req.id));
-                active.set_snapshot(task.clone()).await;
+                let (active, _inputs, _state) = ActiveExecution::with_task(handle);
+                active.set_snapshot(task.clone());
                 active
             }
         };
-        handler
-            .tasks
-            .pushes
-            .attach(handler, &req.id, &control.events);
+        handler.tasks.pushes.attach(handler, &req.id, &control.task);
         *slot = Some(Self::new(
             control,
             task,
@@ -154,7 +151,6 @@ impl Cancellation {
         let base = self
             .active
             .snapshot()
-            .await
             .ok_or_else(|| A2AError::internal("cancellation has no task"))?;
         validate_event_identity(&base, &event)?;
         let contradicts = match &event {
@@ -180,9 +176,7 @@ impl Cancellation {
             }
             update.generation = amended.generation;
             let saved = handler.tasks.save(amended, false).await?;
-            self.active
-                .publish_marked(Ok(&event), Some(saved), false)
-                .await;
+            self.active.publish_marked(Ok(&event), Some(saved), false);
             self.entry.announced = true;
             true
         } else {
@@ -193,7 +187,6 @@ impl Cancellation {
             self.entry.note_published(published, &event);
             published
         };
-        handler.tasks.changes.notify_event(&event);
         Ok(published)
     }
 
@@ -205,7 +198,7 @@ impl Cancellation {
         let recorded = self.record_if_missing(handler).await;
         if let Some(error) = failure {
             if self.signal_failure {
-                self.active.publish(Err(&error), None).await;
+                self.active.publish(Err(&error), None);
             }
             return Err(error);
         }
@@ -219,7 +212,7 @@ impl Cancellation {
         if self.entry.recorded_by_store && self.entry.announced {
             return Ok(());
         }
-        let Some(base) = self.active.snapshot().await else {
+        let Some(base) = self.active.snapshot() else {
             return Ok(());
         };
         if !self.entry.recorded_by_store && base.timeline.iter().flatten().any(|entry| {
@@ -240,14 +233,13 @@ impl Cancellation {
                 unreachable!()
             };
             update.generation = base.generation;
-            self.active.publish(Ok(&event), None).await;
+            self.active.publish(Ok(&event), None);
         } else {
             handler
                 .tasks
                 .apply_and_publish(&self.active, Some(base), &mut event)
                 .await?;
         }
-        handler.tasks.changes.notify_event(&event);
         Ok(())
     }
 }
@@ -350,7 +342,7 @@ mod tests {
             .unwrap();
         assert!(matches!(response, SendMessageResponse::Task(_)));
         timeout(Duration::from_secs(2), async {
-            while handler.tasks.registry.get("task").await.is_some() {
+            while handler.tasks.task("task").active().is_some() {
                 tokio::task::yield_now().await;
             }
         })
@@ -378,7 +370,7 @@ mod tests {
         assert!(task.timeline.unwrap().iter().any(|entry| matches!(
             &entry.content, TimelineContent::Status(status) if status.state == TaskState::Canceled
         )));
-        assert!(handler.tasks.registry.get("task").await.is_none());
+        assert!(handler.tasks.task("task").active().is_none());
     }
 
     struct GatedHook {
@@ -433,7 +425,7 @@ mod tests {
             .unwrap();
         assert!(matches!(response, SendMessageResponse::Task(_)));
         timeout(Duration::from_secs(2), async {
-            while handler.tasks.registry.get("task").await.is_some() {
+            while handler.tasks.task("task").active().is_some() {
                 tokio::task::yield_now().await;
             }
         })
