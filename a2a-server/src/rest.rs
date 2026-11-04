@@ -65,6 +65,16 @@ impl<H: RequestHandler> Clone for RestState<H> {
 }
 
 /// Create an axum router for the REST/HTTP+JSON protocol binding.
+///
+/// Every method is served on its plain path and, as the proto's
+/// `additional_bindings` require, under `/{tenant}` as well. The tenant
+/// routes are always on and answer for any tenant string: the path tenant
+/// only reaches the request as `tenant`. The default stack
+/// (`DefaultRequestHandler`, `InMemoryTaskStore`) does not isolate tenants,
+/// so `GET /acme/tasks/t1` and `GET /other/tasks/t1` return the same task
+/// unless the executor or the task store separates them; isolation is the
+/// application's job. A gateway rule written for `/tasks/**` also has to
+/// match `/{tenant}/tasks/**`.
 pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
     let state = RestState { handler };
     axum::Router::new()
@@ -123,6 +133,39 @@ pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
             REST_EXTENDED_AGENT_CARD_LEGACY_PATH,
             axum::routing::get(handle_get_extended_agent_card::<H>),
         )
+        // The proto's `additional_bindings`: every method again under `/{tenant}`.
+        .route(
+            "/{tenant}/message:send",
+            axum::routing::post(handle_send_message::<H>),
+        )
+        .route(
+            "/{tenant}/message:stream",
+            axum::routing::post(handle_stream_message::<H>),
+        )
+        // The proto binds `:subscribe` to GET only; POST `:subscribe` is the
+        // legacy alias of the plain route, kept here too because
+        // `handle_post_task_action` serves `:cancel` and `:subscribe` alike.
+        .route(
+            "/{tenant}/tasks/{id}",
+            axum::routing::get(handle_get_task_or_subscribe::<H>)
+                .post(handle_post_task_action::<H>),
+        )
+        .route(
+            "/{tenant}/tasks",
+            axum::routing::get(handle_list_tasks::<H>),
+        )
+        .route(
+            "/{tenant}/tasks/{id}/pushNotificationConfigs",
+            axum::routing::post(handle_create_push_config::<H>).get(handle_list_push_configs::<H>),
+        )
+        .route(
+            "/{tenant}/tasks/{id}/pushNotificationConfigs/{config_id}",
+            axum::routing::get(handle_get_push_config::<H>).delete(handle_delete_push_config::<H>),
+        )
+        .route(
+            "/{tenant}/extendedAgentCard",
+            axum::routing::get(handle_get_extended_agent_card::<H>),
+        )
         .route_layer(axum::middleware::from_fn(validate_protocol_version))
         .layer(axum::extract::DefaultBodyLimit::max(
             crate::jsonrpc::MAX_REQUEST_BODY_BYTES,
@@ -140,18 +183,67 @@ async fn validate_protocol_version(request: Request, next: Next) -> Response {
     }
 }
 
+/// The path of a task route; `tenant` is set on its `/{tenant}/…` binding.
+#[derive(Deserialize)]
+struct TaskPath {
+    tenant: Option<String>,
+    id: String,
+}
+
+/// The path of a push-config route; `tenant` is set on its `/{tenant}/…` binding.
+#[derive(Deserialize)]
+struct PushConfigPath {
+    tenant: Option<String>,
+    id: String,
+    config_id: String,
+}
+
+/// The tenant of a request whose body may name one. `body: "*"` maps the
+/// fields the path did not capture, so a body tenant next to a path tenant
+/// is a conflict unless it is the same value, which the reference clients
+/// send; the plain binding takes the body's.
+fn reconcile_tenant(
+    path: Option<String>,
+    body: Option<String>,
+) -> Result<Option<String>, Box<axum::response::Response>> {
+    match (path, body) {
+        (Some(path), Some(body)) if path != body => {
+            let violation = FieldViolation {
+                field: "tenant".to_string(),
+                description: format!(
+                    "tenant in the body ({body}) does not match the tenant in the path ({path})"
+                ),
+            };
+            Err(Box::new(rest_error_response(
+                A2AError::invalid_params("invalid request body")
+                    .with_details(vec![TypedDetail::bad_request(vec![violation])]),
+            )))
+        }
+        (Some(path), _) => Ok(Some(path)),
+        (None, body) => Ok(body),
+    }
+}
+
 async fn handle_send_message<H: RequestHandler>(
     State(state): State<RestState<H>>,
+    // `None` on the plain binding, which has no path parameter; a tenant that
+    // fails to decode is a 400 before the handler, as on the task routes.
+    tenant: Option<Path<String>>,
     headers: HeaderMap,
     body: Result<Json<Value>, JsonRejection>,
 ) -> impl IntoResponse {
+    let tenant = tenant.map(|Path(tenant)| tenant);
     let Json(raw_req) = match body {
         Ok(body) => body,
         Err(rejection) => return json_rejection_response(rejection),
     };
-    let req = match protojson_conv::from_value::<SendMessageRequest>(raw_req) {
+    let mut req = match protojson_conv::from_value::<SendMessageRequest>(raw_req) {
         Ok(req) => req,
         Err(e) => return rest_payload_error_response(e),
+    };
+    req.tenant = match reconcile_tenant(tenant, req.tenant.take()) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
     };
     let params = extract_service_params(&headers);
     match state.handler.send_message(&params, req).await {
@@ -162,16 +254,22 @@ async fn handle_send_message<H: RequestHandler>(
 
 async fn handle_stream_message<H: RequestHandler>(
     State(state): State<RestState<H>>,
+    tenant: Option<Path<String>>,
     headers: HeaderMap,
     body: Result<Json<Value>, JsonRejection>,
 ) -> impl IntoResponse {
+    let tenant = tenant.map(|Path(tenant)| tenant);
     let Json(raw_req) = match body {
         Ok(body) => body,
         Err(rejection) => return json_rejection_response(rejection),
     };
-    let req = match protojson_conv::from_value::<SendMessageRequest>(raw_req) {
+    let mut req = match protojson_conv::from_value::<SendMessageRequest>(raw_req) {
         Ok(req) => req,
         Err(e) => return rest_payload_error_response(e),
+    };
+    req.tenant = match reconcile_tenant(tenant, req.tenant.take()) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
     };
     let params = extract_service_params(&headers);
     match state.handler.send_streaming_message(&params, req).await {
@@ -189,13 +287,13 @@ pub struct GetTaskQuery {
 async fn handle_get_task_inner<H: RequestHandler>(
     state: RestState<H>,
     params: ServiceParams,
-    id: String,
+    TaskPath { tenant, id }: TaskPath,
     query: GetTaskQuery,
 ) -> axum::response::Response {
     let req = GetTaskRequest {
         id,
         history_length: query.history_length,
-        tenant: None,
+        tenant,
     };
     match state.handler.get_task(&params, req).await {
         Ok(task) => protojson_json_response(&task),
@@ -205,7 +303,7 @@ async fn handle_get_task_inner<H: RequestHandler>(
 
 async fn handle_get_task_or_subscribe<H: RequestHandler>(
     State(state): State<RestState<H>>,
-    Path(id): Path<String>,
+    Path(path): Path<TaskPath>,
     query: Result<Query<GetTaskQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -214,11 +312,12 @@ async fn handle_get_task_or_subscribe<H: RequestHandler>(
         Err(rejection) => return rest_payload_error_response(rejection.body_text()),
     };
     let params = extract_service_params(&headers);
-    if let Some(task_id) = id.strip_suffix(":subscribe") {
-        return handle_subscribe_to_task_inner(state, params, task_id.to_string()).await;
+    if let Some(task_id) = path.id.strip_suffix(":subscribe") {
+        let id = task_id.to_string();
+        return handle_subscribe_to_task_inner(state, params, id, path.tenant).await;
     }
 
-    handle_get_task_inner(state, params, id, query).await
+    handle_get_task_inner(state, params, path, query).await
 }
 
 #[derive(Deserialize)]
@@ -243,9 +342,11 @@ pub struct ListTasksQuery {
 
 async fn handle_list_tasks<H: RequestHandler>(
     State(state): State<RestState<H>>,
+    tenant: Option<Path<String>>,
     query: Result<Query<ListTasksQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let tenant = tenant.map(|Path(tenant)| tenant);
     let Query(query) = match query {
         Ok(query) => query,
         Err(rejection) => return rest_payload_error_response(rejection.body_text()),
@@ -253,6 +354,9 @@ async fn handle_list_tasks<H: RequestHandler>(
     let params = extract_service_params(&headers);
     let status = match query.status {
         Some(s) => match serde_json::from_value::<TaskState>(serde_json::Value::String(s)) {
+            // The proto's default: no filter, as the JSON-RPC and gRPC
+            // bindings already read it.
+            Ok(TaskState::Unspecified) => None,
             Ok(state) => Some(state),
             Err(_) => {
                 return rest_error_response(A2AError::invalid_params("invalid status filter"));
@@ -268,7 +372,7 @@ async fn handle_list_tasks<H: RequestHandler>(
         history_length: query.history_length,
         status_timestamp_after: query.status_timestamp_after,
         include_artifacts: query.include_artifacts,
-        tenant: None,
+        tenant,
     };
     match state.handler.list_tasks(&params, req).await {
         Ok(resp) => protojson_json_response(&resp),
@@ -280,6 +384,7 @@ async fn handle_cancel_task_inner<H: RequestHandler>(
     state: RestState<H>,
     params: ServiceParams,
     id: String,
+    tenant: Option<String>,
     body: Bytes,
 ) -> axum::response::Response {
     // The binding maps the whole request to the body (`body: "*"`), so its
@@ -302,6 +407,10 @@ async fn handle_cancel_task_inner<H: RequestHandler>(
         }
     };
     req.id = id;
+    req.tenant = match reconcile_tenant(tenant, req.tenant.take()) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
     match state.handler.cancel_task(&params, req).await {
         Ok(task) => protojson_json_response(&task),
         Err(e) => rest_error_response(e),
@@ -310,16 +419,16 @@ async fn handle_cancel_task_inner<H: RequestHandler>(
 
 async fn handle_post_task_action<H: RequestHandler>(
     State(state): State<RestState<H>>,
-    Path(id): Path<String>,
+    Path(TaskPath { tenant, id }): Path<TaskPath>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
     if let Some(task_id) = id.strip_suffix(":cancel") {
-        return handle_cancel_task_inner(state, params, task_id.to_string(), body).await;
+        return handle_cancel_task_inner(state, params, task_id.to_string(), tenant, body).await;
     }
     if let Some(task_id) = id.strip_suffix(":subscribe") {
-        return handle_subscribe_to_task_inner(state, params, task_id.to_string()).await;
+        return handle_subscribe_to_task_inner(state, params, task_id.to_string(), tenant).await;
     }
 
     rest_error_response(A2AError::invalid_request("unsupported task action"))
@@ -332,15 +441,16 @@ async fn handle_cancel_task_legacy<H: RequestHandler>(
     body: Bytes,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
-    handle_cancel_task_inner(state, params, id, body).await
+    handle_cancel_task_inner(state, params, id, None, body).await
 }
 
 async fn handle_subscribe_to_task_inner<H: RequestHandler>(
     state: RestState<H>,
     params: ServiceParams,
     id: String,
+    tenant: Option<String>,
 ) -> axum::response::Response {
-    let req = SubscribeToTaskRequest { id, tenant: None };
+    let req = SubscribeToTaskRequest { id, tenant };
     match state.handler.subscribe_to_task(&params, req).await {
         Ok(stream) => rest_sse(protojson_stream(stream)),
         Err(e) => rest_error_response(e),
@@ -353,7 +463,7 @@ async fn handle_subscribe_to_task_legacy<H: RequestHandler>(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
-    handle_subscribe_to_task_inner(state, params, id).await
+    handle_subscribe_to_task_inner(state, params, id, None).await
 }
 
 #[derive(Deserialize)]
@@ -367,7 +477,7 @@ pub struct ListPushConfigsQuery {
 
 async fn handle_create_push_config<H: RequestHandler>(
     State(state): State<RestState<H>>,
-    Path(id): Path<String>,
+    Path(TaskPath { tenant, id }): Path<TaskPath>,
     headers: HeaderMap,
     body: Result<Json<Value>, JsonRejection>,
 ) -> impl IntoResponse {
@@ -375,9 +485,13 @@ async fn handle_create_push_config<H: RequestHandler>(
         Ok(body) => body,
         Err(rejection) => return json_rejection_response(rejection),
     };
-    let req = match parse_create_push_config_request(id, raw_config) {
+    let mut req = match parse_create_push_config_request(id, raw_config) {
         Ok(req) => req,
         Err(e) => return rest_payload_error_response(e),
+    };
+    req.tenant = match reconcile_tenant(tenant, req.tenant.take()) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
     };
     let params = extract_service_params(&headers);
     match state.handler.create_push_config(&params, req).await {
@@ -388,14 +502,18 @@ async fn handle_create_push_config<H: RequestHandler>(
 
 async fn handle_get_push_config<H: RequestHandler>(
     State(state): State<RestState<H>>,
-    Path((id, config_id)): Path<(String, String)>,
+    Path(PushConfigPath {
+        tenant,
+        id,
+        config_id,
+    }): Path<PushConfigPath>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
     let req = GetTaskPushNotificationConfigRequest {
         task_id: id,
         id: config_id,
-        tenant: None,
+        tenant,
     };
     match state.handler.get_push_config(&params, req).await {
         Ok(resp) => protojson_json_response(&resp),
@@ -405,7 +523,7 @@ async fn handle_get_push_config<H: RequestHandler>(
 
 async fn handle_list_push_configs<H: RequestHandler>(
     State(state): State<RestState<H>>,
-    Path(id): Path<String>,
+    Path(TaskPath { tenant, id }): Path<TaskPath>,
     query: Result<Query<ListPushConfigsQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -418,7 +536,7 @@ async fn handle_list_push_configs<H: RequestHandler>(
         task_id: id,
         page_size: query.page_size,
         page_token: query.page_token,
-        tenant: None,
+        tenant,
     };
     match state.handler.list_push_configs(&params, req).await {
         Ok(resp) => protojson_json_response(&resp),
@@ -428,27 +546,38 @@ async fn handle_list_push_configs<H: RequestHandler>(
 
 async fn handle_delete_push_config<H: RequestHandler>(
     State(state): State<RestState<H>>,
-    Path((id, config_id)): Path<(String, String)>,
+    Path(PushConfigPath {
+        tenant,
+        id,
+        config_id,
+    }): Path<PushConfigPath>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
     let req = DeleteTaskPushNotificationConfigRequest {
         task_id: id,
         id: config_id,
-        tenant: None,
+        tenant,
     };
     match state.handler.delete_push_config(&params, req).await {
-        Ok(()) => StatusCode::OK.into_response(),
+        // google.protobuf.Empty, as ProtoJSON spells it: a client that
+        // parses every success body (a2a-python) needs one.
+        Ok(()) => with_content_type(
+            Json(Value::Object(Default::default())).into_response(),
+            "application/a2a+json",
+        ),
         Err(e) => rest_error_response(e),
     }
 }
 
 async fn handle_get_extended_agent_card<H: RequestHandler>(
     State(state): State<RestState<H>>,
+    tenant: Option<Path<String>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let tenant = tenant.map(|Path(tenant)| tenant);
     let params = extract_service_params(&headers);
-    let req = GetExtendedAgentCardRequest { tenant: None };
+    let req = GetExtendedAgentCardRequest { tenant };
     match state.handler.get_extended_agent_card(&params, req).await {
         Ok(card) => protojson_json_response(&card),
         Err(e) => rest_error_response(e),
@@ -491,14 +620,11 @@ fn protojson_stream<T: ProtoJsonPayload + 'static>(
 }
 
 /// Spec §11.6: an error inside an HTTP+JSON stream is an event carrying the
-/// same `{"error": google.rpc.Status}` body a non-streaming error has.
+/// same `{"error": google.rpc.Status}` body a non-streaming error has, named
+/// `error` as a2a-python's REST server names it and its client expects.
 fn rest_sse(stream: BoxStream<'static, Result<Value, A2AError>>) -> axum::response::Response {
-    let events = stream.map(|item| {
-        Ok(item.unwrap_or_else(|err| {
-            serde_json::to_value(rest_error_envelope(err).1).unwrap_or_default()
-        }))
-    });
-    sse::sse_from_stream(Box::pin(events)).into_response()
+    let events = stream.map(|item| item.map_err(|err| rest_error_envelope(err).1));
+    sse::sse_from_rest_stream(Box::pin(events)).into_response()
 }
 
 fn parse_create_push_config_request(
@@ -553,7 +679,8 @@ fn rest_error_envelope(err: A2AError) -> (StatusCode, RestErrorEnvelope) {
     let reason = error_reason(err.code);
     let grpc_status = rest_grpc_status(err.code);
 
-    let mut metadata = HashMap::from([("timestamp".to_string(), Utc::now().to_rfc3339())]);
+    let mut metadata =
+        HashMap::from([("timestamp".to_string(), a2a::format_timestamp(&Utc::now()))]);
     let mut details = Vec::new();
 
     if let Some(extra) = err.details {
@@ -1036,8 +1163,8 @@ mod tests {
             .await
             .unwrap()
             .to_bytes();
-        let frames: Vec<Value> = String::from_utf8(body.to_vec())
-            .unwrap()
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let frames: Vec<Value> = body
             .lines()
             .filter_map(|line| line.strip_prefix("data: "))
             .map(|data| serde_json::from_str(data).unwrap())
@@ -1047,6 +1174,13 @@ mod tests {
         assert_eq!(error["code"], 404);
         assert_eq!(error["status"], "NOT_FOUND");
         assert_eq!(error["details"][0]["reason"], "TASK_NOT_FOUND");
+        // The error frame alone is named: a2a-python's REST client reads an
+        // unnamed frame as a StreamResponse and drops the error.
+        let names: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("event: "))
+            .collect();
+        assert_eq!(names, vec!["error"], "{body}");
     }
 
     #[tokio::test]
@@ -1070,6 +1204,20 @@ mod tests {
         // Merged metadata should contain both taskId and timestamp
         assert_eq!(details[0]["metadata"]["taskId"], "t99");
         assert!(details[0]["metadata"]["timestamp"].is_string());
+    }
+
+    /// The ErrorInfo timestamp is a wire timestamp (§5.6.1): `Z`, not the
+    /// `+00:00` that chrono's `to_rfc3339` writes.
+    #[tokio::test]
+    async fn test_rest_error_info_timestamp_uses_the_z_designator() {
+        let resp = rest_error_response(A2AError::task_not_found("t1"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let timestamp = payload["error"]["details"][0]["metadata"]["timestamp"]
+            .as_str()
+            .unwrap();
+        assert!(timestamp.ends_with('Z'), "{timestamp}");
+        assert!(timestamp.parse::<DateTime<Utc>>().is_ok());
     }
 
     #[tokio::test]
@@ -1220,6 +1368,17 @@ mod tests {
             .unwrap();
         let delete_resp = app.clone().oneshot(delete_req).await.unwrap();
         assert_eq!(delete_resp.status(), StatusCode::OK);
+        // google.protobuf.Empty in ProtoJSON: `{}`, typed like every other
+        // success, so a client that parses the body gets a document.
+        assert_eq!(
+            delete_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/a2a+json"
+        );
+        let body = delete_resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({})
+        );
 
         let list_req = Request::builder()
             .header("a2a-version", "1.0")
@@ -1246,6 +1405,40 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `TASK_STATE_UNSPECIFIED` is the proto's default for an unset
+    /// `status`: no filter, as the other bindings treat it, not a filter
+    /// no task can match.
+    #[tokio::test]
+    async fn test_list_tasks_status_unspecified_is_no_filter() {
+        let app = make_app();
+        let body = serde_json::json!({
+            "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hello"}]}
+        });
+        let req = Request::builder()
+            .header("a2a-version", "1.0")
+            .uri(REST_SEND_MESSAGE_PATH)
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let req = Request::builder()
+            .header("a2a-version", "1.0")
+            .uri("/tasks?status=TASK_STATE_UNSPECIFIED")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["totalSize"], 1, "{payload}");
     }
 
     #[tokio::test]
@@ -1838,5 +2031,255 @@ mod tests {
             .unwrap();
         let resp = make_app().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Every method is served on its proto `/{tenant}/…` binding as well, and
+    /// the path tenant reaches the request; the plain binding has none.
+    #[tokio::test]
+    async fn test_every_method_is_routed_under_a_tenant() {
+        let (handler, _) = CapturingHandler::new();
+        let app = rest_router(handler.clone());
+        let send = r#"{"message":{"messageId":"m1","role":"ROLE_USER","parts":[{"text":"hi"}]}}"#;
+        let config = r#"{"url":"https://example.com/cb"}"#;
+        for (method, uri, body, called, tenant) in [
+            (
+                "POST",
+                "/acme/message:send",
+                send,
+                "send_message",
+                Some("acme"),
+            ),
+            (
+                "POST",
+                "/acme/message:stream",
+                send,
+                "send_streaming_message",
+                Some("acme"),
+            ),
+            ("GET", "/acme/tasks/t1", "", "get_task", Some("acme")),
+            ("GET", "/acme/tasks", "", "list_tasks", Some("acme")),
+            (
+                "POST",
+                "/acme/tasks/t1:cancel",
+                "",
+                "cancel_task",
+                Some("acme"),
+            ),
+            (
+                "GET",
+                "/acme/tasks/t1:subscribe",
+                "",
+                "subscribe_to_task",
+                Some("acme"),
+            ),
+            (
+                "POST",
+                "/acme/tasks/t1:subscribe",
+                "",
+                "subscribe_to_task",
+                Some("acme"),
+            ),
+            (
+                "POST",
+                "/acme/tasks/t1/pushNotificationConfigs",
+                config,
+                "create_push_config",
+                Some("acme"),
+            ),
+            (
+                "GET",
+                "/acme/tasks/t1/pushNotificationConfigs/c1",
+                "",
+                "get_push_config",
+                Some("acme"),
+            ),
+            (
+                "GET",
+                "/acme/tasks/t1/pushNotificationConfigs",
+                "",
+                "list_push_configs",
+                Some("acme"),
+            ),
+            (
+                "DELETE",
+                "/acme/tasks/t1/pushNotificationConfigs/c1",
+                "",
+                "delete_push_config",
+                Some("acme"),
+            ),
+            (
+                "GET",
+                "/acme/extendedAgentCard",
+                "",
+                "get_extended_agent_card",
+                Some("acme"),
+            ),
+            ("POST", REST_SEND_MESSAGE_PATH, send, "send_message", None),
+        ] {
+            let req = Request::builder()
+                .uri(uri)
+                .method(method)
+                .header("a2a-version", "1.0")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                handler.take_tenant(called),
+                Some(tenant.map(str::to_owned)),
+                "{method} {uri}"
+            );
+        }
+    }
+
+    /// A tenant that fails to decode is a 400 on every route, like a task id
+    /// that fails to decode, and never runs as the default tenant.
+    #[tokio::test]
+    async fn test_an_undecodable_tenant_is_rejected() {
+        let (handler, _) = CapturingHandler::new();
+        let app = rest_router(handler.clone());
+        let send = r#"{"message":{"messageId":"m1","role":"ROLE_USER","parts":[{"text":"hi"}]}}"#;
+        for (method, uri, body, called) in [
+            ("POST", "/%FF/message:send", send, "send_message"),
+            (
+                "POST",
+                "/%FF/message:stream",
+                send,
+                "send_streaming_message",
+            ),
+            ("GET", "/%FF/tasks", "", "list_tasks"),
+            ("GET", "/%FF/tasks/t1", "", "get_task"),
+            (
+                "GET",
+                "/%FF/extendedAgentCard",
+                "",
+                "get_extended_agent_card",
+            ),
+        ] {
+            let req = Request::builder()
+                .uri(uri)
+                .method(method)
+                .header("a2a-version", "1.0")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+            assert_eq!(handler.take_tenant(called), None, "{method} {uri}");
+        }
+    }
+
+    /// A path tenant reaches the handler, also beside the same tenant in the
+    /// body; a different body tenant is a 400 that names the field; the plain
+    /// binding takes the body's.
+    #[tokio::test]
+    async fn test_path_and_body_tenant() {
+        let (handler, _) = CapturingHandler::new();
+        let app = rest_router(handler.clone());
+        let send = r#"{"message":{"messageId":"m1","role":"ROLE_USER","parts":[{"text":"hi"}]}}"#;
+        let send_acme = r#"{"tenant":"acme","message":{"messageId":"m1","role":"ROLE_USER","parts":[{"text":"hi"}]}}"#;
+        let send_body = r#"{"tenant":"body","message":{"messageId":"m1","role":"ROLE_USER","parts":[{"text":"hi"}]}}"#;
+        let cancel_acme = r#"{"tenant":"acme"}"#;
+        let cancel_body = r#"{"tenant":"body"}"#;
+        let config_acme = r#"{"tenant":"acme","url":"https://example.com/cb"}"#;
+        let config_body = r#"{"tenant":"body","url":"https://example.com/cb"}"#;
+        // `None`: a 400 and no handler call.
+        for (uri, body, called, tenant) in [
+            ("/acme/message:send", send, "send_message", Some("acme")),
+            (
+                "/acme/message:send",
+                send_acme,
+                "send_message",
+                Some("acme"),
+            ),
+            ("/acme/message:send", send_body, "send_message", None),
+            (
+                REST_SEND_MESSAGE_PATH,
+                send_body,
+                "send_message",
+                Some("body"),
+            ),
+            (
+                "/acme/message:stream",
+                send_acme,
+                "send_streaming_message",
+                Some("acme"),
+            ),
+            (
+                "/acme/message:stream",
+                send_body,
+                "send_streaming_message",
+                None,
+            ),
+            (
+                REST_STREAM_MESSAGE_PATH,
+                send_body,
+                "send_streaming_message",
+                Some("body"),
+            ),
+            ("/acme/tasks/t1:cancel", "", "cancel_task", Some("acme")),
+            (
+                "/acme/tasks/t1:cancel",
+                cancel_acme,
+                "cancel_task",
+                Some("acme"),
+            ),
+            ("/acme/tasks/t1:cancel", cancel_body, "cancel_task", None),
+            ("/tasks/t1:cancel", cancel_body, "cancel_task", Some("body")),
+            (
+                "/acme/tasks/t1/pushNotificationConfigs",
+                config_acme,
+                "create_push_config",
+                Some("acme"),
+            ),
+            (
+                "/acme/tasks/t1/pushNotificationConfigs",
+                config_body,
+                "create_push_config",
+                None,
+            ),
+            (
+                "/tasks/t1/pushNotificationConfigs",
+                config_body,
+                "create_push_config",
+                Some("body"),
+            ),
+        ] {
+            let req = Request::builder()
+                .uri(uri)
+                .method("POST")
+                .header("a2a-version", "1.0")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status() == StatusCode::BAD_REQUEST,
+                tenant.is_none(),
+                "POST {uri} {body}"
+            );
+            assert_eq!(
+                handler.take_tenant(called),
+                tenant.map(|tenant| Some(tenant.to_owned())),
+                "POST {uri} {body}"
+            );
+        }
+
+        let req = Request::builder()
+            .uri("/acme/tasks/t1:cancel")
+            .method("POST")
+            .header("a2a-version", "1.0")
+            .header("content-type", "application/json")
+            .body(Body::from(cancel_body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let violation = &payload["error"]["details"][0]["fieldViolations"][0];
+        assert_eq!(violation["field"], "tenant");
+        assert_eq!(
+            violation["description"],
+            "tenant in the body (body) does not match the tenant in the path (acme)"
+        );
     }
 }

@@ -131,12 +131,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // values are still rejected.
     builder.ignore_unknown_fields();
     builder.build(PROTOJSON_PACKAGES)?;
-    patch_generated_protojson_serde(&out_dir)?;
+    patch_generated_protojson_serde(&out_dir, &descriptor_set)?;
 
     Ok(())
 }
 
-fn patch_generated_protojson_serde(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn patch_generated_protojson_serde(
+    out_dir: &Path,
+    descriptor_set: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
     let serde_path = out_dir.join("lf.a2a.v1.serde.rs");
     let mut generated = std::fs::read_to_string(&serde_path)?;
 
@@ -146,8 +149,105 @@ fn patch_generated_protojson_serde(out_dir: &Path) -> Result<(), Box<dyn std::er
         generated = replace_if_present(generated, from, to);
     }
 
+    for (message, json_name) in timestamp_fields(descriptor_set)? {
+        generated = write_timestamp_as_wire_form(generated, &message, &json_name)?;
+    }
+
     std::fs::write(serde_path, generated)?;
     Ok(())
+}
+
+/// The `(message, JSON name)` of every `google.protobuf.Timestamp` field.
+///
+/// pbjson writes a Timestamp with chrono's `to_rfc3339`, which ends in
+/// `+00:00`; the wire form is `Z` (spec §5.6.1). Only a plain field of a
+/// top-level message is handled, which is every Timestamp in the proto today;
+/// any other shape fails the build rather than reaching the wire unpatched.
+fn timestamp_fields(
+    descriptor_set: &[u8],
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    use prost::Message;
+    use prost_types::{
+        DescriptorProto, FileDescriptorSet, field_descriptor_proto::Label as FieldLabel,
+    };
+
+    const TIMESTAMP: &str = ".google.protobuf.Timestamp";
+
+    fn nested_timestamp(message: &DescriptorProto) -> Option<&str> {
+        message
+            .nested_type
+            .iter()
+            .find(|nested| {
+                nested.field.iter().any(|f| f.type_name() == TIMESTAMP)
+                    || nested_timestamp(nested).is_some()
+            })
+            .map(|nested| nested.name())
+    }
+
+    let mut fields = Vec::new();
+    for file in FileDescriptorSet::decode(descriptor_set)?.file {
+        if !PROTOJSON_PACKAGES.contains(&format!(".{}", file.package()).as_str()) {
+            continue;
+        }
+        for message in &file.message_type {
+            if let Some(nested) = nested_timestamp(message) {
+                return Err(format!(
+                    "{}.{nested} has a google.protobuf.Timestamp field; \
+                     build.rs only writes those of top-level messages in wire form",
+                    message.name()
+                )
+                .into());
+            }
+            for field in &message.field {
+                if field.type_name() != TIMESTAMP {
+                    continue;
+                }
+                if field.label() != FieldLabel::Optional || field.oneof_index.is_some() {
+                    return Err(format!(
+                        "{}.{} is a repeated or oneof google.protobuf.Timestamp field; \
+                         build.rs only writes a plain one in wire form",
+                        message.name(),
+                        field.name()
+                    )
+                    .into());
+                }
+                fields.push((message.name().to_string(), field.json_name().to_string()));
+            }
+        }
+    }
+    Ok(fields)
+}
+
+/// Route one Timestamp field through `crate::timestamp::WireTimestamp`.
+///
+/// The edit has to land exactly once inside the message's own `Serialize`
+/// impl, and a miss fails the build: a pbjson upgrade that changes its output
+/// must not silently bring back the `+00:00` form.
+fn write_timestamp_as_wire_form(
+    generated: String,
+    message: &str,
+    json_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let impl_start = format!("impl serde::Serialize for {message} {{");
+    let impl_end = format!("impl<'de> serde::Deserialize<'de> for {message} {{");
+    let call = format!("struct_ser.serialize_field(\"{json_name}\", v)?;");
+    let wired = format!(
+        "struct_ser.serialize_field(\"{json_name}\", &crate::timestamp::WireTimestamp(v))?;"
+    );
+
+    let not_found = || format!("pbjson output changed: no `{call}` to patch in {message}");
+    let start = generated.find(&impl_start).ok_or_else(not_found)?;
+    let end = start + generated[start..].find(&impl_end).ok_or_else(not_found)?;
+    let serialize_impl = &generated[start..end];
+    if serialize_impl.matches(&call).count() != 1 {
+        return Err(not_found().into());
+    }
+    Ok(format!(
+        "{}{}{}",
+        &generated[..start],
+        serialize_impl.replace(&call, &wired),
+        &generated[end..]
+    ))
 }
 
 fn replace_if_present(source: String, from: &str, to: &str) -> String {

@@ -122,7 +122,7 @@ async fn handle_unary_request<H: RequestHandler>(
     request: &JsonRpcRequest,
 ) -> axum::response::Response {
     let id = request.id.clone();
-    let raw_params = request.params.clone().unwrap_or(Value::Null);
+    let raw_params = params_or_empty(request);
 
     let result: Result<Value, A2AError> = match request.method.as_str() {
         methods::SEND_MESSAGE => match protojson_conv::from_value::<SendMessageRequest>(raw_params)
@@ -226,7 +226,7 @@ async fn handle_streaming_request<H: RequestHandler>(
     request: &JsonRpcRequest,
 ) -> axum::response::Response {
     let id = request.id.clone();
-    let raw_params = request.params.clone().unwrap_or(Value::Null);
+    let raw_params = params_or_empty(request);
 
     match request.method.as_str() {
         methods::SEND_STREAMING_MESSAGE => {
@@ -275,6 +275,16 @@ fn protojson_stream(
             })
         })
     }))
+}
+
+/// JSON-RPC 2.0 §4: `params` MAY be omitted, and §9.4.8's own
+/// `GetExtendedAgentCard` request has none. Omitted or `null` is the
+/// request with no parameters, which ProtoJSON spells `{}`.
+fn params_or_empty(request: &JsonRpcRequest) -> Value {
+    match &request.params {
+        Some(params) if !params.is_null() => params.clone(),
+        _ => Value::Object(Default::default()),
+    }
 }
 
 fn parse_create_push_config_request(
@@ -715,6 +725,29 @@ mod tests {
         });
         let resp = post_jsonrpc(app, methods::DELETE_PUSH_CONFIG, params).await;
         assert!(resp.error.is_some() || resp.result.is_some());
+    }
+
+    /// JSON-RPC 2.0 §4: `params` MAY be omitted; §9.4.8's own request has
+    /// none. Omitted or `null`, it is the request with no parameters.
+    #[tokio::test]
+    async fn test_omitted_or_null_params_are_no_params() {
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":null}"#,
+        ] {
+            let req = Request::builder()
+                .uri("/")
+                .method("POST")
+                .header("content-type", "application/json")
+                .header("a2a-version", "1.0")
+                .body(Body::from(body))
+                .unwrap();
+            let resp = make_app().oneshot(req).await.unwrap();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let resp: JsonRpcResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(resp.error, None, "{body}");
+            assert_eq!(resp.result.unwrap()["tasks"], serde_json::json!([]));
+        }
     }
 
     #[tokio::test]

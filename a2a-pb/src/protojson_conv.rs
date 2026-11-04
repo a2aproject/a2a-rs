@@ -49,47 +49,15 @@ pub trait ProtoJsonPayload: Sized {
     fn normalize_json(_value: &mut Value) {}
 }
 
+/// Timestamps come out in wire form (`Z`, spec §5.6.1) from the generated
+/// serializers themselves (see `build.rs`); the JSON is not touched afterwards,
+/// so caller content such as `metadata` is written exactly as it was given.
 pub fn to_value<T: ProtoJsonPayload>(value: &T) -> Result<Value, ProtoJsonPayloadError> {
     let proto = T::to_proto(value);
     let protojson: T::ProtoJson = transcode_message(&proto)?;
     let mut json = serde_json::to_value(protojson).map_err(ProtoJsonPayloadError::Json)?;
-    normalize_timestamp_strings(&mut json);
     T::normalize_json(&mut json);
     Ok(json)
-}
-
-/// JSON field names in `a2a.proto` whose value is a `google.protobuf.Timestamp`.
-const TIMESTAMP_FIELD_NAMES: &[&str] = &["timestamp", "statusTimestampAfter"];
-
-/// `pbjson_types::Timestamp`'s own `Serialize` emits an RFC 3339 string with
-/// a numeric `+00:00` offset (e.g. `"...846477544+00:00"`); the protobuf
-/// JSON canonical mapping requires the `Z` UTC designator instead
-/// (<https://protobuf.dev/programming-guides/proto3/#json>), and DM-SERIAL-001
-/// enforces exactly that. Recurses through the whole tree, keyed by field
-/// name rather than a blind string match, so an unrelated string value that
-/// happens to end the same way (e.g. user-supplied message text) is never
-/// touched.
-fn normalize_timestamp_strings(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, v) in map.iter_mut() {
-                if TIMESTAMP_FIELD_NAMES.contains(&key.as_str()) {
-                    if let Value::String(s) = v {
-                        if let Some(prefix) = s.strip_suffix("+00:00") {
-                            *s = format!("{prefix}Z");
-                        }
-                    }
-                }
-                normalize_timestamp_strings(v);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                normalize_timestamp_strings(item);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Spec §5.7: a REQUIRED field MUST be present, so the defaults proto3-JSON
@@ -432,7 +400,20 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_timestamp_strings_recurses_into_nested_tasks() {
+    fn test_task_status_timestamp_keeps_only_the_digits_the_value_needs() {
+        for (input, expected) in [
+            ("2026-09-23T02:07:57Z", "2026-09-23T02:07:57Z"),
+            ("2026-09-23T02:07:57.5Z", "2026-09-23T02:07:57.500Z"),
+            ("2026-09-23T02:07:57.000123Z", "2026-09-23T02:07:57.000123Z"),
+        ] {
+            let timestamp = input.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+            let json = to_value(&sample_task_with_timestamp(timestamp)).unwrap();
+            assert_eq!(json["status"]["timestamp"], expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn test_nested_task_timestamps_use_z_suffix() {
         let timestamp = "2026-09-23T02:07:57Z"
             .parse::<chrono::DateTime<chrono::Utc>>()
             .unwrap();
@@ -447,17 +428,52 @@ mod tests {
         assert_eq!(rendered, "2026-09-23T02:07:57Z");
     }
 
-    /// A key-based fix rather than a blind string replace: an unrelated
-    /// field whose value happens to end the same way as the buggy timestamp
-    /// format (e.g. user-supplied text) must never be rewritten.
+    /// `statusTimestampAfter` is the other `google.protobuf.Timestamp` field
+    /// in the proto.
     #[test]
-    fn test_normalize_timestamp_strings_ignores_unrelated_fields() {
-        let mut json = serde_json::json!({
-            "notATimestamp": "ends with +00:00",
-            "nested": { "alsoNotATimestamp": "also +00:00" }
-        });
-        normalize_timestamp_strings(&mut json);
-        assert_eq!(json["notATimestamp"], "ends with +00:00");
-        assert_eq!(json["nested"]["alsoNotATimestamp"], "also +00:00");
+    fn test_status_timestamp_after_uses_z_suffix() {
+        let request = ListTasksRequest {
+            context_id: None,
+            status: None,
+            page_size: None,
+            page_token: None,
+            history_length: None,
+            status_timestamp_after: Some("2026-09-23T02:07:57.5Z".parse().unwrap()),
+            include_artifacts: None,
+            tenant: None,
+        };
+        let json = to_value(&request).unwrap();
+        assert_eq!(json["statusTimestampAfter"], "2026-09-23T02:07:57.500Z");
+    }
+
+    /// `metadata` and a data part hold the caller's own content. A key named
+    /// `timestamp` there is theirs: whatever it says reaches the peer as it
+    /// was written, including a `+00:00` offset.
+    #[test]
+    fn test_caller_content_under_a_timestamp_key_is_left_as_sent() {
+        let offset = "2026-09-23T02:07:57+00:00";
+        let timestamp = "2026-09-23T02:07:57Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let mut task = sample_task_with_timestamp(timestamp);
+        task.metadata = Some(std::collections::HashMap::from([(
+            "timestamp".to_string(),
+            Value::String(offset.to_string()),
+        )]));
+        task.artifacts = Some(vec![a2a::Artifact {
+            artifact_id: "artifact-1".to_string(),
+            name: None,
+            description: None,
+            parts: vec![a2a::Part::data(serde_json::json!({ "timestamp": offset }))],
+            metadata: None,
+            extensions: None,
+        }]);
+        let json = to_value(&task).unwrap();
+        assert_eq!(json["status"]["timestamp"], "2026-09-23T02:07:57Z");
+        assert_eq!(json["metadata"]["timestamp"], offset);
+        assert_eq!(
+            json["artifacts"][0]["parts"][0]["data"]["timestamp"],
+            offset
+        );
     }
 }

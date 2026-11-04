@@ -24,6 +24,11 @@ env:
 permissions:
   contents: read
 
+# A newer push to a PR cancels its earlier run; other events get their own group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   build-test:
     name: Build and test (${{ matrix.os }})
