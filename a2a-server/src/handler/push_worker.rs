@@ -19,7 +19,7 @@ pub(super) struct Notification {
     pub(super) event: Arc<ExecutionEvent>,
     pub(super) sender: Arc<crate::HttpPushSender>,
     // Retain the source across intake retirement until accepted work drains.
-    pub(super) source: Arc<TaskHandle>,
+    pub(super) source: TaskHandle,
 }
 
 impl Notification {
@@ -62,9 +62,9 @@ pub(super) struct PushDispatcher {
 }
 
 impl PushDispatcher {
-    pub(super) fn spawn(workers: &super::workers::Workers) -> Self {
+    pub(super) fn spawn(background_tasks: &super::background_tasks::BackgroundTasks) -> Self {
         let (queue, receiver) = mpsc::channel(PUSH_QUEUE_CAPACITY);
-        workers.spawn(dispatch(receiver, MAX_PUSH_DELIVERIES, PUSH_QUEUE_CAPACITY));
+        background_tasks.spawn(dispatch(receiver, MAX_PUSH_DELIVERIES, PUSH_QUEUE_CAPACITY));
         Self { queue }
     }
 
@@ -187,7 +187,7 @@ mod tests {
         generation: i64,
         url: &str,
         sender: &Arc<crate::HttpPushSender>,
-        source: &Arc<TaskHandle>,
+        source: &TaskHandle,
     ) -> Notification {
         let mut task = task_with_history(task_id, "context", 0);
         task.generation = generation;
@@ -208,12 +208,13 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_cancels_in_flight_http_and_releases_queued_task_handles() {
-        let workers = Arc::new(super::super::workers::Workers::default());
+        let background_tasks = Arc::new(super::super::background_tasks::BackgroundTasks::default());
         let sender = sender();
         let (url, mut seen, server) = endpoint(true).await;
-        let source = TaskHandle::with_workers("task".into(), None, workers.clone());
-        let weak = Arc::downgrade(&source);
-        let dispatcher = PushDispatcher::spawn(&workers);
+        let source =
+            TaskHandle::with_background_tasks("task".into(), None, background_tasks.clone());
+        let weak = source.downgrade();
+        let dispatcher = PushDispatcher::spawn(&background_tasks);
         assert!(dispatcher.submit(notification("task", 1, &url, &sender, &source)));
         assert!(dispatcher.submit(notification("task", 2, &url, &sender, &source)));
         let (_, _, release) = timeout(Duration::from_secs(2), seen.recv())
@@ -225,7 +226,7 @@ mod tests {
             weak.upgrade().is_some(),
             "in-flight and queued notifications retain their Task"
         );
-        timeout(Duration::from_secs(1), workers.shutdown())
+        timeout(Duration::from_secs(1), background_tasks.shutdown())
             .await
             .expect("shutdown must not wait for the HTTP request timeout");
         assert!(
@@ -242,7 +243,7 @@ mod tests {
         let sender = sender();
         let (url, mut seen, server) = endpoint(false).await;
         let source = TaskHandle::new("task".into(), None);
-        let retained = Arc::downgrade(&source);
+        let retained = source.downgrade();
         let (queue, receiver) = PushDispatcher::channel(8);
         for (task, generation, path) in [
             ("a", 1, "/slow"),

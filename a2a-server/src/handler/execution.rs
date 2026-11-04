@@ -7,13 +7,13 @@ use super::DefaultRequestHandler;
 use super::cancellation::Cancellation;
 use super::events::{ActiveExecution, EventKind};
 use super::protocol::is_terminal_event;
-use super::runtime::TaskRuntime;
+use super::task_handle::TaskController;
 use crate::executor::{ClientInput, ClientInputSender, QueuedInput, ReturnedInputs};
 use a2a::*;
 use futures::StreamExt;
 use std::sync::Arc;
 
-/// Mutable bookkeeping held in TaskRuntime, never behind a shared mutex.
+/// Mutable bookkeeping held in TaskController, never behind a shared mutex.
 #[derive(Default)]
 pub(super) struct InvocationState {
     pending_inputs: Vec<QueuedInput>,
@@ -195,8 +195,8 @@ async fn poll_executor(
                     .output(handler.clone(), active.clone(), event)
                     .await;
                 match action {
-                    Ok(super::runtime::OutputAction::Continue) => {}
-                    Ok(super::runtime::OutputAction::Stopped) => return TurnEnd::Stopped,
+                    Ok(super::task_handle::OutputAction::Continue) => {}
+                    Ok(super::task_handle::OutputAction::Stopped) => return TurnEnd::Stopped,
                     Err(error) => return TurnEnd::Failed(error),
                 }
             }
@@ -237,7 +237,7 @@ pub(super) async fn start_next_turn(
     task_id: &TaskId,
     snapshot: Task,
     mut unread: Vec<crate::executor::ClientInput>,
-    state: &mut TaskRuntime,
+    state: &mut TaskController,
 ) -> Result<(), Vec<crate::executor::ClientInput>> {
     let Ok((next, inputs)) = state.reserve(handler, task_id).await else {
         return Err(unread);
@@ -280,7 +280,7 @@ pub(super) async fn start_next_turn(
 pub(super) async fn release_execution(
     active: &Arc<ActiveExecution>,
     task_id: &str,
-    state: &mut TaskRuntime,
+    state: &mut TaskController,
 ) {
     reject_unread_inputs(active, task_id, state).await;
     state.release(active);
@@ -291,7 +291,7 @@ pub(super) async fn release_execution(
 pub(super) async fn save_pending_push_config(
     active: &ActiveExecution,
     handler: &DefaultRequestHandler,
-    state: &mut TaskRuntime,
+    state: &mut TaskController,
 ) {
     if let (Some(invocation), Some(pushes)) = (state.execution.bookkeeping(active), &handler.pushes)
     {
@@ -307,7 +307,7 @@ pub(super) async fn save_pending_push_config(
 pub(super) async fn reject_unread_inputs(
     active: &ActiveExecution,
     task_id: &str,
-    state: &mut TaskRuntime,
+    state: &mut TaskController,
 ) {
     reject_inputs(
         active,
@@ -521,7 +521,7 @@ mod driver_tests {
     ) -> (
         Arc<ActiveExecution>,
         ExecutorContext,
-        Arc<super::super::runtime::TaskSender>,
+        Arc<super::super::task_handle::TaskSender>,
     ) {
         let lease = runtime.tasks.test_lease(&task.id);
         let handler = runtime.clone();
@@ -976,7 +976,7 @@ mod turn_tests {
             &task.id,
             task.clone(),
             vec![input.clone()],
-            &mut TaskRuntime::default(),
+            &mut TaskController::default(),
         )
         .await
         .unwrap_err();
@@ -1005,7 +1005,7 @@ mod turn_tests {
             store.save(config(id)).await.unwrap();
         }
         let active = ActiveExecution::new(None);
-        let mut state = TaskRuntime::default();
+        let mut state = TaskController::default();
         let invocation = InvocationState {
             pending_push: Some(config(50)),
             ..Default::default()
@@ -1245,13 +1245,13 @@ mod failure_tests {
     }
     #[tokio::test]
     async fn an_executor_failure_releases_its_owner_even_when_failure_persistence_is_down() {
-        use crate::handler::{execution::TurnEnd, runtime::TaskRuntime};
+        use crate::handler::{execution::TurnEnd, task_handle::TaskController};
         for read_outage in [true, false] {
             let store = UnavailableStore::default();
             let handler = DefaultRequestHandler::new(EchoExecutor, store.clone());
             seed_task(&handler, "task", "context").await;
             let before = handler.tasks.load("task").await.unwrap();
-            let mut runtime = TaskRuntime::default();
+            let mut runtime = TaskController::default();
             let (active, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
             active.set_snapshot(before.clone());
             let mut events = active.subscribe();

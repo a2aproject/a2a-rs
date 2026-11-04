@@ -4,11 +4,28 @@
 //! In-memory channels and execution routing owned by one task handle.
 
 use super::events::{ActiveExecution, EventKind, ExecutionEvent, ExecutionReceiver, FailureSignal};
-use super::runtime::{self, TaskSender};
 use a2a::*;
 use parking_lot::RwLock;
 use std::sync::{Arc, Weak};
 use tokio::sync::{broadcast, watch};
+
+mod controller;
+
+pub(super) use controller::{OutputAction, TaskController};
+
+const TASK_QUEUE_CAPACITY: usize = 32;
+type TaskTransition =
+    Box<dyn for<'a> FnOnce(&'a mut TaskController) -> futures::future::BoxFuture<'a, ()> + Send>;
+pub(super) type TaskSender = tokio::sync::mpsc::Sender<TaskTransition>;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum TaskOperation {
+    Input,
+    Subscribe,
+    Output,
+    Finished,
+    Cancel,
+}
 
 #[derive(Default)]
 struct State {
@@ -23,60 +40,183 @@ struct State {
 
 /// Persisted Task data stays in TaskStore. This handle owns its process-local
 /// channels; receivers and active workers retain it across executor invocations.
+#[derive(Clone)]
 pub(super) struct TaskHandle {
-    pub(super) id: TaskId,
-    pub(super) workers: Arc<super::workers::Workers>,
+    inner: Arc<TaskInner>,
+}
+
+/// Weak routing reference that does not retain a task's channels or snapshot.
+pub(super) struct WeakTaskHandle {
+    inner: Weak<TaskInner>,
+}
+
+impl WeakTaskHandle {
+    pub(super) fn upgrade(&self) -> Option<TaskHandle> {
+        self.inner.upgrade().map(|inner| TaskHandle { inner })
+    }
+
+    pub(super) fn is_alive(&self) -> bool {
+        self.inner.strong_count() > 0
+    }
+}
+
+struct TaskInner {
+    id: TaskId,
+    background_tasks: Arc<super::background_tasks::BackgroundTasks>,
     changes: watch::Sender<u64>,
-    pub(super) sender: broadcast::Sender<ExecutionEvent>,
+    sender: broadcast::Sender<ExecutionEvent>,
     state: RwLock<State>,
-    pub(super) notifications: std::sync::OnceLock<Arc<super::push_delivery::PushService>>,
-    pub(super) webhook_subscribed: std::sync::Mutex<super::push_delivery::SubscriptionState>,
+    notifications: std::sync::OnceLock<Arc<super::push_delivery::PushService>>,
+    webhook_subscribed: std::sync::Mutex<super::push_delivery::SubscriptionState>,
 }
 
 impl TaskHandle {
     #[cfg(test)]
-    pub(super) fn new(id: TaskId, snapshot: Option<Task>) -> Arc<Self> {
-        Self::with_workers(id, snapshot, Arc::default())
+    pub(super) fn new(id: TaskId, snapshot: Option<Task>) -> Self {
+        Self::with_background_tasks(id, snapshot, Arc::default())
     }
 
-    pub(super) fn with_workers(
+    pub(super) fn with_background_tasks(
         id: TaskId,
         snapshot: Option<Task>,
-        workers: Arc<super::workers::Workers>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            id,
-            workers,
-            changes: watch::channel(0).0,
-            sender: broadcast::channel(super::EXECUTION_BUFFER_CAPACITY).0,
-            state: RwLock::new(State {
-                snapshot,
-                ..State::default()
+        background_tasks: Arc<super::background_tasks::BackgroundTasks>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(TaskInner {
+                id,
+                background_tasks,
+                changes: watch::channel(0).0,
+                sender: broadcast::channel(super::EXECUTION_BUFFER_CAPACITY).0,
+                state: RwLock::new(State {
+                    snapshot,
+                    ..State::default()
+                }),
+                notifications: std::sync::OnceLock::new(),
+                webhook_subscribed: std::sync::Mutex::default(),
             }),
-            notifications: std::sync::OnceLock::new(),
-            webhook_subscribed: std::sync::Mutex::default(),
-        })
+        }
+    }
+
+    pub(super) fn downgrade(&self) -> WeakTaskHandle {
+        WeakTaskHandle {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(super) fn id(&self) -> &TaskId {
+        &self.inner.id
+    }
+
+    pub(super) fn background_tasks(&self) -> &Arc<super::background_tasks::BackgroundTasks> {
+        &self.inner.background_tasks
+    }
+
+    pub(super) fn sender(&self) -> &broadcast::Sender<ExecutionEvent> {
+        &self.inner.sender
+    }
+
+    pub(super) fn pushes(&self) -> Option<&Arc<super::push_delivery::PushService>> {
+        self.inner.notifications.get()
+    }
+
+    pub(super) fn configure_pushes(
+        &self,
+        service: Arc<super::push_delivery::PushService>,
+    ) -> Result<(), Arc<super::push_delivery::PushService>> {
+        self.inner.notifications.set(service)
+    }
+
+    pub(super) fn webhook_subscription(
+        &self,
+    ) -> std::sync::MutexGuard<'_, super::push_delivery::SubscriptionState> {
+        self.inner
+            .webhook_subscribed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The worker holds this handle, but the handle keeps only a weak sender.
     /// Once callers and drivers release the sender, the idle worker can retire.
-    pub(super) fn operations(self: &Arc<Self>) -> Arc<TaskSender> {
-        let mut state = self.state.write();
+    pub(super) fn operations(&self) -> Arc<TaskSender> {
+        let mut state = self.inner.state.write();
         if let Some(queue) = state.operations.upgrade() {
             return queue;
         }
-        let queue = runtime::spawn_task(self.clone());
+        let queue = self.spawn_controller();
         state.operations = Arc::downgrade(&queue);
         queue
     }
 
-    pub(super) fn active(&self) -> Option<Arc<ActiveExecution>> {
-        self.state.read().execution.upgrade()
+    fn spawn_controller(&self) -> Arc<TaskSender> {
+        let task = self.clone();
+        let (sender, mut commands) =
+            tokio::sync::mpsc::channel::<TaskTransition>(TASK_QUEUE_CAPACITY);
+        let background_tasks = task.background_tasks().clone();
+        background_tasks.spawn(async move {
+            let mut state = TaskController::default();
+            while let Some(transition) = commands.recv().await {
+                tracing::trace!(task_id = %task.id(), "processing task operation");
+                transition(&mut state).await;
+            }
+        });
+        Arc::new(sender)
     }
 
-    /// The runtime owns the invocation; routing must not keep it alive.
+    /// Once enqueued, the operation owns its reply and queue lease independently of its caller.
+    pub(super) async fn submit<T, F>(
+        &self,
+        operation: TaskOperation,
+        transition: F,
+    ) -> Result<T, A2AError>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(&'a mut TaskController) -> futures::future::BoxFuture<'a, T>
+            + Send
+            + 'static,
+    {
+        use futures::FutureExt;
+        self.background_tasks().check_running()?;
+        let task = self.operations();
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let owner = task.clone();
+        let work: TaskTransition = Box::new(move |state| {
+            Box::pin(async move {
+                let result = std::panic::AssertUnwindSafe(async { transition(state).await })
+                    .catch_unwind()
+                    .await;
+                if result.is_err() {
+                    state.recover_preparation();
+                }
+                let result = result.map_err(|_| {
+                    A2AError::internal(match operation {
+                        TaskOperation::Input => "message preparation failed unexpectedly",
+                        _ => "task transition failed unexpectedly",
+                    })
+                });
+                let _ = reply.send(result);
+                drop(owner);
+            })
+        });
+        task.send(work)
+            .await
+            .map_err(|_| A2AError::internal("task operation queue closed"))?;
+        result
+            .await
+            .map_err(|_| A2AError::internal("task operation lost its response"))?
+    }
+
+    pub(super) fn active(&self) -> Option<Arc<ActiveExecution>> {
+        self.inner.state.read().execution.upgrade()
+    }
+
+    /// The controller owns the invocation; routing must not keep it alive.
     pub(super) fn register(&self, active: &Arc<ActiveExecution>) -> Result<(), A2AError> {
-        let mut state = self.state.write();
+        let mut state = self.inner.state.write();
         if state
             .execution
             .upgrade()
@@ -84,7 +224,7 @@ impl TaskHandle {
         {
             return Err(A2AError::invalid_request(format!(
                 "task execution is already in progress: {}",
-                self.id
+                self.inner.id
             )));
         }
         state.execution = Arc::downgrade(active);
@@ -92,7 +232,7 @@ impl TaskHandle {
     }
 
     pub(super) fn unregister(&self, active: &Arc<ActiveExecution>) {
-        let mut state = self.state.write();
+        let mut state = self.inner.state.write();
         if state
             .execution
             .upgrade()
@@ -108,7 +248,7 @@ impl TaskHandle {
 
     #[cfg(test)]
     pub(super) fn reserve(
-        self: &Arc<Self>,
+        &self,
     ) -> Result<
         (
             Arc<ActiveExecution>,
@@ -122,43 +262,43 @@ impl TaskHandle {
         Ok((active, inputs, state))
     }
 
-    pub(super) fn watch(self: &Arc<Self>) -> TaskWatch {
+    pub(super) fn watch(&self) -> TaskWatch {
         TaskWatch {
-            changes: self.changes.subscribe(),
+            changes: self.inner.changes.subscribe(),
             _task: self.clone(),
         }
     }
 
     pub(super) fn notify(&self) {
-        self.changes.send_modify(|version| *version += 1);
+        self.inner.changes.send_modify(|version| *version += 1);
     }
 
     #[cfg(test)]
     pub(super) fn is_watched(&self) -> bool {
-        self.changes.receiver_count() > 0
+        self.inner.changes.receiver_count() > 0
     }
 
     pub(super) fn snapshot(&self) -> Option<Task> {
-        self.state.read().snapshot.clone()
+        self.inner.state.read().snapshot.clone()
     }
 
     pub(super) fn set_snapshot(&self, task: Task) {
-        self.state.write().snapshot = Some(task);
+        self.inner.state.write().snapshot = Some(task);
     }
 
     pub(super) fn sequence(&self) -> u64 {
-        self.state.read().sequence
+        self.inner.state.read().sequence
     }
 
     pub(super) fn subscribe(&self) -> (broadcast::Receiver<ExecutionEvent>, u64) {
-        let receiver = self.sender.subscribe();
-        let sequence = self.state.read().sequence;
+        let receiver = self.inner.sender.subscribe();
+        let sequence = self.inner.state.read().sequence;
         (receiver, sequence)
     }
 
     pub(super) fn resubscribe(&self) -> (broadcast::Receiver<ExecutionEvent>, Option<Task>, u64) {
-        let receiver = self.sender.subscribe();
-        let state = self.state.read();
+        let receiver = self.inner.sender.subscribe();
+        let state = self.inner.state.read();
         (receiver, state.snapshot.clone(), state.sequence)
     }
 
@@ -168,8 +308,8 @@ impl TaskHandle {
         &self,
         after: u64,
     ) -> Result<(broadcast::Receiver<ExecutionEvent>, Option<Task>, u64), A2AError> {
-        let receiver = self.sender.subscribe();
-        let state = self.state.read();
+        let receiver = self.inner.sender.subscribe();
+        let state = self.inner.state.read();
         if let Some((sequence, error)) = &state.last_error
             && *sequence > after
         {
@@ -180,7 +320,7 @@ impl TaskHandle {
 
     /// Cache and broadcast a persisted update before waking task readers.
     pub(super) fn publish(
-        self: &Arc<Self>,
+        &self,
         result: Result<&StreamResponse, &A2AError>,
         snapshot: Option<Task>,
         kind: EventKind,
@@ -198,7 +338,7 @@ impl TaskHandle {
     /// Input is persisted as one batch. Reattachment must see its final cursor
     /// and snapshot, so wake readers only after all its events are available.
     pub(super) fn publish_input(
-        self: &Arc<Self>,
+        &self,
         snapshot: Task,
         events: &[StreamResponse],
         failure: FailureSignal,
@@ -220,14 +360,14 @@ impl TaskHandle {
     }
 
     fn publish_event(
-        self: &Arc<Self>,
+        &self,
         result: Result<&StreamResponse, &A2AError>,
         snapshot: Option<Task>,
         kind: EventKind,
         failure: Option<FailureSignal>,
     ) {
         let sequence = {
-            let mut state = self.state.write();
+            let mut state = self.inner.state.write();
             if let Some(task) = snapshot {
                 state.snapshot = Some(task);
             }
@@ -242,14 +382,15 @@ impl TaskHandle {
         // Subscription startup/retirement and send share this short lock; an
         // idle subscriber cannot disappear between admission and publication.
         let _subscription = if notifies {
-            self.notifications
+            self.inner
+                .notifications
                 .get()
                 .map(|_| super::push_delivery::subscribe(self))
         } else {
             None
         };
-        if self.sender.receiver_count() > 0 {
-            let _ = self.sender.send(ExecutionEvent {
+        if self.inner.sender.receiver_count() > 0 {
+            let _ = self.inner.sender.send(ExecutionEvent {
                 sequence,
                 result: result.cloned().map_err(Clone::clone),
                 kind,
@@ -261,7 +402,7 @@ impl TaskHandle {
 
 /// Holds the task handle while waiting, so updates use the same channel.
 pub(super) struct TaskWatch {
-    _task: Arc<TaskHandle>,
+    _task: TaskHandle,
     changes: watch::Receiver<u64>,
 }
 
@@ -281,7 +422,7 @@ mod tests {
     async fn input_batch_exposes_its_complete_snapshot_and_events_before_waking_readers() {
         let task = TaskHandle::new("task".into(), None);
         let mut watch = task.watch();
-        let mut events = task.sender.subscribe();
+        let mut events = task.sender().subscribe();
         let snapshot = task_with_history("task", "context", 0);
         let updates = vec![StreamResponse::Task(snapshot.clone()); 3];
         task.publish_input(
@@ -309,7 +450,7 @@ mod tests {
     async fn publication_wakes_readers_after_the_snapshot_and_event_are_available() {
         let task = TaskHandle::new("task".into(), None);
         let mut watch = task.watch();
-        let mut events = task.sender.subscribe();
+        let mut events = task.sender().subscribe();
         let snapshot = task_with_history("task", "context", 0);
         let waiter = tokio::spawn({
             let task = task.clone();
@@ -361,7 +502,7 @@ mod tests {
         let manager = make_handler().tasks;
         let (first, _inputs, _invocation) = manager.task("task").reserve().unwrap();
         let source = first.task.clone();
-        let mut subscriber = source.sender.subscribe();
+        let mut subscriber = source.sender().subscribe();
         let task = task_with_history("task", "context", 0);
         first.set_snapshot(task.clone());
         first.publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()));
@@ -369,7 +510,7 @@ mod tests {
         drop(first);
 
         let (second, _inputs, _invocation) = manager.task("task").reserve().unwrap();
-        assert!(Arc::ptr_eq(&source, &second.task));
+        assert!(source.ptr_eq(&second.task));
         assert!(
             second.snapshot().is_none(),
             "a new reservation must wait for preparation"
@@ -384,7 +525,7 @@ mod tests {
     async fn registry_does_not_retain_unused_task_sources() {
         let manager = make_handler().tasks;
         let source = manager.task("unused");
-        let weak = Arc::downgrade(&source);
+        let weak = source.downgrade();
         drop(source);
         assert!(weak.upgrade().is_none());
     }

@@ -44,7 +44,7 @@ pub(super) enum MessageResponse {
 impl MessageResponse {
     pub(super) async fn receive(
         tasks: Arc<TaskService>,
-        task: Arc<TaskHandle>,
+        task: TaskHandle,
         mut events: Events,
     ) -> Result<Self, A2AError> {
         // Retention may remove a terminal task before the caller reads its response.
@@ -61,7 +61,7 @@ impl MessageResponse {
 
 pub(super) struct TaskResponse {
     tasks: Arc<TaskService>,
-    task: Arc<TaskHandle>,
+    task: TaskHandle,
     events: Events,
 }
 
@@ -77,7 +77,7 @@ impl TaskResponse {
     }
 
     pub(super) async fn snapshot(self) -> Result<Task, A2AError> {
-        match self.tasks.load(&self.task.id).await {
+        match self.tasks.load(self.task.id()).await {
             Ok(task) => Ok(task),
             Err(error) if error.code == error_code::TASK_NOT_FOUND => match self.task.snapshot() {
                 Some(task) if task.status.state.is_terminal() => Ok(task),
@@ -89,7 +89,7 @@ impl TaskResponse {
 }
 
 pub(super) struct PreparedResponse {
-    pub(super) task: Arc<TaskHandle>,
+    pub(super) task: TaskHandle,
     pub(super) events: Option<Events>,
     pub(super) opening: Option<Task>,
     pub(super) completion: RunCompletion,
@@ -177,7 +177,7 @@ pub(super) fn with_opening_task(
 /// Validated task attachment before choosing how a response delivers it.
 /// The receiver and snapshot share the cursor captured during lookup.
 pub(super) struct SubscriptionAttachment {
-    pub(super) task: Arc<TaskHandle>,
+    pub(super) task: TaskHandle,
     pub(super) receiver: Option<ExecutionReceiver>,
     pub(super) opening: Option<Task>,
     pub(super) sequence: u64,
