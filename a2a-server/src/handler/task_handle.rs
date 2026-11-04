@@ -10,6 +10,7 @@ use std::sync::{Arc, Weak};
 use tokio::sync::{broadcast, watch};
 
 mod controller;
+mod prepared_execution;
 
 pub(super) use controller::{OutputAction, TaskController};
 

@@ -11,7 +11,7 @@ use super::DefaultRequestHandler;
 use super::background_tasks::BackgroundTasks;
 use super::cancellation::CancellationStart;
 use super::delivery::{AuthorizedMessage, Delivery, StartMode, request_task_id};
-use super::events::ActiveExecution;
+use super::events::{ActiveExecution, ExecutionReceiver};
 use super::execution::{ExecutionRequest, InvocationState, TurnEnd};
 use super::protocol::Rejection;
 use super::push_delivery::PushService;
@@ -433,71 +433,53 @@ impl TaskService {
         handle: TaskHandle,
         req: SubscribeToTaskRequest,
     ) -> Result<SubscriptionAttachment, A2AError> {
-        // Earlier admission commands have completed before this lookup. An
-        // unpublished lazy reservation is still private to its opening caller.
-        if let Some(active) = handle.active() {
-            if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(A2AError::task_not_found(&req.id));
-            }
-        }
-        let mut resubscribed = handle.resubscribe_active();
-        // An abandoned reservation with no snapshot has no subscribable Task.
-        if matches!(resubscribed, Some((_, None, _))) {
-            resubscribed = None;
-        }
-        if let Some((receiver, snapshot_task, sequence)) = resubscribed {
-            if snapshot_task
-                .as_ref()
-                .is_some_and(|task| task.status.state.is_terminal())
-            {
-                return Err(A2AError::unsupported_operation(format!(
-                    "task {} has already reached a terminal state",
-                    req.id
-                )));
-            }
-            // A client that already holds the task's current generation has
-            // missed nothing, so it resumes without a snapshot. One that is
-            // behind cannot be replayed to -- events are not retained -- and
-            // falls back to a snapshot, which the spec allows.
-            let snapshot_task = match (req.last_seen_generation, snapshot_task) {
-                (Some(last_seen), Some(task))
-                    if task.generation == last_seen && !task.status.state.is_terminal() =>
-                {
-                    None
-                }
-                (_, snapshot) => snapshot,
-            };
-            return Ok(SubscriptionAttachment {
-                task: handle,
-                receiver: Some(receiver),
-                opening: snapshot_task,
-                sequence,
-                seen_generation: req.last_seen_generation.unwrap_or(0),
-            });
+        // Resolve a snapshot and receiver together inside the task's operation queue.
+        let (receiver, snapshot, sequence) = self.subscription_source(&handle, &req.id).await?;
+
+        // Active and idle tasks obey the same subscription checks.
+        if snapshot.status.state.is_terminal() {
+            return Err(A2AError::unsupported_operation(format!(
+                "task {} has already reached a terminal state",
+                req.id
+            )));
         }
 
-        // A registry miss also happens once a task finishes and its
-        // execution is cleaned up, so it doesn't by itself mean the task
-        // never existed -- check the store to tell the two apart before
-        // reporting TaskNotFoundError.
-        if let Some(task) = self.store.get(&req.id).await? {
-            if task.status.state.is_terminal() {
-                return Err(A2AError::unsupported_operation(format!(
-                    "task {} has already reached a terminal state",
-                    req.id
-                )));
-            }
-            let current = req.last_seen_generation == Some(task.generation);
-            return Ok(SubscriptionAttachment {
-                task: handle,
-                receiver: None,
-                opening: (!current).then_some(task),
-                sequence: 0,
-                seen_generation: req.last_seen_generation.unwrap_or(0),
-            });
-        }
-        Err(A2AError::task_not_found(&req.id))
+        // A current client needs no opening snapshot. Older cursors recover from
+        // the latest snapshot because this process does not retain event replay.
+        let opening = (req.last_seen_generation != Some(snapshot.generation)).then_some(snapshot);
+        Ok(SubscriptionAttachment {
+            task: handle,
+            receiver,
+            opening,
+            sequence,
+            seen_generation: req.last_seen_generation.unwrap_or(0),
+        })
     }
+
+    async fn subscription_source(
+        &self,
+        handle: &TaskHandle,
+        task_id: &str,
+    ) -> Result<(Option<ExecutionReceiver>, Task, u64), A2AError> {
+        // A deferred Task is private until the executor actually creates it.
+        if let Some(active) = handle.active()
+            && active.uncreated.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(A2AError::task_not_found(task_id));
+        }
+        if let Some((receiver, Some(snapshot), sequence)) = handle.resubscribe_active() {
+            return Ok((Some(receiver), snapshot, sequence));
+        }
+        // No active snapshot can mean an idle task or an abandoned reservation.
+        // Storage distinguishes those cases from a task that never existed.
+        let task = self
+            .store
+            .get(task_id)
+            .await?
+            .ok_or_else(|| A2AError::task_not_found(task_id))?;
+        Ok((None, task, 0))
+    }
+
     pub(super) async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
         self.store.get(task_id).await
     }

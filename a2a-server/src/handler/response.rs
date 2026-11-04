@@ -143,76 +143,34 @@ impl Run {
         out: ResponseSender,
     ) -> futures::future::BoxFuture<'static, ()> {
         Box::pin(async move {
-            // Watched from here, so a change from now on is seen however it is
-            // timed against the looks below.
+            // Register before the first state read so intervening changes are observed.
             let mut watch = self.task.watch();
-            // The generation the client has been told of, so a change it was not
-            // there for (an idle task, then another client's turn) is noticed.
             let mut last_generation = seen_generation;
-            if let Some(task) = opening {
-                if !self
-                    .forward(Ok(StreamResponse::Task(task)), &mut last_generation, &out)
-                    .await
-                {
-                    return self.finish().await;
-                }
-            }
             let mut uplink_open = self.uplink.is_some();
-            // What happened between the opening and the watch is looked at once.
-            if inner.is_none()
-                && matches!(
-                    self.reattach(&mut inner, &mut last_generation, &out).await,
-                    Reattach::End
-                )
+            if !self
+                .initialize_response(opening, &mut inner, &mut last_generation, &out)
+                .await
             {
                 return self.finish().await;
             }
+
+            // Keep all concurrent waits here; handlers run only after a branch wins.
             loop {
                 tokio::select! {
-                    // The client went away: nothing is left to deliver to.
                     () = out.closed() => break,
                     event = async {
                         match inner.as_mut() {
                             Some(events) => events.next().await,
                             None => std::future::pending().await,
                         }
-                    } => match event {
-                        Some(item) => {
-                            if !self.forward(item, &mut last_generation, &out).await {
-                                break;
-                            }
-                        }
-                        None => {
-                            // The execution is over. The task may not be: the
-                            // exchange stays open for the next message.
-                            inner = None;
-                            if self.settings.is_live() && !uplink_open {
-                                break;
-                            }
-                            // Watch registration predates this read, so a turn or
-                            // cancellation that raced the old stream's closure is
-                            // observed even if no further notification arrives.
-                            if matches!(self.reattach(&mut inner, &mut last_generation, &out).await, Reattach::End) {
-                                break;
-                            }
-                        }
-                    },
-                    // Nothing is running that this exchange follows: it watches the
-                    // task, so another client's turn, or a cancel, reaches it too.
-                    () = watch.changed(), if inner.is_none() ||
-                        (self.settings.is_live() && !uplink_open) => {
-                        if inner.is_some() && !uplink_open
-                            && self.task.active().is_none()
-                        {
-                            // The input half is closed and the invocation ended.
-                            // Preserve all buffered Task events before closing.
-                            self.flush(&mut inner, &mut last_generation, &out).await;
+                    } => {
+                        if !self.handle_output(event, &mut inner, &mut last_generation, &out, uplink_open).await {
                             break;
                         }
-                        if inner.is_none() && matches!(
-                            self.reattach(&mut inner, &mut last_generation, &out).await,
-                            Reattach::End
-                        ) {
+                    },
+                    () = watch.changed(), if inner.is_none() ||
+                        (self.settings.is_live() && !uplink_open) => {
+                        if !self.handle_task_change(&mut inner, &mut last_generation, &out, uplink_open).await {
                             break;
                         }
                     },
@@ -221,21 +179,9 @@ impl Run {
                             Some(uplink) => uplink.next().await,
                             None => std::future::pending().await,
                         }
-                    }, if uplink_open => match item {
-                        Some(item) => {
-                            if !self.handle(item, &mut inner, &mut last_generation, &out).await {
-                                break;
-                            }
-                        }
-                        None => {
-                            uplink_open = false;
-                            if inner.is_none() {
-                                break;
-                            }
-                            if self.task.active().is_none() {
-                                self.flush(&mut inner, &mut last_generation, &out).await;
-                                break;
-                            }
+                    }, if uplink_open => {
+                        if !self.handle_uplink(item, &mut uplink_open, &mut inner, &mut last_generation, &out).await {
+                            break;
                         }
                     },
                 }
@@ -243,6 +189,91 @@ impl Run {
             self.finish().await;
         })
     }
+
+    async fn initialize_response(
+        &mut self,
+        opening: Option<Task>,
+        inner: &mut Option<Events>,
+        last_generation: &mut i64,
+        out: &ResponseSender,
+    ) -> bool {
+        if let Some(task) = opening
+            && !self
+                .forward(Ok(StreamResponse::Task(task)), last_generation, out)
+                .await
+        {
+            return false;
+        }
+        inner.is_some()
+            || !matches!(
+                self.reattach(inner, last_generation, out).await,
+                Reattach::End
+            )
+    }
+
+    async fn handle_output(
+        &mut self,
+        event: Option<Result<StreamResponse, A2AError>>,
+        inner: &mut Option<Events>,
+        last_generation: &mut i64,
+        out: &ResponseSender,
+        uplink_open: bool,
+    ) -> bool {
+        if let Some(event) = event {
+            return self.forward(event, last_generation, out).await;
+        }
+        // An invocation ending need not end the task or its client response.
+        *inner = None;
+        if self.settings.is_live() && !uplink_open {
+            return false;
+        }
+        !matches!(
+            self.reattach(inner, last_generation, out).await,
+            Reattach::End
+        )
+    }
+
+    async fn handle_task_change(
+        &mut self,
+        inner: &mut Option<Events>,
+        last_generation: &mut i64,
+        out: &ResponseSender,
+        uplink_open: bool,
+    ) -> bool {
+        if inner.is_some() && !uplink_open && self.task.active().is_none() {
+            // A closed uplink finishes after the invocation and buffered output.
+            self.flush(inner, last_generation, out).await;
+            return false;
+        }
+        inner.is_some()
+            || !matches!(
+                self.reattach(inner, last_generation, out).await,
+                Reattach::End
+            )
+    }
+
+    async fn handle_uplink(
+        &mut self,
+        item: Option<Incoming>,
+        uplink_open: &mut bool,
+        inner: &mut Option<Events>,
+        last_generation: &mut i64,
+        out: &ResponseSender,
+    ) -> bool {
+        if let Some(item) = item {
+            return self.handle(item, inner, last_generation, out).await;
+        }
+        *uplink_open = false;
+        if inner.is_none() {
+            return false;
+        }
+        if self.task.active().is_none() {
+            self.flush(inner, last_generation, out).await;
+            return false;
+        }
+        true
+    }
+
     /// Ends the exchange: no more calls are routed to it, and a call that was
     /// queued but never reached is told so (it is delivered nowhere, so the
     /// caller may open a new exchange with it).

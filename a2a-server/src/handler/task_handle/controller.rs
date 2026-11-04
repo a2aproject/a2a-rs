@@ -4,9 +4,7 @@
 //! Private task execution decisions, serialized by TaskHandle’s operation queue.
 
 use super::super::cancellation::CancellationStart;
-use super::super::delivery::{
-    AuthorizedMessage, Delivery, StartMode, is_artifact_only, request_task_id,
-};
+use super::super::delivery::{AuthorizedMessage, Delivery, StartMode, request_task_id};
 use super::super::events::{ActiveExecution, EventKind};
 use super::super::execution::{
     self, ExecutionState, Invocation, TurnEnd, reject_unread_inputs, release_execution,
@@ -15,6 +13,7 @@ use super::super::execution::{
 use super::super::protocol::Rejection;
 use super::super::updates::validate_event_identity;
 use super::super::{DefaultRequestHandler, admission, cancellation};
+use super::prepared_execution::PreparedExecution;
 use crate::User;
 use crate::middleware::ServiceParams;
 use a2a::*;
@@ -127,99 +126,45 @@ impl TaskController {
         mode: StartMode,
         reserved_id: TaskId,
     ) -> Result<Delivery, Rejection> {
-        let req = &message.request;
-        let include_task_snapshot_in_context = mode == StartMode::Blocking;
-        // A new task is created by the executor: only a live exchange, which is
-        // bound to its task from the first request, creates it up front.
-        let lazy = mode != StartMode::Bidi;
-        let artifact_only = is_artifact_only(req);
-        let task_id = reserved_id;
+        // Reserve the invocation and commit input before making it observable.
+        let mut prepared = self
+            .prepare_execution(handler, &message, mode, &reserved_id)
+            .await?;
 
-        // The mailbox owns preparation through completion or panic recovery.
-        let (active, inputs) = self.reserve(handler, &task_id).await?;
-        let prepared = async {
-            let input = admission::prepare(handler, req, &task_id).await?;
-            handler
-                .tasks
-                .commit_input(
-                    &input,
-                    handler,
-                    &message,
-                    lazy,
-                    self.execution
-                        .bookkeeping(&active)
-                        .expect("reserved invocation"),
-                )
-                .await?;
-            active.set_snapshot(input.task.clone());
-            active
-                .uncreated
-                .store(lazy && !input.existed, std::sync::atomic::Ordering::SeqCst);
-            Ok::<_, A2AError>(input)
-        }
-        .await;
-        let admission::PreparedInput {
-            task,
-            existed,
-            events: input_events,
-        } = match prepared {
-            Ok(input) => input,
-            Err(error) => {
-                self.release(&active);
-                return Err(error.into());
-            }
-        };
-        let AuthorizedMessage {
-            request: req,
-            params,
-            user,
-            ..
-        } = message;
-        let params = &params;
-        handler.attach_pushes(&active.task);
-        if existed || !lazy {
-            // Existing subscribers and webhooks observe persisted client input
-            // through the same publication path as executor output. The new
-            // response subscribes below and announces its input via its opening
-            // snapshot (or recorded follow-up), avoiding duplicate generations.
-            active.publish_input(task.clone(), &input_events);
-        } else {
-            // A lazy reservation starts an execution without publishing a Task.
-            active.task.notify();
-        }
-        // Attach before acknowledging admission, so output and cancellation
-        // commands queued immediately afterwards cannot be missed.
-        let receiver = active.subscribe();
+        // Publish input and attach its receiver before the driver can emit output.
+        let delivery = prepared.attach_delivery(handler);
 
-        let stored_task = (existed || include_task_snapshot_in_context).then(|| task.clone());
-        let service_params = params.clone();
-
-        let exec_ctx = crate::ExecutorContext {
-            execution_id: active.execution_id.clone(),
-            message: (!artifact_only).then_some(req.message),
-            task_id: task_id.clone(),
-            // The task as it stands once the request is applied. A task this
-            // request created is withheld unless the caller asked for it
-            // (`send_message` does, streaming does not): executors use its
-            // absence to recognise a new task.
-            stored_task,
-            context_id: task.context_id.clone(),
-            metadata: req.metadata,
-            user,
-            service_params,
-            tenant: req.tenant,
-            inputs,
-            new_task: !existed,
-        };
+        // Move the prepared input and caller context into the separate driver.
+        let active = prepared.active().clone();
+        let context = prepared.into_executor_context(message);
         handler
             .tasks
-            .spawn_execution(handler.clone(), active, exec_ctx);
+            .spawn_execution(handler.clone(), active, context);
+        Ok(delivery)
+    }
 
-        Ok(Delivery::Started {
-            task,
-            receiver,
-            recorded: input_events,
-        })
+    async fn prepare_execution(
+        &mut self,
+        handler: &DefaultRequestHandler,
+        message: &AuthorizedMessage,
+        mode: StartMode,
+        task_id: &str,
+    ) -> Result<PreparedExecution, A2AError> {
+        let (active, inputs) = self.reserve(handler, task_id).await?;
+        let invocation = self
+            .execution
+            .bookkeeping(&active)
+            .expect("reserved invocation");
+        match PreparedExecution::prepare(handler, message, mode, active.clone(), inputs, invocation)
+            .await
+        {
+            Ok(prepared) => Ok(prepared),
+            Err(error) => {
+                // No driver was started, so the controller releases the reservation.
+                self.release(&active);
+                Err(error)
+            }
+        }
     }
 
     pub(in crate::handler) async fn begin_cancel(
@@ -387,42 +332,60 @@ impl TaskController {
         active: &Arc<ActiveExecution>,
         task_id: &TaskId,
     ) {
-        if active
-            .uncreated
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            if let Some(task) = active.snapshot() {
-                match handler.tasks.save(task, true).await {
-                    Ok(_) => save_pending_push_config(active, handler, self).await,
-                    Err(error) => {
-                        tracing::warn!(task_id = %task_id, %error, "could not create the task");
-                    }
-                }
-            }
-        }
-        let snapshot = active.snapshot();
-        let goes_on = snapshot
-            .as_ref()
-            .is_some_and(|task| !task.status.state.is_terminal());
-        let unread = if goes_on {
-            self.execution
-                .bookkeeping(active)
-                .map(|invocation| invocation.drain_inputs(&active.inputs))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let (Some(snapshot), false) = (snapshot, unread.is_empty()) else {
+        // Finish deferred creation before deciding whether another invocation is needed.
+        self.persist_deferred_task(handler, active, task_id).await;
+
+        // Only a nonterminal task can hand accepted input to a successor.
+        let Some(snapshot) = active
+            .snapshot()
+            .filter(|task| !task.status.state.is_terminal())
+        else {
             release_execution(active, task_id, self).await;
             return;
         };
+        let unread = self.take_unread_inputs(active);
+        if unread.is_empty() {
+            release_execution(active, task_id, self).await;
+            return;
+        }
+
+        // Release the old invocation before reserving its successor.
         self.release(active);
         if let Err(unread) =
             execution::start_next_turn(handler, task_id, snapshot, unread, self).await
         {
-            // Nothing could take them over: they are answered, as at any end.
             execution::reject_inputs(active, task_id, unread).await;
         }
+    }
+
+    async fn persist_deferred_task(
+        &mut self,
+        handler: &DefaultRequestHandler,
+        active: &Arc<ActiveExecution>,
+        task_id: &str,
+    ) {
+        if !active
+            .uncreated
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let Some(task) = active.snapshot() else {
+            return;
+        };
+        match handler.tasks.save(task, true).await {
+            Ok(_) => save_pending_push_config(active, handler, self).await,
+            Err(error) => {
+                tracing::warn!(task_id = %task_id, %error, "could not create the task");
+            }
+        }
+    }
+
+    fn take_unread_inputs(&mut self, active: &Arc<ActiveExecution>) -> Vec<crate::ClientInput> {
+        self.execution
+            .bookkeeping(active)
+            .map(|invocation| invocation.drain_inputs(&active.inputs))
+            .unwrap_or_default()
     }
 
     pub(in crate::handler) async fn panicked(
@@ -556,6 +519,39 @@ mod tests {
 mod invalid_lifecycle_tests {
     use super::*;
     use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn failed_preparation_releases_the_reservation_without_starting_execution() {
+        let handler = make_handler();
+        let task = handler.tasks.task("missing");
+        let mut controller = TaskController::default();
+        let message = AuthorizedMessage {
+            request: send_req(Some("missing"), None),
+            params: ServiceParams::new(),
+            user: None,
+            response_id: None,
+        };
+        let error = controller
+            .start(&handler, message, StartMode::Blocking, "missing".into())
+            .await
+            .err()
+            .expect("an unknown task must reject the input");
+        assert_eq!(error.into_error().code, error_code::TASK_NOT_FOUND);
+        assert!(matches!(controller.execution, ExecutionState::Idle));
+        assert!(task.active().is_none());
+        assert!(
+            handler
+                .tasks
+                .store()
+                .get("missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let (next, _inputs) = controller.reserve(&handler, "missing").await.unwrap();
+        controller.release(&next);
+    }
 
     #[tokio::test]
     async fn duplicate_reservation_and_unstarted_cancellation_leave_the_owner_intact() {
