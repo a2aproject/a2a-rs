@@ -442,6 +442,7 @@ mod tests {
     #[test]
     fn test_status_timestamp_after_uses_z_suffix() {
         let request = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: None,
@@ -470,6 +471,9 @@ mod tests {
             Value::String(offset.to_string()),
         )]));
         task.artifacts = Some(vec![a2a::Artifact {
+            role: None,
+            start_generation: None,
+            end_generation: None,
             artifact_id: "artifact-1".to_string(),
             name: None,
             description: None,

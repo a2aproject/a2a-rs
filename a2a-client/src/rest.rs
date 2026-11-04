@@ -758,6 +758,7 @@ mod tests {
             .list_tasks(
                 &ServiceParams::new(),
                 &ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
