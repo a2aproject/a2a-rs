@@ -3215,6 +3215,56 @@ mod tests {
             .unwrap();
     }
 
+    struct PushScriptedExecutor<F>(F);
+
+    type PushStep = (Option<Arc<Notify>>, Result<StreamResponse, A2AError>);
+
+    impl<F> crate::AgentExecutor for PushScriptedExecutor<F>
+    where
+        F: Fn(&ExecutorContext) -> Vec<PushStep> + Send + Sync + 'static,
+    {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            push_play((self.0)(&ctx))
+        }
+
+        fn cancel(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            push_play((self.0)(&ctx))
+        }
+    }
+
+    fn push_play(steps: Vec<PushStep>) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        Box::pin(stream::iter(steps).then(|(gate, event)| async move {
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            event
+        }))
+    }
+
+    fn push_status_event(
+        ctx: &ExecutorContext,
+        state: TaskState,
+        message: Option<Message>,
+    ) -> StreamResponse {
+        StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: ctx.task_id.clone(),
+            context_id: ctx.context_id.clone(),
+            status: TaskStatus {
+                state,
+                message,
+                timestamp: None,
+            },
+            generation: 0,
+            metadata: None,
+        })
+    }
+
     fn push_delivery_handler(executor: impl crate::AgentExecutor) -> DefaultRequestHandler {
         DefaultRequestHandler::new(executor, InMemoryTaskStore::new()).with_push_notifications(
             InMemoryPushConfigStore::new(),
@@ -3231,9 +3281,9 @@ mod tests {
     async fn test_execution_error_pushes_the_failed_state() {
         install_crypto_provider();
         let (url, mut receiver, shutdown_tx, server) = start_push_webhook().await;
-        let handler = push_delivery_handler(ScriptedExecutor(|ctx: &ExecutorContext| {
+        let handler = push_delivery_handler(PushScriptedExecutor(|ctx: &ExecutorContext| {
             vec![
-                (None, Ok(status_event(ctx, TaskState::Working, None))),
+                (None, Ok(push_status_event(ctx, TaskState::Working, None))),
                 (None, Err(A2AError::internal("boom"))),
             ]
         }));
@@ -3280,13 +3330,14 @@ mod tests {
         install_crypto_provider();
         for executor_emits_canceled in [false, true] {
             let (url, mut receiver, shutdown_tx, server) = start_push_webhook().await;
-            let handler = push_delivery_handler(ScriptedExecutor(move |ctx: &ExecutorContext| {
-                if executor_emits_canceled {
-                    vec![(None, Ok(status_event(ctx, TaskState::Canceled, None)))]
-                } else {
-                    Vec::<Step>::new()
-                }
-            }));
+            let handler =
+                push_delivery_handler(PushScriptedExecutor(move |ctx: &ExecutorContext| {
+                    if executor_emits_canceled {
+                        vec![(None, Ok(push_status_event(ctx, TaskState::Canceled, None)))]
+                    } else {
+                        Vec::<PushStep>::new()
+                    }
+                }));
             let params = ServiceParams::new();
             seed_task(&handler, "t-cancel-push", "c-cancel-push").await;
             handler
@@ -3340,7 +3391,7 @@ mod tests {
     async fn test_failed_cancel_still_pushes_the_canceled_state() {
         install_crypto_provider();
         let (url, mut receiver, shutdown_tx, server) = start_push_webhook().await;
-        let handler = push_delivery_handler(ScriptedExecutor(|_ctx: &ExecutorContext| {
+        let handler = push_delivery_handler(PushScriptedExecutor(|_ctx: &ExecutorContext| {
             vec![(None, Err(A2AError::internal("boom")))]
         }));
         let params = ServiceParams::new();
