@@ -2159,13 +2159,34 @@ async fn a_subscription_that_races_a_follow_up_always_opens_with_the_task() {
     let mut opened_with_task = 0;
     for round in 0..300 {
         let release = Arc::new(Notify::new());
+        // This test races subscription against admission of a new invocation.
+        // Seed an idle task so an unrelated previous invocation cannot still
+        // be releasing its reservation when that race starts.
+        let store = InMemoryTaskStore::new();
+        let first = Task {
+            id: format!("task-{round}"),
+            context_id: "context".into(),
+            status: TaskStatus {
+                state: TaskState::InputRequired,
+                message: None,
+                timestamp: Some(chrono::Utc::now()),
+            },
+            generation: 1,
+            history: None,
+            timeline: None,
+            artifacts: None,
+            metadata: None,
+        };
+        a2a_server::TaskStore::create(&store, first.clone())
+            .await
+            .unwrap();
         let handler = Arc::new(
             DefaultRequestHandler::new(
                 ScriptAgent {
                     release: release.clone(),
                     cancel: CancelMode::Status,
                 },
-                InMemoryTaskStore::new(),
+                store,
             )
             .with_capabilities(a2a::AgentCapabilities {
                 streaming: Some(true),
@@ -2173,13 +2194,6 @@ async fn a_subscription_that_races_a_follow_up_always_opens_with_the_task() {
             }),
         );
         let params = ServiceParams::new();
-        let first = task_of(
-            handler
-                .send_message(&params, send("ask", None))
-                .await
-                .unwrap(),
-        );
-
         // The follow-up is held, so the execution outlives the subscription.
         let follow_up = {
             let handler = handler.clone();

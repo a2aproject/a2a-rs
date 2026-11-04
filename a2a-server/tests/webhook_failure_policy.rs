@@ -142,6 +142,8 @@ async fn invalid_legacy_webhook_only_stops_execution_when_configured_to_fail() {
         let configs = OrderedConfigs {
             inner: InMemoryPushConfigStore::new(),
             listed: listed.clone(),
+            fail_next_list: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            list_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         configs.save(config("http://127.0.0.1/hook")).await.unwrap();
         let handler = DefaultRequestHandler::new(Waiting, store().await)
@@ -212,6 +214,8 @@ async fn invalid_new_configuration_is_rejected_before_it_is_registered() {
 struct OrderedConfigs {
     inner: InMemoryPushConfigStore,
     listed: Arc<Notify>,
+    fail_next_list: Arc<std::sync::atomic::AtomicBool>,
+    list_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 #[async_trait]
 impl PushConfigStore for OrderedConfigs {
@@ -225,6 +229,15 @@ impl PushConfigStore for OrderedConfigs {
         self.inner.get(task, id).await
     }
     async fn list(&self, task: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
+        self.list_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .fail_next_list
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.listed.notify_one();
+            return Err(A2AError::internal("configuration lookup unavailable"));
+        }
         let mut configs = self.inner.list(task).await?;
         configs.sort_by(|a, b| a.id.cmp(&b.id));
         self.listed.notify_one();
@@ -262,6 +275,8 @@ async fn invalid_configuration_does_not_skip_a_later_healthy_webhook() {
         let configs = OrderedConfigs {
             inner: InMemoryPushConfigStore::new(),
             listed: Arc::new(Notify::new()),
+            fail_next_list: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            list_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let mut bad = config(&url);
         bad.id = Some("0-invalid".into());
@@ -307,5 +322,61 @@ async fn invalid_configuration_does_not_skip_a_later_healthy_webhook() {
         release.notify_one();
         finish_execution(&handler, fail_on_error).await;
         server.abort();
+    }
+}
+
+#[tokio::test]
+async fn configuration_lookup_failures_follow_policy_and_allow_later_notifications() {
+    for fail_on_error in [false, true] {
+        let listed = Arc::new(Notify::new());
+        let fail_next_list = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let list_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = DefaultRequestHandler::new(Waiting, store().await)
+            .with_capabilities(AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            })
+            .with_push_notifications(
+                OrderedConfigs {
+                    inner: InMemoryPushConfigStore::new(),
+                    listed: listed.clone(),
+                    fail_next_list: fail_next_list.clone(),
+                    list_calls: list_calls.clone(),
+                },
+                HttpPushSender::new(Some(HttpPushSenderConfig {
+                    fail_on_error,
+                    ..Default::default()
+                })),
+            );
+        let mut downlink = working(&handler).await;
+        tokio::time::timeout(Duration::from_secs(5), listed.notified())
+            .await
+            .unwrap();
+        assert!(!fail_next_list.load(std::sync::atomic::Ordering::SeqCst));
+        if fail_on_error {
+            let error = tokio::time::timeout(Duration::from_secs(5), downlink.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, error_code::INTERNAL_ERROR);
+            assert!(downlink.next().await.is_none());
+        } else {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), downlink.next())
+                    .await
+                    .is_err()
+            );
+        }
+        // FAILED/CANCELED is another notification: the failed lookup must not
+        // kill the worker or prevent a later successful configuration read.
+        finish_execution(&handler, fail_on_error).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while list_calls.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                listed.notified().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

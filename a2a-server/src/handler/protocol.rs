@@ -191,6 +191,39 @@ mod coverage_tests {
     use crate::handler::test_support::{make_message, send_req};
 
     #[test]
+    fn busy_live_rejections_keep_the_request_reference_and_allow_retry() {
+        for reference in [None, Some("".into()), Some("input-id".into())] {
+            let event = Rejection::Declined("input queue full".into())
+                .into_stream_error("task", reference.clone());
+            let StreamResponse::Error(error) = &event else {
+                panic!("expected an in-band rejection")
+            };
+            assert_eq!(error.code, "UNAVAILABLE");
+            assert_eq!(error.task_id, "task");
+            assert_eq!(error.message, "input queue full");
+            assert_eq!(error.reference_id, reference.filter(|id| !id.is_empty()));
+            assert!(!is_terminal_event(&event));
+            assert_eq!(task_id_for_event(&event), None);
+        }
+    }
+
+    #[test]
+    fn subscription_receipts_do_not_require_a_recorded_message() {
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        assert!(records_message(
+            &crate::handler::test_support::task_with_history("task", "context", 0),
+            &request
+        ));
+    }
+
+    #[test]
     fn immediate_unary_responses_do_not_discard_a_direct_message() {
         let mut request = send_req(None, None);
         request.configuration = Some(SendMessageConfiguration {
