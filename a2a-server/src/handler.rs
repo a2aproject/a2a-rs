@@ -445,6 +445,7 @@ async fn fail_task(
 /// CANCELED on `begin_cancel`) is pushed in, like one the executor emits.
 fn status_update(task: &Task) -> StreamResponse {
     StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+        generation: task.generation,
         task_id: task.id.clone(),
         context_id: task.context_id.clone(),
         status: task.status.clone(),
@@ -5103,6 +5104,8 @@ mod tests {
         }));
         let mut request = send_request();
         request.configuration = Some(SendMessageConfiguration {
+            if_generation_match: None,
+            timeline_length: None,
             accepted_output_modes: None,
             task_push_notification_config: Some(TaskPushNotificationConfig {
                 url: url.clone(),
