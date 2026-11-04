@@ -200,6 +200,40 @@ mod tests {
     use crate::handler::test_support::*;
 
     #[tokio::test]
+    async fn terminal_turn_cleanup_rejects_unread_input_even_after_creation_fails() {
+        for deferred in [false, true] {
+            let runtime = make_handler();
+            let mut task = task_with_history("terminal", "context", 0);
+            task.status.state = TaskState::Canceled;
+            runtime.task_store.create(task.clone()).await.unwrap();
+            let (active, _inbox, writer) =
+                runtime.execution_manager.reserve(&task.id).await.unwrap();
+            active.set_snapshot(task.clone()).await;
+            active
+                .uncreated
+                .store(deferred, std::sync::atomic::Ordering::SeqCst);
+            let input = crate::ClientInput::new(make_message(), 1);
+            let reference = input.message.message_id.clone();
+            let queued = active.track_input(input).await;
+            active.inputs.sender.try_send(queued).unwrap();
+            let mut events = active.subscribe().await;
+            drop(writer);
+            // In the deferred case create collides with an already persisted
+            // terminal task; cleanup must still release and reject the inbox.
+            end_turn(&runtime, &active, &task.id).await;
+            let event = events.recv().await.unwrap().result.unwrap();
+            assert!(matches!(event, StreamResponse::Error(ref error)
+                if error.code == "UNAVAILABLE" && error.reference_id.as_deref() == Some(reference.as_str())));
+            assert!(active.inputs.closed.is_cancelled());
+            assert!(runtime.execution_manager.get(&task.id).await.is_none());
+            assert_eq!(
+                runtime.task_store.get(&task.id).await.unwrap().unwrap(),
+                task
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_busy_handoff_returns_input_with_its_caller_identity_intact() {
         let runtime = make_handler();
         let task = task_with_history("busy-handoff", "context", 0);

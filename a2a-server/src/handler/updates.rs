@@ -369,6 +369,34 @@ mod tests {
     use super::*;
     use crate::handler::test_support::*;
 
+    #[tokio::test]
+    async fn initial_snapshot_stamps_artifacts_with_the_first_committed_generation() {
+        for state in [TaskState::Working, TaskState::Completed] {
+            let store = InMemoryTaskStore::new();
+            let mut task = task_with_history("new-task", "context", 0);
+            task.status.state = state.clone();
+            task.status.timestamp = Some(chrono::Utc::now());
+            task.generation = 99;
+            task.artifacts = Some(vec![
+                serde_json::from_value(serde_json::json!({
+                    "artifactId":"result", "parts":[{"text":"answer"}], "role":"ROLE_AGENT"
+                }))
+                .unwrap(),
+            ]);
+            let mut event = StreamResponse::Task(task);
+            let saved = apply_event_to_new_or_stored_task(&store, None, &mut event, true)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.generation, 1);
+            let artifact = &saved.artifacts.as_ref().unwrap()[0];
+            assert_eq!(artifact.start_generation, Some(1));
+            assert_eq!(artifact.end_generation, state.is_terminal().then_some(1));
+            assert_eq!(store.get("new-task").await.unwrap().unwrap(), saved);
+            assert_eq!(event, StreamResponse::Task(saved));
+        }
+    }
+
     /// DM-SERIAL-001: `save_task`'s backfill only covers what gets persisted
     /// -- a live subscriber receives the broadcast event directly, never a
     /// reload from the store, so the timestamp must also be backfilled on

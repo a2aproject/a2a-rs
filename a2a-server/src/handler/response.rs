@@ -703,3 +703,78 @@ mod tests {
         assert!(handler.task_store.get(&task.id).await.unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn unary_response_does_not_return_missing_or_nonterminal_cached_tasks() {
+        for cached in [false, true] {
+            let handler = make_handler();
+            let source = handler.execution_manager.events_for("missing");
+            if cached {
+                let mut task = task_with_history("missing", "context", 0);
+                task.status.state = TaskState::Working;
+                source.set_snapshot(task).await;
+            }
+            let error = Run::unary_response(
+                handler,
+                "missing".into(),
+                stream::empty().boxed(),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, error_code::TASK_NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_response_stops_when_its_consumer_is_gone() {
+        let handler = make_handler();
+        let mut task = task_with_history("task", "context", 0);
+        task.generation = 2;
+        handler.task_store.create(task).await.unwrap();
+        let run = Run::new(
+            handler,
+            ServiceParams::new(),
+            "task".into(),
+            RunCompletion::Task,
+        );
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let mut inner = None;
+        let mut generation = 0;
+        assert!(matches!(
+            run.reattach(&mut inner, &mut generation, &DeliverySink::Stream(sender))
+                .await,
+            Reattach::End
+        ));
+        assert_eq!(generation, 2);
+        assert!(inner.is_none());
+    }
+
+    #[tokio::test]
+    async fn flushing_an_exhausted_subscription_detaches_it_without_closing_downlink() {
+        let run = Run::new(
+            make_handler(),
+            ServiceParams::new(),
+            "task".into(),
+            RunCompletion::Task,
+        );
+        let mut inner = Some(EventSource::Subscription(stream::empty().boxed()));
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut generation = 7;
+        let sink = DeliverySink::Stream(sender);
+        assert!(run.flush(&mut inner, &mut generation, &sink).await);
+        assert!(inner.is_none());
+        assert_eq!(generation, 7);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+}

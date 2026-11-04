@@ -2023,6 +2023,42 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    #[tokio::test]
+    async fn malformed_message_requests_are_rejected_before_handler_dispatch() {
+        for path in [
+            REST_SEND_MESSAGE_PATH,
+            REST_STREAM_MESSAGE_PATH,
+            REST_LIVE_MESSAGE_PATH,
+        ] {
+            let (handler, captured) = CapturingHandler::new();
+            let response = rest_router(handler)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("A2A-Version", "1.1")
+                        .body(Body::from(r#"{"message":42,"sendMessage":42}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["status"], "INVALID_ARGUMENT");
+            assert!(captured.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn version_query_with_embedded_newline_is_rejected() {
+        assert_version_not_supported(
+            send_message_with_version("/message:send?A2A-Version=1.1%0Ainvalid", None).await,
+        )
+        .await;
+    }
+
     async fn send_message_with_version(uri: &str, version: Option<&str>) -> Response {
         let body = serde_json::json!({
             "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
