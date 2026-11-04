@@ -7,6 +7,7 @@ use chrono::Utc;
 use serde_json::Value;
 
 use crate::errordetails::{self, TypedDetail};
+use crate::timestamp::format_timestamp;
 
 /// A2A-specific error codes (JSON-RPC).
 pub mod error_code {
@@ -216,7 +217,7 @@ impl A2AError {
     /// is always appended as the last element, matching the Go SDK behavior.
     pub fn to_jsonrpc_error(&self) -> crate::JsonRpcError {
         let reason = error_reason(self.code);
-        let metadata = HashMap::from([("timestamp".to_string(), Utc::now().to_rfc3339())]);
+        let metadata = HashMap::from([("timestamp".to_string(), format_timestamp(&Utc::now()))]);
 
         let mut data: Vec<Value> = self
             .details
@@ -382,6 +383,17 @@ mod tests {
         assert_eq!(arr[0]["reason"], "TASK_NOT_FOUND");
         assert_eq!(arr[0]["domain"], errordetails::PROTOCOL_DOMAIN);
         assert!(arr[0]["metadata"]["timestamp"].is_string());
+    }
+
+    /// The ErrorInfo timestamp is a wire timestamp (§5.6.1): `Z`, not the
+    /// `+00:00` that chrono's `to_rfc3339` writes.
+    #[test]
+    fn test_error_info_timestamp_uses_the_z_designator() {
+        let rpc = A2AError::task_not_found("t1").to_jsonrpc_error();
+        let data = rpc.data.unwrap();
+        let timestamp = data[0]["metadata"]["timestamp"].as_str().unwrap();
+        assert!(timestamp.ends_with('Z'), "{timestamp}");
+        assert!(timestamp.parse::<chrono::DateTime<Utc>>().is_ok());
     }
 
     #[test]

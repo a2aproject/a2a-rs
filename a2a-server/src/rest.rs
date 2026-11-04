@@ -674,7 +674,8 @@ fn rest_error_envelope(err: A2AError) -> (StatusCode, RestErrorEnvelope) {
     let reason = error_reason(err.code);
     let grpc_status = rest_grpc_status(err.code);
 
-    let mut metadata = HashMap::from([("timestamp".to_string(), Utc::now().to_rfc3339())]);
+    let mut metadata =
+        HashMap::from([("timestamp".to_string(), a2a::format_timestamp(&Utc::now()))]);
     let mut details = Vec::new();
 
     if let Some(extra) = err.details {
@@ -1191,6 +1192,20 @@ mod tests {
         // Merged metadata should contain both taskId and timestamp
         assert_eq!(details[0]["metadata"]["taskId"], "t99");
         assert!(details[0]["metadata"]["timestamp"].is_string());
+    }
+
+    /// The ErrorInfo timestamp is a wire timestamp (§5.6.1): `Z`, not the
+    /// `+00:00` that chrono's `to_rfc3339` writes.
+    #[tokio::test]
+    async fn test_rest_error_info_timestamp_uses_the_z_designator() {
+        let resp = rest_error_response(A2AError::task_not_found("t1"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let timestamp = payload["error"]["details"][0]["metadata"]["timestamp"]
+            .as_str()
+            .unwrap();
+        assert!(timestamp.ends_with('Z'), "{timestamp}");
+        assert!(timestamp.parse::<DateTime<Utc>>().is_ok());
     }
 
     #[tokio::test]
