@@ -8,6 +8,7 @@ use super::EXECUTION_BUFFER_CAPACITY;
 use super::TASK_INPUT_CAPACITY;
 use super::execution::InvocationState;
 use super::protocol::is_terminal_event;
+use super::task_handle::TaskHandle;
 use crate::executor::{ClientInputSender, ClientInputs};
 use a2a::*;
 use futures::stream::BoxStream;
@@ -46,7 +47,7 @@ pub(super) enum EventKind {
 pub(super) struct ExecutionReceiver {
     receiver: broadcast::Receiver<ExecutionEvent>,
     /// Keep the Task source, not the executor invocation, alive.
-    task: Arc<super::task_handle::TaskHandle>,
+    task: TaskHandle,
     finished: Option<tokio_util::sync::CancellationToken>,
     opening_message: bool,
     /// Events at or before this subscription opened must not be replayed.
@@ -54,7 +55,7 @@ pub(super) struct ExecutionReceiver {
 }
 
 impl ExecutionReceiver {
-    pub(super) fn task(&self) -> Arc<super::task_handle::TaskHandle> {
+    pub(super) fn task(&self) -> TaskHandle {
         self.task.clone()
     }
 
@@ -107,7 +108,7 @@ impl ExecutionReceiver {
 /// bookkeeping is exclusively owned by the task runtime.
 pub(super) struct ActiveExecution {
     pub(super) execution_id: String,
-    pub(super) task: Arc<super::task_handle::TaskHandle>,
+    pub(super) task: TaskHandle,
     pub(super) finished: tokio_util::sync::CancellationToken,
     prepared: std::sync::atomic::AtomicBool,
     /// Where messages sent to this task go while the executor runs. The queue
@@ -126,7 +127,7 @@ impl ActiveExecution {
     #[cfg(test)]
     pub(super) fn new(task: Option<Task>) -> Arc<Self> {
         let prepared = task.is_some();
-        let (active, _inputs, _state) = Self::with_task(super::task_handle::TaskHandle::new(
+        let (active, _inputs, _state) = Self::with_task(TaskHandle::new(
             task.as_ref()
                 .map(|task| task.id.clone())
                 .unwrap_or_default(),
@@ -138,9 +139,7 @@ impl ActiveExecution {
         active
     }
 
-    pub(super) fn with_task(
-        task: Arc<super::task_handle::TaskHandle>,
-    ) -> (Arc<Self>, ClientInputs, InvocationState) {
+    pub(super) fn with_task(task: TaskHandle) -> (Arc<Self>, ClientInputs, InvocationState) {
         let (inputs, receiver, returned_inputs) = ClientInputs::for_execution(TASK_INPUT_CAPACITY);
         (
             Arc::new(Self {

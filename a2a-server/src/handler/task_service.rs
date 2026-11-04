@@ -8,6 +8,7 @@
 //! executor, response, and webhook I/O stay outside it.
 
 use super::DefaultRequestHandler;
+use super::background_tasks::BackgroundTasks;
 use super::cancellation::CancellationStart;
 use super::delivery::{AuthorizedMessage, Delivery, StartMode, request_task_id};
 use super::events::ActiveExecution;
@@ -15,35 +16,33 @@ use super::execution::{ExecutionRequest, InvocationState, TurnEnd};
 use super::protocol::Rejection;
 use super::push_delivery::PushService;
 use super::response_preparation::SubscriptionAttachment;
-use super::runtime::{self, OutputAction, TaskOperation, TaskRuntime, TaskSender};
-use super::task_handle::TaskHandle;
+#[cfg(test)]
+use super::task_handle::TaskController;
+use super::task_handle::{OutputAction, TaskOperation, TaskSender};
+use super::task_handle::{TaskHandle, WeakTaskHandle};
 use super::updates;
-use super::workers::Workers;
 use crate::middleware::{ServiceParams, User};
 use a2a::*;
+#[cfg(test)]
 use futures::future::BoxFuture;
 use parking_lot::RwLock;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Weak},
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 pub(super) struct TaskService {
     pub(super) executor: Arc<dyn crate::AgentExecutor>,
     store: Arc<dyn crate::TaskStore>,
-    handles: RwLock<HashMap<TaskId, Weak<TaskHandle>>>,
-    pub(super) workers: Arc<Workers>,
+    handles: RwLock<HashMap<TaskId, WeakTaskHandle>>,
+    pub(super) background_tasks: Arc<BackgroundTasks>,
 }
 
 impl TaskService {
     pub(super) fn new(executor: impl crate::AgentExecutor, store: impl crate::TaskStore) -> Self {
-        let workers = Arc::new(Workers::default());
+        let background_tasks = Arc::new(BackgroundTasks::default());
         Self {
             executor: Arc::new(executor),
             store: Arc::new(store),
             handles: RwLock::default(),
-            workers,
+            background_tasks,
         }
     }
 
@@ -53,19 +52,28 @@ impl TaskService {
         self.store.as_ref()
     }
 
-    /// Get the shared runtime handle without creating or loading a stored Task.
-    pub(super) fn task(&self, task_id: &str) -> Arc<TaskHandle> {
-        if let Some(task) = self.handles.read().get(task_id).and_then(Weak::upgrade) {
+    /// Get the shared task handle without creating or loading a stored Task.
+    pub(super) fn task(&self, task_id: &str) -> TaskHandle {
+        if let Some(task) = self
+            .handles
+            .read()
+            .get(task_id)
+            .and_then(WeakTaskHandle::upgrade)
+        {
             return task;
         }
         let mut tasks = self.handles.write();
         // Another request may have installed a handle while we acquired the writer.
-        if let Some(task) = tasks.get(task_id).and_then(Weak::upgrade) {
+        if let Some(task) = tasks.get(task_id).and_then(WeakTaskHandle::upgrade) {
             return task;
         }
-        tasks.retain(|_, task| task.strong_count() > 0);
-        let task = TaskHandle::with_workers(task_id.to_owned(), None, self.workers.clone());
-        tasks.insert(task_id.to_owned(), Arc::downgrade(&task));
+        tasks.retain(|_, task| task.is_alive());
+        let task = TaskHandle::with_background_tasks(
+            task_id.to_owned(),
+            None,
+            self.background_tasks.clone(),
+        );
+        tasks.insert(task_id.to_owned(), task.downgrade());
         task
     }
 
@@ -78,23 +86,23 @@ impl TaskService {
         self.handles
             .read()
             .values()
-            .filter_map(Weak::upgrade)
+            .filter_map(WeakTaskHandle::upgrade)
             .filter(|task| task.is_watched())
             .count()
     }
 
+    #[cfg(test)]
     async fn with_task<T, F>(
         &self,
-        task: Arc<TaskHandle>,
+        task: TaskHandle,
         operation: TaskOperation,
         transition: F,
     ) -> Result<T, A2AError>
     where
         T: Send + 'static,
-        F: for<'a> FnOnce(&'a mut TaskRuntime) -> BoxFuture<'a, T> + Send + 'static,
+        F: for<'a> FnOnce(&'a mut TaskController) -> BoxFuture<'a, T> + Send + 'static,
     {
-        self.workers.check_running()?;
-        runtime::submit(task.operations(), operation, transition).await
+        task.submit(operation, transition).await
     }
 
     #[cfg(test)]
@@ -110,9 +118,10 @@ impl TaskService {
     ) -> Result<T, A2AError>
     where
         T: Send + 'static,
-        F: for<'a> FnOnce(&'a mut TaskRuntime) -> BoxFuture<'a, T> + Send + 'static,
+        F: for<'a> FnOnce(&'a mut TaskController) -> BoxFuture<'a, T> + Send + 'static,
     {
-        self.with_task(self.task(task_id), TaskOperation::Input, transition)
+        self.task(task_id)
+            .submit(TaskOperation::Input, transition)
             .await
     }
 
@@ -125,7 +134,7 @@ impl TaskService {
     ) {
         let request = request.into();
         let lease = active.task.operations();
-        self.workers.spawn(async move {
+        self.background_tasks.spawn(async move {
             let _lease = lease;
             super::execution::drive_execution_guarded(handler, active, request).await;
         });
@@ -136,7 +145,7 @@ impl TaskService {
         &self,
         handler: DefaultRequestHandler,
     ) -> Result<usize, A2AError> {
-        self.workers.check_running()?;
+        self.background_tasks.check_running()?;
         let mut token = None;
         let mut pages = std::collections::HashSet::new();
         let mut seen = std::collections::HashSet::new();
@@ -161,7 +170,8 @@ impl TaskService {
                 let id = task.id.clone();
                 // Re-read and reserve in one task operation, skipping already active tasks.
                 let started = self
-                    .with_task(self.task(&id), TaskOperation::Input, {
+                    .task(&id)
+                    .submit(TaskOperation::Input, {
                         let handler = handler.clone();
                         move |state| {
                             Box::pin(async move { state.restart(&handler, &task.id).await })
@@ -198,11 +208,12 @@ impl TaskService {
     ) -> Result<Delivery, Rejection> {
         let task_id = request_task_id(&message.request).unwrap_or_else(new_task_id);
         let id = task_id.clone();
-        self.with_task(self.task(&task_id), TaskOperation::Input, move |state| {
-            Box::pin(async move { state.admit(&handler, message, mode, id).await })
-        })
-        .await
-        .map_err(Rejection::Interrupted)?
+        self.task(&task_id)
+            .submit(TaskOperation::Input, move |state| {
+                Box::pin(async move { state.admit(&handler, message, mode, id).await })
+            })
+            .await
+            .map_err(Rejection::Interrupted)?
     }
 
     /// Capture the snapshot and event cursor in the same mailbox as mutations.
@@ -213,10 +224,11 @@ impl TaskService {
         request: SubscribeToTaskRequest,
     ) -> Result<SubscriptionAttachment, A2AError> {
         let task = self.task(&request.id);
-        self.with_task(task.clone(), TaskOperation::Subscribe, move |_| {
-            Box::pin(async move { handler.tasks.capture_subscription(task, request).await })
-        })
-        .await?
+        task.clone()
+            .submit(TaskOperation::Subscribe, move |_| {
+                Box::pin(async move { handler.tasks.capture_subscription(task, request).await })
+            })
+            .await?
     }
 
     /// Dropping the request stops waiting, not the admitted cancellation.
@@ -229,7 +241,7 @@ impl TaskService {
     ) -> Result<Task, A2AError> {
         let task_id = request.id.clone();
         let lease = self.queue(&task_id);
-        self.workers
+        self.background_tasks
             .spawn(async move {
                 let _lease = lease;
                 super::cancellation::cancel(handler, params, request, user).await
@@ -250,14 +262,11 @@ impl TaskService {
         request: CancelTaskRequest,
         user: Option<User>,
     ) -> Result<CancellationStart, A2AError> {
-        self.with_task(
-            self.task(&request.id),
-            TaskOperation::Cancel,
-            move |state| {
+        self.task(&request.id)
+            .submit(TaskOperation::Cancel, move |state| {
                 Box::pin(async move { state.begin_cancel(&handler, &params, request, user).await })
-            },
-        )
-        .await?
+            })
+            .await?
     }
 
     pub(super) async fn cancel_update(
@@ -266,10 +275,11 @@ impl TaskService {
         task_id: &str,
         event: StreamResponse,
     ) -> Result<(), A2AError> {
-        self.with_task(self.task(task_id), TaskOperation::Cancel, move |state| {
-            Box::pin(async move { state.cancel_update(&handler, event).await })
-        })
-        .await?
+        self.task(task_id)
+            .submit(TaskOperation::Cancel, move |state| {
+                Box::pin(async move { state.cancel_update(&handler, event).await })
+            })
+            .await?
     }
 
     pub(super) async fn cancel_finished(
@@ -278,10 +288,11 @@ impl TaskService {
         task_id: &str,
         failure: Option<A2AError>,
     ) -> Result<(), A2AError> {
-        self.with_task(self.task(task_id), TaskOperation::Cancel, move |state| {
-            Box::pin(async move { state.cancel_finished(&handler, failure).await })
-        })
-        .await?
+        self.task(task_id)
+            .submit(TaskOperation::Cancel, move |state| {
+                Box::pin(async move { state.cancel_finished(&handler, failure).await })
+            })
+            .await?
     }
 
     pub(super) async fn output(
@@ -290,10 +301,13 @@ impl TaskService {
         active: Arc<ActiveExecution>,
         event: StreamResponse,
     ) -> Result<OutputAction, A2AError> {
-        self.with_task(active.task.clone(), TaskOperation::Output, move |state| {
-            Box::pin(async move { state.output(&handler, active, event).await })
-        })
-        .await?
+        active
+            .task
+            .clone()
+            .submit(TaskOperation::Output, move |state| {
+                Box::pin(async move { state.output(&handler, active, event).await })
+            })
+            .await?
     }
 
     pub(super) async fn finished(
@@ -302,11 +316,14 @@ impl TaskService {
         active: Arc<ActiveExecution>,
         end: TurnEnd,
     ) -> Result<(), A2AError> {
-        let id = active.task.id.clone();
-        self.with_task(active.task.clone(), TaskOperation::Finished, move |state| {
-            Box::pin(async move { state.finished(&handler, id, active, end).await })
-        })
-        .await
+        let id = active.task.id().clone();
+        active
+            .task
+            .clone()
+            .submit(TaskOperation::Finished, move |state| {
+                Box::pin(async move { state.finished(&handler, id, active, end).await })
+            })
+            .await
     }
 
     pub(super) async fn panicked(
@@ -314,11 +331,14 @@ impl TaskService {
         handler: DefaultRequestHandler,
         active: Arc<ActiveExecution>,
     ) -> Result<(), A2AError> {
-        let id = active.task.id.clone();
-        self.with_task(active.task.clone(), TaskOperation::Finished, move |state| {
-            Box::pin(async move { state.panicked(&handler, active, id).await })
-        })
-        .await
+        let id = active.task.id().clone();
+        active
+            .task
+            .clone()
+            .submit(TaskOperation::Finished, move |state| {
+                Box::pin(async move { state.panicked(&handler, active, id).await })
+            })
+            .await
     }
 
     pub(super) async fn load(&self, task_id: &str) -> Result<Task, A2AError> {
@@ -348,7 +368,7 @@ impl TaskService {
                 return Ok(task);
             }
             tokio::select! {
-                () = self.workers.cancelled() => {
+                () = self.background_tasks.cancelled() => {
                     return Err(A2AError::internal("handler is shutting down"));
                 }
                 () = watch.changed() => {}
@@ -410,7 +430,7 @@ impl TaskService {
 
     pub(super) async fn capture_subscription(
         &self,
-        handle: Arc<TaskHandle>,
+        handle: TaskHandle,
         req: SubscribeToTaskRequest,
     ) -> Result<SubscriptionAttachment, A2AError> {
         // Earlier admission commands have completed before this lookup. An
@@ -811,14 +831,14 @@ mod serialization_tests {
         let tasks = make_handler().tasks;
         let task = tasks.task("task");
         let mut watch = task.watch();
-        let mut events = task.sender.subscribe();
+        let mut events = task.sender().subscribe();
         let snapshot = task_with_history("task", "context", 0);
         task.set_snapshot(snapshot.clone());
         let queue = task.operations();
         let weak = Arc::downgrade(&queue);
         drop(queue);
         assert!(weak.upgrade().is_none());
-        assert!(Arc::ptr_eq(&task, &tasks.task("task")));
+        assert!(task.ptr_eq(&tasks.task("task")));
         assert_eq!(
             tasks
                 .with_task(tasks.task("task"), TaskOperation::Input, |_| Box::pin(
@@ -900,30 +920,28 @@ mod routing_tests {
         let (task, operations) = requests.join_next().await.unwrap().unwrap();
         while let Some(result) = requests.join_next().await {
             let (other_task, other_operations) = result.unwrap();
-            assert!(Arc::ptr_eq(&task, &other_task));
+            assert!(task.ptr_eq(&other_task));
             assert!(Arc::ptr_eq(&operations, &other_operations));
         }
         let (active, _inputs, _state) = task.reserve().unwrap();
-        assert!(Arc::ptr_eq(&active.task, &task));
+        assert!(active.task.ptr_eq(&task));
         assert!(Arc::ptr_eq(
             &registry.task("shared").active().unwrap(),
             &active
         ));
-        assert!(!Arc::ptr_eq(&task, &registry.task("different")));
+        assert!(!task.ptr_eq(&registry.task("different")));
     }
 
     #[tokio::test]
     async fn releasing_all_task_users_retires_its_worker_and_handle() {
         let registry = make_handler().tasks;
         let task = registry.task("retired");
-        let weak = Arc::downgrade(&task);
+        let weak = task.downgrade();
         let watch = task.watch();
         let operations = task.operations();
-        super::super::runtime::submit(
-            operations.clone(),
-            super::super::runtime::TaskOperation::Subscribe,
-            |_| Box::pin(async {}),
-        )
+        task.submit(super::super::task_handle::TaskOperation::Subscribe, |_| {
+            Box::pin(async {})
+        })
         .await
         .unwrap();
         drop(operations);
@@ -1051,7 +1069,7 @@ mod routing_tests {
         for id in 0..256 {
             drop(manager.task(&format!("abandoned-{id}")));
         }
-        assert!(Arc::ptr_eq(&held, &manager.task("held")));
+        assert!(held.ptr_eq(&manager.task("held")));
         let sources = manager.handles.write();
         assert!(!sources.contains_key("abandoned-0"));
         assert!(sources.contains_key("held"));

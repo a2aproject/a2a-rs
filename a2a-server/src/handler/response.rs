@@ -15,7 +15,6 @@ use super::{DefaultRequestHandler, RESPONSE_BUFFER_CAPACITY};
 use crate::middleware::ServiceParams;
 use a2a::*;
 use futures::{FutureExt, StreamExt, stream::BoxStream};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// What looking at an idle task found.
@@ -38,7 +37,7 @@ pub(super) struct Run {
     /// own parameters when another caller sends them.
     pub(super) params: ServiceParams,
     /// The task whose execution and updates this response follows.
-    pub(super) task: Arc<TaskHandle>,
+    pub(super) task: TaskHandle,
     pub(super) completion: RunCompletion,
     policy: SubscriptionPolicy,
 }
@@ -60,7 +59,7 @@ impl Run {
     pub(super) fn new(
         handler: DefaultRequestHandler,
         params: ServiceParams,
-        task: Arc<TaskHandle>,
+        task: TaskHandle,
         completion: RunCompletion,
         policy: SubscriptionPolicy,
     ) -> Self {
@@ -81,7 +80,7 @@ impl Run {
         mut registration: Option<RegistrationLease>,
     ) -> Self {
         if let Some(registration) = &mut registration {
-            registration.bind(&self.task.id);
+            registration.bind(self.task.id());
         }
         self.registration = registration;
         self.uplink = uplink;
@@ -116,8 +115,8 @@ impl Run {
         out: ResponseSender,
     ) {
         let failure_sink = out.clone();
-        let workers = self.handler.tasks.workers.clone();
-        workers.spawn(async move {
+        let background_tasks = self.handler.tasks.background_tasks.clone();
+        background_tasks.spawn(async move {
             let outcome =
                 std::panic::AssertUnwindSafe(self.run(opening, inner, seen_generation, out))
                     .catch_unwind()
@@ -293,7 +292,7 @@ impl Run {
             *inner = Some(self.policy.stream(receiver, opening, sequence));
             return Reattach::Changed;
         }
-        let task = match self.handler.tasks.load(&self.task.id).await {
+        let task = match self.handler.tasks.load(self.task.id()).await {
             Ok(task) => task,
             Err(error) => {
                 self.forward(Err(error), last_generation, out).await;
@@ -340,12 +339,12 @@ impl Run {
             // for earlier requests goes out before this one's rejection.
             downlink_open = self.flush(inner, last_generation, out).await;
             if downlink_open {
-                let event = rejection.into_stream_error(&self.task.id, reference_id);
+                let event = rejection.into_stream_error(self.task.id(), reference_id);
                 downlink_open = self.forward(Ok(event), last_generation, out).await;
             }
         }
         if let Some(receipt) = receipt.filter(|_| !interrupted) {
-            receipt.complete(self.handler.tasks.load(&self.task.id).await);
+            receipt.complete(self.handler.tasks.load(self.task.id()).await);
         }
         // Dropping a begun, interrupted receipt makes the HTTP adapter verify
         // persistence. A readable Task alone does not prove this input committed.
@@ -388,7 +387,7 @@ impl Run {
                 &self.params,
                 request,
                 StartMode::Bidi,
-                Some(&self.task.id),
+                Some(self.task.id()),
                 self.policy.response_id(),
             )
             .await?;

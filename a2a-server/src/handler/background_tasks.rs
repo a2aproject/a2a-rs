@@ -9,12 +9,12 @@ use tokio::task::JoinHandle;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 #[derive(Default)]
-pub(super) struct Workers {
+pub(super) struct BackgroundTasks {
     stopping: CancellationToken,
     tasks: TaskTracker,
 }
 
-impl Workers {
+impl BackgroundTasks {
     pub(super) fn check_running(&self) -> Result<(), A2AError> {
         if self.stopping.is_cancelled() {
             Err(A2AError::internal("handler is shutting down"))
@@ -80,31 +80,32 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shutdown_racing_spawns_releases_every_future_and_rejects_later_work() {
-        let workers = Arc::new(Workers::default());
+        let background_tasks = Arc::new(BackgroundTasks::default());
         let live = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(tokio::sync::Barrier::new(65));
         let mut callers = tokio::task::JoinSet::new();
         for _ in 0..64 {
-            let (workers, live, barrier) = (workers.clone(), live.clone(), barrier.clone());
+            let (background_tasks, live, barrier) =
+                (background_tasks.clone(), live.clone(), barrier.clone());
             callers.spawn(async move {
                 let lease = Lease::new(&live);
                 barrier.wait().await;
-                workers.spawn(async move {
+                background_tasks.spawn(async move {
                     let _lease = lease;
                     std::future::pending::<()>().await;
                 })
             });
         }
         barrier.wait().await;
-        workers.shutdown().await;
+        background_tasks.shutdown().await;
         while let Some(caller) = callers.join_next().await {
             caller.unwrap();
         }
-        workers.shutdown().await;
+        background_tasks.shutdown().await;
         assert_eq!(live.load(Ordering::SeqCst), 0);
         let lease = Lease::new(&live);
         assert!(
-            workers
+            background_tasks
                 .spawn(async move {
                     drop(lease);
                     panic!("must not be polled")
@@ -112,6 +113,6 @@ mod tests {
                 .is_none()
         );
         assert_eq!(live.load(Ordering::SeqCst), 0);
-        assert!(workers.tasks.is_empty());
+        assert!(background_tasks.tasks.is_empty());
     }
 }

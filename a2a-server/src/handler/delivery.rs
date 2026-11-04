@@ -5,6 +5,7 @@
 
 use super::artifacts::apply_client_artifacts;
 use super::events::ExecutionReceiver;
+use super::task_handle::TaskHandle;
 use crate::middleware::ServiceParams;
 use a2a::*;
 
@@ -173,7 +174,7 @@ pub(super) enum Delivery {
 
 /// How a request reaches `start_execution`.
 impl Delivery {
-    pub(super) fn handle(&self) -> std::sync::Arc<super::task_handle::TaskHandle> {
+    pub(super) fn handle(&self) -> TaskHandle {
         match self {
             Self::Started { receiver, .. } | Self::Injected { receiver, .. } => receiver.task(),
         }

@@ -1,96 +1,32 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Task admission and lifecycle decisions, owned by one task queue.
+//! Private task execution decisions, serialized by TaskHandle’s operation queue.
 
-use super::cancellation::CancellationStart;
-use super::delivery::{AuthorizedMessage, Delivery, StartMode, is_artifact_only, request_task_id};
-use super::events::{ActiveExecution, EventKind};
-use super::execution::{
+use super::super::cancellation::CancellationStart;
+use super::super::delivery::{
+    AuthorizedMessage, Delivery, StartMode, is_artifact_only, request_task_id,
+};
+use super::super::events::{ActiveExecution, EventKind};
+use super::super::execution::{
     self, ExecutionState, Invocation, TurnEnd, reject_unread_inputs, release_execution,
     save_pending_push_config,
 };
-use super::protocol::Rejection;
-use super::updates::validate_event_identity;
-use super::{DefaultRequestHandler, admission, cancellation};
+use super::super::protocol::Rejection;
+use super::super::updates::validate_event_identity;
+use super::super::{DefaultRequestHandler, admission, cancellation};
 use crate::User;
 use crate::middleware::ServiceParams;
 use a2a::*;
 use std::sync::Arc;
 
-const TASK_QUEUE_CAPACITY: usize = 32;
-pub(super) type TaskTransition =
-    Box<dyn for<'a> FnOnce(&'a mut TaskRuntime) -> futures::future::BoxFuture<'a, ()> + Send>;
-pub(super) type TaskSender = tokio::sync::mpsc::Sender<TaskTransition>;
-
-#[derive(Clone, Copy, Debug)]
-pub(super) enum TaskOperation {
-    Input,
-    Subscribe,
-    Output,
-    Finished,
-    Cancel,
-}
-
-pub(super) fn spawn_task(task: Arc<super::task_handle::TaskHandle>) -> Arc<TaskSender> {
-    let (sender, mut commands) = tokio::sync::mpsc::channel::<TaskTransition>(TASK_QUEUE_CAPACITY);
-    let workers = task.workers.clone();
-    workers.spawn(async move {
-        let mut state = TaskRuntime::default();
-        while let Some(transition) = commands.recv().await {
-            tracing::trace!(task_id = %task.id, "processing task operation");
-            transition(&mut state).await;
-        }
-    });
-    Arc::new(sender)
-}
-
-/// Once enqueued, the operation owns its reply and queue lease independently of its caller.
-pub(super) async fn submit<T, F>(
-    task: Arc<TaskSender>,
-    operation: TaskOperation,
-    transition: F,
-) -> Result<T, A2AError>
-where
-    T: Send + 'static,
-    F: for<'a> FnOnce(&'a mut TaskRuntime) -> futures::future::BoxFuture<'a, T> + Send + 'static,
-{
-    use futures::FutureExt;
-    let (reply, result) = tokio::sync::oneshot::channel();
-    let owner = task.clone();
-    let work: TaskTransition = Box::new(move |state| {
-        Box::pin(async move {
-            let result = std::panic::AssertUnwindSafe(async { transition(state).await })
-                .catch_unwind()
-                .await;
-            if result.is_err() {
-                state.recover_preparation();
-            }
-            let result = result.map_err(|_| {
-                A2AError::internal(match operation {
-                    TaskOperation::Input => "message preparation failed unexpectedly",
-                    _ => "task transition failed unexpectedly",
-                })
-            });
-            let _ = reply.send(result);
-            drop(owner);
-        })
-    });
-    task.send(work)
-        .await
-        .map_err(|_| A2AError::internal("task operation queue closed"))?;
-    result
-        .await
-        .map_err(|_| A2AError::internal("task operation lost its response"))?
-}
-
 #[derive(Default)]
-pub(super) struct TaskRuntime {
-    pub(super) execution: ExecutionState,
+pub(in crate::handler) struct TaskController {
+    pub(in crate::handler) execution: ExecutionState,
 }
 
-impl TaskRuntime {
-    pub(super) async fn admit(
+impl TaskController {
+    pub(in crate::handler) async fn admit(
         &mut self,
         handler: &DefaultRequestHandler,
         message: AuthorizedMessage,
@@ -119,7 +55,7 @@ impl TaskRuntime {
     }
 
     /// Recover an existing snapshot without replaying a client message or changing its status.
-    pub(super) async fn restart(
+    pub(in crate::handler) async fn restart(
         &mut self,
         handler: &DefaultRequestHandler,
         task_id: &str,
@@ -149,7 +85,7 @@ impl TaskRuntime {
         Ok(Some(started))
     }
 
-    pub(super) async fn reserve(
+    pub(in crate::handler) async fn reserve(
         &mut self,
         handler: &DefaultRequestHandler,
         task_id: &str,
@@ -169,13 +105,13 @@ impl TaskRuntime {
         Ok((active, inputs))
     }
 
-    pub(super) fn release(&mut self, active: &Arc<ActiveExecution>) {
+    pub(in crate::handler) fn release(&mut self, active: &Arc<ActiveExecution>) {
         self.execution.release(active);
         active.task.unregister(active);
     }
 
     /// A panicking preparation has not started a driver to clean up its inbox.
-    pub(super) fn recover_preparation(&mut self) {
+    pub(in crate::handler) fn recover_preparation(&mut self) {
         if let ExecutionState::Running(invocation) = &self.execution
             && !invocation.active.is_prepared()
         {
@@ -286,7 +222,7 @@ impl TaskRuntime {
         })
     }
 
-    pub(super) async fn begin_cancel(
+    pub(in crate::handler) async fn begin_cancel(
         &mut self,
         handler: &DefaultRequestHandler,
         params: &ServiceParams,
@@ -324,7 +260,7 @@ impl TaskRuntime {
         Ok(plan)
     }
 
-    pub(super) async fn cancel_update(
+    pub(in crate::handler) async fn cancel_update(
         &mut self,
         handler: &DefaultRequestHandler,
         event: StreamResponse,
@@ -335,7 +271,7 @@ impl TaskRuntime {
         progress.apply(handler, event).await.map(|_| ())
     }
 
-    pub(super) async fn cancel_finished(
+    pub(in crate::handler) async fn cancel_finished(
         &mut self,
         handler: &DefaultRequestHandler,
         failure: Option<A2AError>,
@@ -352,7 +288,7 @@ impl TaskRuntime {
         result
     }
 
-    pub(super) async fn output(
+    pub(in crate::handler) async fn output(
         &mut self,
         handler: &DefaultRequestHandler,
         active: Arc<ActiveExecution>,
@@ -373,7 +309,7 @@ impl TaskRuntime {
             } else {
                 // A reply closes response streams. Reject unread input first,
                 // then finish this invocation even if its Task is nonterminal.
-                reject_unread_inputs(&active, &active.task.id, self).await;
+                reject_unread_inputs(&active, active.task.id(), self).await;
                 self.apply_output(handler, &active, &mut event).await?;
             }
             self.release(&active);
@@ -400,7 +336,7 @@ impl TaskRuntime {
             .await
     }
 
-    pub(super) async fn finished(
+    pub(in crate::handler) async fn finished(
         &mut self,
         handler: &DefaultRequestHandler,
         task_id: TaskId,
@@ -489,7 +425,7 @@ impl TaskRuntime {
         }
     }
 
-    pub(super) async fn panicked(
+    pub(in crate::handler) async fn panicked(
         &mut self,
         handler: &DefaultRequestHandler,
         active: Arc<ActiveExecution>,
@@ -536,7 +472,7 @@ impl TaskRuntime {
     }
 }
 
-pub(super) enum OutputAction {
+pub(in crate::handler) enum OutputAction {
     Continue,
     Stopped,
 }
@@ -549,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn late_driver_commands_cannot_release_or_publish_into_a_successor() {
         let handler = make_handler();
-        let mut runtime = TaskRuntime::default();
+        let mut runtime = TaskController::default();
         let (old, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
         runtime.release(&old);
         let (next, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
@@ -579,7 +515,7 @@ mod tests {
     async fn driver_completion_preserves_cancellation_until_the_hook_finishes() {
         let handler = make_handler();
         seed_task(&handler, "task", "context").await;
-        let mut runtime = TaskRuntime::default();
+        let mut runtime = TaskController::default();
         let (active, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
         active.set_snapshot(handler.tasks.load("task").await.unwrap());
         let plan = runtime
@@ -624,7 +560,7 @@ mod invalid_lifecycle_tests {
     #[tokio::test]
     async fn duplicate_reservation_and_unstarted_cancellation_leave_the_owner_intact() {
         let handler = make_handler();
-        let mut runtime = TaskRuntime::default();
+        let mut runtime = TaskController::default();
         let (active, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
         let error = runtime.reserve(&handler, "task").await.err().unwrap();
         assert_eq!(error.code, error_code::INVALID_REQUEST);

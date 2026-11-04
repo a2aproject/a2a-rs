@@ -103,7 +103,7 @@ impl DefaultRequestHandler {
     /// remain the application's responsibility. This is cooperative: user futures
     /// must yield rather than block Tokio's worker threads.
     pub async fn shutdown(&self) {
-        self.tasks.workers.shutdown().await;
+        self.tasks.background_tasks.shutdown().await;
     }
 
     /// Bounds how long a `GetTask` carrying `currentGeneration` is held open
@@ -162,7 +162,7 @@ impl DefaultRequestHandler {
         params: &ServiceParams,
         task_id: Option<&str>,
     ) -> Result<(), A2AError> {
-        self.tasks.workers.check_running()?;
+        self.tasks.background_tasks.check_running()?;
         if let Some(authorizer) = &self.authorizer {
             authorizer.authorize(params, task_id)?;
         }
@@ -264,7 +264,7 @@ impl DefaultRequestHandler {
     }
 
     fn require_streaming(&self) -> Result<(), A2AError> {
-        self.tasks.workers.check_running()?;
+        self.tasks.background_tasks.check_running()?;
         Self::require_capability(self.capabilities.streaming, || {
             A2AError::unsupported_operation("the agent card does not declare streaming")
         })
@@ -319,7 +319,7 @@ impl DefaultRequestHandler {
     ) -> Result<Events, A2AError> {
         let first = tokio::select! {
             biased;
-            () = self.tasks.workers.cancelled() => {
+            () = self.tasks.background_tasks.cancelled() => {
                 return Err(A2AError::internal("handler is shutting down"));
             }
             first = uplink.next() => first
