@@ -703,6 +703,8 @@ mod tests {
         let (url, line) = spawn_request_line_server().await;
         let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), url);
         let req = GetTaskRequest {
+            current_generation: None,
+            timeline_length: None,
             id: "t1".into(),
             history_length: None,
             tenant: tenant.clone(),
@@ -735,6 +737,8 @@ mod tests {
         let (url, line) = spawn_request_line_server().await;
         let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), url);
         let req = GetTaskRequest {
+            current_generation: None,
+            timeline_length: None,
             id: "t1".into(),
             history_length: None,
             tenant: Some(String::new()),
