@@ -90,7 +90,7 @@ pub(super) async fn inject_input(
     if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(Rejection::Failed(A2AError::task_not_found(task_id)));
     }
-    let Some(base) = active.snapshot().await else {
+    let Some(base) = active.snapshot() else {
         return Err(Rejection::Failed(A2AError::internal(
             "a running execution has no task",
         )));
@@ -126,17 +126,10 @@ pub(super) async fn inject_input(
         .await?;
     let task = handler.tasks.save(task, false).await?;
 
-    let sequence_before = active.sequence().await;
-    let receiver = active.subscribe().await;
-    let last = events.len().saturating_sub(1);
-    for (index, event) in events.iter().enumerate() {
-        let snapshot = (index == last).then(|| task.clone());
-        active.publish_marked(Ok(event), snapshot, false).await;
-    }
-    if events.is_empty() {
-        active.set_snapshot(task.clone()).await;
-    }
-    let sequence_after = active.sequence().await;
+    let sequence_before = active.sequence();
+    let receiver = active.subscribe();
+    active.publish_input(task.clone(), &events);
+    let sequence_after = active.sequence();
     if let Some(permit) = permit {
         let input = ClientInput::received(
             request,
@@ -149,7 +142,6 @@ pub(super) async fn inject_input(
         );
         permit.send(invocation.track_input(input));
     }
-    handler.tasks.changes.notify(task_id);
 
     Ok(Delivery::Injected {
         task,
@@ -173,7 +165,7 @@ mod tests {
         seed_task(&handler, "task", "context").await;
         let before = handler.tasks.load("task").await.unwrap();
         let (active, inputs, mut invocation) =
-            ActiveExecution::with_events(handler.tasks.registry.events_for("task"));
+            ActiveExecution::with_task(handler.tasks.task("task"));
         let mut inputs = Some(inputs);
         let mut request = send_request();
         request.message.task_id = Some("task".into());
@@ -185,7 +177,7 @@ mod tests {
         };
         for missing_snapshot in [true, false] {
             if !missing_snapshot {
-                active.set_snapshot(before.clone()).await;
+                active.set_snapshot(before.clone());
                 assert!(inputs.as_mut().unwrap().close_and_drain().is_empty());
                 drop(inputs.take());
             }

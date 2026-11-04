@@ -9,7 +9,7 @@ use super::protocol::{
     Rejection, apply_lengths, is_at_least_1_1, requested_protocol_version, unary_refusal,
 };
 use super::response::{Events, Run, RunCompletion};
-use super::response_preparation::{MessageResponse, PreparedResponse};
+use super::response_preparation::{MessageResponse, PreparedResponse, ResponseOptions};
 use super::response_preparation::{SubscriptionAttachment, SubscriptionPolicy};
 use super::task_service::TaskService;
 use super::uplink::{IncomingRequest, LiveSessions, Uplink};
@@ -303,9 +303,9 @@ impl DefaultRequestHandler {
                 None,
             )
             .await?;
-        let task_id = prepared.task_id.clone();
+        let task = prepared.task.clone();
         let events = self.response_stream(params, prepared, None, None);
-        MessageResponse::receive(self.tasks.clone(), task_id, events).await
+        MessageResponse::receive(self.tasks.clone(), task, events).await
     }
 
     /// Live transports supply an opening request and retain their input stream.
@@ -361,7 +361,7 @@ impl DefaultRequestHandler {
         Run::new(
             self.clone(),
             params.clone(),
-            prepared.task_id,
+            prepared.task,
             prepared.completion,
             prepared.policy,
         )
@@ -379,19 +379,20 @@ impl DefaultRequestHandler {
     ) -> Result<PreparedResponse, A2AError> {
         let request = input
             .send_request()
-            .ok_or_else(|| A2AError::invalid_request("expected a SendMessage request"))?
-            .clone();
+            .ok_or_else(|| A2AError::invalid_request("expected a SendMessage request"))?;
+        let options = ResponseOptions::from_request(request);
+        let requested_task = request_task_id(request);
         let delivery = self
             .receive_message(params, input, mode, None, response_id)
             .await
             .map_err(|rejection| match mode {
                 StartMode::Bidi => rejection.into_error(),
-                _ => unary_refusal(rejection, &request),
+                _ => unary_refusal(rejection, requested_task.as_deref()),
             })?;
         let policy =
             SubscriptionPolicy::new(mode, is_at_least_1_1(&requested_protocol_version(params)))
                 .for_response(response_id);
-        Ok(PreparedResponse::message(request, delivery, mode, policy))
+        Ok(PreparedResponse::message(options, delivery, mode, policy))
     }
 
     /// Bind and authorize each message once, using its caller rather than
@@ -404,7 +405,10 @@ impl DefaultRequestHandler {
         bound_task: Option<&str>,
     ) -> Result<AuthorizedMessage, Rejection> {
         let (mut request, authorized) = match input {
-            IncomingRequest::Authorized(message) => (message.request.clone(), Some(message)),
+            IncomingRequest::Authorized(message) => (
+                message.request,
+                Some((message.params, message.user, message.response_id)),
+            ),
             IncomingRequest::Raw(StreamRequest {
                 payload: StreamRequestPayload::SendMessage(request),
                 ..
@@ -434,9 +438,13 @@ impl DefaultRequestHandler {
                 None => request.message.task_id = Some(bound.to_string()),
             }
         }
-        if let Some(mut authorized) = authorized {
-            authorized.request = request;
-            return Ok(authorized);
+        if let Some((params, user, response_id)) = authorized {
+            return Ok(AuthorizedMessage {
+                request,
+                params,
+                user,
+                response_id,
+            });
         }
         self.authorize(params, request_task_id(&request).as_deref())?;
         Ok(AuthorizedMessage {
@@ -544,15 +552,12 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        let config = req.configuration.as_ref();
-        let blocking = !config.and_then(|c| c.return_immediately).unwrap_or(false);
-        let history_length = config.and_then(|c| c.history_length);
-        let timeline_length = config.and_then(|c| c.timeline_length);
+        let options = ResponseOptions::from_request(&req);
 
         let mut response = match self.send(params, req).await? {
             MessageResponse::Message(message) => SendMessageResponse::Message(message),
             MessageResponse::Task(task) => {
-                if blocking {
+                if !options.return_immediately {
                     task.wait().await?
                 } else {
                     SendMessageResponse::Task(task.snapshot().await?)
@@ -560,7 +565,7 @@ impl RequestHandler for DefaultRequestHandler {
             }
         };
         if let SendMessageResponse::Task(task) = &mut response {
-            apply_lengths(task, history_length, timeline_length);
+            options.trim(task);
         }
         Ok(response)
     }
@@ -570,8 +575,7 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let history_length = req.configuration.as_ref().and_then(|c| c.history_length);
-        let timeline_length = req.configuration.as_ref().and_then(|c| c.timeline_length);
+        let options = ResponseOptions::from_request(&req);
         self.require_streaming()?;
         let prepared = self
             .prepare_message(
@@ -585,7 +589,7 @@ impl RequestHandler for DefaultRequestHandler {
         Ok(Box::pin(events.map(move |item| {
             item.map(|mut event| {
                 if let StreamResponse::Task(task) = &mut event {
-                    apply_lengths(task, history_length, timeline_length);
+                    options.trim(task);
                 }
                 event
             })
@@ -938,7 +942,7 @@ mod tests {
         let task = task.expect("expected a task");
         assert_eq!(task.status.state, TaskState::InputRequired);
         timeout(Duration::from_secs(2), async {
-            while handler.tasks.registry.get(&task.id).await.is_some() {
+            while handler.tasks.task(&task.id).active().is_some() {
                 tokio::task::yield_now().await;
             }
         })
@@ -1400,8 +1404,7 @@ mod tests {
 
         let handler = Arc::new(make_handler());
         seed_task(&handler, "t-prep", "c-prep").await;
-        let (active, _inputs, _invocation) =
-            handler.tasks.registry.reserve("t-prep").await.unwrap();
+        let (active, _inputs, _invocation) = handler.tasks.task("t-prep").reserve().unwrap();
         let _lease = handler.tasks.test_lease("t-prep");
         let (entered, began) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
@@ -1414,9 +1417,7 @@ mod tests {
                         Box::pin(async move {
                             entered.send(()).unwrap();
                             released.await.unwrap();
-                            active
-                                .set_snapshot(handler.tasks.load("t-prep").await.unwrap())
-                                .await;
+                            active.set_snapshot(handler.tasks.load("t-prep").await.unwrap());
                         })
                     })
                     .await
@@ -1457,8 +1458,7 @@ mod tests {
     async fn test_subscribe_ignores_a_dropped_requests_leftover() {
         let handler = make_handler();
         seed_task(&handler, "t-leftover", "c-leftover").await;
-        let (_stale, _inputs, _invocation) =
-            handler.tasks.registry.reserve("t-leftover").await.unwrap();
+        let (_stale, _inputs, _invocation) = handler.tasks.task("t-leftover").reserve().unwrap();
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(2),
@@ -1689,7 +1689,7 @@ mod tests {
             !published,
             "a snapshot that changes nothing is not published"
         );
-        assert_eq!(active.snapshot().await.unwrap().generation, 3);
+        assert_eq!(active.snapshot().unwrap().generation, 3);
     }
 
     #[tokio::test]
@@ -1761,7 +1761,7 @@ mod tests {
             matches!(timeout(Duration::from_secs(2), events.next()).await.unwrap(),
             Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Working)
         );
-        let active = handler.tasks.registry.get("detached-cancel").await.unwrap();
+        let active = handler.tasks.task("detached-cancel").active().unwrap();
         let caller = {
             let handler = handler.clone();
             tokio::spawn(async move {
@@ -1805,14 +1805,7 @@ mod tests {
             Ok(StreamResponse::StatusUpdate(update)) => update.status.state == TaskState::Canceled,
             _ => false,
         }));
-        assert!(
-            handler
-                .tasks
-                .registry
-                .get("detached-cancel")
-                .await
-                .is_none()
-        );
+        assert!(handler.tasks.task("detached-cancel").active().is_none());
     }
 
     #[tokio::test]
@@ -3035,7 +3028,7 @@ mod tests {
             .unwrap();
         let mut task = task_with_history("uncreated", "context", 0);
         task.status.state = TaskState::Submitted;
-        active.set_snapshot(task).await;
+        active.set_snapshot(task);
         active
             .uncreated
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3068,11 +3061,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        handler
-            .tasks
-            .registry
-            .unregister("uncreated", &active)
-            .await;
+        handler.tasks.task("uncreated").unregister(&active);
     }
 
     #[test]
@@ -3208,7 +3197,7 @@ mod tests {
             idle,
             "panic recovery resets the resident task state before its next command"
         );
-        assert!(handler.tasks.registry.get("panic").await.is_none());
+        assert!(handler.tasks.task("panic").active().is_none());
         assert_eq!(
             store.get("panic").await.unwrap().unwrap().status.state,
             TaskState::Submitted
@@ -3255,9 +3244,8 @@ mod tests {
         let handler = make_handler();
         let task = task_with_history("finished", "context", 0);
         handler.tasks.store().create(task.clone()).await.unwrap();
-        let (active, _inputs, _invocation) =
-            handler.tasks.registry.reserve(&task.id).await.unwrap();
-        active.set_snapshot(task.clone()).await;
+        let (active, _inputs, _invocation) = handler.tasks.task(&task.id).reserve().unwrap();
+        active.set_snapshot(task.clone());
         let error = handler
             .subscribe_to_task(
                 &ServiceParams::new(),
@@ -3271,7 +3259,7 @@ mod tests {
             .err()
             .expect("task is terminal");
         assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
-        handler.tasks.registry.unregister(&task.id, &active).await;
+        handler.tasks.task(&task.id).unregister(&active);
     }
 
     #[tokio::test]
@@ -3290,7 +3278,7 @@ mod tests {
         let StreamResponse::Task(task) = events.next().await.unwrap().unwrap() else {
             panic!("expected Task");
         };
-        let active = handler.tasks.registry.get(&task.id).await.unwrap();
+        let active = handler.tasks.task(&task.id).active().unwrap();
         let capacity = active.inputs.sender.capacity();
         let mut request = send_req(None, None);
         request.message = Message::new(Role::Unspecified, Vec::new());
@@ -3418,7 +3406,7 @@ mod tests {
             Ok(_) => panic!("expected subscribe_to_task to fail"),
             Err(error) => assert_eq!(error.code, error_code::TASK_NOT_FOUND),
         }
-        assert!(handler.tasks.changes.watcher_count() == 0);
+        assert!(handler.tasks.watcher_count() == 0);
     }
 
     #[tokio::test]
@@ -3501,7 +3489,7 @@ mod tests {
                 if stored.status.state == TaskState::InputRequired
                     && last.status.state == TaskState::Canceled
         ));
-        assert!(handler.tasks.changes.watcher_count() == 0);
+        assert!(handler.tasks.watcher_count() == 0);
     }
 
     #[tokio::test]
@@ -3559,7 +3547,7 @@ mod tests {
                     if stored.status.state == TaskState::InputRequired
                         && last.status.state == TaskState::Canceled
             ));
-            assert!(handler.tasks.changes.watcher_count() == 0);
+            assert!(handler.tasks.watcher_count() == 0);
         }
     }
 
@@ -3650,10 +3638,10 @@ mod tests {
             subscription.next().await,
             Some(Ok(StreamResponse::Task(_)))
         ));
-        assert_eq!(handler.tasks.changes.watcher_count(), 1);
+        assert_eq!(handler.tasks.watcher_count(), 1);
         drop(subscription);
         timeout(Duration::from_secs(2), async {
-            while handler.tasks.changes.watcher_count() != 0 {
+            while handler.tasks.watcher_count() != 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -3679,8 +3667,8 @@ mod subscription_attachment_tests {
                     handler.tasks.store().update(task.clone()).await.unwrap();
                     let execution = if running {
                         let (active, inputs, _invocation) =
-                            handler.tasks.registry.reserve("task").await.unwrap();
-                        active.set_snapshot(task.clone()).await;
+                            handler.tasks.task("task").reserve().unwrap();
+                        active.set_snapshot(task.clone());
                         Some((active, inputs))
                     } else {
                         None
@@ -3711,7 +3699,7 @@ mod subscription_attachment_tests {
                         handler.subscribe_to_task(&params, request).await.unwrap()
                     };
                     assert_eq!(
-                        handler.tasks.registry.get("task").await.is_some(),
+                        handler.tasks.task("task").active().is_some(),
                         running,
                         "subscribing must not start an executor"
                     );
@@ -3736,12 +3724,10 @@ mod subscription_attachment_tests {
                     task.status.state = TaskState::Completed;
                     handler.tasks.store().update(task.clone()).await.unwrap();
                     if let Some((active, _inputs)) = execution {
-                        active
-                            .publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()))
-                            .await;
-                        handler.tasks.registry.unregister("task", &active).await;
+                        active.publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()));
+                        handler.tasks.task("task").unregister(&active);
                     }
-                    handler.tasks.changes.notify("task");
+                    handler.tasks.task("task").notify();
                     let remaining = timeout(Duration::from_secs(2), events.collect::<Vec<_>>())
                         .await
                         .unwrap();
@@ -4343,7 +4329,7 @@ mod upstream_regressions {
     /// A Message after the task's own events is an invalid agent response,
     /// not the answer (§3.1.2), and the task fails.
     #[tokio::test]
-    async fn test_message_after_task_events_is_an_invalid_agent_response() {
+    async fn test_message_after_task_handle_is_an_invalid_agent_response() {
         let handler = upstream_handler(
             ScriptedExecutor(|ctx: &ExecutorContext| {
                 vec![

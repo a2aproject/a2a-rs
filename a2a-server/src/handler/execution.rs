@@ -131,7 +131,7 @@ async fn drive_execution(
     let end = poll_executor(&handler, &task_id, &active, request).await;
     handler
         .tasks
-        .finished(handler.clone(), &task_id, active, end)
+        .finished(handler.clone(), active, end)
         .await
         .expect("execution completion must reach the task service");
 }
@@ -164,7 +164,7 @@ async fn poll_executor(
         }
         let failure = push_failure.borrow_and_update().clone();
         if let Some(error) = failure {
-            if active.snapshot_is_terminal().await {
+            if active.snapshot_is_terminal() {
                 return TurnEnd::Stopped;
             }
             return TurnEnd::Failed(error);
@@ -178,7 +178,7 @@ async fn poll_executor(
         let Some(result) = result else {
             return TurnEnd::Finished;
         };
-        if active.snapshot_is_terminal().await {
+        if active.snapshot_is_terminal() {
             return TurnEnd::Stopped;
         }
         if let Ok(event) = &result {
@@ -194,7 +194,7 @@ async fn poll_executor(
             Ok(event) => {
                 let action = handler
                     .tasks
-                    .output(handler.clone(), task_id, active.clone(), event)
+                    .output(handler.clone(), active.clone(), event)
                     .await;
                 match action {
                     Ok(super::runtime::OutputAction::Continue) => {}
@@ -232,7 +232,7 @@ pub(super) async fn drive_execution_guarded(
     handler
         .tasks
         .pushes
-        .attach(&handler, &task_id, &active.events);
+        .attach(&handler, &task_id, &active.task);
     let outcome = std::panic::AssertUnwindSafe(drive_execution(
         handler,
         task_id.clone(),
@@ -245,10 +245,7 @@ pub(super) async fn drive_execution_guarded(
         return;
     }
 
-    let _ = recovery
-        .tasks
-        .panicked(recovery.clone(), active, &task_id)
-        .await;
+    let _ = recovery.tasks.panicked(recovery.clone(), active).await;
 }
 
 /// Starts the invocation that takes over `unread` inside the completion
@@ -263,7 +260,7 @@ pub(super) async fn start_next_turn(
     let Ok((next, inputs)) = state.reserve(handler, task_id).await else {
         return Err(unread);
     };
-    next.set_snapshot(snapshot.clone()).await;
+    next.set_snapshot(snapshot.clone());
     let first = unread.remove(0);
     for input in unread {
         if let Ok(permit) = next.inputs.sender.clone().try_reserve_owned() {
@@ -292,20 +289,19 @@ pub(super) async fn start_next_turn(
     };
     handler
         .tasks
-        .spawn_execution(handler.clone(), task_id.clone(), next, exec_ctx);
+        .spawn_execution(handler.clone(), next, exec_ctx);
     Ok(())
 }
 
 /// Close input delivery and unregister in one task operation. Later
 /// input commands either join a successor or start a new invocation.
 pub(super) async fn release_execution(
-    handler: &DefaultRequestHandler,
     active: &Arc<ActiveExecution>,
     task_id: &str,
     state: &mut TaskRuntime,
 ) {
     reject_unread_inputs(active, task_id, state).await;
-    state.release(handler, task_id, active).await;
+    state.release(active);
 }
 
 /// Saves the push configuration the request that started the execution
@@ -359,9 +355,7 @@ pub(super) async fn reject_inputs(
             reference_id: Some(input.message.message_id.clone()).filter(|id| !id.is_empty()),
             metadata: None,
         });
-        active
-            .publish_kind(Ok(&event), None, EventKind::LiveOnly(input.response_id))
-            .await;
+        active.publish_kind(Ok(&event), None, EventKind::LiveOnly(input.response_id));
     }
 }
 
@@ -372,7 +366,7 @@ pub(super) async fn persist_failure(
     task_id: &str,
     error: &A2AError,
 ) -> Option<Task> {
-    if active.snapshot_is_terminal().await {
+    if active.snapshot_is_terminal() {
         return None;
     }
     let task = match handler.tasks.get(task_id).await {
@@ -416,9 +410,9 @@ pub(super) async fn publish_failure(
     error: &A2AError,
 ) {
     let failed = persist_failure(handler, active, task_id, error).await;
-    active.publish(Err(error), failed.clone()).await;
+    active.publish(Err(error), failed.clone());
     if let Some(task) = failed {
-        active.publish(Ok(&StreamResponse::Task(task)), None).await;
+        active.publish(Ok(&StreamResponse::Task(task)), None);
     }
 }
 
@@ -560,7 +554,7 @@ mod driver_tests {
             .await
             .unwrap()
             .unwrap();
-        active.set_snapshot(task.clone()).await;
+        active.set_snapshot(task.clone());
         let context = ExecutorContext::new(task.id.clone(), task.context_id.clone(), inputs)
             .with_stored_task(task);
         (active, context, lease)
@@ -574,7 +568,7 @@ mod driver_tests {
         runtime.tasks.store().create(task.clone()).await.unwrap();
         task.status.state = TaskState::Working;
         let (active, context, _lease) = registered(&runtime, task.clone()).await;
-        let mut events = active.subscribe().await;
+        let mut events = active.subscribe();
         timeout(
             Duration::from_secs(1),
             drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context),
@@ -585,7 +579,7 @@ mod driver_tests {
             events.recv().await.unwrap().result.unwrap_err().code,
             error_code::INVALID_REQUEST
         );
-        assert!(runtime.tasks.registry.get(&task.id).await.is_none());
+        assert!(runtime.tasks.task(&task.id).active().is_none());
         assert!(active.inputs_drained.is_cancelled());
         assert_eq!(
             runtime
@@ -622,7 +616,7 @@ mod driver_tests {
                 poll_executor(&runtime, &task.id, &active, context).await,
                 TurnEnd::Stopped
             ));
-            assert!(active.snapshot().await.is_some());
+            assert!(active.snapshot().is_some());
         }
     }
 
@@ -633,7 +627,7 @@ mod driver_tests {
         task.status.state = TaskState::Submitted;
         runtime.tasks.store().create(task.clone()).await.unwrap();
         let (active, context, _lease) = registered(&runtime, task.clone()).await;
-        let mut events = active.subscribe().await;
+        let mut events = active.subscribe();
         let runner = tokio::spawn({
             let runtime = runtime.clone();
             let active = active.clone();
@@ -646,7 +640,7 @@ mod driver_tests {
         });
         events.recv().await.unwrap().result.unwrap();
         let canceled = runtime.tasks.store().begin_cancel(&task.id).await.unwrap();
-        active.set_snapshot(canceled).await;
+        active.set_snapshot(canceled);
         release.notify_one();
         assert!(matches!(
             timeout(Duration::from_secs(1), runner)
@@ -697,7 +691,7 @@ mod driver_tests {
         runtime.tasks.store().create(task.clone()).await.unwrap();
         task.status.state = TaskState::Working;
         let (active, context, _lease) = registered(&runtime, task.clone()).await;
-        let mut events = active.subscribe().await;
+        let mut events = active.subscribe();
         timeout(
             Duration::from_secs(1),
             drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context),
@@ -709,7 +703,7 @@ mod driver_tests {
             error_code::INVALID_REQUEST
         );
         assert!(active.inputs_drained.is_cancelled());
-        assert!(runtime.tasks.registry.get(&task.id).await.is_none());
+        assert!(runtime.tasks.task(&task.id).active().is_none());
         assert_eq!(
             runtime
                 .tasks
@@ -761,7 +755,7 @@ mod driver_tests {
                 .uncreated
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             context.new_task = true;
-            let mut events = active.subscribe().await;
+            let mut events = active.subscribe();
             drive_execution_guarded(runtime.clone(), task.id.clone(), active.clone(), context)
                 .await;
             let event = events.recv().await.unwrap();
@@ -775,7 +769,7 @@ mod driver_tests {
                 assert!(matches!(event.result, Ok(StreamResponse::Message(_))));
             }
             assert!(runtime.tasks.store().get(&task.id).await.unwrap().is_none());
-            assert!(runtime.tasks.registry.get(&task.id).await.is_none());
+            assert!(runtime.tasks.task(&task.id).active().is_none());
             assert!(
                 events.try_recv().is_err(),
                 "outputs following a direct reply must be ignored"
@@ -823,7 +817,7 @@ mod driver_tests {
                     .id,
                 task.id
             );
-            assert!(runtime.tasks.registry.get(&task.id).await.is_none());
+            assert!(runtime.tasks.task(&task.id).active().is_none());
             let configs = runtime
                 .push_config_store
                 .as_ref()
@@ -844,14 +838,14 @@ mod driver_tests {
         active
             .uncreated
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let mut events = active.subscribe().await;
+        let mut events = active.subscribe();
         drive_execution_guarded(runtime.clone(), task.id.clone(), active, context).await;
         assert_eq!(
             events.recv().await.unwrap().result.unwrap_err().code,
             error_code::INTERNAL_ERROR
         );
         assert!(runtime.tasks.store().get(&task.id).await.unwrap().is_none());
-        assert!(runtime.tasks.registry.get(&task.id).await.is_none());
+        assert!(runtime.tasks.task(&task.id).active().is_none());
     }
 
     #[tokio::test]
@@ -887,9 +881,8 @@ mod turn_tests {
     async fn a_busy_handoff_returns_input_with_its_caller_identity_intact() {
         let runtime = make_handler();
         let task = task_with_history("busy-handoff", "context", 0);
-        let (active, _inputs, _invocation) =
-            runtime.tasks.registry.reserve(&task.id).await.unwrap();
-        active.set_snapshot(task.clone()).await;
+        let (active, _inputs, _invocation) = runtime.tasks.task(&task.id).reserve().unwrap();
+        active.set_snapshot(task.clone());
         let mut input = crate::ClientInput::new(make_message(), 7);
         input.user = Some(crate::User::authenticated("alice"));
         input.tenant = Some("tenant-a".into());
@@ -911,7 +904,7 @@ mod turn_tests {
         assert_eq!(returned[0].user, input.user);
         assert_eq!(returned[0].metadata, input.metadata);
         assert_eq!(returned[0].tenant, input.tenant);
-        assert!(runtime.tasks.registry.get(&task.id).await.is_some());
+        assert!(runtime.tasks.task(&task.id).active().is_some());
     }
 
     #[tokio::test]
@@ -958,7 +951,7 @@ mod turn_tests {
     #[tokio::test]
     async fn artifact_only_unread_input_has_no_empty_message_reference() {
         let active = ActiveExecution::new(None);
-        let mut events = active.subscribe().await;
+        let mut events = active.subscribe();
         let mut message = make_message();
         message.message_id.clear();
         reject_inputs(&active, "task", vec![crate::ClientInput::new(message, 3)]).await;
@@ -1056,7 +1049,7 @@ mod turn_tests {
             [2, 3]
         );
         timeout(Duration::from_secs(1), async {
-            while runtime.tasks.registry.get(&task.id).await.is_some() {
+            while runtime.tasks.task(&task.id).active().is_some() {
                 tokio::task::yield_now().await;
             }
         })
@@ -1122,7 +1115,7 @@ mod failure_tests {
         seed_task(&handler, "task", "context").await;
         let before = handler.tasks.load("task").await.unwrap();
         let active = ActiveExecution::new(None);
-        active.set_snapshot(before.clone()).await;
+        active.set_snapshot(before.clone());
         let error = A2AError::internal("private executor detail");
 
         store.fail_read.store(true, Ordering::SeqCst);
@@ -1139,7 +1132,7 @@ mod failure_tests {
                 .is_none()
         );
         assert_eq!(handler.tasks.load("task").await.unwrap(), before);
-        assert_eq!(active.snapshot().await.unwrap(), before);
+        assert_eq!(active.snapshot().unwrap(), before);
 
         store.fail_write.store(false, Ordering::SeqCst);
         let failed = persist_failure(&handler, &active, "task", &error)
@@ -1161,9 +1154,7 @@ mod failure_tests {
             error_code::TASK_NOT_CANCELABLE
         );
 
-        active
-            .set_snapshot(handler.tasks.load("task").await.unwrap())
-            .await;
+        active.set_snapshot(handler.tasks.load("task").await.unwrap());
         assert!(
             persist_failure(&handler, &active, "task", &error)
                 .await
@@ -1181,8 +1172,8 @@ mod failure_tests {
             let before = handler.tasks.load("task").await.unwrap();
             let mut runtime = TaskRuntime::default();
             let (active, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
-            active.set_snapshot(before.clone()).await;
-            let mut events = active.subscribe().await;
+            active.set_snapshot(before.clone());
+            let mut events = active.subscribe();
             store.fail_read.store(read_outage, Ordering::SeqCst);
             store.fail_write.store(!read_outage, Ordering::SeqCst);
             runtime
@@ -1194,14 +1185,14 @@ mod failure_tests {
                 )
                 .await;
             assert!(events.recv().await.unwrap().result.is_err());
-            assert!(handler.tasks.registry.get("task").await.is_none());
+            assert!(handler.tasks.task("task").active().is_none());
             assert!(runtime.execution.invocation().is_none());
-            assert_eq!(active.snapshot().await.unwrap(), before);
+            assert_eq!(active.snapshot().unwrap(), before);
             store.fail_read.store(false, Ordering::SeqCst);
             assert_eq!(handler.tasks.load("task").await.unwrap(), before);
             let (successor, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
             assert_ne!(successor.execution_id, active.execution_id);
-            runtime.release(&handler, "task", &successor).await;
+            runtime.release(&successor);
         }
     }
 }

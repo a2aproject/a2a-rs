@@ -9,11 +9,13 @@ use super::protocol::{
     Rejection, generation_of, is_terminal_event, should_interrupt_non_streaming,
 };
 use super::response_preparation::{DeliveryAttachment, SubscriptionPolicy};
+use super::task_handle::TaskHandle;
 use super::uplink::{Incoming, IncomingRequest, Receipt, Uplink};
 use super::{DefaultRequestHandler, RESPONSE_BUFFER_CAPACITY};
 use crate::middleware::ServiceParams;
 use a2a::*;
 use futures::{FutureExt, StreamExt, stream::BoxStream};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// What looking at an idle task found.
@@ -36,7 +38,7 @@ pub(super) struct Run {
     /// own parameters when another caller sends them.
     pub(super) params: ServiceParams,
     /// The task whose execution and updates this response follows.
-    pub(super) task_id: TaskId,
+    pub(super) task: Arc<TaskHandle>,
     pub(super) completion: RunCompletion,
     policy: SubscriptionPolicy,
 }
@@ -46,7 +48,7 @@ pub(super) enum RunCompletion {
     /// Follow task updates across execution turns until the task is terminal.
     Task,
     /// Finish at the unary request's return condition, including interruptions.
-    Unary(Box<SendMessageRequest>),
+    Unary { return_immediately: bool },
     /// Follow later turns while the uplink remains open.
     Exchange,
 }
@@ -58,7 +60,7 @@ impl Run {
     pub(super) fn new(
         handler: DefaultRequestHandler,
         params: ServiceParams,
-        task_id: TaskId,
+        task: Arc<TaskHandle>,
         completion: RunCompletion,
         policy: SubscriptionPolicy,
     ) -> Self {
@@ -67,7 +69,7 @@ impl Run {
             uplink: None,
             handler,
             params,
-            task_id,
+            task,
             completion,
             policy,
         }
@@ -79,7 +81,7 @@ impl Run {
         mut registration: Option<RegistrationLease>,
     ) -> Self {
         if let Some(registration) = &mut registration {
-            registration.bind(&self.task_id);
+            registration.bind(&self.task.id);
         }
         self.registration = registration;
         self.uplink = uplink;
@@ -95,7 +97,7 @@ impl Run {
         seen_generation: i64,
     ) -> Events {
         let (out, downlink) = mpsc::channel(RESPONSE_BUFFER_CAPACITY);
-        let source = self.handler.tasks.registry.events_for(&self.task_id);
+        let source = self.task.clone();
         self.spawn(opening, inner, seen_generation, out);
         // Keep the authoritative snapshot until the response is consumed,
         // including when retention purges the task before unary delivery.
@@ -131,8 +133,8 @@ impl Run {
         is_terminal_event(event)
             || matches!(event, StreamResponse::Message(_))
             || match &self.completion {
-                RunCompletion::Unary(request) => {
-                    should_interrupt_non_streaming(request, event).is_some()
+                RunCompletion::Unary { return_immediately } => {
+                    should_interrupt_non_streaming(*return_immediately, event).is_some()
                 }
                 _ => false,
             }
@@ -164,7 +166,7 @@ impl Run {
         Box::pin(async move {
             // Watched from here, so a change from now on is seen however it is
             // timed against the looks below.
-            let mut watch = self.handler.tasks.changes.watch(&self.task_id);
+            let mut watch = self.task.watch();
             // The generation the client has been told of, so a change it was not
             // there for (an idle task, then another client's turn) is noticed.
             let mut last_generation = seen_generation;
@@ -221,7 +223,7 @@ impl Run {
                     () = watch.changed(), if inner.is_none() ||
                         (matches!(self.completion, RunCompletion::Exchange) && !uplink_open) => {
                         if inner.is_some() && !uplink_open
-                            && self.handler.tasks.registry.get(&self.task_id).await.is_none()
+                            && self.task.active().is_none()
                         {
                             // The input half is closed and the invocation ended.
                             // Preserve all buffered Task events before closing.
@@ -251,7 +253,7 @@ impl Run {
                             if inner.is_none() {
                                 break;
                             }
-                            if self.handler.tasks.registry.get(&self.task_id).await.is_none() {
+                            if self.task.active().is_none() {
                                 self.flush(&mut inner, &mut last_generation, &out).await;
                                 break;
                             }
@@ -281,9 +283,7 @@ impl Run {
         last_generation: &mut i64,
         out: &ResponseSender,
     ) -> Reattach {
-        if let Some((receiver, Some(snapshot), sequence)) =
-            self.handler.tasks.registry.resubscribe(&self.task_id).await
-        {
+        if let Some((receiver, Some(snapshot), sequence)) = self.task.resubscribe_active() {
             let event = StreamResponse::Task(snapshot.clone());
             let ends = self.completes(&event);
             let opening =
@@ -292,7 +292,7 @@ impl Run {
             *inner = Some(self.policy.stream(receiver, opening, sequence));
             return Reattach::Changed;
         }
-        let task = match self.handler.tasks.load(&self.task_id).await {
+        let task = match self.handler.tasks.load(&self.task.id).await {
             Ok(task) => task,
             Err(error) => {
                 self.forward(Err(error), last_generation, out).await;
@@ -339,12 +339,12 @@ impl Run {
             // for earlier requests goes out before this one's rejection.
             downlink_open = self.flush(inner, last_generation, out).await;
             if downlink_open {
-                let event = rejection.into_stream_error(&self.task_id, reference_id);
+                let event = rejection.into_stream_error(&self.task.id, reference_id);
                 downlink_open = self.forward(Ok(event), last_generation, out).await;
             }
         }
         if let Some(receipt) = receipt.filter(|_| !interrupted) {
-            receipt.complete(self.handler.tasks.load(&self.task_id).await);
+            receipt.complete(self.handler.tasks.load(&self.task.id).await);
         }
         // Dropping a begun, interrupted receipt makes the HTTP adapter verify
         // persistence. A readable Task alone does not prove this input committed.
@@ -387,7 +387,7 @@ impl Run {
                 &self.params,
                 request,
                 StartMode::Bidi,
-                Some(&self.task_id),
+                Some(&self.task.id),
                 self.policy.response_id(),
             )
             .await?;
@@ -437,15 +437,17 @@ mod tests {
         let run = Run::new(
             handler.clone(),
             ServiceParams::new(),
-            "working".into(),
-            RunCompletion::Unary(Box::new(send_req(Some("working"), None))),
+            handler.tasks.task("working"),
+            RunCompletion::Unary {
+                return_immediately: false,
+            },
             SubscriptionPolicy::new(StartMode::Blocking, false),
         );
         let events = run.start(None, Some(events), 0);
         let tasks = handler.tasks.clone();
         let mut response = tokio::spawn(async move {
             let MessageResponse::Task(task) =
-                MessageResponse::receive(tasks, "working".into(), events).await?
+                MessageResponse::receive(tasks.clone(), tasks.task("working"), events).await?
             else {
                 panic!("expected a task response");
             };
@@ -486,7 +488,9 @@ mod tests {
         let task = handler.tasks.load("task").await.unwrap();
         for mode in [StartMode::Blocking, StartMode::Streaming, StartMode::Bidi] {
             let completion = || match mode {
-                StartMode::Blocking => RunCompletion::Unary(Box::new(send_req(Some("task"), None))),
+                StartMode::Blocking => RunCompletion::Unary {
+                    return_immediately: false,
+                },
                 StartMode::Streaming => RunCompletion::Task,
                 StartMode::Bidi => RunCompletion::Exchange,
             };
@@ -512,7 +516,7 @@ mod tests {
             let normal = Run::new(
                 handler.clone(),
                 ServiceParams::new(),
-                "task".into(),
+                handler.tasks.task("task"),
                 completion(),
                 SubscriptionPolicy::new(mode, false),
             )
@@ -523,7 +527,7 @@ mod tests {
             let mut run = Run::new(
                 handler.clone(),
                 ServiceParams::new(),
-                "task".into(),
+                handler.tasks.task("task"),
                 completion(),
                 SubscriptionPolicy::new(mode, false),
             );
@@ -546,10 +550,11 @@ mod tests {
 
     #[tokio::test]
     async fn flushing_a_direct_reply_does_not_forward_later_events() {
+        let handler = make_handler();
         let mut run = Run::new(
-            make_handler(),
+            handler.clone(),
             ServiceParams::new(),
-            "task".into(),
+            handler.tasks.task("task"),
             RunCompletion::Exchange,
             SubscriptionPolicy::new(StartMode::Bidi, false),
         );
@@ -581,9 +586,9 @@ mod tests {
                 handler.tasks.store().create(task).await.unwrap();
             }
             let mut events = Run::new(
-                handler,
+                handler.clone(),
                 ServiceParams::new(),
-                "task".into(),
+                handler.tasks.task("task"),
                 RunCompletion::Task,
                 SubscriptionPolicy::new(StartMode::Streaming, false),
             )
@@ -605,6 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn unary_direct_messages_and_errors_do_not_require_a_stored_task() {
+        let handler = make_handler();
         let message = make_message();
         let events = stream::once({
             let message = message.clone();
@@ -612,13 +618,13 @@ mod tests {
         })
         .boxed();
         let response =
-            MessageResponse::receive(make_handler().tasks.clone(), "missing".into(), events)
+            MessageResponse::receive(handler.tasks.clone(), handler.tasks.task("missing"), events)
                 .await
                 .unwrap();
         assert!(matches!(response, MessageResponse::Message(reply) if reply == message));
         let events = stream::once(async { Err(A2AError::internal("executor error")) }).boxed();
         let error =
-            MessageResponse::receive(make_handler().tasks.clone(), "missing".into(), events)
+            MessageResponse::receive(handler.tasks.clone(), handler.tasks.task("missing"), events)
                 .await
                 .err()
                 .expect("executor error");
@@ -633,9 +639,9 @@ mod tests {
         task.generation = 3;
         handler.tasks.store().create(task.clone()).await.unwrap();
         let mut events = Run::new(
-            handler,
+            handler.clone(),
             ServiceParams::new(),
-            task.id.clone(),
+            handler.tasks.task(&task.id),
             RunCompletion::Task,
             SubscriptionPolicy::new(StartMode::Streaming, false),
         )
@@ -677,10 +683,11 @@ mod delivery_tests {
     #[tokio::test]
     async fn runner_panic_is_reported_and_a_disconnected_consumer_stops_delivery() {
         let run = || {
+            let handler = make_handler();
             Run::new(
-                make_handler(),
+                handler.clone(),
                 ServiceParams::new(),
-                "task".into(),
+                handler.tasks.task("task"),
                 RunCompletion::Task,
                 SubscriptionPolicy::new(StartMode::Streaming, false),
             )

@@ -32,12 +32,12 @@ pub(super) enum TaskOperation {
     Cancel,
 }
 
-pub(super) fn spawn_task(task_id: TaskId) -> Arc<TaskSender> {
+pub(super) fn spawn_task(task: Arc<super::task_handle::TaskHandle>) -> Arc<TaskSender> {
     let (sender, mut commands) = tokio::sync::mpsc::channel::<TaskTransition>(TASK_QUEUE_CAPACITY);
     tokio::spawn(async move {
         let mut state = TaskRuntime::default();
         while let Some(transition) = commands.recv().await {
-            tracing::trace!(%task_id, "processing task operation");
+            tracing::trace!(task_id = %task.id, "processing task operation");
             transition(&mut state).await;
         }
     });
@@ -133,11 +133,8 @@ impl TaskRuntime {
             return Ok(None);
         }
         let (active, inputs) = self.reserve(handler, task_id).await?;
-        active.set_snapshot(task.clone()).await;
-        handler
-            .tasks
-            .pushes
-            .attach(handler, task_id, &active.events);
+        active.set_snapshot(task.clone());
+        handler.tasks.pushes.attach(handler, task_id, &active.task);
         let mut context =
             crate::ExecutorContext::new(task.id.clone(), task.context_id.clone(), inputs)
                 .with_stored_task(task);
@@ -145,7 +142,6 @@ impl TaskRuntime {
         let (accepted, started) = tokio::sync::oneshot::channel();
         handler.tasks.spawn_execution(
             handler.clone(),
-            task_id.to_owned(),
             active,
             execution::ExecutionRequest::Restart { context, accepted },
         );
@@ -162,9 +158,9 @@ impl TaskRuntime {
                 "task execution is already in progress",
             ));
         }
-        let (active, inputs, bookkeeping) =
-            ActiveExecution::with_events(handler.tasks.registry.events_for(task_id));
-        handler.tasks.registry.register(task_id, &active).await?;
+        let task = handler.tasks.task(task_id);
+        let (active, inputs, bookkeeping) = ActiveExecution::with_task(task.clone());
+        task.register(&active)?;
         self.execution = ExecutionState::Running(Invocation {
             active: active.clone(),
             bookkeeping,
@@ -172,14 +168,9 @@ impl TaskRuntime {
         Ok((active, inputs))
     }
 
-    pub(super) async fn release(
-        &mut self,
-        handler: &DefaultRequestHandler,
-        task_id: &str,
-        active: &Arc<ActiveExecution>,
-    ) {
+    pub(super) fn release(&mut self, active: &Arc<ActiveExecution>) {
         self.execution.release(active);
-        handler.tasks.registry.unregister(task_id, active).await;
+        active.task.unregister(active);
     }
 
     /// A panicking preparation has not started a driver to clean up its inbox.
@@ -223,7 +214,7 @@ impl TaskRuntime {
                         .expect("reserved invocation"),
                 )
                 .await?;
-            active.set_snapshot(input.task.clone()).await;
+            active.set_snapshot(input.task.clone());
             active
                 .uncreated
                 .store(lazy && !input.existed, std::sync::atomic::Ordering::SeqCst);
@@ -237,7 +228,7 @@ impl TaskRuntime {
         } = match prepared {
             Ok(input) => input,
             Err(error) => {
-                self.release(handler, &task_id, &active).await;
+                self.release(&active);
                 return Err(error.into());
             }
         };
@@ -248,23 +239,20 @@ impl TaskRuntime {
             ..
         } = message;
         let params = &params;
-        handler
-            .tasks
-            .pushes
-            .attach(handler, &task_id, &active.events);
+        handler.tasks.pushes.attach(handler, &task_id, &active.task);
         if existed || !lazy {
             // Existing subscribers and webhooks observe persisted client input
             // through the same publication path as executor output. The new
             // response subscribes below and announces its input via its opening
             // snapshot (or recorded follow-up), avoiding duplicate generations.
-            for event in &input_events {
-                active.publish(Ok(event), None).await;
-            }
+            active.publish_input(task.clone(), &input_events);
+        } else {
+            // A lazy reservation starts an execution without publishing a Task.
+            active.task.notify();
         }
-        handler.tasks.changes.notify(&task_id);
         // Attach before acknowledging admission, so output and cancellation
         // commands queued immediately afterwards cannot be missed.
-        let receiver = active.subscribe().await;
+        let receiver = active.subscribe();
 
         let stored_task = (existed || include_task_snapshot_in_context).then(|| task.clone());
         let service_params = params.clone();
@@ -288,7 +276,7 @@ impl TaskRuntime {
         };
         handler
             .tasks
-            .spawn_execution(handler.clone(), task_id, active, exec_ctx);
+            .spawn_execution(handler.clone(), active, exec_ctx);
 
         Ok(Delivery::Started {
             task,
@@ -349,7 +337,6 @@ impl TaskRuntime {
     pub(super) async fn cancel_finished(
         &mut self,
         handler: &DefaultRequestHandler,
-        task_id: &str,
         failure: Option<A2AError>,
     ) -> Result<(), A2AError> {
         if !matches!(self.execution, ExecutionState::Canceling { .. }) {
@@ -360,45 +347,40 @@ impl TaskRuntime {
         };
         let active = progress.active.clone();
         let result = progress.finish(handler, failure).await;
-        handler.tasks.registry.unregister(task_id, &active).await;
+        active.task.unregister(&active);
         result
     }
 
     pub(super) async fn output(
         &mut self,
         handler: &DefaultRequestHandler,
-        task_id: TaskId,
         active: Arc<ActiveExecution>,
         mut event: StreamResponse,
     ) -> Result<OutputAction, A2AError> {
         if !self.execution.is_current(&active)
             || matches!(self.execution, ExecutionState::Canceling { .. })
-            || active.snapshot_is_terminal().await
+            || active.snapshot_is_terminal()
         {
             return Ok(OutputAction::Stopped);
         }
         if active.uncreated.load(std::sync::atomic::Ordering::SeqCst)
             && matches!(event, StreamResponse::Message(_))
         {
-            if let Some(task) = active.snapshot().await {
+            if let Some(task) = active.snapshot() {
                 validate_event_identity(&task, &event)?;
             }
-            active
-                .publish_kind(Ok(&event), None, EventKind::Reply)
-                .await;
-            self.release(handler, &task_id, &active).await;
-            handler.tasks.changes.notify(&task_id);
+            active.publish_kind(Ok(&event), None, EventKind::Reply);
+            self.release(&active);
+            active.task.notify();
             return Ok(OutputAction::Drain);
         }
-        self.apply_output(handler, &task_id, &active, &mut event)
-            .await?;
+        self.apply_output(handler, &active, &mut event).await?;
         Ok(OutputAction::Continue)
     }
 
     async fn apply_output(
         &mut self,
         handler: &DefaultRequestHandler,
-        task_id: &str,
         active: &Arc<ActiveExecution>,
         event: &mut StreamResponse,
     ) -> Result<(), A2AError> {
@@ -409,7 +391,6 @@ impl TaskRuntime {
         handler
             .tasks
             .update(
-                task_id,
                 active,
                 event,
                 invocation,
@@ -429,8 +410,8 @@ impl TaskRuntime {
             return;
         }
         if matches!(self.execution, ExecutionState::Canceling { .. }) {
-            release_execution(handler, &active, &task_id, self).await;
-            handler.tasks.changes.notify(&task_id);
+            release_execution(&active, &task_id, self).await;
+            active.task.notify();
             return;
         }
         match end {
@@ -439,15 +420,12 @@ impl TaskRuntime {
             }
             TurnEnd::Terminal(mut event) => {
                 reject_unread_inputs(&active, &task_id, self).await;
-                if !active.snapshot_is_terminal().await {
-                    if let Err(error) = self
-                        .apply_output(handler, &task_id, &active, &mut event)
-                        .await
-                    {
+                if !active.snapshot_is_terminal() {
+                    if let Err(error) = self.apply_output(handler, &active, &mut event).await {
                         execution::publish_failure(handler, &active, &task_id, &error).await;
                     }
                 }
-                self.release(handler, &task_id, &active).await;
+                self.release(&active);
             }
             TurnEnd::Failed(error) => {
                 active
@@ -455,14 +433,14 @@ impl TaskRuntime {
                     .store(false, std::sync::atomic::Ordering::SeqCst);
                 reject_unread_inputs(&active, &task_id, self).await;
                 execution::publish_failure(handler, &active, &task_id, &error).await;
-                release_execution(handler, &active, &task_id, self).await;
+                release_execution(&active, &task_id, self).await;
             }
             TurnEnd::Stopped => {
-                release_execution(handler, &active, &task_id, self).await;
+                release_execution(&active, &task_id, self).await;
             }
         }
 
-        handler.tasks.changes.notify(&task_id);
+        active.task.notify();
     }
 
     /// Keep a nonterminal Task and hand unread accepted input to a new invocation.
@@ -476,7 +454,7 @@ impl TaskRuntime {
             .uncreated
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            if let Some(task) = active.snapshot().await {
+            if let Some(task) = active.snapshot() {
                 match handler.tasks.save(task, true).await {
                     Ok(_) => save_pending_push_config(active, handler, self).await,
                     Err(error) => {
@@ -485,7 +463,7 @@ impl TaskRuntime {
                 }
             }
         }
-        let snapshot = active.snapshot().await;
+        let snapshot = active.snapshot();
         let goes_on = snapshot
             .as_ref()
             .is_some_and(|task| !task.status.state.is_terminal());
@@ -498,10 +476,10 @@ impl TaskRuntime {
             Vec::new()
         };
         let (Some(snapshot), false) = (snapshot, unread.is_empty()) else {
-            release_execution(handler, active, task_id, self).await;
+            release_execution(active, task_id, self).await;
             return;
         };
-        self.release(handler, task_id, active).await;
+        self.release(active);
         if let Err(unread) =
             execution::start_next_turn(handler, task_id, snapshot, unread, self).await
         {
@@ -519,14 +497,12 @@ impl TaskRuntime {
         tracing::error!(task_id = %task_id, "the agent executor panicked; failing the task");
         let registered = self.execution.is_current(&active);
         if registered && active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
-            active
-                .publish(
-                    Err(&A2AError::internal("the agent failed unexpectedly")),
-                    None,
-                )
-                .await;
+            active.publish(
+                Err(&A2AError::internal("the agent failed unexpectedly")),
+                None,
+            );
         } else if registered
-            && let Some(base) = active.snapshot().await
+            && let Some(base) = active.snapshot()
             && !base.status.state.is_terminal()
         {
             // Unread input errors precede the terminal status which closes streams.
@@ -550,12 +526,12 @@ impl TaskRuntime {
                 .apply_and_publish(&active, Some(base), &mut event)
                 .await
             {
-                active.publish(Err(&error), None).await;
+                active.publish(Err(&error), None);
             }
         }
         // Identity-checked cleanup cannot unregister a successor invocation.
-        release_execution(handler, &active, &task_id, self).await;
-        handler.tasks.changes.notify(&task_id);
+        release_execution(&active, &task_id, self).await;
+        active.task.notify();
     }
 }
 
@@ -575,16 +551,15 @@ mod tests {
         let handler = make_handler();
         let mut runtime = TaskRuntime::default();
         let (old, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
-        runtime.release(&handler, "task", &old).await;
+        runtime.release(&old);
         let (next, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
-        let sequence = next.sequence().await;
+        let sequence = next.sequence();
         runtime
             .finished(&handler, "task".into(), old.clone(), TurnEnd::Stopped)
             .await;
         let action = runtime
             .output(
                 &handler,
-                "task".into(),
                 old,
                 StreamResponse::Task(task_with_history("task", "context", 0)),
             )
@@ -593,10 +568,10 @@ mod tests {
         assert!(matches!(action, OutputAction::Stopped));
         assert!(runtime.execution.is_current(&next));
         assert!(Arc::ptr_eq(
-            &handler.tasks.registry.get("task").await.unwrap(),
+            &handler.tasks.task("task").active().unwrap(),
             &next
         ));
-        assert_eq!(next.sequence().await, sequence);
+        assert_eq!(next.sequence(), sequence);
         assert!(handler.tasks.store().get("task").await.unwrap().is_none());
     }
 
@@ -606,9 +581,7 @@ mod tests {
         seed_task(&handler, "task", "context").await;
         let mut runtime = TaskRuntime::default();
         let (active, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
-        active
-            .set_snapshot(handler.tasks.load("task").await.unwrap())
-            .await;
+        active.set_snapshot(handler.tasks.load("task").await.unwrap());
         let plan = runtime
             .begin_cancel(
                 &handler,
@@ -633,11 +606,8 @@ mod tests {
                 ..
             }
         ));
-        assert!(handler.tasks.registry.get("task").await.is_none());
-        runtime
-            .cancel_finished(&handler, "task", None)
-            .await
-            .unwrap();
+        assert!(handler.tasks.task("task").active().is_none());
+        runtime.cancel_finished(&handler, None).await.unwrap();
         assert!(matches!(runtime.execution, ExecutionState::Idle));
         assert_eq!(
             handler.tasks.load("task").await.unwrap().status.state,
@@ -669,7 +639,7 @@ mod invalid_lifecycle_tests {
         );
         assert_eq!(
             runtime
-                .cancel_finished(&handler, "task", None)
+                .cancel_finished(&handler, None)
                 .await
                 .unwrap_err()
                 .message,
@@ -677,10 +647,10 @@ mod invalid_lifecycle_tests {
         );
         assert!(runtime.execution.is_current(&active));
         assert!(Arc::ptr_eq(
-            &handler.tasks.registry.get("task").await.unwrap(),
+            &handler.tasks.task("task").active().unwrap(),
             &active
         ));
-        runtime.release(&handler, "task", &active).await;
-        assert!(handler.tasks.registry.get("task").await.is_none());
+        runtime.release(&active);
+        assert!(handler.tasks.task("task").active().is_none());
     }
 }

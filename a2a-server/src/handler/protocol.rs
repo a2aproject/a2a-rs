@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Interpret request versions, response policies, and protocol errors.
 
-use super::delivery::request_task_id;
 use crate::middleware::ServiceParams;
 use crate::task_store::{apply_history_length, apply_timeline_length};
 use a2a::*;
@@ -63,15 +62,10 @@ pub(super) fn task_id_for_event(event: &StreamResponse) -> Option<&str> {
 }
 
 pub(super) fn should_interrupt_non_streaming(
-    req: &SendMessageRequest,
+    return_immediately: bool,
     event: &StreamResponse,
 ) -> Option<TaskId> {
-    if req
-        .configuration
-        .as_ref()
-        .and_then(|config| config.return_immediately)
-        .unwrap_or(false)
-    {
+    if return_immediately {
         return match event {
             StreamResponse::Message(_) => None,
             _ => task_id_for_event(event).map(ToOwned::to_owned),
@@ -95,11 +89,11 @@ pub(super) fn should_interrupt_non_streaming(
 /// carried out. A message the running agent will not take is reported as the
 /// task being busy, which is what these calls said before they could join a
 /// running turn.
-pub(super) fn unary_refusal(rejection: Rejection, request: &SendMessageRequest) -> A2AError {
+pub(super) fn unary_refusal(rejection: Rejection, task_id: Option<&str>) -> A2AError {
     match rejection {
         Rejection::Declined(reason) => A2AError::invalid_request(format!(
             "task execution is already in progress: {} ({reason})",
-            request_task_id(request).unwrap_or_default()
+            task_id.unwrap_or_default()
         )),
         Rejection::Failed(error) | Rejection::Interrupted(error) => error,
     }
@@ -192,6 +186,7 @@ pub(super) fn records_message(task: &Task, request: &StreamRequest) -> bool {
 
 #[cfg(test)]
 mod coverage_tests {
+    use super::super::response_preparation::ResponseOptions;
     use super::*;
     use crate::handler::test_support::{make_message, send_req};
 
@@ -240,7 +235,13 @@ mod coverage_tests {
             if_generation_match: None,
         });
         let reply = StreamResponse::Message(make_message());
-        assert_eq!(should_interrupt_non_streaming(&request, &reply), None);
+        assert_eq!(
+            should_interrupt_non_streaming(
+                ResponseOptions::from_request(&request).return_immediately,
+                &reply
+            ),
+            None
+        );
         assert_eq!(task_id_for_event(&reply), None);
     }
 
@@ -267,7 +268,7 @@ mod coverage_tests {
             Rejection::Declined("busy".into()).into_error().code,
             error_code::UNSUPPORTED_OPERATION
         );
-        let refusal = unary_refusal(Rejection::Declined("full".into()), &send_req(None, None));
+        let refusal = unary_refusal(Rejection::Declined("full".into()), None);
         assert_eq!(refusal.code, error_code::INVALID_REQUEST);
         assert!(refusal.message.contains("full"));
     }
@@ -302,11 +303,17 @@ mod coverage_tests {
         });
         let request = crate::handler::test_support::send_req(None, None);
         assert_eq!(
-            should_interrupt_non_streaming(&request, &StreamResponse::Task(task)),
+            should_interrupt_non_streaming(
+                ResponseOptions::from_request(&request).return_immediately,
+                &StreamResponse::Task(task)
+            ),
             Some("task".into())
         );
         assert_eq!(
-            should_interrupt_non_streaming(&request, &status),
+            should_interrupt_non_streaming(
+                ResponseOptions::from_request(&request).return_immediately,
+                &status
+            ),
             Some("task".into())
         );
     }
