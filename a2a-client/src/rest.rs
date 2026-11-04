@@ -33,6 +33,15 @@ fn segment(id: &str) -> PercentEncode<'_> {
     utf8_percent_encode(id, PATH_SEGMENT)
 }
 
+/// The proto's `/{tenant}/…` binding of `path` when the request names a
+/// tenant (§8.3.2): on HTTP+JSON the tenant travels in the path.
+fn tenant_path(tenant: Option<&str>, path: &str) -> String {
+    match tenant {
+        Some(tenant) if !tenant.is_empty() => format!("/{}{path}", segment(tenant)),
+        _ => path.to_owned(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RestErrorEnvelope {
     error: RestErrorStatus,
@@ -291,7 +300,8 @@ impl Transport for RestTransport {
         params: &ServiceParams,
         req: &SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        self.post_json(REST_SEND_MESSAGE_PATH, params, req).await
+        let path = tenant_path(req.tenant.as_deref(), REST_SEND_MESSAGE_PATH);
+        self.post_json(&path, params, req).await
     }
 
     async fn send_streaming_message(
@@ -299,8 +309,8 @@ impl Transport for RestTransport {
         params: &ServiceParams,
         req: &SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        self.post_streaming(REST_STREAM_MESSAGE_PATH, params, req)
-            .await
+        let path = tenant_path(req.tenant.as_deref(), REST_STREAM_MESSAGE_PATH);
+        self.post_streaming(&path, params, req).await
     }
 
     async fn get_task(
@@ -308,7 +318,10 @@ impl Transport for RestTransport {
         params: &ServiceParams,
         req: &GetTaskRequest,
     ) -> Result<Task, A2AError> {
-        let path = format!("/tasks/{}", segment(&req.id));
+        let path = tenant_path(
+            req.tenant.as_deref(),
+            &format!("/tasks/{}", segment(&req.id)),
+        );
         let mut query_parts = Vec::new();
         if let Some(hl) = req.history_length {
             query_parts.push(("historyLength".to_string(), hl.to_string()));
@@ -347,7 +360,8 @@ impl Transport for RestTransport {
         if let Some(ia) = req.include_artifacts {
             query_parts.push(("includeArtifacts".to_string(), ia.to_string()));
         }
-        self.get_json("/tasks", params, &query_parts).await
+        let path = tenant_path(req.tenant.as_deref(), "/tasks");
+        self.get_json(&path, params, &query_parts).await
     }
 
     async fn cancel_task(
@@ -355,7 +369,8 @@ impl Transport for RestTransport {
         params: &ServiceParams,
         req: &CancelTaskRequest,
     ) -> Result<Task, A2AError> {
-        self.post_json(&format!("/tasks/{}:cancel", segment(&req.id)), params, req)
+        let path = format!("/tasks/{}:cancel", segment(&req.id));
+        self.post_json(&tenant_path(req.tenant.as_deref(), &path), params, req)
             .await
     }
 
@@ -364,11 +379,13 @@ impl Transport for RestTransport {
         params: &ServiceParams,
         req: &SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let canonical_path = format!("/tasks/{}:subscribe", segment(&req.id));
+        let tenant = req.tenant.as_deref();
+        let canonical_path = tenant_path(tenant, &format!("/tasks/{}:subscribe", segment(&req.id)));
         match self.get_streaming(&canonical_path, params).await {
             Ok(stream) => Ok(stream),
             Err(err) if should_retry_subscribe_with_legacy_path(&err) => {
-                self.get_streaming(&format!("/tasks/{}/subscribe", segment(&req.id)), params)
+                let legacy_path = format!("/tasks/{}/subscribe", segment(&req.id));
+                self.get_streaming(&tenant_path(tenant, &legacy_path), params)
                     .await
             }
             Err(err) => Err(err),
@@ -382,7 +399,10 @@ impl Transport for RestTransport {
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let payload = self
             .post_value(
-                &format!("/tasks/{}/pushNotificationConfigs", segment(&req.task_id)),
+                &tenant_path(
+                    req.tenant.as_deref(),
+                    &format!("/tasks/{}/pushNotificationConfigs", segment(&req.task_id)),
+                ),
                 params,
                 req,
             )
@@ -397,10 +417,13 @@ impl Transport for RestTransport {
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let payload = self
             .get_value(
-                &format!(
-                    "/tasks/{}/pushNotificationConfigs/{}",
-                    segment(&req.task_id),
-                    segment(&req.id)
+                &tenant_path(
+                    req.tenant.as_deref(),
+                    &format!(
+                        "/tasks/{}/pushNotificationConfigs/{}",
+                        segment(&req.task_id),
+                        segment(&req.id)
+                    ),
                 ),
                 params,
                 &[],
@@ -424,7 +447,10 @@ impl Transport for RestTransport {
 
         let payload = self
             .get_value(
-                &format!("/tasks/{}/pushNotificationConfigs", segment(&req.task_id)),
+                &tenant_path(
+                    req.tenant.as_deref(),
+                    &format!("/tasks/{}/pushNotificationConfigs", segment(&req.task_id)),
+                ),
                 params,
                 &query_parts,
             )
@@ -438,10 +464,13 @@ impl Transport for RestTransport {
         req: &DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
         self.delete(
-            &format!(
-                "/tasks/{}/pushNotificationConfigs/{}",
-                segment(&req.task_id),
-                segment(&req.id)
+            &tenant_path(
+                req.tenant.as_deref(),
+                &format!(
+                    "/tasks/{}/pushNotificationConfigs/{}",
+                    segment(&req.task_id),
+                    segment(&req.id)
+                ),
             ),
             params,
         )
@@ -451,10 +480,10 @@ impl Transport for RestTransport {
     async fn get_extended_agent_card(
         &self,
         params: &ServiceParams,
-        _req: &GetExtendedAgentCardRequest,
+        req: &GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
-        self.get_json(REST_EXTENDED_AGENT_CARD_PATH, params, &[])
-            .await
+        let path = tenant_path(req.tenant.as_deref(), REST_EXTENDED_AGENT_CARD_PATH);
+        self.get_json(&path, params, &[]).await
     }
 
     async fn destroy(&self) -> Result<(), A2AError> {
@@ -655,6 +684,56 @@ mod tests {
             line.await.unwrap(),
             "POST /a2a/tasks/t%231%20%25:cancel HTTP/1.1"
         );
+    }
+
+    /// A request that names a tenant goes to the proto's `/{tenant}/…`
+    /// binding, its tenant percent-encoded like an id.
+    #[tokio::test]
+    async fn test_requests_with_a_tenant_use_the_tenant_path() {
+        let params = ServiceParams::new();
+        let tenant = Some("acme eu".to_string());
+
+        let (url, line) = spawn_request_line_server().await;
+        let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), url);
+        let req = GetTaskRequest {
+            id: "t1".into(),
+            history_length: None,
+            tenant: tenant.clone(),
+        };
+        let _ = transport.get_task(&params, &req).await;
+        assert_eq!(line.await.unwrap(), "GET /a2a/acme%20eu/tasks/t1 HTTP/1.1");
+
+        let (url, line) = spawn_request_line_server().await;
+        let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), url);
+        let req = DeleteTaskPushNotificationConfigRequest {
+            task_id: "t1".into(),
+            id: "c1".into(),
+            tenant: tenant.clone(),
+        };
+        let _ = transport.delete_push_config(&params, &req).await;
+        assert_eq!(
+            line.await.unwrap(),
+            "DELETE /a2a/acme%20eu/tasks/t1/pushNotificationConfigs/c1 HTTP/1.1"
+        );
+
+        let (url, line) = spawn_request_line_server().await;
+        let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), url);
+        let req = GetExtendedAgentCardRequest { tenant };
+        let _ = transport.get_extended_agent_card(&params, &req).await;
+        assert_eq!(
+            line.await.unwrap(),
+            "GET /a2a/acme%20eu/extendedAgentCard HTTP/1.1"
+        );
+
+        let (url, line) = spawn_request_line_server().await;
+        let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), url);
+        let req = GetTaskRequest {
+            id: "t1".into(),
+            history_length: None,
+            tenant: Some(String::new()),
+        };
+        let _ = transport.get_task(&params, &req).await;
+        assert_eq!(line.await.unwrap(), "GET /a2a/tasks/t1 HTTP/1.1");
     }
 
     #[test]
