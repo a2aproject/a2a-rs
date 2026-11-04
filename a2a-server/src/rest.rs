@@ -354,6 +354,9 @@ async fn handle_list_tasks<H: RequestHandler>(
     let params = extract_service_params(&headers);
     let status = match query.status {
         Some(s) => match serde_json::from_value::<TaskState>(serde_json::Value::String(s)) {
+            // The proto's default: no filter, as the JSON-RPC and gRPC
+            // bindings already read it.
+            Ok(TaskState::Unspecified) => None,
             Ok(state) => Some(state),
             Err(_) => {
                 return rest_error_response(A2AError::invalid_params("invalid status filter"));
@@ -1367,6 +1370,40 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `TASK_STATE_UNSPECIFIED` is the proto's default for an unset
+    /// `status`: no filter, as the other bindings treat it, not a filter
+    /// no task can match.
+    #[tokio::test]
+    async fn test_list_tasks_status_unspecified_is_no_filter() {
+        let app = make_app();
+        let body = serde_json::json!({
+            "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hello"}]}
+        });
+        let req = Request::builder()
+            .header("a2a-version", "1.0")
+            .uri(REST_SEND_MESSAGE_PATH)
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let req = Request::builder()
+            .header("a2a-version", "1.0")
+            .uri("/tasks?status=TASK_STATE_UNSPECIFIED")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["totalSize"], 1, "{payload}");
     }
 
     #[tokio::test]
