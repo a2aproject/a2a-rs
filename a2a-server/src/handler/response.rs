@@ -1,14 +1,13 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Follow task output with a shared runner and an explicit completion policy.
+//! Follow task output with a shared runner and shared response settings.
 
+#[cfg(test)]
 use super::delivery::StartMode;
 use super::http_exchange::RegistrationLease;
-use super::protocol::{
-    Rejection, generation_of, is_terminal_event, should_interrupt_non_streaming,
-};
-use super::response_preparation::{DeliveryAttachment, SubscriptionPolicy};
+use super::protocol::{Rejection, generation_of};
+use super::response_preparation::{DeliveryAttachment, ResponseSettings};
 use super::task_handle::TaskHandle;
 use super::uplink::{Incoming, IncomingRequest, Receipt, Uplink};
 use super::{DefaultRequestHandler, RESPONSE_BUFFER_CAPACITY};
@@ -38,18 +37,7 @@ pub(super) struct Run {
     pub(super) params: ServiceParams,
     /// The task whose execution and updates this response follows.
     pub(super) task: TaskHandle,
-    pub(super) completion: RunCompletion,
-    policy: SubscriptionPolicy,
-}
-
-/// When a response has observed enough of the task to finish.
-pub(super) enum RunCompletion {
-    /// Follow task updates across execution turns until the task is terminal.
-    Task,
-    /// Finish at the unary request's return condition, including interruptions.
-    Unary { return_immediately: bool },
-    /// Follow later turns while the uplink remains open.
-    Exchange,
+    settings: ResponseSettings,
 }
 
 pub(super) type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
@@ -60,8 +48,7 @@ impl Run {
         handler: DefaultRequestHandler,
         params: ServiceParams,
         task: TaskHandle,
-        completion: RunCompletion,
-        policy: SubscriptionPolicy,
+        settings: ResponseSettings,
     ) -> Self {
         Self {
             registration: None,
@@ -69,8 +56,7 @@ impl Run {
             handler,
             params,
             task,
-            completion,
-            policy,
+            settings,
         }
     }
 
@@ -130,14 +116,7 @@ impl Run {
     }
 
     fn completes(&self, event: &StreamResponse) -> bool {
-        is_terminal_event(event)
-            || matches!(event, StreamResponse::Message(_))
-            || match &self.completion {
-                RunCompletion::Unary { return_immediately } => {
-                    should_interrupt_non_streaming(*return_immediately, event).is_some()
-                }
-                _ => false,
-            }
+        self.settings.completes(event)
     }
 
     /// Forward one event, keeping generation tracking and response completion
@@ -207,7 +186,7 @@ impl Run {
                             // The execution is over. The task may not be: the
                             // exchange stays open for the next message.
                             inner = None;
-                            if matches!(self.completion, RunCompletion::Exchange) && !uplink_open {
+                            if self.settings.is_live() && !uplink_open {
                                 break;
                             }
                             // Watch registration predates this read, so a turn or
@@ -221,7 +200,7 @@ impl Run {
                     // Nothing is running that this exchange follows: it watches the
                     // task, so another client's turn, or a cancel, reaches it too.
                     () = watch.changed(), if inner.is_none() ||
-                        (matches!(self.completion, RunCompletion::Exchange) && !uplink_open) => {
+                        (self.settings.is_live() && !uplink_open) => {
                         if inner.is_some() && !uplink_open
                             && self.task.active().is_none()
                         {
@@ -289,7 +268,7 @@ impl Run {
             let opening =
                 (snapshot.generation > *last_generation || ends).then_some(snapshot.clone());
             *last_generation = (*last_generation).max(snapshot.generation);
-            *inner = Some(self.policy.stream(receiver, opening, sequence));
+            *inner = Some(self.settings.stream(receiver, opening, sequence));
             return Reattach::Changed;
         }
         let task = match self.handler.tasks.load(self.task.id()).await {
@@ -385,10 +364,10 @@ impl Run {
             .handler
             .receive_message(
                 &self.params,
-                request,
-                StartMode::Bidi,
+                request.into_message()?,
+                self.settings.mode(),
                 Some(self.task.id()),
-                self.policy.response_id(),
+                self.settings.response_id(),
             )
             .await?;
         // The source belongs to the Task, so this subscription also receives
@@ -397,13 +376,15 @@ impl Run {
         if inner.is_some() {
             return Ok(true);
         }
-        let subscription = self.policy.delivery(delivery, DeliveryAttachment::FollowUp);
+        let subscription = self
+            .settings
+            .delivery(delivery, DeliveryAttachment::FollowUp);
         *inner = Some(subscription.events);
         // This response was detached when input was published. Announce the
         // recorded input once; the newly attached receiver starts after it.
         for event in subscription.recorded {
             if matches!(event, StreamResponse::MessageUpdate(_))
-                && !self.policy.wants_message_updates()
+                && !self.settings.wants_message_updates()
             {
                 continue;
             }
@@ -438,10 +419,7 @@ mod tests {
             handler.clone(),
             ServiceParams::new(),
             handler.tasks.task("working"),
-            RunCompletion::Unary {
-                return_immediately: false,
-            },
-            SubscriptionPolicy::new(StartMode::Blocking, false),
+            ResponseSettings::new(StartMode::Blocking, false),
         );
         let events = run.start(None, Some(events), 0);
         let tasks = handler.tasks.clone();
@@ -487,13 +465,6 @@ mod tests {
         seed_task(&handler, "task", "context").await;
         let task = handler.tasks.load("task").await.unwrap();
         for mode in [StartMode::Blocking, StartMode::Streaming, StartMode::Bidi] {
-            let completion = || match mode {
-                StartMode::Blocking => RunCompletion::Unary {
-                    return_immediately: false,
-                },
-                StartMode::Streaming => RunCompletion::Task,
-                StartMode::Bidi => RunCompletion::Exchange,
-            };
             let events = || -> Events {
                 futures::stream::iter(
                     [
@@ -517,8 +488,7 @@ mod tests {
                 handler.clone(),
                 ServiceParams::new(),
                 handler.tasks.task("task"),
-                completion(),
-                SubscriptionPolicy::new(mode, false),
+                ResponseSettings::new(mode, false),
             )
             .start(None, Some(events()), 0);
             let normal = tokio::time::timeout(Duration::from_secs(2), normal.collect::<Vec<_>>())
@@ -528,8 +498,7 @@ mod tests {
                 handler.clone(),
                 ServiceParams::new(),
                 handler.tasks.task("task"),
-                completion(),
-                SubscriptionPolicy::new(mode, false),
+                ResponseSettings::new(mode, false),
             );
             let (out, mut received) = mpsc::channel(8);
             let mut generation = 0;
@@ -555,8 +524,7 @@ mod tests {
             handler.clone(),
             ServiceParams::new(),
             handler.tasks.task("task"),
-            RunCompletion::Exchange,
-            SubscriptionPolicy::new(StartMode::Bidi, false),
+            ResponseSettings::new(StartMode::Bidi, false),
         );
         let mut events = Some(
             futures::stream::iter([
@@ -589,8 +557,7 @@ mod tests {
                 handler.clone(),
                 ServiceParams::new(),
                 handler.tasks.task("task"),
-                RunCompletion::Task,
-                SubscriptionPolicy::new(StartMode::Streaming, false),
+                ResponseSettings::new(StartMode::Streaming, false),
             )
             .start(None, None, 0);
             let event = timeout(Duration::from_secs(1), events.next())
@@ -642,8 +609,7 @@ mod tests {
             handler.clone(),
             ServiceParams::new(),
             handler.tasks.task(&task.id),
-            RunCompletion::Task,
-            SubscriptionPolicy::new(StartMode::Streaming, false),
+            ResponseSettings::new(StartMode::Streaming, false),
         )
         .start(None, None, 0);
         assert!(
@@ -688,8 +654,7 @@ mod delivery_tests {
                 handler.clone(),
                 ServiceParams::new(),
                 handler.tasks.task("task"),
-                RunCompletion::Task,
-                SubscriptionPolicy::new(StartMode::Streaming, false),
+                ResponseSettings::new(StartMode::Streaming, false),
             )
         };
         let panic_stream = stream::once(async { panic!("private runner detail") }).boxed();

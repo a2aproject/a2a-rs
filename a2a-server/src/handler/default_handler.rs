@@ -3,18 +3,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Default request-handler state, configuration, operations, and tests.
 
-use super::delivery::{AuthorizedMessage, Delivery, StartMode, is_artifact_only, request_task_id};
-use super::http_exchange::{self, HttpOpening, RegistrationLease};
-use super::protocol::{
-    Rejection, apply_lengths, is_at_least_1_1, requested_protocol_version, unary_refusal,
+use super::delivery::{
+    AuthorizedMessage, Delivery, MessageInput, StartMode, is_artifact_only, request_task_id,
 };
+use super::http_exchange::{self, HttpOpening, RegistrationLease};
+use super::protocol::{Rejection, apply_lengths, requested_protocol_version, unary_refusal};
 use super::push_delivery::PushService;
-use super::response::{Events, Run, RunCompletion};
-use super::response_preparation::{MessageResponse, PreparedResponse, ResponseOptions};
-use super::response_preparation::{SubscriptionAttachment, SubscriptionPolicy};
+use super::response::{Events, Run};
+use super::response_preparation::{MessageResponse, PreparedResponse};
+use super::response_preparation::{ResponseSettings, SubscriptionAttachment};
 use super::task_handle::TaskHandle;
 use super::task_service::TaskService;
-use super::uplink::{IncomingRequest, LiveSessions, Uplink};
+use super::uplink::{HttpLiveResponses, IncomingRequest, Uplink};
 
 use crate::middleware::{ServiceParams, User};
 use crate::pagination::resolve_page_size;
@@ -47,7 +47,7 @@ pub struct DefaultRequestHandler {
     extended_agent_card: Option<Arc<dyn ExtendedAgentCardResolver>>,
     long_poll_timeout: Duration,
     pub(super) cancel_hook_timeout: Duration,
-    pub(super) live: Arc<LiveSessions>,
+    pub(super) http_live_responses: Arc<HttpLiveResponses>,
 }
 
 impl DefaultRequestHandler {
@@ -62,7 +62,7 @@ impl DefaultRequestHandler {
             extended_agent_card: None,
             long_poll_timeout: DEFAULT_LONG_POLL_TIMEOUT,
             cancel_hook_timeout: DEFAULT_CANCEL_HOOK_TIMEOUT,
-            live: Arc::new(LiveSessions::default()),
+            http_live_responses: Arc::new(HttpLiveResponses::default()),
         }
     }
 
@@ -296,14 +296,10 @@ impl DefaultRequestHandler {
         &self,
         params: &ServiceParams,
         request: SendMessageRequest,
+        settings: ResponseSettings,
     ) -> Result<MessageResponse, A2AError> {
         let prepared = self
-            .prepare_message(
-                params,
-                IncomingRequest::message(request),
-                StartMode::Blocking,
-                None,
-            )
+            .prepare_message(params, MessageInput::Raw(request), settings)
             .await?;
         let task = prepared.task.clone();
         let events = self.response_stream(params, prepared, None, None);
@@ -325,29 +321,17 @@ impl DefaultRequestHandler {
             first = uplink.next() => first
                 .ok_or_else(|| A2AError::invalid_request("a response needs a first request"))?,
         };
-        let response_id = Some(uuid::Uuid::now_v7());
         let prepared = match first.request {
-            input @ (IncomingRequest::Authorized(_)
-            | IncomingRequest::Raw(StreamRequest {
-                payload: StreamRequestPayload::SendMessage(_),
-                ..
-            })) => {
-                self.prepare_message(params, input, StartMode::Bidi, response_id)
-                    .await?
+            IncomingRequest::Message(input) => {
+                let settings = ResponseSettings::message(StartMode::Bidi, params, input.request());
+                self.prepare_message(params, *input, settings).await?
             }
-            IncomingRequest::Raw(StreamRequest {
-                payload: StreamRequestPayload::Subscribe(request),
-                ..
-            }) => {
+            IncomingRequest::Subscribe(request) => {
                 let attachment = self.attach_subscription(params, request).await?;
-                let policy = SubscriptionPolicy::new(
-                    StartMode::Bidi,
-                    is_at_least_1_1(&requested_protocol_version(params)),
-                )
-                .for_response(response_id);
-                PreparedResponse::subscription(attachment, RunCompletion::Exchange, policy)
+                let settings = ResponseSettings::subscription(StartMode::Bidi, params);
+                PreparedResponse::subscription(attachment, settings)
             }
-            _ => {
+            IncomingRequest::Invalid => {
                 return Err(A2AError::invalid_request(
                     "unrecognised StreamRequest payload",
                 ));
@@ -368,8 +352,7 @@ impl DefaultRequestHandler {
             self.clone(),
             params.clone(),
             prepared.task,
-            prepared.completion,
-            prepared.policy,
+            prepared.settings,
         )
         .with_uplink(uplink, registration)
         .start(prepared.opening, prepared.events, prepared.seen_generation)
@@ -379,26 +362,18 @@ impl DefaultRequestHandler {
     async fn prepare_message(
         &self,
         params: &ServiceParams,
-        input: IncomingRequest,
-        mode: StartMode,
-        response_id: Option<uuid::Uuid>,
+        input: MessageInput,
+        settings: ResponseSettings,
     ) -> Result<PreparedResponse, A2AError> {
-        let request = input
-            .send_request()
-            .ok_or_else(|| A2AError::invalid_request("expected a SendMessage request"))?;
-        let options = ResponseOptions::from_request(request);
-        let requested_task = request_task_id(request);
+        let requested_task = request_task_id(input.request());
         let delivery = self
-            .receive_message(params, input, mode, None, response_id)
+            .receive_message(params, input, settings.mode(), None, settings.response_id())
             .await
-            .map_err(|rejection| match mode {
+            .map_err(|rejection| match settings.mode() {
                 StartMode::Bidi => rejection.into_error(),
                 _ => unary_refusal(rejection, requested_task.as_deref()),
             })?;
-        let policy =
-            SubscriptionPolicy::new(mode, is_at_least_1_1(&requested_protocol_version(params)))
-                .for_response(response_id);
-        Ok(PreparedResponse::message(options, delivery, mode, policy))
+        Ok(PreparedResponse::message(delivery, settings))
     }
 
     /// Bind and authorize each message once, using its caller rather than
@@ -407,33 +382,13 @@ impl DefaultRequestHandler {
     pub(super) fn authorize_message(
         &self,
         params: &ServiceParams,
-        input: IncomingRequest,
+        mut input: MessageInput,
         bound_task: Option<&str>,
     ) -> Result<AuthorizedMessage, Rejection> {
-        let (mut request, authorized) = match input {
-            IncomingRequest::Authorized(message) => (
-                message.request,
-                Some((message.params, message.user, message.response_id)),
-            ),
-            IncomingRequest::Raw(StreamRequest {
-                payload: StreamRequestPayload::SendMessage(request),
-                ..
-            }) => (request, None),
-            IncomingRequest::Raw(StreamRequest {
-                payload: StreamRequestPayload::Subscribe(_),
-                ..
-            }) => {
-                return Err(A2AError::invalid_request(
-                    "subscribe is only valid as the first request of a stream",
-                )
-                .into());
-            }
-            _ => {
-                return Err(A2AError::invalid_request("unrecognised StreamRequest payload").into());
-            }
-        };
+        // Bind before authorization so native follow-ups check the inferred task.
         if let Some(bound) = bound_task {
-            match request_task_id(&request) {
+            let request = input.request_mut();
+            match request_task_id(request) {
                 Some(named) if named != bound => {
                     return Err(A2AError::invalid_params(format!(
                         "this stream is bound to task {bound}, not {named}"
@@ -444,28 +399,26 @@ impl DefaultRequestHandler {
                 None => request.message.task_id = Some(bound.to_string()),
             }
         }
-        if let Some((params, user, response_id)) = authorized {
-            return Ok(AuthorizedMessage {
-                request,
-                params,
-                user,
-                response_id,
-            });
+        match input {
+            // HTTP routing already checked this caller. Keep its credentials.
+            MessageInput::Authorized(message) => Ok(message),
+            MessageInput::Raw(request) => {
+                self.authorize(params, request_task_id(&request).as_deref())?;
+                Ok(AuthorizedMessage {
+                    request,
+                    params: params.clone(),
+                    user: self.authenticated_user(params)?,
+                    response_id: None,
+                })
+            }
         }
-        self.authorize(params, request_task_id(&request).as_deref())?;
-        Ok(AuthorizedMessage {
-            request,
-            params: params.clone(),
-            user: self.authenticated_user(params)?,
-            response_id: None,
-        })
     }
 
     /// The message gateway for unary, server-streaming, and every live input.
     pub(super) async fn receive_message(
         &self,
         params: &ServiceParams,
-        input: IncomingRequest,
+        input: MessageInput,
         mode: StartMode,
         bound_task: Option<&str>,
         response_id: Option<uuid::Uuid>,
@@ -556,12 +509,11 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        let options = ResponseOptions::from_request(&req);
-
-        let mut response = match self.send(params, req).await? {
+        let settings = ResponseSettings::message(StartMode::Blocking, params, &req);
+        let mut response = match self.send(params, req, settings).await? {
             MessageResponse::Message(message) => SendMessageResponse::Message(message),
             MessageResponse::Task(task) => {
-                if !options.return_immediately {
+                if !settings.return_immediately() {
                     task.wait().await?
                 } else {
                     SendMessageResponse::Task(task.snapshot().await?)
@@ -569,7 +521,7 @@ impl RequestHandler for DefaultRequestHandler {
             }
         };
         if let SendMessageResponse::Task(task) = &mut response {
-            options.trim(task);
+            settings.trim(task);
         }
         Ok(response)
     }
@@ -579,21 +531,16 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let options = ResponseOptions::from_request(&req);
+        let settings = ResponseSettings::message(StartMode::Streaming, params, &req);
         self.require_streaming()?;
         let prepared = self
-            .prepare_message(
-                params,
-                IncomingRequest::message(req),
-                StartMode::Streaming,
-                None,
-            )
+            .prepare_message(params, MessageInput::Raw(req), settings)
             .await?;
         let events = self.response_stream(params, prepared, None, None);
         Ok(Box::pin(events.map(move |item| {
             item.map(|mut event| {
                 if let StreamResponse::Task(task) = &mut event {
-                    options.trim(task);
+                    settings.trim(task);
                 }
                 event
             })
@@ -696,11 +643,8 @@ impl RequestHandler for DefaultRequestHandler {
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let attachment = self.attach_subscription(params, req).await?;
-        let policy = SubscriptionPolicy::new(
-            StartMode::Streaming,
-            is_at_least_1_1(&requested_protocol_version(params)),
-        );
-        let prepared = PreparedResponse::subscription(attachment, RunCompletion::Task, policy);
+        let settings = ResponseSettings::subscription(StartMode::Streaming, params);
+        let prepared = PreparedResponse::subscription(attachment, settings);
         Ok(self.response_stream(params, prepared, None, None))
     }
 
@@ -2985,7 +2929,7 @@ mod tests {
                 handler
                     .receive_message(
                         &params,
-                        IncomingRequest::Raw(request),
+                        IncomingRequest::from(request).into_message().unwrap(),
                         StartMode::Bidi,
                         Some(&task.id),
                         None
@@ -3005,7 +2949,7 @@ mod tests {
         let refusal = handler
             .receive_message(
                 &params,
-                IncomingRequest::Raw(request),
+                IncomingRequest::from(request).into_message().unwrap(),
                 StartMode::Bidi,
                 Some(&task.id),
                 None,
@@ -3074,7 +3018,6 @@ mod tests {
 
     #[test]
     fn subscriptions_and_unknown_payloads_are_rejected_as_live_follow_ups() {
-        let handler = make_handler();
         for payload in [
             StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
                 id: "task".into(),
@@ -3083,15 +3026,13 @@ mod tests {
             }),
             StreamRequestPayload::Unrecognised,
         ] {
-            let input = IncomingRequest::Raw(StreamRequest {
+            let error = IncomingRequest::from(StreamRequest {
                 tenant: None,
                 payload,
-            });
-            let error = handler
-                .authorize_message(&ServiceParams::new(), input, Some("task"))
-                .err()
-                .expect("not a message")
-                .into_error();
+            })
+            .into_message()
+            .err()
+            .expect("not a message");
             assert_eq!(error.code, error_code::INVALID_REQUEST);
         }
     }
@@ -3308,10 +3249,7 @@ mod tests {
             handler
                 .receive_message(
                     &params,
-                    IncomingRequest::Raw(StreamRequest {
-                        tenant: None,
-                        payload: StreamRequestPayload::SendMessage(request)
-                    }),
+                    MessageInput::Raw(request),
                     StartMode::Bidi,
                     Some(&task.id),
                     None
@@ -4631,13 +4569,13 @@ mod shutdown_tests {
         let handle = handler.tasks.task(&task.id);
         let active = Arc::downgrade(&handle.active().unwrap());
         let queue = Arc::downgrade(&handle.operations());
-        assert!(!handler.live.open.read().is_empty());
+        assert!(!handler.http_live_responses.open.read().is_empty());
         timeout(Duration::from_secs(2), handler.shutdown())
             .await
             .unwrap();
         assert!(active.upgrade().is_none());
         assert!(queue.upgrade().is_none());
-        assert!(handler.live.open.read().is_empty());
+        assert!(handler.http_live_responses.open.read().is_empty());
         timeout(Duration::from_secs(1), events.collect::<Vec<_>>())
             .await
             .unwrap();
