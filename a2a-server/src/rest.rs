@@ -145,6 +145,10 @@ pub fn rest_router<H: RequestHandler>(handler: Arc<H>) -> axum::Router {
             "/{tenant}/message:stream",
             axum::routing::post(handle_stream_message::<H>),
         )
+        .route(
+            "/{tenant}/message:live",
+            axum::routing::post(handle_live_message::<H>),
+        )
         // The proto binds `:subscribe` to GET only; POST `:subscribe` is the
         // legacy alias of the plain route, kept here too because
         // `handle_post_task_action` serves `:cancel` and `:subscribe` alike.
@@ -305,18 +309,34 @@ async fn handle_stream_message<H: RequestHandler>(
 /// the task as it stands.
 async fn handle_live_message<H: RequestHandler>(
     State(state): State<RestState<H>>,
+    tenant: Option<Path<String>>,
     headers: HeaderMap,
     Json(raw_req): Json<Value>,
 ) -> impl IntoResponse {
-    let req = match protojson_conv::from_value::<StreamRequest>(raw_req) {
+    let mut req = match protojson_conv::from_value::<StreamRequest>(raw_req) {
         Ok(req) => req,
         Err(e) => return rest_payload_error_response(e),
     };
+    req.tenant = match reconcile_tenant(tenant.map(|Path(tenant)| tenant), req.tenant.take()) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
+    // The live envelope and its nested request carry the same routing tenant.
+    let inner_tenant = match &mut req.payload {
+        StreamRequestPayload::SendMessage(message) => Some(&mut message.tenant),
+        StreamRequestPayload::Subscribe(request) => Some(&mut request.tenant),
+        _ => None,
+    };
+    if let Some(inner_tenant) = inner_tenant {
+        req.tenant = match reconcile_tenant(req.tenant.take(), inner_tenant.take()) {
+            Ok(tenant) => tenant,
+            Err(response) => return *response,
+        };
+        *inner_tenant = req.tenant.clone();
+    }
     let params = extract_service_params(&headers);
     match state.handler.send_live_request(&params, req).await {
-        Ok(LiveResponse::Stream(stream)) => {
-            rest_sse(protojson_stream(stream))
-        }
+        Ok(LiveResponse::Stream(stream)) => rest_sse(protojson_stream(stream)),
         Ok(LiveResponse::Ack(task)) => protojson_json_response(&*task),
         Err(e) => rest_error_response(e),
     }
@@ -2162,6 +2182,84 @@ mod tests {
             .unwrap();
         let resp = make_app().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn live_tenant_paths_reconcile_the_envelope_and_nested_request() {
+        for subscribe in [false, true] {
+            for (path, outer, inner, expected, rejected) in [
+                ("/message:live", None, None, None, false),
+                ("/acme/message:live", None, None, Some("acme"), false),
+                (
+                    "/acme%20eu/message:live",
+                    None,
+                    None,
+                    Some("acme eu"),
+                    false,
+                ),
+                (
+                    "/acme/message:live",
+                    Some("acme"),
+                    Some("acme"),
+                    Some("acme"),
+                    false,
+                ),
+                ("/acme/message:live", Some("other"), None, None, true),
+                ("/acme/message:live", None, Some("other"), None, true),
+                ("/message:live", Some("body"), None, Some("body"), false),
+                ("/message:live", None, Some("body"), Some("body"), false),
+                ("/message:live", Some("body"), Some("other"), None, true),
+                ("/%FF/message:live", None, None, None, true),
+            ] {
+                let (handler, _) = CapturingHandler::new();
+                let app = rest_router(handler.clone());
+                let mut payload = if subscribe {
+                    serde_json::json!({"id":"task"})
+                } else {
+                    serde_json::json!({"message":{"messageId":"m1","role":"ROLE_USER","parts":[{"text":"hello"}]}})
+                };
+                if let Some(inner) = inner {
+                    payload["tenant"] = inner.into();
+                }
+                let mut body = serde_json::json!({});
+                body[if subscribe {
+                    "subscribe"
+                } else {
+                    "sendMessage"
+                }] = payload;
+                if let Some(outer) = outer {
+                    body["tenant"] = outer.into();
+                }
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("A2A-Version", "1.1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                let response = app.oneshot(request).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    if rejected {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::OK
+                    },
+                    "{path} {body}"
+                );
+                let expected = (!rejected).then(|| expected.map(str::to_owned));
+                assert_eq!(
+                    handler.take_tenant("send_live_request"),
+                    expected,
+                    "{path} {body}"
+                );
+                assert_eq!(
+                    handler.take_tenant("live_payload"),
+                    expected,
+                    "{path} {body}"
+                );
+            }
+        }
     }
 
     /// Every method is served on its proto `/{tenant}/…` binding as well, and
