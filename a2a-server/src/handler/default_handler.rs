@@ -1182,7 +1182,6 @@ mod tests {
             .unwrap();
     }
 
-
     #[tokio::test]
     async fn test_extended_agent_card_not_configured() {
         let handler = make_handler();

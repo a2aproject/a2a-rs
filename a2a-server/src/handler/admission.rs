@@ -5,10 +5,11 @@
 
 use super::DefaultRequestHandler;
 use super::delivery::{
-    AuthorizedMessage, Delivery, is_artifact_only, record_client_input, validate_existing_task,
+    AuthorizedMessage, Delivery, RecordedInput, is_artifact_only, record_client_input,
+    validate_existing_task,
 };
 use super::{events::ActiveExecution, execution::InvocationState, protocol::Rejection};
-use crate::ClientInput;
+use crate::{ClientInput, executor::QueuedInput};
 use a2a::*;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -85,70 +86,96 @@ pub(super) async fn inject_input(
     active: &Arc<ActiveExecution>,
     invocation: &mut InvocationState,
 ) -> Result<Delivery, Rejection> {
-    let (params, request) = (&message.params, &message.request);
-    // A task the executor has not created yet is not one a client can know.
-    if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(Rejection::Failed(A2AError::task_not_found(task_id)));
-    }
-    let Some(base) = active.snapshot() else {
-        return Err(Rejection::Failed(A2AError::internal(
-            "a running execution has no task",
-        )));
-    };
-    validate_existing_task(&base, request)?;
-    let artifact_only = is_artifact_only(request);
-    // Room for the message is secured before anything is changed, so a
-    // message the executor cannot take is declined with nothing recorded.
-    let permit =
-        if artifact_only {
-            None
-        } else {
-            Some(active.inputs.sender.clone().try_reserve_owned().map_err(
-                |refusal| match refusal {
-                    mpsc::error::TrySendError::Full(_) => {
-                        Rejection::Declined("the agent is busy with earlier input".to_string())
-                    }
-                    // Closing and unregistering are one task operation.
-                    mpsc::error::TrySendError::Closed(_) => Rejection::Failed(A2AError::internal(
-                        "the input queue of a registered execution is closed",
-                    )),
-                },
-            )?)
-        };
+    // Secure delivery capacity before recording anything in the store.
+    let (task, permit) = validate_and_reserve_input(active, &message.request, task_id)?;
 
-    let mut task = base;
-    let recorded = record_client_input(&mut task, request, false)?;
-    let events = recorded.events;
-    // Admit configuration before committing input: a rejected configuration
-    // must not leave a recorded message that no executor will receive.
+    // Configuration must be accepted before the input is committed.
+    let (task, recorded) = persist_input(handler, message, task_id, task).await?;
+
+    // Publish the complete batch before handing the message to user code.
+    let delivery = publish_input(active, task, &recorded.events);
+    deliver_input(permit, recorded.message_generation, message, invocation);
+    Ok(delivery)
+}
+
+type InputPermit = mpsc::OwnedPermit<QueuedInput>;
+
+fn validate_and_reserve_input(
+    active: &Arc<ActiveExecution>,
+    request: &SendMessageRequest,
+    task_id: &str,
+) -> Result<(Task, Option<InputPermit>), Rejection> {
+    if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(A2AError::task_not_found(task_id).into());
+    }
+    let task = active
+        .snapshot()
+        .ok_or_else(|| A2AError::internal("a running execution has no task"))?;
+    validate_existing_task(&task, request)?;
+    if is_artifact_only(request) {
+        return Ok((task, None));
+    }
+    let permit =
+        active
+            .inputs
+            .sender
+            .clone()
+            .try_reserve_owned()
+            .map_err(|refusal| match refusal {
+                mpsc::error::TrySendError::Full(_) => {
+                    Rejection::Declined("the agent is busy with earlier input".to_string())
+                }
+                // Closing and unregistering are serialized in the same task queue.
+                mpsc::error::TrySendError::Closed(_) => Rejection::Failed(A2AError::internal(
+                    "the input queue of a registered execution is closed",
+                )),
+            })?;
+    Ok((task, Some(permit)))
+}
+
+async fn persist_input(
+    handler: &DefaultRequestHandler,
+    message: &AuthorizedMessage,
+    task_id: &str,
+    mut task: Task,
+) -> Result<(Task, RecordedInput), A2AError> {
+    let recorded = record_client_input(&mut task, &message.request, false)?;
     handler
-        .save_request_push_config(params, task_id, request)
+        .save_request_push_config(&message.params, task_id, &message.request)
         .await?;
     let task = handler.tasks.save(task, false).await?;
+    Ok((task, recorded))
+}
 
+fn publish_input(active: &Arc<ActiveExecution>, task: Task, events: &[StreamResponse]) -> Delivery {
     let sequence_before = active.sequence();
     let receiver = active.subscribe();
-    active.publish_input(task.clone(), &events);
-    let sequence_after = active.sequence();
-    if let Some(permit) = permit {
-        let input = ClientInput::received(
-            request,
-            recorded
-                .message_generation
-                .expect("a reserved input has a message"),
-            message.user.clone(),
-            params,
-            message.response_id,
-        );
-        permit.send(invocation.track_input(input));
-    }
-
-    Ok(Delivery::Injected {
+    active.publish_input(task.clone(), events);
+    Delivery::Injected {
         task,
         receiver,
         sequence_before,
-        sequence_after,
-    })
+        sequence_after: active.sequence(),
+    }
+}
+
+fn deliver_input(
+    permit: Option<InputPermit>,
+    message_generation: Option<i64>,
+    message: &AuthorizedMessage,
+    invocation: &mut InvocationState,
+) {
+    let Some(permit) = permit else {
+        return;
+    };
+    let input = ClientInput::received(
+        &message.request,
+        message_generation.expect("a reserved input has a message"),
+        message.user.clone(),
+        &message.params,
+        message.response_id,
+    );
+    permit.send(invocation.track_input(input));
 }
 
 #[cfg(test)]
