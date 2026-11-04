@@ -95,6 +95,17 @@ impl DefaultRequestHandler {
         self.tasks.restart_tasks(self.clone()).await
     }
 
+    /// Stop SDK-owned workers and wait until their futures have been dropped.
+    ///
+    /// Shutdown applies to every clone and is permanent. Stop accepting transport
+    /// requests first. Active responses close and persisted tasks keep their last
+    /// committed state for optional recovery. Application-spawned executor tasks
+    /// remain the application's responsibility. This is cooperative: user futures
+    /// must yield rather than block Tokio's worker threads.
+    pub async fn shutdown(&self) {
+        self.tasks.workers.shutdown().await;
+    }
+
     /// Bounds how long a `GetTask` carrying `currentGeneration` is held open
     /// when the task does not advance. The request then returns the current
     /// state, which the spec allows.
@@ -151,6 +162,7 @@ impl DefaultRequestHandler {
         params: &ServiceParams,
         task_id: Option<&str>,
     ) -> Result<(), A2AError> {
+        self.tasks.workers.check_running()?;
         if let Some(authorizer) = &self.authorizer {
             authorizer.authorize(params, task_id)?;
         }
@@ -262,6 +274,7 @@ impl DefaultRequestHandler {
     }
 
     fn require_streaming(&self) -> Result<(), A2AError> {
+        self.tasks.workers.check_running()?;
         Self::require_capability(self.capabilities.streaming, || {
             A2AError::unsupported_operation("the agent card does not declare streaming")
         })
@@ -315,10 +328,14 @@ impl DefaultRequestHandler {
         mut uplink: Uplink,
         registration: Option<RegistrationLease>,
     ) -> Result<Events, A2AError> {
-        let first = uplink
-            .next()
-            .await
-            .ok_or_else(|| A2AError::invalid_request("a response needs a first request"))?;
+        let first = tokio::select! {
+            biased;
+            () = self.tasks.workers.cancelled() => {
+                return Err(A2AError::internal("handler is shutting down"));
+            }
+            first = uplink.next() => first
+                .ok_or_else(|| A2AError::invalid_request("a response needs a first request"))?,
+        };
         let response_id = Some(uuid::Uuid::now_v7());
         let prepared = match first.request {
             input @ (IncomingRequest::Authorized(_)
@@ -4595,5 +4612,89 @@ mod upstream_regressions {
 
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn shutdown_releases_execution_queues_responses_and_http_registrations() {
+        let (handler, _release) = make_resumable_handler();
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::SendMessage(send_req(None, None)),
+        };
+        let LiveResponse::Stream(mut events) = handler
+            .send_live_request(&ServiceParams::new(), request)
+            .await
+            .unwrap()
+        else {
+            panic!("expected live stream");
+        };
+        let StreamResponse::Task(task) = events.next().await.unwrap().unwrap() else {
+            panic!("task");
+        };
+        let handle = handler.tasks.task(&task.id);
+        let active = Arc::downgrade(&handle.active().unwrap());
+        let queue = Arc::downgrade(&handle.operations());
+        assert!(!handler.live.open.read().is_empty());
+        timeout(Duration::from_secs(2), handler.shutdown())
+            .await
+            .unwrap();
+        assert!(active.upgrade().is_none());
+        assert!(queue.upgrade().is_none());
+        assert!(handler.live.open.read().is_empty());
+        timeout(Duration::from_secs(1), events.collect::<Vec<_>>())
+            .await
+            .unwrap();
+        assert!(
+            !handler
+                .tasks
+                .load(&task.id)
+                .await
+                .unwrap()
+                .status
+                .state
+                .is_terminal()
+        );
+        assert!(
+            handler
+                .send_message(&ServiceParams::new(), send_req(None, None))
+                .await
+                .is_err()
+        );
+        handler.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_a_live_opening_waiting_for_its_first_input() {
+        let handler = make_handler();
+        let entered = Arc::new(Notify::new());
+        let signal = entered.clone();
+        let input = stream::once(async move {
+            signal.notify_one();
+            std::future::pending::<StreamRequest>().await
+        })
+        .boxed();
+        let opening = tokio::spawn({
+            let handler = handler.clone();
+            async move {
+                handler
+                    .send_live_message(&ServiceParams::new(), input)
+                    .await
+            }
+        });
+        entered.notified().await;
+        handler.shutdown().await;
+        assert!(
+            timeout(Duration::from_secs(1), opening)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
     }
 }

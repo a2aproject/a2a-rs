@@ -15,6 +15,7 @@ use std::{
 use tokio::sync::broadcast;
 
 pub(super) const PUSH_QUEUE_CAPACITY: usize = 1024;
+const PUSH_CONFIG_TIMEOUT: Duration = Duration::from_secs(30);
 const PUSH_WORKER_IDLE: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
@@ -63,7 +64,13 @@ pub(super) fn subscribe(events: &Arc<TaskHandle>) -> MutexGuard<'_, Subscription
     if events.notifications.get().is_some() && !state.running {
         let receiver = events.sender.subscribe();
         state.running = true;
-        tokio::spawn(receive_events(events.clone(), receiver));
+        if events
+            .workers
+            .spawn(receive_events(events.clone(), receiver))
+            .is_none()
+        {
+            state.running = false;
+        }
     }
     state
 }
@@ -101,7 +108,15 @@ async fn receive_events(
                         .is_ok_and(|event| super::protocol::task_id_for_event(event).is_some()) =>
             {
                 let settings = events.notifications.get().unwrap();
-                let configs = match settings.store.list(&settings.task_id).await {
+                let lookup = tokio::time::timeout(
+                    PUSH_CONFIG_TIMEOUT,
+                    settings.store.list(&settings.task_id),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(A2AError::internal("webhook configuration lookup timed out"))
+                });
+                let configs = match lookup {
                     Ok(configs) => configs,
                     Err(error) => {
                         signal_failure(&settings.sender, &event, error.clone());
@@ -120,7 +135,7 @@ async fn receive_events(
                     }
                     if !settings
                         .dispatcher
-                        .get_or_init(PushDispatcher::spawn)
+                        .get_or_init(|| PushDispatcher::spawn(&events.workers))
                         .submit(Notification {
                             config,
                             event: event.clone(),
@@ -150,6 +165,88 @@ async fn receive_events(
 mod tests {
     use super::*;
     use crate::handler::test_support::*;
+
+    struct LookupGuard(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for LookupGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    struct HangingStore {
+        entered: Arc<Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait]
+    impl PushConfigStore for HangingStore {
+        async fn save(
+            &self,
+            config: TaskPushNotificationConfig,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            Ok(config)
+        }
+        async fn get(&self, _: &str, _: &str) -> Result<TaskPushNotificationConfig, A2AError> {
+            Err(A2AError::internal("unused"))
+        }
+        async fn list(&self, _: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
+            let _guard = LookupGuard(self.dropped.clone());
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+        async fn delete(&self, _: &str, _: &str) -> Result<(), A2AError> {
+            Ok(())
+        }
+        async fn delete_all(&self, _: &str) -> Result<(), A2AError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_configuration_lookups_expire_and_shutdown_drops_them_immediately() {
+        for shutdown in [false, true] {
+            let (configured, _queue) = captured_source(8, true).await;
+            let mut settings = configured.notifications.get().unwrap().clone();
+            let entered = Arc::new(Notify::new());
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            settings.store = Arc::new(HangingStore {
+                entered: entered.clone(),
+                dropped: dropped.clone(),
+            });
+            let source = TaskHandle::new("task".into(), None);
+            assert!(source.notifications.set(settings).is_ok());
+            let (failure, mut observed) = tokio::sync::watch::channel(None);
+            source.publish(
+                Ok(&StreamResponse::Task(task_with_history(
+                    "task", "context", 0,
+                ))),
+                None,
+                EventKind::Normal,
+                Some(failure),
+            );
+            entered.notified().await;
+            if shutdown {
+                source.workers.shutdown().await;
+            } else {
+                tokio::time::advance(PUSH_CONFIG_TIMEOUT).await;
+                observed.changed().await.unwrap();
+                assert_eq!(
+                    observed.borrow().as_ref().unwrap().message,
+                    "webhook configuration lookup timed out"
+                );
+                tokio::time::advance(PUSH_WORKER_IDLE + Duration::from_secs(1)).await;
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(source.sender.receiver_count(), 0);
+            let weak = Arc::downgrade(&source);
+            drop(source);
+            assert!(
+                weak.upgrade().is_none(),
+                "neither the hanging lookup nor its worker retains the task"
+            );
+        }
+    }
 
     async fn captured_source(
         capacity: usize,

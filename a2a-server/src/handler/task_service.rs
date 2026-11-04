@@ -19,6 +19,7 @@ use super::runtime::{self, OutputAction, TaskOperation, TaskRuntime, TaskSender}
 use super::task_handle::TaskHandle;
 use super::task_registry::TaskRegistry;
 use super::updates;
+use super::workers::Workers;
 use crate::middleware::{ServiceParams, User};
 use a2a::*;
 use futures::future::BoxFuture;
@@ -28,15 +29,18 @@ pub(super) struct TaskService {
     pub(super) executor: Arc<dyn crate::AgentExecutor>,
     store: Arc<dyn crate::TaskStore>,
     handles: TaskRegistry,
+    pub(super) workers: Arc<Workers>,
     pub(super) pushes: PushSubscriptions,
 }
 
 impl TaskService {
     pub(super) fn new(executor: impl crate::AgentExecutor, store: impl crate::TaskStore) -> Self {
+        let workers = Arc::new(Workers::default());
         Self {
             executor: Arc::new(executor),
             store: Arc::new(store),
-            handles: TaskRegistry::default(),
+            handles: TaskRegistry::new(workers.clone()),
+            workers,
             pushes: PushSubscriptions::default(),
         }
     }
@@ -71,6 +75,7 @@ impl TaskService {
         T: Send + 'static,
         F: for<'a> FnOnce(&'a mut TaskRuntime) -> BoxFuture<'a, T> + Send + 'static,
     {
+        self.workers.check_running()?;
         runtime::submit(task.operations(), operation, transition).await
     }
 
@@ -103,7 +108,7 @@ impl TaskService {
         let request = request.into();
         let task_id = active.task.id.clone();
         let lease = active.task.operations();
-        tokio::spawn(async move {
+        self.workers.spawn(async move {
             let _lease = lease;
             super::execution::drive_execution_guarded(handler, task_id, active, request).await;
         });
@@ -114,6 +119,7 @@ impl TaskService {
         &self,
         handler: DefaultRequestHandler,
     ) -> Result<usize, A2AError> {
+        self.workers.check_running()?;
         let mut token = None;
         let mut pages = std::collections::HashSet::new();
         let mut seen = std::collections::HashSet::new();
@@ -206,15 +212,18 @@ impl TaskService {
     ) -> Result<Task, A2AError> {
         let task_id = request.id.clone();
         let lease = self.queue(&task_id);
-        tokio::spawn(async move {
-            let _lease = lease;
-            super::cancellation::cancel(handler, params, request, user).await
-        })
-        .await
-        .map_err(|error| {
-            tracing::error!(%task_id, %error, "cancellation operation failed");
-            A2AError::internal("cancellation operation failed unexpectedly")
-        })?
+        self.workers
+            .spawn(async move {
+                let _lease = lease;
+                super::cancellation::cancel(handler, params, request, user).await
+            })
+            .ok_or_else(|| A2AError::internal("handler is shutting down"))?
+            .await
+            .map_err(|error| {
+                tracing::error!(%task_id, %error, "cancellation operation failed");
+                A2AError::internal("cancellation operation failed unexpectedly")
+            })?
+            .ok_or_else(|| A2AError::internal("handler is shutting down"))?
     }
 
     pub(super) async fn begin_cancel(
@@ -322,6 +331,9 @@ impl TaskService {
                 return Ok(task);
             }
             tokio::select! {
+                () = self.workers.cancelled() => {
+                    return Err(A2AError::internal("handler is shutting down"));
+                }
                 () = watch.changed() => {}
                 _ = tokio::time::sleep((deadline - now).min(Duration::from_secs(1))) => {}
             }

@@ -14,9 +14,17 @@ use std::{
 #[derive(Default)]
 pub(super) struct TaskRegistry {
     tasks: RwLock<HashMap<TaskId, Weak<TaskHandle>>>,
+    workers: Arc<super::workers::Workers>,
 }
 
 impl TaskRegistry {
+    pub(super) fn new(workers: Arc<super::workers::Workers>) -> Self {
+        Self {
+            tasks: RwLock::default(),
+            workers,
+        }
+    }
+
     pub(super) fn task(&self, task_id: &str) -> Arc<TaskHandle> {
         if let Some(task) = self.tasks.read().get(task_id).and_then(Weak::upgrade) {
             return task;
@@ -27,7 +35,7 @@ impl TaskRegistry {
             return task;
         }
         tasks.retain(|_, task| task.strong_count() > 0);
-        let task = TaskHandle::new(task_id.to_owned(), None);
+        let task = TaskHandle::with_workers(task_id.to_owned(), None, self.workers.clone());
         tasks.insert(task_id.to_owned(), Arc::downgrade(&task));
         task
     }

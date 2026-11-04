@@ -116,7 +116,8 @@ impl Run {
         out: ResponseSender,
     ) {
         let failure_sink = out.clone();
-        tokio::spawn(async move {
+        let workers = self.handler.tasks.workers.clone();
+        workers.spawn(async move {
             let outcome =
                 std::panic::AssertUnwindSafe(self.run(opening, inner, seen_generation, out))
                     .catch_unwind()

@@ -35,6 +35,21 @@ task operations. The response `Run` owns its input stream and optional HTTP
 registration lease, unregistering before releasing the stream on exit or panic.
 `AgentExecutor` and its owned `ctx.inputs` API are unchanged.
 
+## Shutdown
+
+After stopping incoming transport requests, call `handler.shutdown().await`.
+Shutdown affects every clone, rejects new work, and waits for SDK-owned execution,
+response, task-queue, cancellation, and webhook futures to be dropped. It closes
+live registrations and pending HTTP deliveries. Persisted tasks retain their last
+committed state and can be resumed by a new handler through startup recovery.
+Shutdown is permanent and may interrupt an admitted operation; it does not roll
+back writes or mark unfinished tasks canceled.
+
+Executors' direct `Message` replies finish their execution: the SDK drops the
+output stream immediately. Webhook configuration lookups have a 30-second
+deadline. Application-spawned tasks remain the application's responsibility;
+shutdown is cooperative and cannot interrupt code blocking a Tokio worker thread.
+
 ## Startup Recovery
 
 After configuring a handler backed by a persistent `TaskStore`, call
