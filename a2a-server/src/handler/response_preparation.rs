@@ -3,41 +3,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Prepare response subscriptions, initial events, and completion settings.
 
-use super::delivery::{Delivery, StartMode};
+use super::delivery::Delivery;
 use super::events::{ExecutionReceiver, subscription_stream};
-use super::protocol::{
-    is_at_least_1_1, is_terminal_event, requested_protocol_version, should_interrupt_non_streaming,
-};
+#[cfg(test)]
+use super::protocol::StartMode;
+use super::protocol::{self, DeliveryAttachment, InputCursor, OpeningPolicy, ResponsePolicy};
 use super::response::Events;
 use super::{task_handle::TaskHandle, task_service::TaskService};
-use crate::middleware::ServiceParams;
 use a2a::*;
 use futures::{StreamExt, stream::BoxStream};
 use std::sync::Arc;
-
-#[derive(Clone, Copy, Default)]
-pub(super) struct ResponseOptions {
-    pub(super) return_immediately: bool,
-    history_length: Option<i32>,
-    timeline_length: Option<i32>,
-}
-
-impl ResponseOptions {
-    pub(super) fn from_request(request: &SendMessageRequest) -> Self {
-        let config = request.configuration.as_ref();
-        Self {
-            return_immediately: config
-                .and_then(|config| config.return_immediately)
-                .unwrap_or(false),
-            history_length: config.and_then(|config| config.history_length),
-            timeline_length: config.and_then(|config| config.timeline_length),
-        }
-    }
-
-    pub(super) fn trim(self, task: &mut Task) {
-        super::protocol::apply_lengths(task, self.history_length, self.timeline_length);
-    }
-}
 
 /// A direct reply has no task to wait for. Task replies retain their completion stream.
 pub(super) enum MessageResponse {
@@ -97,7 +72,7 @@ pub(super) struct PreparedResponse {
     pub(super) events: Option<Events>,
     pub(super) opening: Option<Task>,
     /// Reused for the opening, followups, and later executor invocations.
-    pub(super) settings: ResponseSettings,
+    pub(super) settings: ResponsePolicy,
     pub(super) seen_generation: i64,
 }
 
@@ -105,14 +80,14 @@ impl PreparedResponse {
     /// Translate delivery into one initial subscription. A caller joining a
     /// running turn starts before or after its own input events according to
     /// the response mode; a new turn starts at its first event.
-    pub(super) fn message(delivery: Delivery, settings: ResponseSettings) -> Self {
+    pub(super) fn message(delivery: Delivery, settings: ResponsePolicy) -> Self {
         let handle = delivery.handle();
-        let subscription = settings.delivery(delivery, DeliveryAttachment::Opening);
+        let subscription = attach_delivery(settings, delivery, DeliveryAttachment::Opening);
         let (task, events) = (subscription.task, subscription.events);
-        let (opening, events) = match settings.mode() {
-            StartMode::Blocking => (None, events),
-            StartMode::Streaming => (None, with_opening_task(events, task)),
-            StartMode::Bidi => (Some(task), events),
+        let (opening, events) = match settings.opening() {
+            OpeningPolicy::None => (None, events),
+            OpeningPolicy::OnFirstEvent => (None, with_opening_task(events, task)),
+            OpeningPolicy::Snapshot => (Some(task), events),
         };
         Self {
             task: handle,
@@ -125,13 +100,13 @@ impl PreparedResponse {
 
     pub(super) fn subscription(
         attachment: SubscriptionAttachment,
-        settings: ResponseSettings,
+        settings: ResponsePolicy,
     ) -> Self {
         Self {
             task: attachment.task,
             events: attachment
                 .receiver
-                .map(|receiver| settings.stream(receiver, None, attachment.sequence)),
+                .map(|receiver| event_stream(settings, receiver, None, attachment.sequence)),
             opening: attachment.opening,
             settings,
             seen_generation: attachment.seen_generation,
@@ -157,9 +132,10 @@ pub(super) fn with_opening_task(
                 // restated the task, or ended): the stream is the task.
                 return futures::stream::iter([Ok(StreamResponse::Task(opening))]).boxed();
             };
-            let head: Vec<_> = match &first {
-                Ok(StreamResponse::Message(_) | StreamResponse::Task(_)) | Err(_) => vec![first],
-                _ => vec![Ok(StreamResponse::Task(opening)), first],
+            let head = if protocol::needs_opening_task(&first) {
+                vec![Ok(StreamResponse::Task(opening)), first]
+            } else {
+                vec![first]
             };
             futures::stream::iter(head).chain(stream).boxed()
         })
@@ -177,21 +153,6 @@ pub(super) struct SubscriptionAttachment {
     pub(super) seen_generation: i64,
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct ResponseSettings {
-    mode: StartMode,
-    wants_message_updates: bool,
-    options: ResponseOptions,
-    response_id: Option<uuid::Uuid>,
-}
-
-pub(super) enum DeliveryAttachment {
-    /// Start a response; streaming modes announce the input in their opening snapshot.
-    Opening,
-    /// An existing response must observe the follow-up's input events.
-    FollowUp,
-}
-
 pub(super) struct DeliverySubscription {
     pub(super) task: Task,
     pub(super) events: Events,
@@ -199,147 +160,76 @@ pub(super) struct DeliverySubscription {
     pub(super) recorded: Vec<StreamResponse>,
 }
 
-impl ResponseSettings {
-    pub(super) fn new(mode: StartMode, wants_message_updates: bool) -> Self {
-        Self {
-            mode,
-            wants_message_updates,
-            options: ResponseOptions::default(),
-            response_id: None,
-        }
-    }
+/// Attach the protocol-selected cursor to the actual task event receiver.
+pub(super) fn event_stream(
+    policy: ResponsePolicy,
+    receiver: ExecutionReceiver,
+    opening: Option<Task>,
+    sequence: u64,
+) -> Events {
+    let receiver = if policy.follows_task() {
+        receiver.follow_task()
+    } else {
+        receiver
+    };
+    subscription_stream_with_policy(policy, receiver, opening, sequence)
+}
 
-    /// Resolve response behavior once, before admitting the opening message.
-    pub(super) fn message(
-        mode: StartMode,
-        params: &ServiceParams,
-        request: &SendMessageRequest,
-    ) -> Self {
-        Self {
-            options: ResponseOptions::from_request(request),
-            ..Self::subscription(mode, params)
-        }
-    }
+fn subscription_stream_with_policy(
+    policy: ResponsePolicy,
+    receiver: ExecutionReceiver,
+    opening: Option<Task>,
+    sequence: u64,
+) -> Events {
+    let filter = policy.event_filter();
+    subscription_stream(receiver, opening, sequence, filter)
+}
 
-    pub(super) fn subscription(mode: StartMode, params: &ServiceParams) -> Self {
-        Self {
-            response_id: (mode == StartMode::Bidi).then(uuid::Uuid::now_v7),
-            ..Self::new(mode, is_at_least_1_1(&requested_protocol_version(params)))
-        }
-    }
-
-    pub(super) fn mode(self) -> StartMode {
-        self.mode
-    }
-
-    pub(super) fn is_live(self) -> bool {
-        self.mode == StartMode::Bidi
-    }
-
-    pub(super) fn return_immediately(self) -> bool {
-        self.options.return_immediately
-    }
-
-    pub(super) fn trim(self, task: &mut Task) {
-        self.options.trim(task);
-    }
-
-    pub(super) fn completes(self, event: &StreamResponse) -> bool {
-        is_terminal_event(event)
-            || matches!(event, StreamResponse::Message(_))
-            || (self.mode == StartMode::Blocking
-                && should_interrupt_non_streaming(self.return_immediately(), event).is_some())
-    }
-
-    pub(super) fn wants_message_updates(self) -> bool {
-        self.wants_message_updates
-    }
-
-    pub(super) fn response_id(self) -> Option<uuid::Uuid> {
-        self.response_id
-    }
-
-    pub(super) fn stream(
-        self,
-        receiver: ExecutionReceiver,
-        opening: Option<Task>,
-        sequence: u64,
-    ) -> Events {
-        // A streaming response owns a Task subscription, not an invocation
-        // subscription. Closing/reopening at a handoff can discard queued events.
-        let receiver = if self.mode == StartMode::Blocking {
-            receiver
-        } else {
-            receiver.follow_task()
-        };
-        self.event_stream(receiver, opening, sequence)
-    }
-
-    fn event_stream(
-        self,
-        receiver: ExecutionReceiver,
-        opening: Option<Task>,
-        sequence: u64,
-    ) -> Events {
-        subscription_stream(
-            receiver,
-            opening,
-            sequence,
-            self.mode == StartMode::Blocking,
-            self.mode != StartMode::Blocking && self.wants_message_updates,
-            self.mode == StartMode::Bidi,
-            self.response_id,
-        )
-    }
-
-    pub(super) fn delivery(
-        self,
-        delivery: Delivery,
-        attachment: DeliveryAttachment,
-    ) -> DeliverySubscription {
-        let (task, receiver, sequence, recorded) = match delivery {
-            Delivery::Started {
-                task,
-                receiver,
-                recorded,
-            } => (task, Some(receiver), 0, recorded),
-            Delivery::Injected {
-                task,
-                receiver,
-                sequence_before,
-                sequence_after,
-            } => {
-                let immediate = self.mode == StartMode::Blocking
-                    && self.return_immediately()
-                    && matches!(attachment, DeliveryAttachment::Opening);
-                let sequence = if self.mode == StartMode::Blocking
-                    || matches!(attachment, DeliveryAttachment::FollowUp)
-                {
-                    sequence_before
-                } else {
-                    sequence_after
-                };
-                (task, (!immediate).then_some(receiver), sequence, Vec::new())
-            }
-        };
-        let events = match receiver {
-            Some(receiver)
-                if self.mode == StartMode::Streaming
-                    && matches!(attachment, DeliveryAttachment::Opening) =>
-            {
-                self.event_stream(receiver.opening_message(), None, sequence)
-            }
-            Some(receiver) => self.stream(receiver, None, sequence),
-            None => {
-                let event = StreamResponse::Task(task.clone());
-                futures::stream::once(async move { Ok(event) }).boxed()
-            }
-        };
-        DeliverySubscription {
+pub(super) fn attach_delivery(
+    policy: ResponsePolicy,
+    delivery: Delivery,
+    attachment: DeliveryAttachment,
+) -> DeliverySubscription {
+    let plan = policy.delivery_plan(attachment);
+    let (task, receiver, sequence, recorded) = match delivery {
+        Delivery::Started {
             task,
-            events,
+            receiver,
             recorded,
+        } => (task, Some(receiver), 0, recorded),
+        Delivery::Injected {
+            task,
+            receiver,
+            sequence_before,
+            sequence_after,
+        } => {
+            let sequence = match plan.cursor {
+                InputCursor::Before => sequence_before,
+                InputCursor::After => sequence_after,
+            };
+            (
+                task,
+                plan.attach_receiver.then_some(receiver),
+                sequence,
+                Vec::new(),
+            )
         }
+    };
+    let events = match receiver {
+        Some(receiver) if plan.wait_for_first_output => {
+            subscription_stream_with_policy(policy, receiver.opening_message(), None, sequence)
+        }
+        Some(receiver) => event_stream(policy, receiver, None, sequence),
+        None => futures::stream::once({
+            let task = task.clone();
+            async move { Ok(StreamResponse::Task(task)) }
+        })
+        .boxed(),
+    };
+    DeliverySubscription {
+        task,
+        events,
+        recorded,
     }
 }
 
@@ -387,14 +277,18 @@ mod subscription_tests {
             sequence_before: 0,
             sequence_after: 0,
         };
-        let settings = ResponseSettings {
-            options: ResponseOptions {
-                return_immediately: true,
-                ..ResponseOptions::default()
-            },
-            ..ResponseSettings::new(StartMode::Blocking, false)
-        };
-        let mut subscription = settings.delivery(delivery, DeliveryAttachment::Opening);
+        let mut request = crate::handler::test_support::send_request();
+        request.configuration = Some(SendMessageConfiguration {
+            return_immediately: Some(true),
+            accepted_output_modes: None,
+            task_push_notification_config: None,
+            history_length: None,
+            timeline_length: None,
+            if_generation_match: None,
+        });
+        let settings =
+            ResponsePolicy::message(StartMode::Blocking, &crate::ServiceParams::new(), &request);
+        let mut subscription = attach_delivery(settings, delivery, DeliveryAttachment::Opening);
         assert!(
             matches!(subscription.events.next().await.unwrap().unwrap(), StreamResponse::Task(snapshot) if snapshot == task)
         );

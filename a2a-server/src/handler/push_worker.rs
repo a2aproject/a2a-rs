@@ -134,7 +134,7 @@ async fn dispatch(mut queue: mpsc::Receiver<Notification>, concurrency: usize, c
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::events::EventKind;
+    use crate::handler::protocol::EventKind;
     use crate::handler::test_support::*;
     use axum::Json;
 

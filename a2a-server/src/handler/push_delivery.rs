@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Subscribe to the task broadcast without awaiting webhook network I/O.
 
-use super::events::{EventKind, ExecutionEvent};
+use super::events::ExecutionEvent;
+use super::protocol::EventKind;
 use super::push_worker::{Notification, PushDispatcher, signal_failure};
 use super::task_handle::TaskHandle;
 use a2a::*;

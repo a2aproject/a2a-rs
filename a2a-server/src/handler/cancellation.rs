@@ -5,8 +5,10 @@
 
 use super::DefaultRequestHandler;
 use super::events::ActiveExecution;
-use super::protocol::is_terminal_event;
-use super::updates::{CancelEntry, backfill_status_timestamp, validate_event_identity};
+use super::protocol::{
+    self, CancelEntry, CancellationMutation, CancellationNotification, backfill_status_timestamp,
+    is_terminal_event,
+};
 use crate::middleware::ServiceParams;
 use crate::{ClientInputs, User};
 use a2a::*;
@@ -26,7 +28,6 @@ pub(super) struct CancellationHook {
 
 pub(super) struct Cancellation {
     pub(super) active: Arc<ActiveExecution>,
-    canceled: Task,
     entry: CancelEntry,
     signal_failure: bool,
 }
@@ -46,14 +47,8 @@ impl Cancellation {
         let task = handler.tasks.load(&req.id).await?;
         let generation_before = task.generation;
 
-        // Idempotent: re-cancelling an already-canceled task is a no-op that
-        // returns the current task (matching a2a-go). Other terminal states
-        // are still not cancelable, per A2A and a2a-cli SPEC.md §10.4.
-        if task.status.state == TaskState::Canceled {
+        if !protocol::cancel_requires_transition(&task)? {
             return Ok(CancellationStart::Unchanged(Box::new(task)));
-        }
-        if task.status.state.is_terminal() {
-            return Err(A2AError::task_not_cancelable(&req.id));
         }
 
         // Atomically transition the task to CANCELED so two concurrent cancel
@@ -66,7 +61,7 @@ impl Cancellation {
                 // already moved to CANCELED is returned (idempotent); any
                 // other terminal state is still not cancelable.
                 let raced = handler.tasks.load(&req.id).await?;
-                if raced.status.state == TaskState::Canceled {
+                if matches!(protocol::cancel_requires_transition(&raced), Ok(false)) {
                     return Ok(CancellationStart::Unchanged(Box::new(raced)));
                 }
                 return Err(error);
@@ -136,7 +131,6 @@ impl Cancellation {
         };
         Self {
             active,
-            canceled,
             entry,
             signal_failure,
         }
@@ -152,40 +146,21 @@ impl Cancellation {
             .active
             .snapshot()
             .ok_or_else(|| A2AError::internal("cancellation has no task"))?;
-        validate_event_identity(&base, &event)?;
-        let contradicts = match &event {
-            StreamResponse::Task(task) => task.status.state != TaskState::Canceled,
-            StreamResponse::StatusUpdate(update) => update.status.state != TaskState::Canceled,
-            _ => false,
-        };
-        if contradicts {
-            return Err(A2AError::invalid_agent_response());
-        }
-        let published = if self.entry.can_amend(&base, &event) {
-            let StreamResponse::StatusUpdate(update) = &mut event else {
-                unreachable!("can_amend matches a status")
-            };
-            let mut amended = base;
-            amended.status = update.status.clone();
-            if let Some(TimelineEntry {
-                content: TimelineContent::Status(status),
-                ..
-            }) = amended.timeline.iter_mut().flatten().last()
-            {
-                *status = update.status.clone();
+        let published = match self.entry.plan_update(base, &mut event)? {
+            CancellationMutation::Amend(amended) => {
+                let saved = handler.tasks.save(amended, false).await?;
+                self.active.publish_marked(Ok(&event), Some(saved), false);
+                self.entry.announced = true;
+                true
             }
-            update.generation = amended.generation;
-            let saved = handler.tasks.save(amended, false).await?;
-            self.active.publish_marked(Ok(&event), Some(saved), false);
-            self.entry.announced = true;
-            true
-        } else {
-            let published = handler
-                .tasks
-                .apply_and_publish(&self.active, Some(base), &mut event)
-                .await?;
-            self.entry.note_published(published, &event);
-            published
+            CancellationMutation::Apply(base) => {
+                let published = handler
+                    .tasks
+                    .apply_and_publish(&self.active, Some(base), &mut event)
+                    .await?;
+                self.entry.note_published(published, &event);
+                published
+            }
         };
         Ok(published)
     }
@@ -209,37 +184,17 @@ impl Cancellation {
         &self,
         handler: &DefaultRequestHandler,
     ) -> Result<(), A2AError> {
-        if self.entry.recorded_by_store && self.entry.announced {
-            return Ok(());
+        match self.entry.notification(self.active.snapshot()) {
+            CancellationNotification::None => {}
+            CancellationNotification::Publish(event) => self.active.publish(Ok(&event), None),
+            CancellationNotification::Persist { task, mut event } => {
+                handler
+                    .tasks
+                    .apply_and_publish(&self.active, Some(*task), &mut event)
+                    .await?;
+            }
         }
-        let Some(base) = self.active.snapshot() else {
-            return Ok(());
-        };
-        if !self.entry.recorded_by_store && base.timeline.iter().flatten().any(|entry| {
-            entry.generation > self.canceled.generation
-                && matches!(&entry.content, TimelineContent::Status(status) if status.state == TaskState::Canceled)
-        }) { return Ok(()); }
-        let mut status = base.status.clone();
-        status.state = TaskState::Canceled;
-        let mut event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-            task_id: base.id.clone(),
-            context_id: base.context_id.clone(),
-            status,
-            metadata: None,
-            generation: 0,
-        });
-        if self.entry.recorded_by_store && base.generation == self.entry.generation {
-            let StreamResponse::StatusUpdate(update) = &mut event else {
-                unreachable!()
-            };
-            update.generation = base.generation;
-            self.active.publish(Ok(&event), None);
-        } else {
-            handler
-                .tasks
-                .apply_and_publish(&self.active, Some(base), &mut event)
-                .await?;
-        }
+
         Ok(())
     }
 }

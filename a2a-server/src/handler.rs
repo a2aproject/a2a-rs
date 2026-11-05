@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 mod admission;
-mod artifacts;
 mod background_tasks;
 mod cancellation;
 mod default_handler;
@@ -17,7 +16,7 @@ mod delivery;
 mod events;
 mod execution;
 mod http_exchange;
-mod protocol;
+pub(crate) mod protocol;
 mod push_delivery;
 mod push_worker;
 mod response;

@@ -7,7 +7,7 @@
 use super::EXECUTION_BUFFER_CAPACITY;
 use super::TASK_INPUT_CAPACITY;
 use super::execution::InvocationState;
-use super::protocol::is_terminal_event;
+use super::protocol::{EventDecision, EventFilter, EventKind};
 use super::task_handle::TaskHandle;
 use crate::executor::{ClientInputSender, ClientInputs};
 use a2a::*;
@@ -25,25 +25,6 @@ pub(super) struct ExecutionEvent {
     pub(super) failure: Option<FailureSignal>,
 }
 
-/// How an event is meant to be delivered.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum EventKind {
-    Normal,
-    /// A `Task` snapshot that changed nothing. It sits at a generation that was
-    /// already announced, so streams meant for clients leave it out; the
-    /// blocking send, which only needs to know the executor spoke, keeps it.
-    Repeated,
-    /// Something only a live exchange is told (a `StreamError` about a message
-    /// of its own), not the other subscribers of the task.
-    LiveOnly(Option<uuid::Uuid>),
-    /// The executor's direct reply, with no task: the last thing any stream
-    /// following the execution is sent.
-    Reply,
-}
-
-/// A subscription to an execution's events. One that falls further behind than
-/// the buffer holds can start over from the task as it stands, which is what a
-/// client that sees a gap in the generations does anyway.
 pub(super) struct ExecutionReceiver {
     receiver: broadcast::Receiver<ExecutionEvent>,
     /// Keep the Task source, not the executor invocation, alive.
@@ -282,10 +263,7 @@ pub(super) fn subscription_stream(
     receiver: ExecutionReceiver,
     snapshot_task: Option<Task>,
     min_sequence: u64,
-    include_repeats: bool,
-    message_updates: bool,
-    live: bool,
-    response_id: Option<uuid::Uuid>,
+    filter: EventFilter,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
     let min_sequence = min_sequence.max(receiver.opened_at);
     Box::pin(futures::stream::unfold(
@@ -311,36 +289,14 @@ pub(super) fn subscription_stream(
             loop {
                 match state.receiver.recv().await {
                     Ok(event) if event.sequence <= state.min_sequence => continue,
-                    Ok(event) if event.kind == EventKind::Repeated && !include_repeats => {
-                        state.min_sequence = event.sequence;
-                        continue;
-                    }
-                    Ok(event)
-                        if matches!(event.kind, EventKind::LiveOnly(recipient)
-                        if !live || recipient != response_id) =>
-                    {
-                        state.min_sequence = event.sequence;
-                        continue;
-                    }
-                    // A message appended to the task is a payload kind a 1.0
-                    // client does not know; only one that announced 1.1 or later
-                    // is sent it, and reconciles the generation gap otherwise.
-                    Ok(event)
-                        if !message_updates
-                            && matches!(&event.result, Ok(StreamResponse::MessageUpdate(_))) =>
-                    {
-                        state.min_sequence = event.sequence;
-                        continue;
-                    }
                     Ok(event) => {
-                        state.receiver.opened();
                         state.min_sequence = event.sequence;
-                        match &event.result {
-                            Ok(item) if is_terminal_event(item) => state.done = true,
-                            Err(_) => state.done = true,
-                            _ if event.kind == EventKind::Reply => state.done = true,
-                            _ => {}
+                        let decision = filter.decide(event.kind, &event.result);
+                        if matches!(decision, EventDecision::Skip) {
+                            continue;
                         }
+                        state.receiver.opened();
+                        state.done = matches!(decision, EventDecision::DeliverAndClose);
                         return Some((event.result.clone(), state));
                     }
                     // Events were lost: start over from the task as it stands.
@@ -611,7 +567,17 @@ mod tests {
             active.publish(Ok(&probe(&format!("lost-{i}"))), None);
         }
 
-        let mut stream = subscription_stream(receiver, None, 0, true, false, false, None);
+        let mut stream = subscription_stream(
+            receiver,
+            None,
+            0,
+            EventFilter {
+                include_repeats: true,
+                message_updates: false,
+                live: false,
+                response_id: None,
+            },
+        );
         let first = stream.next().await.expect("an item").expect("not an error");
         assert!(
             matches!(&first, StreamResponse::Task(task) if task.generation == 7),
@@ -642,7 +608,17 @@ mod tests {
             task.generation = 99;
             active.publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()));
             let opening = (!lagged).then_some(task);
-            let mut events = subscription_stream(receiver, opening, 0, false, true, false, None);
+            let mut events = subscription_stream(
+                receiver,
+                opening,
+                0,
+                EventFilter {
+                    include_repeats: false,
+                    message_updates: true,
+                    live: false,
+                    response_id: None,
+                },
+            );
             assert!(
                 matches!(events.next().await.unwrap().unwrap(), StreamResponse::Task(task) if task.status.state == TaskState::Completed && task.generation == 99)
             );
@@ -662,8 +638,17 @@ mod tests {
         let (first, _inputs, _invocation) = manager.task(&task.id).reserve().unwrap();
         first.set_snapshot(task.clone());
         let (receiver, _, sequence) = first.resubscribe();
-        let mut old_response =
-            subscription_stream(receiver, None, sequence, false, true, false, None);
+        let mut old_response = subscription_stream(
+            receiver,
+            None,
+            sequence,
+            EventFilter {
+                include_repeats: false,
+                message_updates: true,
+                live: false,
+                response_id: None,
+            },
+        );
         let error = A2AError::internal("executor failed");
         first.publish(Err(&error), None);
         manager.task(&task.id).unregister(&first);
@@ -682,8 +667,17 @@ mod tests {
 
         // A response opened after the error follows the new turn normally.
         let receiver = second.subscribe();
-        let mut new_response =
-            subscription_stream(receiver, Some(task.clone()), 0, false, true, false, None);
+        let mut new_response = subscription_stream(
+            receiver,
+            Some(task.clone()),
+            0,
+            EventFilter {
+                include_repeats: false,
+                message_updates: true,
+                live: false,
+                response_id: None,
+            },
+        );
         assert!(matches!(
             new_response.next().await,
             Some(Ok(StreamResponse::Task(_)))

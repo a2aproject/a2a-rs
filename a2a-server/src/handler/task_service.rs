@@ -10,10 +10,10 @@
 use super::DefaultRequestHandler;
 use super::background_tasks::BackgroundTasks;
 use super::cancellation::CancellationStart;
-use super::delivery::{AuthorizedMessage, Delivery, StartMode, request_task_id};
+use super::delivery::{AuthorizedMessage, Delivery};
 use super::events::{ActiveExecution, ExecutionReceiver};
 use super::execution::{ExecutionRequest, InvocationState, TurnEnd};
-use super::protocol::Rejection;
+use super::protocol::{ProtocolError, Rejection, StartMode, request_task_id};
 use super::push_delivery::PushService;
 use super::response_preparation::SubscriptionAttachment;
 #[cfg(test)]
@@ -345,7 +345,7 @@ impl TaskService {
         self.store
             .get(task_id)
             .await?
-            .ok_or_else(|| A2AError::task_not_found(task_id))
+            .ok_or_else(|| ProtocolError::TaskNotFound(task_id).into())
     }
 
     /// Register the watch before reading, so an intervening write is observed.
@@ -411,7 +411,7 @@ impl TaskService {
         invocation: &mut InvocationState,
         pushes: Option<&PushService>,
     ) -> Result<(), A2AError> {
-        updates::backfill_status_timestamp(event);
+        super::protocol::backfill_status_timestamp(event);
         let base = active.snapshot();
         let creating = active.uncreated.load(std::sync::atomic::Ordering::SeqCst);
         let applied = self.persist(base, event, creating).await;
@@ -436,23 +436,13 @@ impl TaskService {
         // Resolve a snapshot and receiver together inside the task's operation queue.
         let (receiver, snapshot, sequence) = self.subscription_source(&handle, &req.id).await?;
 
-        // Active and idle tasks obey the same subscription checks.
-        if snapshot.status.state.is_terminal() {
-            return Err(A2AError::unsupported_operation(format!(
-                "task {} has already reached a terminal state",
-                req.id
-            )));
-        }
-
-        // A current client needs no opening snapshot. Older cursors recover from
-        // the latest snapshot because this process does not retain event replay.
-        let opening = (req.last_seen_generation != Some(snapshot.generation)).then_some(snapshot);
+        let plan = super::protocol::subscription_plan(snapshot, &req)?;
         Ok(SubscriptionAttachment {
             task: handle,
             receiver,
-            opening,
+            opening: plan.opening,
             sequence,
-            seen_generation: req.last_seen_generation.unwrap_or(0),
+            seen_generation: plan.seen_generation,
         })
     }
 
@@ -465,7 +455,7 @@ impl TaskService {
         if let Some(active) = handle.active()
             && active.uncreated.load(std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(A2AError::task_not_found(task_id));
+            return Err(ProtocolError::TaskNotFound(task_id).into());
         }
         if let Some((receiver, Some(snapshot), sequence)) = handle.resubscribe_active() {
             return Ok((Some(receiver), snapshot, sequence));
@@ -476,7 +466,7 @@ impl TaskService {
             .store
             .get(task_id)
             .await?
-            .ok_or_else(|| A2AError::task_not_found(task_id))?;
+            .ok_or(ProtocolError::TaskNotFound(task_id))?;
         Ok((None, task, 0))
     }
 
@@ -835,7 +825,7 @@ mod serialization_tests {
         retained.publish(
             Ok(&StreamResponse::Task(snapshot.clone())),
             None,
-            super::super::events::EventKind::Normal,
+            super::super::protocol::EventKind::Normal,
             None,
         );
         assert!(matches!(events.recv().await.unwrap().result,

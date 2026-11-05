@@ -5,8 +5,10 @@
 
 use super::DefaultRequestHandler;
 use super::cancellation::Cancellation;
-use super::events::{ActiveExecution, EventKind};
-use super::protocol::is_terminal_event;
+use super::events::ActiveExecution;
+use super::protocol::{
+    self, EventKind, ExecutionFailure, ExecutionProtocol, OutputKind, Rejection,
+};
 use super::task_handle::TaskController;
 use crate::executor::{ClientInput, ClientInputSender, QueuedInput, ReturnedInputs};
 use a2a::*;
@@ -154,7 +156,7 @@ async fn poll_executor(
         }
     };
     let mut push_failure = active.push_failure.subscribe();
-    let (mut answered, mut tracked) = (false, false);
+    let mut output_protocol = ExecutionProtocol::default();
     loop {
         // Cancellation and terminal state take precedence over a late delivery error.
         if active.inputs.closed.is_cancelled() {
@@ -179,17 +181,13 @@ async fn poll_executor(
         if active.snapshot_is_terminal() {
             return TurnEnd::Stopped;
         }
-        if let Ok(event) = &result {
-            let message = matches!(event, StreamResponse::Message(_));
-            if answered || (message && tracked) {
-                return TurnEnd::Failed(A2AError::invalid_agent_response());
-            }
-            answered = message;
-            tracked |= !message;
-        }
         match result {
-            Ok(event) if is_terminal_event(&event) => return TurnEnd::Terminal(Box::new(event)),
             Ok(event) => {
+                match output_protocol.accept(&event) {
+                    Ok(OutputKind::Terminal) => return TurnEnd::Terminal(Box::new(event)),
+                    Err(error) => return TurnEnd::Failed(error),
+                    _ => {}
+                }
                 let action = handler
                     .tasks
                     .output(handler.clone(), active.clone(), event)
@@ -328,13 +326,8 @@ pub(super) async fn reject_inputs(
     inputs: Vec<crate::executor::ClientInput>,
 ) {
     for input in inputs {
-        let event = StreamResponse::Error(StreamError {
-            task_id: task_id.to_string(),
-            code: "UNAVAILABLE".to_string(),
-            message: "the agent finished its turn before reading this message".to_string(),
-            reference_id: Some(input.message.message_id.clone()).filter(|id| !id.is_empty()),
-            metadata: None,
-        });
+        let event = Rejection::unread_input()
+            .into_stream_error(task_id, Some(input.message.message_id.clone()));
         active.publish_kind(Ok(&event), None, EventKind::LiveOnly(input.response_id));
     }
 }
@@ -357,22 +350,7 @@ pub(super) async fn persist_failure(
             return None;
         }
     };
-    let text = crate::sanitized_internal_error(&error.message).message;
-    let mut event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-        task_id: task.id.clone(),
-        context_id: task.context_id.clone(),
-        generation: 0,
-        metadata: None,
-        status: TaskStatus {
-            state: TaskState::Failed,
-            message: Some(Message {
-                task_id: Some(task.id.clone()),
-                context_id: Some(task.context_id.clone()),
-                ..Message::new(Role::Agent, vec![Part::text(text)])
-            }),
-            timestamp: Some(chrono::Utc::now()),
-        },
-    });
+    let mut event = protocol::failure_event(&task, ExecutionFailure::Error(error));
     match handler.tasks.persist(Some(task), &mut event, false).await {
         Ok((snapshot, _)) => snapshot,
         Err(cause) => {
@@ -392,20 +370,14 @@ pub(super) async fn publish_failure(
     let failed = persist_failure(handler, active, task_id, error).await;
     active.publish(Err(error), failed.clone());
     if let Some(task) = failed {
-        let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-            generation: task.generation,
-            task_id: task.id,
-            context_id: task.context_id,
-            status: task.status,
-            metadata: None,
-        });
+        let event = protocol::current_status_event(task);
         active.publish(Ok(&event), None);
     }
 }
 
 #[cfg(test)]
 mod driver_tests {
-    use super::super::events::EventKind;
+    use super::super::protocol::EventKind;
     use super::*;
     use crate::handler::test_support::*;
 
@@ -734,9 +706,9 @@ mod driver_tests {
             }
         }
         for mode in [
-            super::super::delivery::StartMode::Blocking,
-            super::super::delivery::StartMode::Streaming,
-            super::super::delivery::StartMode::Bidi,
+            super::super::protocol::StartMode::Blocking,
+            super::super::protocol::StartMode::Streaming,
+            super::super::protocol::StartMode::Bidi,
         ] {
             let dropped = Arc::new(AtomicBool::new(false));
             let handler =
@@ -747,7 +719,7 @@ mod driver_tests {
                     });
             let service = Arc::downgrade(&handler.tasks);
             let request = send_req(None, None);
-            if mode == super::super::delivery::StartMode::Blocking {
+            if mode == super::super::protocol::StartMode::Blocking {
                 let response = timeout(
                     Duration::from_secs(1),
                     handler.send_message(&ServiceParams::new(), request),
@@ -757,7 +729,7 @@ mod driver_tests {
                 .unwrap();
                 assert!(matches!(response, SendMessageResponse::Message(_)));
             } else {
-                let mut events = if mode == super::super::delivery::StartMode::Streaming {
+                let mut events = if mode == super::super::protocol::StartMode::Streaming {
                     handler
                         .send_streaming_message(&ServiceParams::new(), request)
                         .await

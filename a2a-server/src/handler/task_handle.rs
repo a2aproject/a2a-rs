@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! In-memory channels and execution routing owned by one task handle.
 
-use super::events::{ActiveExecution, EventKind, ExecutionEvent, ExecutionReceiver, FailureSignal};
+use super::events::{ActiveExecution, ExecutionEvent, ExecutionReceiver, FailureSignal};
+use super::protocol::EventKind;
 use a2a::*;
 use parking_lot::RwLock;
 use std::sync::{Arc, Weak};

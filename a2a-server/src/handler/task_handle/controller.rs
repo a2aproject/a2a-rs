@@ -4,14 +4,16 @@
 //! Private task execution decisions, serialized by TaskHandle’s operation queue.
 
 use super::super::cancellation::CancellationStart;
-use super::super::delivery::{AuthorizedMessage, Delivery, StartMode, request_task_id};
-use super::super::events::{ActiveExecution, EventKind};
+use super::super::delivery::{AuthorizedMessage, Delivery};
+use super::super::events::ActiveExecution;
 use super::super::execution::{
     self, ExecutionState, Invocation, TurnEnd, reject_unread_inputs, release_execution,
     save_pending_push_config,
 };
-use super::super::protocol::Rejection;
-use super::super::updates::validate_event_identity;
+use super::super::protocol::{
+    self, EventKind, ExecutionFailure, OutputKind, ProtocolError, Rejection, StartMode,
+    classify_output, request_task_id, validate_event_identity,
+};
 use super::super::{DefaultRequestHandler, admission, cancellation};
 use super::prepared_execution::PreparedExecution;
 use crate::User;
@@ -45,10 +47,7 @@ impl TaskController {
             .await;
         }
         if matches!(self.execution, ExecutionState::Canceling { .. }) {
-            return Err(A2AError::unsupported_operation(format!(
-                "task {reserved_id} has already reached a terminal state"
-            ))
-            .into());
+            return Err(ProtocolError::TaskTerminated(&reserved_id).into());
         }
         self.start(handler, message, mode, reserved_id).await
     }
@@ -90,9 +89,7 @@ impl TaskController {
         task_id: &str,
     ) -> Result<(Arc<ActiveExecution>, crate::ClientInputs), A2AError> {
         if !matches!(self.execution, ExecutionState::Idle) {
-            return Err(A2AError::invalid_request(
-                "task execution is already in progress",
-            ));
+            return Err(ProtocolError::ExecutionInProgress.into());
         }
         let task = handler.tasks.task(task_id);
         let (active, inputs, bookkeeping) = ActiveExecution::with_task(task.clone());
@@ -245,7 +242,7 @@ impl TaskController {
         {
             return Ok(OutputAction::Stopped);
         }
-        if matches!(event, StreamResponse::Message(_)) {
+        if classify_output(&event) == OutputKind::Reply {
             if let Some(task) = active.snapshot() {
                 validate_event_identity(&task, &event)?;
             }
@@ -407,20 +404,7 @@ impl TaskController {
         {
             // Unread input errors precede the terminal status which closes streams.
             reject_unread_inputs(&active, &task_id, self).await;
-            let mut event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-                task_id: task_id.clone(),
-                context_id: base.context_id.clone(),
-                status: TaskStatus {
-                    state: TaskState::Failed,
-                    message: Some(Message::new(
-                        Role::Agent,
-                        vec![Part::text("The agent failed unexpectedly.")],
-                    )),
-                    timestamp: Some(chrono::Utc::now()),
-                },
-                metadata: None,
-                generation: 0,
-            });
+            let mut event = protocol::failure_event(&base, ExecutionFailure::Panic);
             if let Err(error) = handler
                 .tasks
                 .apply_and_publish(&active, Some(base), &mut event)

@@ -5,9 +5,10 @@
 
 use super::super::DefaultRequestHandler;
 use super::super::admission::{self, PreparedInput};
-use super::super::delivery::{AuthorizedMessage, Delivery, StartMode, is_artifact_only};
+use super::super::delivery::{AuthorizedMessage, Delivery};
 use super::super::events::ActiveExecution;
 use super::super::execution::InvocationState;
+use super::super::protocol::{StartMode, is_artifact_only};
 use crate::{ClientInputs, ExecutorContext};
 use a2a::A2AError;
 use std::sync::{Arc, atomic::Ordering};
