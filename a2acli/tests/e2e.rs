@@ -19,6 +19,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -79,6 +80,9 @@ struct ServerState {
     /// resumption fixture task ids below, so each reconnect gets the next
     /// canned event sequence in that id's list.
     subscribe_attempts: Mutex<BTreeMap<String, u32>>,
+    /// Number of `SubscribeToTask` calls the dropped-connection middleware
+    /// has seen for each of the fixture ids below.
+    dropped_stream_calls: Mutex<BTreeMap<String, u32>>,
 }
 
 /// Fixture task ids that settle to `COMPLETED` only after this many
@@ -119,6 +123,105 @@ const SUBSCRIBE_CUT_FILE_ID: &str = "task-subscribe-cut-file";
 
 /// Like [`SUBSCRIBE_CUT_FILE_ID`], but nothing is written before the cut.
 const SUBSCRIBE_CUT_FILE_LATE_ID: &str = "task-subscribe-cut-file-late";
+
+/// Dropped-connection fixtures. The first `SubscribeToTask` for each of
+/// these is answered by [`drop_subscribe_connections`] with a stream whose
+/// connection breaks mid-body, which is how a network failure reaches the
+/// client; a canned `Err` item cannot stand in for it, because the server
+/// would send that as an error event carrying details.
+///
+/// Drops after a `Working` update; the reconnect settles the task.
+const SUBSCRIBE_DROPPED_ID: &str = "task-subscribe-dropped";
+/// Like [`SUBSCRIBE_DROPPED_ID`], but the stream is open and quiet for longer
+/// than any `--timeout` the test gives before it drops.
+const SUBSCRIBE_DROPPED_SLOW_ID: &str = "task-subscribe-dropped-slow";
+/// Delivers the settled task and then drops, so there is nothing to
+/// reconnect for.
+const SUBSCRIBE_DROPPED_SETTLED_ID: &str = "task-subscribe-dropped-settled";
+/// Every connection drops after a `Working` update.
+const SUBSCRIBE_ALWAYS_DROPPED_ID: &str = "task-subscribe-always-dropped";
+
+/// How long [`SUBSCRIBE_DROPPED_SLOW_ID`]'s first stream stays open.
+const SLOW_STREAM_HEALTHY_FOR: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// What the dropped-connection fixtures send before breaking the connection
+/// on `call` (1 on the first), after waiting: an event, or only a keep-alive
+/// comment when `None`.
+fn dropped_stream_event(
+    task_id: &str,
+    call: u32,
+) -> Option<(Option<StreamResponse>, std::time::Duration)> {
+    let none = std::time::Duration::ZERO;
+    let working = || Some(working_status_update(task_id).unwrap());
+    match task_id {
+        SUBSCRIBE_DROPPED_ID if call == 1 => Some((working(), none)),
+        SUBSCRIBE_DROPPED_SLOW_ID if call == 1 => Some((None, SLOW_STREAM_HEALTHY_FOR)),
+        SUBSCRIBE_DROPPED_SETTLED_ID if call == 1 => Some((
+            Some(task_event(task_id, TaskState::Completed).unwrap()),
+            none,
+        )),
+        SUBSCRIBE_ALWAYS_DROPPED_ID => Some((working(), none)),
+        _ => None,
+    }
+}
+
+/// Answers a dropped-connection fixture's `SubscribeToTask` itself, with an
+/// event stream that ends in an I/O error so the connection is aborted;
+/// everything else goes on to the handler.
+async fn drop_subscribe_connections(
+    state: Arc<ServerState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let rpc: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+
+    if rpc["method"] == "SubscribeToTask" {
+        let task_id = rpc["params"]["id"].as_str().unwrap_or_default().to_string();
+        let call = {
+            let mut calls = state.dropped_stream_calls.lock().unwrap();
+            let counter = calls.entry(task_id.clone()).or_insert(0);
+            *counter += 1;
+            *counter
+        };
+        if let Some((event, wait)) = dropped_stream_event(&task_id, call) {
+            state
+                .received_calls
+                .lock()
+                .unwrap()
+                .push("subscribe_to_task");
+            let first = match event {
+                Some(event) => {
+                    let message = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": rpc["id"],
+                        "result": serde_json::to_value(&event).unwrap(),
+                    });
+                    format!("data: {message}\n\n")
+                }
+                None => ": keep-alive\n\n".to_string(),
+            };
+            let first = axum::body::Bytes::from(first);
+            let events = stream::iter(vec![Ok::<_, std::io::Error>(first)]).chain(stream::once(
+                async move {
+                    tokio::time::sleep(wait).await;
+                    Err(std::io::Error::other("connection reset"))
+                },
+            ));
+            return axum::response::Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(axum::body::Body::from_stream(events))
+                .unwrap();
+        }
+    }
+
+    next.run(axum::extract::Request::from_parts(
+        parts,
+        axum::body::Body::from(bytes),
+    ))
+    .await
+}
 
 fn raw_file_part(bytes: &[u8], filename: Option<&str>) -> Part {
     Part {
@@ -218,6 +321,8 @@ fn subscribe_resumption_events(
         SUBSCRIBE_RESUBSCRIBE_FAILS_ONCE_ID,
         SUBSCRIBE_CUT_FILE_ID,
         SUBSCRIBE_CUT_FILE_LATE_ID,
+        SUBSCRIBE_DROPPED_ID,
+        SUBSCRIBE_DROPPED_SLOW_ID,
     ]
     .contains(&task_id)
     {
@@ -266,6 +371,10 @@ fn subscribe_resumption_events(
                 task_with_file(task_id, TaskState::Working, b"first and second"),
                 task_event(task_id, TaskState::Completed),
             ]
+        }
+        // Only reached by the reconnect: the middleware took the first call.
+        SUBSCRIBE_DROPPED_ID | SUBSCRIBE_DROPPED_SLOW_ID => {
+            vec![task_event(task_id, TaskState::Completed)]
         }
         SUBSCRIBE_CUT_UNCHANGED_ID if attempt == 1 => {
             vec![task_event(task_id, TaskState::Working)]
@@ -397,6 +506,13 @@ impl TestServer {
             },
         );
 
+        let dropping_state = state.clone();
+        let drop_connections = axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                drop_subscribe_connections(dropping_state.clone(), request, next)
+            },
+        );
+
         let app = Router::new()
             .route(
                 WELL_KNOWN_AGENT_CARD_PATH,
@@ -428,7 +544,9 @@ impl TestServer {
             )
             .nest(
                 "/jsonrpc",
-                jsonrpc_router(handler.clone()).layer(record_agent_headers.clone()),
+                jsonrpc_router(handler.clone())
+                    .layer(record_agent_headers.clone())
+                    .layer(drop_connections),
             )
             .nest("/rest", rest_router(handler).layer(record_agent_headers));
 
@@ -1319,6 +1437,124 @@ async fn task_subscribe_retries_a_failed_resubscribe_attempt() {
         3,
         "expected the failed attempt plus two that opened a stream: {calls:?}"
     );
+}
+
+fn subscribe_calls(server: &TestServer) -> usize {
+    calls(server)
+        .iter()
+        .filter(|call| **call == "subscribe_to_task")
+        .count()
+}
+
+/// Runs `task subscribe <id>` with a short poll interval; returns the
+/// parsed stdout events, stderr and the process's success.
+fn subscribe_dropped(server: &TestServer, extra: &[&str], id: &str) -> (Vec<Value>, String, bool) {
+    let mut args = vec!["--output", "json", "--compact", "--poll-interval", "10ms"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["task", "subscribe", id]);
+    let output = run_cli_output(server, &args);
+    (
+        parse_json_lines(&String::from_utf8(output.stdout).unwrap()),
+        String::from_utf8(output.stderr).unwrap(),
+        output.status.success(),
+    )
+}
+
+/// A connection that breaks in the middle of the stream -- how a proxy or a
+/// sleeping laptop actually ends a long subscription -- is reconnected like a
+/// clean end of stream, and the warning names what went wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_reconnects_after_the_connection_drops_mid_stream() {
+    let server = TestServer::spawn().await;
+
+    let (events, stderr, success) = subscribe_dropped(&server, &[], SUBSCRIBE_DROPPED_ID);
+
+    assert!(success, "{stderr}");
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(
+        events[0]["statusUpdate"]["status"]["state"],
+        "TASK_STATE_WORKING"
+    );
+    assert_eq!(events[1]["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+    assert!(
+        stderr.contains("SSE stream error") && stderr.contains("reconnecting"),
+        "expected the cause and a reconnect warning: {stderr}"
+    );
+    assert_eq!(subscribe_calls(&server), 2);
+}
+
+/// `--timeout` is for the outage, so a stream that was open for longer than
+/// it still gets its reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_reconnects_after_a_healthy_stream_outlasts_the_timeout() {
+    let server = TestServer::spawn().await;
+
+    let (events, stderr, success) =
+        subscribe_dropped(&server, &["--timeout", "300ms"], SUBSCRIBE_DROPPED_SLOW_ID);
+
+    assert!(success, "{stderr}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+    assert_eq!(subscribe_calls(&server), 2);
+}
+
+/// Once the task has settled, a connection that fails afterwards loses
+/// nothing, so there is nothing to reconnect for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_does_not_reconnect_for_a_drop_after_the_task_settled() {
+    let server = TestServer::spawn().await;
+
+    let (events, stderr, success) = subscribe_dropped(
+        &server,
+        &["--timeout", "300ms"],
+        SUBSCRIBE_DROPPED_SETTLED_ID,
+    );
+
+    assert!(success, "{stderr}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(subscribe_calls(&server), 1);
+}
+
+/// A connection that keeps dropping is retried for as long as `--timeout`
+/// allows, then reported as a timeout, as a stream that keeps ending is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_gives_up_on_a_connection_that_keeps_dropping() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_output(
+        &server,
+        &[
+            "--output",
+            "json",
+            "--timeout",
+            "300ms",
+            "--poll-interval",
+            "20ms",
+            "task",
+            "subscribe",
+            SUBSCRIBE_ALWAYS_DROPPED_ID,
+        ],
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(5), "{stderr}");
+    let envelope = parse_error_envelope(stderr.lines().next_back().unwrap());
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_TIMEOUT");
+    assert!(subscribe_calls(&server) > 1, "{:?}", calls(&server));
+}
+
+/// An error the agent reports on the stream is its answer, not a failed
+/// connection: it is shown at once, with no reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_does_not_retry_an_error_the_agent_reported() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(&server, &["task", "subscribe", "stream-error"]);
+
+    let envelope = parse_error_envelope(stderr.lines().next_back().unwrap());
+    assert_eq!(envelope["error"]["message"], "stream failed");
+    assert!(!stderr.contains("reconnecting"), "{stderr}");
+    assert_eq!(subscribe_calls(&server), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
