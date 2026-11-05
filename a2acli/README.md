@@ -61,8 +61,9 @@ the provenance do that.
 - Create, fetch, list, and delete task push notification configs
 - Request an extended agent card when the server exposes one
 - Bearer token, API key, and general service-parameter authentication on
-  every request, with an ordered `--transport` preference and an `--insecure`
-  escape hatch (development only, always warns) for self-signed endpoints
+  every request, with an ordered `--transport` preference, `--ca-cert` to
+  trust a private CA, `--unix-socket` to reach an agent through a socket, and
+  an `--insecure` escape hatch (development only, always warns)
 - Human-readable `text` output by default, or the protocol's own JSON
   (`-o/--output json`); every failure is a machine-readable error object
   with a stable code and exit status
@@ -163,6 +164,8 @@ cargo run --bin a2acli -- --api-key "$KEY" card get
 cargo run --bin a2acli -- --svc-param "X-Trace-Id:abc123" send "hello"
 cargo run --bin a2acli -- --transport jsonrpc --transport rest card get
 cargo run --bin a2acli -- --a2a-version 1.0 card get
+cargo run --bin a2acli -- --ca-cert ./private-ca.pem card get  # trust only this CA's certificates
+cargo run --bin a2acli -- --unix-socket /run/agent.sock card get # every HTTP request goes through the socket
 cargo run --bin a2acli -- --insecure --bearer "$TOKEN" card get  # dev only; always warns
 cargo run --bin a2acli -- --debug send "hello"                  # raw wire messages + diagnostics to stderr
 ```
@@ -179,6 +182,27 @@ other than the tool's own is named on stderr rather than applied silently.
 never itself a credential flag. `--insecure` disables TLS certificate
 verification and always prints a warning naming the risk when a credential is
 also configured — it never disables verification silently.
+
+`--ca-cert <file>` is the safe way to reach an agent behind a private or
+self-signed CA: the connection is still verified, against the PEM certificates
+in the file. They **replace** the system roots rather than adding to them, for
+the card fetch and the JSON-RPC and REST transports alike, so a certificate
+issued by a public CA stops being trusted while the flag is set. It cannot be
+combined with `--insecure`, which would leave the file unused, and a build
+without TLS support refuses it rather than ignoring it. The file is read when
+a command connects: an unreadable path, or a file with no certificate, fails
+that command with a usage error (exit `2`) while `config show` still works.
+
+`--unix-socket <path>` sends every HTTP request, the card fetch included,
+through the Unix domain socket at that path, for an agent reached through a
+local harness. Nothing is resolved: the URL's host is still sent as the
+`Host` header and used as the TLS server name, proxies are bypassed, and a
+socket that is not there fails the command instead of falling back to the
+network. Unix only; elsewhere it is a usage error.
+
+Neither flag is read from a `.env` found by walking up from the working
+directory (see Configuration), so a cloned repository cannot choose what
+`a2acli` trusts or where it sends traffic.
 
 `--debug` writes developer diagnostics to stderr, including the raw protocol
 messages exchanged on the wire: the request and response body of every call
@@ -348,6 +372,12 @@ A2ACLI_BEARER="Bearer <token>"
 
 `--stream`, `-h/--help`, and `-v/--version` are never read from the
 environment or a file — they must always be passed explicitly.
+
+`A2ACLI_CA_CERT` and `A2ACLI_UNIX_SOCKET` are also never read from a `.env`
+found by walking up from the working directory: `a2acli` ignores them there,
+says so on stderr, and reports the setting as unset. They are honoured from the
+environment, the global `.env`, and a file named with `--config <path>`, which
+is the caller's own choice.
 
 ```sh
 cargo run --bin a2acli -- config show                  # inspect effective settings
