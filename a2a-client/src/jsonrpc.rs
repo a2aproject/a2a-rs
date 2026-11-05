@@ -32,7 +32,7 @@ fn parse_jsonrpc_error(err: JsonRpcError) -> A2AError {
         })
         .unwrap_or_default();
 
-    crate::a2a_error_from_details(err.code, err.message, details)
+    a2a::a2a_error_from_details(err.code, err.message, details)
 }
 
 /// Parses a JSON-RPC envelope. A body that is not one, sent with a non-success

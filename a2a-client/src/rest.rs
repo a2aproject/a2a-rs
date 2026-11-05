@@ -270,7 +270,7 @@ fn parse_rest_error(status: reqwest::StatusCode, body: &str) -> A2AError {
 /// stream also sends in-band as an event (§11.6).
 pub(crate) fn rest_error(body: &str) -> Option<A2AError> {
     let envelope = serde_json::from_str::<RestErrorEnvelope>(body).ok()?;
-    Some(crate::a2a_error_from_details(
+    Some(a2a::a2a_error_from_details(
         error_code::INTERNAL_ERROR,
         envelope.error.message,
         envelope.error.details,
