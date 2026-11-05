@@ -3185,9 +3185,9 @@ async fn consume_stream<
 }
 
 /// Whether the first event after a reconnect only restates the state the
-/// connection had reached before the cut. Only a snapshot reconciles: a
-/// resumed stream carries none, so its first event is a real update even when
-/// it reports the state reached before the cut.
+/// connection had reached before the cut. A generation-bearing status event
+/// is a real update, even when its state is unchanged. Older peers without
+/// generations may instead reconcile with a repeated status event.
 fn is_unchanged_reconciliation(
     first_event: bool,
     value: &StreamResponse,
@@ -3195,7 +3195,7 @@ fn is_unchanged_reconciliation(
     state_before_this_attempt: Option<&TaskState>,
 ) -> bool {
     first_event
-        && matches!(value, StreamResponse::Task(_))
+        && (matches!(value, StreamResponse::Task(_)) || stream_response_generation(value) == 0)
         && state.is_some()
         && state == state_before_this_attempt
 }
@@ -3951,7 +3951,7 @@ mod tests {
     }
 
     #[test]
-    fn test_only_a_snapshot_is_suppressed_as_an_unchanged_reconciliation() {
+    fn test_reconciliation_preserves_generation_updates_and_suppresses_legacy_repeats() {
         let working = TaskState::Working;
         let task = StreamResponse::Task(Task {
             id: "t".into(),
@@ -3989,6 +3989,24 @@ mod tests {
         assert!(!is_unchanged_reconciliation(
             true,
             &update,
+            Some(&working),
+            Some(&working)
+        ));
+        let StreamResponse::StatusUpdate(mut legacy) = update else {
+            unreachable!()
+        };
+        legacy.generation = 0;
+        let legacy = StreamResponse::StatusUpdate(legacy);
+        // Repeated legacy statuses must not restart an outage's timeout.
+        assert!(is_unchanged_reconciliation(
+            true,
+            &legacy,
+            Some(&working),
+            Some(&working)
+        ));
+        assert!(!is_unchanged_reconciliation(
+            false,
+            &legacy,
             Some(&working),
             Some(&working)
         ));
