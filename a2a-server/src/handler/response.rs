@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Follow task output with a shared runner and shared response settings.
 
-#[cfg(test)]
-use super::delivery::StartMode;
 use super::http_exchange::RegistrationLease;
-use super::protocol::{Rejection, generation_of};
-use super::response_preparation::{DeliveryAttachment, ResponseSettings};
+#[cfg(test)]
+use super::protocol::StartMode;
+use super::protocol::{
+    DeliveryAttachment, IncomingRequest, Rejection, ResponsePolicy, StreamDecision, generation_of,
+};
+use super::response_preparation::{attach_delivery, event_stream};
 use super::task_handle::TaskHandle;
-use super::uplink::{Incoming, IncomingRequest, Receipt, Uplink};
+use super::uplink::{Incoming, Receipt, Uplink};
 use super::{DefaultRequestHandler, RESPONSE_BUFFER_CAPACITY};
 use crate::middleware::ServiceParams;
 use a2a::*;
@@ -37,7 +39,7 @@ pub(super) struct Run {
     pub(super) params: ServiceParams,
     /// The task whose execution and updates this response follows.
     pub(super) task: TaskHandle,
-    settings: ResponseSettings,
+    settings: ResponsePolicy,
 }
 
 pub(super) type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
@@ -48,7 +50,7 @@ impl Run {
         handler: DefaultRequestHandler,
         params: ServiceParams,
         task: TaskHandle,
-        settings: ResponseSettings,
+        settings: ResponsePolicy,
     ) -> Self {
         Self {
             registration: None,
@@ -128,11 +130,11 @@ impl Run {
         last_generation: &mut i64,
         out: &ResponseSender,
     ) -> bool {
-        let ends = item.as_ref().map_or(true, |event| self.completes(event));
+        let keep_open = self.settings.after_event(&item) == StreamDecision::KeepOpen;
         if let Some(generation) = item.as_ref().ok().and_then(generation_of) {
             *last_generation = (*last_generation).max(generation);
         }
-        out.send(item).await.is_ok() && !ends
+        out.send(item).await.is_ok() && keep_open
     }
 
     fn run(
@@ -299,7 +301,7 @@ impl Run {
             let opening =
                 (snapshot.generation > *last_generation || ends).then_some(snapshot.clone());
             *last_generation = (*last_generation).max(snapshot.generation);
-            *inner = Some(self.settings.stream(receiver, opening, sequence));
+            *inner = Some(event_stream(self.settings, receiver, opening, sequence));
             return Reattach::Changed;
         }
         let task = match self.handler.tasks.load(self.task.id()).await {
@@ -407,9 +409,7 @@ impl Run {
         if inner.is_some() {
             return Ok(true);
         }
-        let subscription = self
-            .settings
-            .delivery(delivery, DeliveryAttachment::FollowUp);
+        let subscription = attach_delivery(self.settings, delivery, DeliveryAttachment::FollowUp);
         *inner = Some(subscription.events);
         // This response was detached when input was published. Announce the
         // recorded input once; the newly attached receiver starts after it.
@@ -450,7 +450,7 @@ mod tests {
             handler.clone(),
             ServiceParams::new(),
             handler.tasks.task("working"),
-            ResponseSettings::new(StartMode::Blocking, false),
+            ResponsePolicy::new(StartMode::Blocking, false),
         );
         let events = run.start(None, Some(events), 0);
         let tasks = handler.tasks.clone();
@@ -519,7 +519,7 @@ mod tests {
                 handler.clone(),
                 ServiceParams::new(),
                 handler.tasks.task("task"),
-                ResponseSettings::new(mode, false),
+                ResponsePolicy::new(mode, false),
             )
             .start(None, Some(events()), 0);
             let normal = tokio::time::timeout(Duration::from_secs(2), normal.collect::<Vec<_>>())
@@ -529,7 +529,7 @@ mod tests {
                 handler.clone(),
                 ServiceParams::new(),
                 handler.tasks.task("task"),
-                ResponseSettings::new(mode, false),
+                ResponsePolicy::new(mode, false),
             );
             let (out, mut received) = mpsc::channel(8);
             let mut generation = 0;
@@ -555,7 +555,7 @@ mod tests {
             handler.clone(),
             ServiceParams::new(),
             handler.tasks.task("task"),
-            ResponseSettings::new(StartMode::Bidi, false),
+            ResponsePolicy::new(StartMode::Bidi, false),
         );
         let mut events = Some(
             futures::stream::iter([
@@ -588,7 +588,7 @@ mod tests {
                 handler.clone(),
                 ServiceParams::new(),
                 handler.tasks.task("task"),
-                ResponseSettings::new(StartMode::Streaming, false),
+                ResponsePolicy::new(StartMode::Streaming, false),
             )
             .start(None, None, 0);
             let event = timeout(Duration::from_secs(1), events.next())
@@ -640,7 +640,7 @@ mod tests {
             handler.clone(),
             ServiceParams::new(),
             handler.tasks.task(&task.id),
-            ResponseSettings::new(StartMode::Streaming, false),
+            ResponsePolicy::new(StartMode::Streaming, false),
         )
         .start(None, None, 0);
         assert!(
@@ -691,7 +691,7 @@ mod delivery_tests {
                     handler.clone(),
                     ServiceParams::from([(SVC_PARAM_VERSION.into(), vec!["1.1".into()])]),
                     handler.tasks.task("task"),
-                    ResponseSettings::new(StartMode::Bidi, wants_messages),
+                    ResponsePolicy::new(StartMode::Bidi, wants_messages),
                 );
                 let mut request = send_request();
                 let message_id = request.message.message_id.clone();
@@ -774,7 +774,7 @@ mod delivery_tests {
                 handler.clone(),
                 ServiceParams::new(),
                 handler.tasks.task("task"),
-                ResponseSettings::new(StartMode::Streaming, false),
+                ResponsePolicy::new(StartMode::Streaming, false),
             )
         };
         let panic_stream = stream::once(async { panic!("private runner detail") }).boxed();
@@ -844,7 +844,7 @@ mod recovery_tests {
             handler.clone(),
             ServiceParams::new(),
             handler.tasks.task("task"),
-            ResponseSettings::new(StartMode::Streaming, false),
+            ResponsePolicy::new(StartMode::Streaming, false),
         );
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
@@ -866,7 +866,7 @@ mod recovery_tests {
             handler.clone(),
             ServiceParams::new(),
             handler.tasks.task("task"),
-            ResponseSettings::new(StartMode::Streaming, false),
+            ResponsePolicy::new(StartMode::Streaming, false),
         );
         let mut inner = Some(stream::empty().boxed());
         let (sender, mut receiver) = mpsc::channel(1);

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Adapt duplex streams and HTTP requests into the shared runner uplink.
 
-use super::delivery::MessageInput;
+use super::protocol::{IncomingRequest, ProtocolError};
 use crate::middleware::{ServiceParams, User};
 use a2a::*;
 use futures::{FutureExt, StreamExt, stream::BoxStream};
@@ -40,61 +40,6 @@ use tokio::sync::{mpsc, oneshot};
 //   (a client sees the gap in the generations and reads the task). With
 //   `fail_on_error`, a failed delivery wakes its execution driver with an error;
 //   an event that was already published is not rolled back.
-
-/// Protocol payload classified once at the native-stream or HTTP boundary.
-pub(super) enum IncomingRequest {
-    Message(Box<MessageInput>),
-    Subscribe(SubscribeToTaskRequest),
-    Invalid,
-}
-
-impl From<StreamRequest> for IncomingRequest {
-    fn from(request: StreamRequest) -> Self {
-        match request.payload {
-            StreamRequestPayload::SendMessage(request) => {
-                Self::Message(Box::new(MessageInput::Raw(request)))
-            }
-            StreamRequestPayload::Subscribe(request) => Self::Subscribe(request),
-            _ => Self::Invalid,
-        }
-    }
-}
-
-impl IncomingRequest {
-    /// Only the opening accepts subscriptions; follow-ups must be messages.
-    pub(super) fn into_message(self) -> Result<MessageInput, A2AError> {
-        match self {
-            Self::Message(message) => Ok(*message),
-            Self::Subscribe(_) => Err(A2AError::invalid_request(
-                "subscribe is only valid as the first request of a stream",
-            )),
-            Self::Invalid => Err(A2AError::invalid_request(
-                "unrecognised StreamRequest payload",
-            )),
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn message(request: SendMessageRequest) -> Self {
-        Self::Message(Box::new(MessageInput::Raw(request)))
-    }
-
-    pub(super) fn reference_id(&self) -> Option<String> {
-        let message = match self {
-            Self::Message(input) => input.request(),
-            Self::Subscribe(subscribe) => return Some(subscribe.id.clone()),
-            Self::Invalid => return None,
-        };
-        Some(message.message.message_id.clone())
-            .filter(|id| !id.is_empty())
-            .or_else(|| {
-                message
-                    .artifact_updates
-                    .first()
-                    .map(|update| update.artifact.artifact_id.clone())
-            })
-    }
-}
 
 /// Normalized input consumed by the runner, with an optional processing receipt.
 pub(super) struct Incoming {
@@ -216,9 +161,7 @@ pub(super) fn exchange_id(params: &ServiceParams) -> Result<Option<String>, A2AE
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
     {
-        return Err(A2AError::invalid_params(
-            "invalid live exchange routing header",
-        ));
+        return Err(ProtocolError::InvalidExchangeRoutingHeader.into());
     }
     Ok(Some(value.clone()))
 }
@@ -237,9 +180,7 @@ impl HttpLiveResponses {
         });
         let task = tasks.next().cloned();
         if tasks.next().is_some() {
-            return Err(A2AError::invalid_request(
-                "ambiguous live exchange identifier",
-            ));
+            return Err(ProtocolError::AmbiguousExchangeIdentifier.into());
         }
         Ok(task)
     }
@@ -290,14 +231,10 @@ impl HttpLiveResponses {
             return Ok(None);
         };
         if candidates.next().is_some() {
-            return Err(A2AError::invalid_request(
-                "ambiguous live exchange; use a distinct exchange routing identifier",
-            ));
+            return Err(ProtocolError::AmbiguousExchange.into());
         }
         if &response.user != user {
-            return Err(A2AError::invalid_request(
-                "live exchange belongs to a different caller",
-            ));
+            return Err(ProtocolError::ForeignExchangeCaller.into());
         }
         Ok(Some((bound_task.clone(), response.sender.clone())))
     }

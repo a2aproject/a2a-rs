@@ -3,18 +3,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Default request-handler state, configuration, operations, and tests.
 
-use super::delivery::{
-    AuthorizedMessage, Delivery, MessageInput, StartMode, is_artifact_only, request_task_id,
-};
+use super::delivery::{AuthorizedMessage, Delivery, MessageInput};
 use super::http_exchange::{self, HttpOpening, RegistrationLease};
-use super::protocol::{Rejection, apply_lengths, requested_protocol_version, unary_refusal};
+use super::protocol::{
+    self, IncomingRequest, ProtocolError, Rejection, RequestRules, ResponsePolicy, StartMode,
+    apply_lengths, request_task_id, requested_protocol_version,
+};
 use super::push_delivery::PushService;
 use super::response::{Events, Run};
-use super::response_preparation::{MessageResponse, PreparedResponse};
-use super::response_preparation::{ResponseSettings, SubscriptionAttachment};
+use super::response_preparation::{MessageResponse, PreparedResponse, SubscriptionAttachment};
 use super::task_handle::TaskHandle;
 use super::task_service::TaskService;
-use super::uplink::{HttpLiveResponses, IncomingRequest, Uplink};
+use super::uplink::{HttpLiveResponses, Uplink};
 
 use crate::middleware::{ServiceParams, User};
 use crate::pagination::resolve_page_size;
@@ -166,31 +166,7 @@ impl DefaultRequestHandler {
         if let Some(authorizer) = &self.authorizer {
             authorizer.authorize(params, task_id)?;
         }
-        // In-process callers may omit transport metadata, but an announced
-        // version must pass the same check as a transport-bound request.
-        if params
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case(SVC_PARAM_VERSION))
-        {
-            crate::middleware::check_a2a_version(params)?;
-        }
-        // Required extensions apply to every operation and every live input.
-        for extension in self.capabilities.extensions.iter().flatten() {
-            if extension.required == Some(true)
-                && !params
-                    .iter()
-                    .filter(|(name, _)| name.eq_ignore_ascii_case(SVC_PARAM_EXTENSIONS))
-                    .flat_map(|(_, values)| values)
-                    .flat_map(|value| value.split(','))
-                    .any(|uri| uri.trim() == extension.uri)
-            {
-                return Err(A2AError::new(
-                    error_code::EXTENSION_SUPPORT_REQUIRED,
-                    format!("required extension: {}", extension.uri),
-                ));
-            }
-        }
-        Ok(())
+        self.protocol().validate_operation(params)
     }
 
     pub fn with_push_config_store(self, push_config_store: impl crate::PushConfigStore) -> Self {
@@ -220,61 +196,18 @@ impl DefaultRequestHandler {
         self
     }
 
-    /// A part with a declared, non-empty media type that isn't among the
-    /// advertised `defaultInputModes` is rejected; a part that declares none
-    /// is unrestricted, and so is every part when no modes were declared.
-    fn validate_content_types(&self, message: &Message) -> Result<(), A2AError> {
-        if self.default_input_modes.is_empty() {
-            return Ok(());
-        }
-        let supported = message.parts.iter().all(|part| {
-            part.media_type.as_deref().is_none_or(|media_type| {
-                media_type.is_empty() || self.default_input_modes.iter().any(|m| m == media_type)
-            })
-        });
-        if supported {
-            Ok(())
-        } else {
-            Err(A2AError::content_type_not_supported())
-        }
-    }
-
-    /// §13.3: refuse a capability-gated operation the card does not declare.
-    ///
-    /// Optional capabilities are available only when explicitly declared true.
-    fn require_capability(
-        declared: Option<bool>,
-        unsupported: impl FnOnce() -> A2AError,
-    ) -> Result<(), A2AError> {
-        match declared {
-            Some(true) => Ok(()),
-            _ => Err(unsupported()),
-        }
-    }
-
-    /// `artifactUpdates` is opt-in: unlike the other capabilities, an
-    /// undeclared `userArtifacts` means the agent does not accept them.
-    fn validate_artifact_updates(&self, req: &SendMessageRequest) -> Result<(), A2AError> {
-        if req.artifact_updates.is_empty() || self.capabilities.user_artifacts == Some(true) {
-            return Ok(());
-        }
-        Err(A2AError::unsupported_operation(
-            "the agent card does not declare userArtifacts",
-        ))
+    /// Shared request rules; application callbacks and worker state stay here.
+    fn protocol(&self) -> RequestRules<'_> {
+        RequestRules::new(&self.capabilities, &self.default_input_modes)
     }
 
     fn require_streaming(&self) -> Result<(), A2AError> {
         self.tasks.background_tasks.check_running()?;
-        Self::require_capability(self.capabilities.streaming, || {
-            A2AError::unsupported_operation("the agent card does not declare streaming")
-        })
+        self.protocol().require_streaming()
     }
 
     fn require_push_notifications(&self) -> Result<(), A2AError> {
-        Self::require_capability(
-            self.capabilities.push_notifications,
-            A2AError::push_notification_not_supported,
-        )
+        self.protocol().require_push_notifications()
     }
 
     /// Require the advertised capability and a fully configured webhook service.
@@ -282,7 +215,7 @@ impl DefaultRequestHandler {
         self.require_push_notifications()?;
         self.pushes
             .as_deref()
-            .ok_or_else(A2AError::push_notification_not_supported)
+            .ok_or_else(|| ProtocolError::PushUnsupported.into())
     }
 
     pub(super) fn attach_pushes(&self, task: &TaskHandle) {
@@ -296,10 +229,10 @@ impl DefaultRequestHandler {
         &self,
         params: &ServiceParams,
         request: SendMessageRequest,
-        settings: ResponseSettings,
+        policy: ResponsePolicy,
     ) -> Result<MessageResponse, A2AError> {
         let prepared = self
-            .prepare_message(params, MessageInput::Raw(request), settings)
+            .prepare_message(params, MessageInput::Raw(request), policy)
             .await?;
         let task = prepared.task.clone();
         let events = self.response_stream(params, prepared, None, None);
@@ -319,22 +252,20 @@ impl DefaultRequestHandler {
                 return Err(A2AError::internal("handler is shutting down"));
             }
             first = uplink.next() => first
-                .ok_or_else(|| A2AError::invalid_request("a response needs a first request"))?,
+                .ok_or(ProtocolError::MissingOpeningRequest)?,
         };
         let prepared = match first.request {
             IncomingRequest::Message(input) => {
-                let settings = ResponseSettings::message(StartMode::Bidi, params, input.request());
-                self.prepare_message(params, *input, settings).await?
+                let policy = ResponsePolicy::message(StartMode::Bidi, params, input.request());
+                self.prepare_message(params, *input, policy).await?
             }
             IncomingRequest::Subscribe(request) => {
                 let attachment = self.attach_subscription(params, request).await?;
-                let settings = ResponseSettings::subscription(StartMode::Bidi, params);
-                PreparedResponse::subscription(attachment, settings)
+                let policy = ResponsePolicy::subscription(StartMode::Bidi, params);
+                PreparedResponse::subscription(attachment, policy)
             }
             IncomingRequest::Invalid => {
-                return Err(A2AError::invalid_request(
-                    "unrecognised StreamRequest payload",
-                ));
+                return Err(ProtocolError::UnknownStreamRequest.into());
             }
         };
         Ok(self.response_stream(params, prepared, Some(uplink), registration))
@@ -363,17 +294,14 @@ impl DefaultRequestHandler {
         &self,
         params: &ServiceParams,
         input: MessageInput,
-        settings: ResponseSettings,
+        policy: ResponsePolicy,
     ) -> Result<PreparedResponse, A2AError> {
         let requested_task = request_task_id(input.request());
         let delivery = self
-            .receive_message(params, input, settings.mode(), None, settings.response_id())
+            .receive_message(params, input, policy.mode(), None, policy.response_id())
             .await
-            .map_err(|rejection| match settings.mode() {
-                StartMode::Bidi => rejection.into_error(),
-                _ => unary_refusal(rejection, requested_task.as_deref()),
-            })?;
-        Ok(PreparedResponse::message(delivery, settings))
+            .map_err(|rejection| policy.opening_error(rejection, requested_task.as_deref()))?;
+        Ok(PreparedResponse::message(delivery, policy))
     }
 
     /// Bind and authorize each message once, using its caller rather than
@@ -387,17 +315,7 @@ impl DefaultRequestHandler {
     ) -> Result<AuthorizedMessage, Rejection> {
         // Bind before authorization so native follow-ups check the inferred task.
         if let Some(bound) = bound_task {
-            let request = input.request_mut();
-            match request_task_id(request) {
-                Some(named) if named != bound => {
-                    return Err(A2AError::invalid_params(format!(
-                        "this stream is bound to task {bound}, not {named}"
-                    ))
-                    .into());
-                }
-                Some(_) => {}
-                None => request.message.task_id = Some(bound.to_string()),
-            }
+            protocol::bind_request_task(input.request_mut(), bound)?;
         }
         match input {
             // HTTP routing already checked this caller. Keep its credentials.
@@ -425,25 +343,8 @@ impl DefaultRequestHandler {
     ) -> Result<Delivery, Rejection> {
         let mut message = self.authorize_message(params, input, bound_task)?;
         message.response_id = response_id;
-        let request = &message.request;
-        self.validate_artifact_updates(request)?;
-        if !is_artifact_only(request) {
-            self.validate_content_types(&request.message)?;
-            if request.message.message_id.is_empty()
-                || request.message.parts.is_empty()
-                || request.message.role != Role::User
-            {
-                return Err(A2AError::invalid_params(
-                    "client messages require a messageId, user role and at least one part",
-                )
-                .into());
-            }
-        } else if request_task_id(request).is_none() {
-            return Err(A2AError::invalid_params(
-                "artifactUpdates sent without a message must name the task",
-            )
-            .into());
-        }
+        // Validate before admission can persist input or deliver it to an executor.
+        self.protocol().validate_message(&message.request)?;
         self.tasks.append_input(self.clone(), message, mode).await
     }
 
@@ -458,8 +359,6 @@ impl DefaultRequestHandler {
         self.require_streaming()?;
         self.tasks.subscribe(self.clone(), req).await
     }
-
-    // Preparation.
 
     // Push delivery.
     /// The push configuration the request carries, for `task_id`.
@@ -509,11 +408,11 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        let settings = ResponseSettings::message(StartMode::Blocking, params, &req);
-        let mut response = match self.send(params, req, settings).await? {
+        let policy = ResponsePolicy::message(StartMode::Blocking, params, &req);
+        let mut response = match self.send(params, req, policy).await? {
             MessageResponse::Message(message) => SendMessageResponse::Message(message),
             MessageResponse::Task(task) => {
-                if !settings.return_immediately() {
+                if !policy.return_immediately() {
                     task.wait().await?
                 } else {
                     SendMessageResponse::Task(task.snapshot().await?)
@@ -521,7 +420,7 @@ impl RequestHandler for DefaultRequestHandler {
             }
         };
         if let SendMessageResponse::Task(task) = &mut response {
-            settings.trim(task);
+            policy.trim(task);
         }
         Ok(response)
     }
@@ -531,16 +430,16 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let settings = ResponseSettings::message(StartMode::Streaming, params, &req);
+        let policy = ResponsePolicy::message(StartMode::Streaming, params, &req);
         self.require_streaming()?;
         let prepared = self
-            .prepare_message(params, MessageInput::Raw(req), settings)
+            .prepare_message(params, MessageInput::Raw(req), policy)
             .await?;
         let events = self.response_stream(params, prepared, None, None);
         Ok(Box::pin(events.map(move |item| {
             item.map(|mut event| {
                 if let StreamResponse::Task(task) = &mut event {
-                    settings.trim(task);
+                    policy.trim(task);
                 }
                 event
             })
@@ -643,8 +542,8 @@ impl RequestHandler for DefaultRequestHandler {
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let attachment = self.attach_subscription(params, req).await?;
-        let settings = ResponseSettings::subscription(StartMode::Streaming, params);
-        let prepared = PreparedResponse::subscription(attachment, settings);
+        let policy = ResponsePolicy::subscription(StartMode::Streaming, params);
+        let prepared = PreparedResponse::subscription(attachment, policy);
         Ok(self.response_stream(params, prepared, None, None))
     }
 
@@ -713,13 +612,7 @@ impl RequestHandler for DefaultRequestHandler {
         // that. PushConfigStore is public, so this clamp is what bounds the
         // response for an implementation with no per-task limit of its own.
         let page_size = resolve_page_size(req.page_size);
-        let start = if let Some(ref token) = req.page_token {
-            token
-                .parse::<usize>()
-                .map_err(|_| A2AError::invalid_params("invalid page token"))?
-        } else {
-            0
-        };
+        let start = protocol::push_config_page_offset(req.page_token.as_deref())?;
         let start = start.min(configs.len());
         let end = (start + page_size).min(configs.len());
         let next_page_token = (end < configs.len()).then(|| end.to_string());
@@ -748,18 +641,14 @@ impl RequestHandler for DefaultRequestHandler {
         _req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
         self.authorize(params, None)?;
-        Self::require_capability(self.capabilities.extended_agent_card, || {
-            A2AError::unsupported_operation(
-                "the agent card does not declare an extended agent card",
-            )
-        })?;
+        self.protocol().require_extended_agent_card()?;
         match &self.extended_agent_card {
             Some(resolver) => resolver.resolve(params),
             // A2A defines a code for exactly this condition.
             // UNSUPPORTED_OPERATION would say the agent does not do extended
             // cards at all, when the truth is that this deployment has not
             // configured one — the client can act on that difference.
-            None => Err(A2AError::extended_card_not_configured()),
+            None => Err(ProtocolError::ExtendedCardNotConfigured.into()),
         }
     }
 }

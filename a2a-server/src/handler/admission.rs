@@ -4,11 +4,12 @@
 //! Validate stored Task identity and commit accepted client input.
 
 use super::DefaultRequestHandler;
-use super::delivery::{
-    AuthorizedMessage, Delivery, RecordedInput, is_artifact_only, record_client_input,
+use super::delivery::{AuthorizedMessage, Delivery};
+use super::protocol::{
+    ProtocolError, RecordedInput, Rejection, is_artifact_only, record_client_input,
     validate_existing_task,
 };
-use super::{events::ActiveExecution, execution::InvocationState, protocol::Rejection};
+use super::{events::ActiveExecution, execution::InvocationState};
 use crate::{ClientInput, executor::QueuedInput};
 use a2a::*;
 use std::sync::Arc;
@@ -27,17 +28,11 @@ pub(super) async fn prepare(
     req: &SendMessageRequest,
     task_id: &str,
 ) -> Result<PreparedInput, A2AError> {
-    let artifact_only = is_artifact_only(req);
     // A2A §3.4.2: a client-provided taskId MUST reference an existing task,
     // and client-provided ids for *creating* tasks are not supported. Only
     // an absent taskId may mint a new one.
     let stored = handler.tasks.get(task_id).await?;
-    if stored.is_none() && (req.message.task_id.is_some() || artifact_only) {
-        return Err(A2AError::task_not_found(task_id));
-    }
-    if let Some(task) = &stored {
-        validate_existing_task(task, req)?;
-    }
+    super::protocol::validate_task_reference(stored.as_ref(), req, task_id)?;
     let context_id = stored
         .as_ref()
         .map(|task| task.context_id.clone())
@@ -106,7 +101,7 @@ fn validate_and_reserve_input(
     task_id: &str,
 ) -> Result<(Task, Option<InputPermit>), Rejection> {
     if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(A2AError::task_not_found(task_id).into());
+        return Err(ProtocolError::TaskNotFound(task_id).into());
     }
     let task = active
         .snapshot()
@@ -122,9 +117,7 @@ fn validate_and_reserve_input(
             .clone()
             .try_reserve_owned()
             .map_err(|refusal| match refusal {
-                mpsc::error::TrySendError::Full(_) => {
-                    Rejection::Declined("the agent is busy with earlier input".to_string())
-                }
+                mpsc::error::TrySendError::Full(_) => Rejection::input_busy(),
                 // Closing and unregistering are serialized in the same task queue.
                 mpsc::error::TrySendError::Closed(_) => Rejection::Failed(A2AError::internal(
                     "the input queue of a registered execution is closed",

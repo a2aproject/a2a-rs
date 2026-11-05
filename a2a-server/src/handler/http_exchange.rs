@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! HTTP-only exchange routing, acknowledgements, and caller binding.
 
-use super::delivery::{AuthorizedMessage, MessageInput, request_task_id};
-use super::protocol::{Rejection, records_message};
-use super::uplink::{HttpLiveResponses, Incoming, IncomingRequest, Receipt, Uplink, exchange_id};
+use super::delivery::{AuthorizedMessage, MessageInput};
+use super::protocol::{
+    IncomingRequest, ProtocolError, Rejection, records_message, request_task_id,
+};
+use super::uplink::{HttpLiveResponses, Incoming, Receipt, Uplink, exchange_id};
 use super::{DefaultRequestHandler, LIVE_UPLINK_CAPACITY};
 use crate::middleware::ServiceParams;
 use a2a::*;
@@ -90,9 +92,7 @@ pub(super) async fn open(
     };
     // Report registry conflicts only after checking credentials.
     if bound_task?.is_some() && matches!(request, IncomingRequest::Subscribe(_)) {
-        return Err(A2AError::invalid_request(
-            "live exchange identifier is already in use",
-        ));
+        return Err(ProtocolError::ExchangeIdentifierInUse.into());
     }
     if let IncomingRequest::Message(input) = &request
         && let MessageInput::Authorized(message) = input.as_ref()
@@ -184,10 +184,10 @@ async fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::protocol::{ResponsePolicy, StartMode};
     use crate::handler::response::{Events, Run};
     use crate::handler::test_support::*;
     use crate::handler::uplink::Receipt;
-    use crate::handler::{delivery::StartMode, response_preparation::ResponseSettings};
     use tokio::sync::oneshot;
 
     async fn bound_run(handler: &DefaultRequestHandler) -> Run {
@@ -213,7 +213,7 @@ mod tests {
             handler.clone(),
             params,
             handler.tasks.task("task"),
-            ResponseSettings::new(StartMode::Bidi, false),
+            ResponsePolicy::new(StartMode::Bidi, false),
         )
         .with_uplink(Some(uplink), Some(registration))
     }
