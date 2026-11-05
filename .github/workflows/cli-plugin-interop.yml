@@ -157,7 +157,7 @@ jobs:
           docker run -d --name "$gateway" \
             -p 127.0.0.1:46357:46357 \
             -v "$PWD/a2acli-transport-slimrpc/examples/slim-gateway.yaml:/config.yaml:ro" \
-            ghcr.io/agntcy/slim:3.4.6 /slim --config /config.yaml
+            ghcr.io/agntcy/slim:3.4.6@sha256:54fde7ce0ef8efa6a61fee47996e941e87acb4e62284e5d9c00eb761295619b7 /slim --config /config.yaml
           # Bound startup separately from the actual test; sends are not retried.
           python3 - <<'PYREADY'
           import socket
@@ -171,17 +171,26 @@ jobs:
           else:
               raise SystemExit("SLIM gateway did not become ready")
           PYREADY
-          GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn \
-            slimrpc-echo-agent --a2a-version v1 --slim-endpoint http://127.0.0.1:46357 \
-            > interop-logs/agent.log 2>&1 &
-          agent_pid=$!
+          # Docker's host port can accept TCP before SLIM accepts gRPC.
+          # Retry only agent startup, retaining every failed attempt's output.
+          touch interop-logs/agent.log
           for attempt in $(seq 1 60); do
-            kill -0 "$agent_pid" 2>/dev/null || { cat interop-logs/agent.log; exit 1; }
+            if [ -z "$agent_pid" ] || ! kill -0 "$agent_pid" 2>/dev/null; then
+              if [ -n "$agent_pid" ]; then
+                wait "$agent_pid" 2>/dev/null || true
+              fi
+              echo "Starting echo agent (readiness attempt $attempt)" >> interop-logs/agent.log
+              GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn \
+                slimrpc-echo-agent --a2a-version v1 --slim-endpoint http://127.0.0.1:46357 \
+                >> interop-logs/agent.log 2>&1 &
+              agent_pid=$!
+            fi
             if grep -q 'echo agent ready' interop-logs/agent.log; then
               break
             fi
             sleep 1
           done
+          kill -0 "$agent_pid"
           grep -q 'echo agent ready' interop-logs/agent.log
           python3 scripts/slimrpc_interop.py --output-dir interop-logs
 
