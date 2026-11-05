@@ -172,6 +172,9 @@ impl FilePartSource for StreamResponse {
             StreamResponse::ArtifactUpdate(event) => {
                 saver.save_artifact(&event.artifact, event.append.unwrap_or(false))
             }
+            StreamResponse::MessageUpdate(event) => saver.save_message(&event.message),
+            // Rejections and future event kinds carry no known file parts.
+            _ => Ok(()),
         }
     }
 }
@@ -348,6 +351,9 @@ mod tests {
 
     fn artifact(id: &str, name: Option<&str>, parts: Vec<Part>) -> Artifact {
         Artifact {
+            end_generation: None,
+            role: None,
+            start_generation: None,
             artifact_id: id.to_string(),
             name: name.map(str::to_string),
             description: None,
@@ -526,6 +532,8 @@ mod tests {
     fn test_a_task_saves_its_artifacts_and_its_status_message() {
         let scratch = Scratch::new();
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t1".to_string(),
             context_id: "c1".to_string(),
             status: a2a::TaskStatus {
@@ -552,6 +560,8 @@ mod tests {
     fn test_the_same_task_seen_again_rewrites_rather_than_duplicates() {
         let scratch = Scratch::new();
         let make = |body: &[u8]| Task {
+            generation: 0,
+            timeline: None,
             id: "t1".to_string(),
             context_id: "c1".to_string(),
             status: a2a::TaskStatus {
@@ -638,6 +648,7 @@ mod tests {
         let part = |body: &[u8], name: &str| vec![raw(body, Some(name), None)];
         let status_update = |message: Option<Message>| {
             StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "t1".to_string(),
                 context_id: "c1".to_string(),
                 status: a2a::TaskStatus {
@@ -663,11 +674,31 @@ mod tests {
             .unwrap();
         status_update(None).save_to(&mut saver).unwrap();
         StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            generation: 0,
             task_id: "t1".to_string(),
             context_id: "c1".to_string(),
             artifact: artifact("a1", Some("chunk.txt"), vec![raw(b"5", None, None)]),
             append: None,
             last_chunk: None,
+            metadata: None,
+        })
+        .save_to(&mut saver)
+        .unwrap();
+
+        StreamResponse::MessageUpdate(a2a::TaskMessageUpdateEvent {
+            task_id: "t1".into(),
+            context_id: "c1".into(),
+            message: message("m5", part(b"6", "update.txt")),
+            generation: 1,
+            metadata: None,
+        })
+        .save_to(&mut saver)
+        .unwrap();
+        StreamResponse::Error(a2a::StreamError {
+            task_id: "t1".into(),
+            code: "UNAVAILABLE".into(),
+            message: "busy".into(),
+            reference_id: None,
             metadata: None,
         })
         .save_to(&mut saver)
@@ -680,10 +711,12 @@ mod tests {
                 "message.txt",
                 "reply.txt",
                 "status.txt",
-                "streamed.txt"
+                "streamed.txt",
+                "update.txt"
             ]
         );
         assert_eq!(scratch.read("reply.txt"), b"2");
+        assert_eq!(scratch.read("update.txt"), b"6");
     }
 
     #[test]

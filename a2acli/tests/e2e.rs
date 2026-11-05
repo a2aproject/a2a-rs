@@ -238,6 +238,9 @@ fn raw_file_part(bytes: &[u8], filename: Option<&str>) -> Part {
 
 fn file_artifact(name: &str, bytes: &[u8]) -> Artifact {
     Artifact {
+        end_generation: None,
+        role: None,
+        start_generation: None,
         artifact_id: "file-1".to_string(),
         name: Some(name.to_string()),
         description: None,
@@ -249,6 +252,7 @@ fn file_artifact(name: &str, bytes: &[u8]) -> Artifact {
 
 fn file_chunk(task_id: &str, bytes: &[u8], append: bool) -> Result<StreamResponse, A2AError> {
     Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+        generation: 0,
         task_id: task_id.to_string(),
         context_id: format!("{task_id}-ctx"),
         artifact: file_artifact("log.txt", bytes),
