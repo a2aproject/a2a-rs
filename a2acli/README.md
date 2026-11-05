@@ -209,11 +209,19 @@ after which the command exits with a timeout error).
 settles — an SSE stream held open for a long-running task will eventually be
 dropped by a proxy, a load balancer, or a laptop going to sleep, and a dropped
 connection looks identical to a finished task unless something distinguishes
-them. `--poll-interval` and `--timeout` apply here too: `--poll-interval` is
-the delay between reconnect attempts, and `--timeout` bounds the reconnection
-budget cumulatively across all of them — not any single attempt, and not a
-healthy stream that never disconnects at all. Each attempt is reported on
-stderr; stdout carries only the protocol events.
+them. That covers a stream that ends and one whose connection fails partway
+through. `--poll-interval` and `--timeout` apply here too: `--poll-interval`
+is the delay between reconnect attempts, and `--timeout` bounds one outage —
+from its first interruption until an event is printed again — across all its
+attempts, not any single attempt, and not a stream that stays open. Each
+attempt is reported on stderr with its cause; stdout carries only the
+protocol events.
+
+An error the agent itself reports on the stream is not a dropped connection
+and is not retried. Over JSON-RPC and REST the client keeps the details such
+an error arrives with, which is how the two are told apart. gRPC and SLIMRPC
+drop them, so there a failure the agent reports is retried as well, until
+`--timeout`.
 
 Reconnecting never issues a `task get`: the server's first event after
 resuming is the full current `Task`, which is enough to reconcile state
