@@ -4185,9 +4185,13 @@ mod tests {
 
     fn artifact_chunk() -> Result<StreamResponse, A2AError> {
         Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            generation: 0,
             task_id: "t".to_string(),
             context_id: "c".to_string(),
             artifact: Artifact {
+                end_generation: None,
+                role: None,
+                start_generation: None,
                 artifact_id: "a".to_string(),
                 name: None,
                 description: None,
