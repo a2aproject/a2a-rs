@@ -85,6 +85,7 @@ struct ServerState {
     dropped_stream_calls: Mutex<BTreeMap<String, u32>>,
     /// The `Host` header of each request, recorded only by the Unix-socket
     /// fixture: over a socket it is the one trace of the URL's host.
+    #[cfg(unix)]
     hosts: Mutex<Vec<String>>,
 }
 
