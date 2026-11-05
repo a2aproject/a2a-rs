@@ -173,25 +173,27 @@ jobs:
           PYREADY
           # Docker's host port can accept TCP before SLIM accepts gRPC.
           # Retry only agent startup, retaining every failed attempt's output.
-          touch interop-logs/agent.log
+          agent_log=""
           for attempt in $(seq 1 60); do
             if [ -z "$agent_pid" ] || ! kill -0 "$agent_pid" 2>/dev/null; then
               if [ -n "$agent_pid" ]; then
                 wait "$agent_pid" 2>/dev/null || true
               fi
-              echo "Starting echo agent (readiness attempt $attempt)" >> interop-logs/agent.log
+              # Keep each attempt's logs, but only inspect the current one.
+              agent_log="interop-logs/agent-attempt-${attempt}.log"
+              echo "Starting echo agent (readiness attempt $attempt)" > "$agent_log"
               GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn \
                 slimrpc-echo-agent --a2a-version v1 --slim-endpoint http://127.0.0.1:46357 \
-                >> interop-logs/agent.log 2>&1 &
+                >> "$agent_log" 2>&1 &
               agent_pid=$!
             fi
-            if grep -q 'echo agent ready' interop-logs/agent.log; then
+            if grep -q 'echo agent ready' "$agent_log"; then
               break
             fi
             sleep 1
           done
           kill -0 "$agent_pid"
-          grep -q 'echo agent ready' interop-logs/agent.log
+          grep -q 'echo agent ready' "$agent_log"
           python3 scripts/slimrpc_interop.py --output-dir interop-logs
 
       - name: Upload interop logs
