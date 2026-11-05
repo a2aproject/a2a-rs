@@ -2,6 +2,7 @@
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 pub mod card_schema;
+mod fileparts;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -15,6 +16,7 @@ use a2a_client::auth::AuthInterceptor;
 use a2a_client::{A2AClient, A2AClientFactory, BoxStream};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use fileparts::{FilePartSaver, FilePartSource};
 use futures::StreamExt;
 use reqwest::{Client, RequestBuilder};
 use serde::Serialize;
@@ -264,7 +266,7 @@ pub enum TaskCommand {
     /// Cancel a task by ID.
     Cancel(TaskIdCommand),
     /// Subscribe to task updates and print each event as it arrives.
-    Subscribe(TaskIdCommand),
+    Subscribe(SubscribeCommand),
     /// Manage push notification configs for a task.
     PushConfig {
         #[command(subcommand)]
@@ -322,6 +324,12 @@ pub struct MessageCommand {
     /// Use the streaming send operation and print each event as it arrives.
     #[arg(long)]
     pub stream: bool,
+
+    /// Save the raw file parts of the response (artifacts and messages) as
+    /// files under DIR. The output still summarises each by name, type and
+    /// size.
+    #[arg(long = "save-fileparts", value_name = "DIR")]
+    pub save_fileparts: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -332,6 +340,12 @@ pub struct TaskLookupCommand {
     /// Ask the server to include up to this many history items.
     #[arg(long)]
     pub history_length: Option<i32>,
+
+    /// Save the raw file parts of the task (artifacts and status message) as
+    /// files under DIR. The output still summarises each by name, type and
+    /// size.
+    #[arg(long = "save-fileparts", value_name = "DIR")]
+    pub save_fileparts: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -365,6 +379,18 @@ pub struct ListTasksCommand {
 pub struct TaskIdCommand {
     /// Task identifier.
     pub id: String,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct SubscribeCommand {
+    /// Task identifier.
+    pub id: String,
+
+    /// Save the raw file parts of each event (artifacts and messages) as
+    /// files under DIR. The output still summarises each by name, type and
+    /// size.
+    #[arg(long = "save-fileparts", value_name = "DIR")]
+    pub save_fileparts: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
@@ -505,6 +531,13 @@ pub enum CliError {
         #[source]
         source: std::io::Error,
     },
+    /// `--save-fileparts`: a file part that could not be written.
+    #[error("failed to save a file part to {path}: {source}")]
+    SaveFilePart {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("timed out after {timeout:?} waiting for task {task_id} to settle")]
     Timeout { task_id: String, timeout: Duration },
     /// A local Agent Card file that couldn't be read — the file-path
@@ -533,6 +566,15 @@ pub enum CliError {
     /// rather than being printed in its place.
     #[error("{0}")]
     Usage(String),
+}
+
+impl From<fileparts::SaveError> for CliError {
+    fn from(error: fileparts::SaveError) -> Self {
+        CliError::SaveFilePart {
+            path: error.path.display().to_string(),
+            source: error.source,
+        }
+    }
 }
 
 /// A2A §5.3: where an agent publishes its card, appended to a reference
@@ -571,6 +613,8 @@ impl CliError {
             CliError::Json(_) => 1,
             CliError::InvalidInput(_) => 2,
             CliError::ReadFile { .. } => 2,
+            // Appendix D has no code for a local write failure: INTERNAL.
+            CliError::SaveFilePart { .. } => 1,
             CliError::Timeout { .. } => 5,
             // Appendix D: the same statuses the HTTP card path uses, so a
             // caller branching on the exit code needn't know whether the
@@ -601,6 +645,11 @@ impl CliError {
                     "check that the --file-part/--data-part path exists and is readable"
                         .to_string(),
                 ),
+                None,
+            ),
+            CliError::SaveFilePart { .. } => (
+                "A2ACLI_ERR_INTERNAL".to_string(),
+                Some("check that --save-fileparts names a directory you can write to".to_string()),
                 None,
             ),
             CliError::CardFile { .. } => (
@@ -848,6 +897,7 @@ pub async fn run(
                 .subcommand_matches("send")
                 .expect("send subcommand matches present when cli.command is Command::Send");
             let parts = resolve_message_parts(send_matches, command)?;
+            let mut saver = file_part_saver(command.save_fileparts.as_deref())?;
             let ResolvedClient {
                 client,
                 tenant,
@@ -872,7 +922,7 @@ pub async fn run(
             if command.stream && streaming {
                 match client.send_streaming_message(&request).await {
                     Ok(stream) => {
-                        consume_stream(client, stream, &cli).await?;
+                        consume_stream(client, stream, &cli, &mut saver).await?;
                     }
                     Err(error) if error.code == a2a::error_code::UNSUPPORTED_OPERATION => {
                         // The agent doesn't advertise the streaming
@@ -890,8 +940,7 @@ pub async fn run(
                             cli.timeout,
                         )
                         .await?;
-                        response.warn_outcome();
-                        print_output(&response, &cli)?;
+                        report(&response, &cli, &mut saver)?;
                     }
                     Err(error) => {
                         let _ = client.destroy().await;
@@ -908,8 +957,7 @@ pub async fn run(
                     cli.timeout,
                 )
                 .await?;
-                response.warn_outcome();
-                print_output(&response, &cli)?;
+                report(&response, &cli, &mut saver)?;
             }
         }
         Command::Task { command } => run_task_command(&cli, matches, command).await?,
@@ -1153,6 +1201,7 @@ async fn run_task_command(
 ) -> Result<(), CliError> {
     match command {
         TaskCommand::Get(command) => {
+            let mut saver = file_part_saver(command.save_fileparts.as_deref())?;
             let ResolvedClient { client, tenant, .. } = resolve_client(cli, matches).await?;
             let result = client
                 .get_task(&GetTaskRequest {
@@ -1177,8 +1226,7 @@ async fn run_task_command(
                 cli.timeout,
             )
             .await?;
-            task.warn_outcome();
-            print_output(&task, cli)?;
+            report(&task, cli, &mut saver)?;
         }
         TaskCommand::List(command) => {
             let ResolvedClient { client, tenant, .. } = resolve_client(cli, matches).await?;
@@ -1211,6 +1259,7 @@ async fn run_task_command(
             print_output(&task, cli)?;
         }
         TaskCommand::Subscribe(command) => {
+            let mut saver = file_part_saver(command.save_fileparts.as_deref())?;
             let ResolvedClient {
                 client,
                 tenant,
@@ -1226,7 +1275,8 @@ async fn run_task_command(
                     tenant: tenant.clone(),
                 })
                 .await?;
-            subscribe_with_resumption(client, stream, command.id.clone(), tenant, cli).await?;
+            subscribe_with_resumption(client, stream, command.id.clone(), tenant, cli, &mut saver)
+                .await?;
         }
         TaskCommand::PushConfig { command } => {
             run_push_config_command(cli, matches, command).await?;
@@ -2926,6 +2976,47 @@ impl TextRender for StreamResponse {
     }
 }
 
+/// The saver for `--save-fileparts`, if given. A target that exists and is
+/// not a directory fails here, before any network work (§11.6).
+fn file_part_saver(dir: Option<&Path>) -> Result<Option<FilePartSaver>, CliError> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    if std::fs::metadata(dir).is_ok_and(|metadata| !metadata.is_dir()) {
+        return Err(CliError::Usage(
+            "--save-fileparts must point to a directory".to_string(),
+        ));
+    }
+    Ok(Some(FilePartSaver::new(dir.to_path_buf())))
+}
+
+/// Write `value`'s file parts when `--save-fileparts` was given, naming each
+/// new file on stderr (stdout stays the protocol payload, §11.1).
+fn save_fileparts(
+    saver: &mut Option<FilePartSaver>,
+    value: &impl FilePartSource,
+) -> Result<(), CliError> {
+    let Some(saver) = saver else {
+        return Ok(());
+    };
+    let result = value.save_to(saver);
+    for path in saver.take_created() {
+        eprintln!("saved file part: {}", path.display());
+    }
+    Ok(result?)
+}
+
+/// Report one complete result: warn about its outcome, print it, save its file parts.
+fn report<V: Serialize + TextRender + TaskOutcome + FilePartSource>(
+    value: &V,
+    cli: &Cli,
+    saver: &mut Option<FilePartSaver>,
+) -> Result<(), CliError> {
+    value.warn_outcome();
+    print_output(value, cli)?;
+    save_fileparts(saver, value)
+}
+
 /// Print `value` in the caller-selected format: `text` (default, §11.2) or
 /// `-o json` as one pretty/compact document per §11.3 (never JSONL — that
 /// form is only used by [`consume_stream`] under `--stream`).
@@ -2995,14 +3086,20 @@ fn print_stream_value<V: Serialize + TextRender>(value: &V, cli: &Cli) -> Result
     }
 }
 
-/// Warns, prints, and destroys `client` first if printing fails.
-async fn print_or_destroy<T: a2a_client::Transport, V: Serialize + TextRender + TaskOutcome>(
+/// Warns, prints and saves the file parts of one event; destroys `client`
+/// first if either fails.
+async fn print_or_destroy<
+    T: a2a_client::Transport,
+    V: Serialize + TextRender + TaskOutcome + FilePartSource,
+>(
     client: &A2AClient<T>,
     value: &V,
     cli: &Cli,
+    saver: &mut Option<FilePartSaver>,
 ) -> Result<(), CliError> {
     value.warn_outcome();
-    if let Err(error) = print_stream_value(value, cli) {
+    let result = print_stream_value(value, cli).and_then(|()| save_fileparts(saver, value));
+    if let Err(error) = result {
         let _ = client.destroy().await;
         return Err(error);
     }
@@ -3012,15 +3109,19 @@ async fn print_or_destroy<T: a2a_client::Transport, V: Serialize + TextRender + 
 /// Consumes a streamed event sequence to completion, printing each event.
 /// Used by `send --stream`, which does not reconnect -- see
 /// [`subscribe_with_resumption`] for `task subscribe`, which does.
-async fn consume_stream<T: a2a_client::Transport, V: Serialize + TextRender + TaskOutcome>(
+async fn consume_stream<
+    T: a2a_client::Transport,
+    V: Serialize + TextRender + TaskOutcome + FilePartSource,
+>(
     client: A2AClient<T>,
     mut stream: BoxStream<'static, Result<V, A2AError>>,
     cli: &Cli,
+    saver: &mut Option<FilePartSaver>,
 ) -> Result<(), CliError> {
     loop {
         match stream.next().await {
             Some(Ok(value)) => {
-                print_or_destroy(&client, &value, cli).await?;
+                print_or_destroy(&client, &value, cli, saver).await?;
             }
             Some(Err(error)) => {
                 let _ = client.destroy().await;
@@ -3054,6 +3155,7 @@ async fn subscribe_with_resumption<T: a2a_client::Transport>(
     task_id: String,
     tenant: Option<String>,
     cli: &Cli,
+    saver: &mut Option<FilePartSaver>,
 ) -> Result<(), CliError> {
     let deadline = tokio::time::Instant::now() + cli.timeout;
     let mut last_state: Option<TaskState> = None;
@@ -3075,10 +3177,16 @@ async fn subscribe_with_resumption<T: a2a_client::Transport>(
                         first_event && state.is_some() && state == state_before_this_attempt;
                     first_event = false;
                     if is_unchanged_reconciliation {
+                        // Not printed again, but it carries the task's complete
+                        // artifacts, which fill in what the cut lost.
+                        if let Err(error) = save_fileparts(saver, &value) {
+                            let _ = client.destroy().await;
+                            return Err(error);
+                        }
                         continue;
                     }
 
-                    print_or_destroy(&client, &value, cli).await?;
+                    print_or_destroy(&client, &value, cli, saver).await?;
                 }
                 Some(Err(error)) => {
                     let _ = client.destroy().await;
@@ -3271,6 +3379,12 @@ mod tests {
 
     impl TaskOutcome for FailingSerialize {
         fn warn_outcome(&self) {}
+    }
+
+    impl FilePartSource for FailingSerialize {
+        fn save_to(&self, _saver: &mut FilePartSaver) -> Result<(), fileparts::SaveError> {
+            Ok(())
+        }
     }
 
     fn make_test_client(destroy_error: Option<A2AError>) -> A2AClient<TestTransport> {
@@ -3728,6 +3842,7 @@ mod tests {
                 accepted_output_modes: vec!["text/plain".to_string()],
                 return_immediately: true,
                 stream: false,
+                save_fileparts: None,
             },
             vec![Part::text("hello")],
             Some("tenant-1".to_string()),
@@ -3768,6 +3883,7 @@ mod tests {
                 accepted_output_modes: Vec::new(),
                 return_immediately: false,
                 stream: false,
+                save_fileparts: None,
             },
             vec![Part::text("hello")],
             None,
@@ -3949,7 +4065,7 @@ mod tests {
     #[tokio::test]
     async fn test_consume_stream_reports_json_error() {
         let stream = Box::pin(stream::once(async { Ok(FailingSerialize) }));
-        let err = consume_stream(make_test_client(None), stream, &json_cli())
+        let err = consume_stream(make_test_client(None), stream, &json_cli(), &mut None)
             .await
             .unwrap_err();
 
@@ -3964,7 +4080,7 @@ mod tests {
     #[tokio::test]
     async fn test_print_or_destroy_reports_json_error() {
         let client = make_test_client(None);
-        let err = print_or_destroy(&client, &FailingSerialize, &json_cli())
+        let err = print_or_destroy(&client, &FailingSerialize, &json_cli(), &mut None)
             .await
             .unwrap_err();
 
@@ -3974,7 +4090,8 @@ mod tests {
     #[tokio::test]
     async fn test_print_or_destroy_succeeds_in_text_mode() {
         let client = make_test_client(None);
-        print_or_destroy(&client, &FailingSerialize, &text_cli())
+        let mut saver = Some(FilePartSaver::new(PathBuf::from("unused")));
+        print_or_destroy(&client, &FailingSerialize, &text_cli(), &mut saver)
             .await
             .unwrap();
     }
@@ -3986,6 +4103,7 @@ mod tests {
             make_test_client(Some(A2AError::internal("destroy failed"))),
             stream,
             &json_cli(),
+            &mut None,
         )
         .await
         .unwrap_err();
@@ -4944,7 +5062,7 @@ mod tests {
     #[tokio::test]
     async fn test_consume_stream_text_mode_does_not_serialize() {
         let stream = Box::pin(stream::once(async { Ok(FailingSerialize) }));
-        consume_stream(make_test_client(None), stream, &text_cli())
+        consume_stream(make_test_client(None), stream, &text_cli(), &mut None)
             .await
             .unwrap();
     }
