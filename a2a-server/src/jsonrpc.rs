@@ -572,6 +572,19 @@ mod tests {
         assert_eq!(error.code, error_code::INVALID_PARAMS);
     }
 
+    /// `Part.content` is a required oneof in a2a.proto: a part that carries
+    /// none is invalid params, not an empty text part.
+    #[tokio::test]
+    async fn test_send_message_rejects_part_without_content() {
+        let app = make_app();
+        let params = serde_json::json!({
+            "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{}]}
+        });
+        let resp = post_jsonrpc(app, methods::SEND_MESSAGE, params).await;
+        let error = resp.error.expect("expected an error");
+        assert_eq!(error.code, error_code::INVALID_PARAMS);
+    }
+
     /// A2A §9.5: a `params` payload that fails to decode is
     /// `InvalidParamsError` (-32602) for *every* method, not just
     /// `message/send`. Each arm decodes its own request type, so guard the

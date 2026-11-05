@@ -884,3 +884,58 @@ async fn slimrpc_collaborate_broadcasts_to_every_other_member() {
         }
     }
 }
+
+/// A reply on a `Collaborate` session comes back to the sender as a `Message`
+/// attributed to the member that sent it.
+#[tokio::test]
+async fn slimrpc_collaborate_replies_are_attributed_to_their_sender() {
+    let service = Arc::new(Service::new(
+        ID::new_with_name(Kind::new("slim").unwrap(), "collab-echo").unwrap(),
+    ));
+    let mut apps = Vec::new();
+    for suffix in ["echo", "asker"] {
+        let name = Arc::new(Name::from_strings([
+            "org",
+            "test",
+            &format!("collab-{suffix}"),
+        ]));
+        let (provider, verifier) = auth(&format!("collab-provider-{suffix}"));
+        let (app, notifications) = service.create_app(&name, provider, verifier).unwrap();
+        apps.push((name, Arc::new(app), notifications));
+    }
+    let (echo_name, echo_app, notifications) = apps.remove(0);
+    let (_, asker_app, _) = apps.remove(0);
+
+    // The echo member answers every broadcast with the same bytes.
+    let server = Arc::new(Server::new(
+        echo_app.clone(),
+        echo_app.app_name().clone(),
+        notifications,
+    ));
+    server.register_stream_stream::<_, Vec<u8>, Vec<u8>, _, _>(
+        "experimental.slimrpc.collaborative_channel.v1.CollaborativeChannelService",
+        "Collaborate",
+        |stream: slim_rpc::DecodedStream<Vec<u8>>, _context: slim_rpc::Context| async move {
+            Ok(stream)
+        },
+    );
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let transport = SlimRpcTransport::new_group(asker_app, vec![echo_name.clone()]).unwrap();
+    let outbound = stream::once(async { sample_message(Role::Agent, "hello", "collaborate") });
+    let replies = transport.collaborate(outbound, Some(Duration::from_secs(5)));
+    futures::pin_mut!(replies);
+    let reply = replies.next().await.expect("one reply").unwrap();
+    assert_eq!(reply.text(), Some("hello"));
+    let source = reply.metadata.as_ref().unwrap()[SLIM_SRC_METADATA_KEY]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        source.starts_with("org/test/collab-echo/"),
+        "{source} is not the echo member"
+    );
+}

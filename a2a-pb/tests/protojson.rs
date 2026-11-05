@@ -333,3 +333,13 @@ fn integers_in_data_parts_stay_integers() {
     );
     assert_eq!(data["ratio"], json!(0.5));
 }
+
+/// `Part.content` is a required oneof: a part that carries none is invalid
+/// input rather than an empty text part.
+#[test]
+fn send_message_request_rejects_part_without_content() {
+    let request = json!({
+        "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{}]}
+    });
+    assert!(a2a_pb::protojson_conv::from_value::<a2a::SendMessageRequest>(request).is_err());
+}

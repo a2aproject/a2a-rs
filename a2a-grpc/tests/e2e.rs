@@ -8,6 +8,8 @@ use a2a::event::{StreamResponse, TaskStatusUpdateEvent};
 use a2a::*;
 use a2a_client::{Transport, TransportFactory};
 use a2a_grpc::{GrpcHandler, GrpcTransport, GrpcTransportFactory};
+use a2a_pb::proto;
+use a2a_pb::proto::a2a_service_client::A2aServiceClient;
 use a2a_pb::proto::a2a_service_server::A2aServiceServer;
 use a2a_server::{DefaultRequestHandler, InMemoryTaskStore, RequestHandler, ServiceParams};
 use async_trait::async_trait;
@@ -687,5 +689,35 @@ async fn grpc_transport_decodes_error_details_from_a_real_server() {
     );
 
     transport.destroy().await.unwrap();
+    handle.abort();
+}
+
+/// `Part.content` is a required oneof in a2a.proto: a part that carries none
+/// is INVALID_ARGUMENT, as a2a-go answers it, not an empty text part.
+#[tokio::test]
+async fn grpc_server_rejects_part_without_content() {
+    let (endpoint, handle) = spawn_grpc_server().await;
+    let mut client = A2aServiceClient::connect(endpoint).await.unwrap();
+
+    let request = || {
+        let mut request = tonic::Request::new(proto::SendMessageRequest {
+            message: Some(proto::Message {
+                message_id: "msg-empty".to_string(),
+                role: proto::Role::User as i32,
+                parts: vec![proto::Part::default()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        request
+            .metadata_mut()
+            .insert("a2a-version", VERSION.parse().unwrap());
+        request
+    };
+    let status = client.send_message(request()).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+    let status = client.send_streaming_message(request()).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+
     handle.abort();
 }

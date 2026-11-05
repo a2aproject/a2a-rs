@@ -4,7 +4,7 @@
 use std::fmt;
 
 use a2a::{
-    AgentCard, CancelTaskRequest, DeleteTaskPushNotificationConfigRequest,
+    A2AError, AgentCard, CancelTaskRequest, DeleteTaskPushNotificationConfigRequest,
     GetExtendedAgentCardRequest, GetTaskPushNotificationConfigRequest, GetTaskRequest,
     ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
     ListTasksRequest, ListTasksResponse, SendMessageRequest, SendMessageResponse, StreamResponse,
@@ -19,6 +19,7 @@ pub enum ProtoJsonPayloadError {
     Json(serde_json::Error),
     Decode(prost::DecodeError),
     MissingPayload(&'static str),
+    Invalid(A2AError),
 }
 
 impl fmt::Display for ProtoJsonPayloadError {
@@ -29,6 +30,7 @@ impl fmt::Display for ProtoJsonPayloadError {
             Self::MissingPayload(type_name) => {
                 write!(f, "ProtoJSON payload missing required data for {type_name}")
             }
+            Self::Invalid(error) => write!(f, "invalid ProtoJSON payload: {error}"),
         }
     }
 }
@@ -109,6 +111,24 @@ macro_rules! impl_protojson_payload {
     };
 }
 
+/// For converters that reject invalid content (see `pbconv::from_proto_part`).
+macro_rules! impl_protojson_payload_fallible {
+    ($native:path, $proto:path, $protojson:path, $to_proto:path, $from_proto:path) => {
+        impl ProtoJsonPayload for $native {
+            type Proto = $proto;
+            type ProtoJson = $protojson;
+
+            fn to_proto(value: &Self) -> Self::Proto {
+                $to_proto(value)
+            }
+
+            fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
+                $from_proto(value).map_err(ProtoJsonPayloadError::Invalid)
+            }
+        }
+    };
+}
+
 macro_rules! impl_protojson_payload_optional {
     ($native:path, $proto:path, $protojson:path, $to_proto:path, $from_proto:path) => {
         impl ProtoJsonPayload for $native {
@@ -120,13 +140,15 @@ macro_rules! impl_protojson_payload_optional {
             }
 
             fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
-                $from_proto(value).ok_or(ProtoJsonPayloadError::MissingPayload(stringify!($native)))
+                $from_proto(value)
+                    .map_err(ProtoJsonPayloadError::Invalid)?
+                    .ok_or(ProtoJsonPayloadError::MissingPayload(stringify!($native)))
             }
         }
     };
 }
 
-impl_protojson_payload!(
+impl_protojson_payload_fallible!(
     SendMessageRequest,
     crate::proto::SendMessageRequest,
     crate::protojson::SendMessageRequest,
@@ -196,7 +218,7 @@ impl_protojson_payload!(
     crate::pbconv::to_proto_task_push_notification_config,
     crate::pbconv::from_proto_task_push_notification_config
 );
-impl_protojson_payload!(
+impl_protojson_payload_fallible!(
     Task,
     crate::proto::Task,
     crate::protojson::Task,
@@ -212,7 +234,7 @@ impl ProtoJsonPayload for ListTasksResponse {
     }
 
     fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
-        Ok(crate::pbconv::from_proto_list_tasks_response(value))
+        crate::pbconv::from_proto_list_tasks_response(value).map_err(ProtoJsonPayloadError::Invalid)
     }
 
     /// REQ-TASK-LIST-002: `nextPageToken` must always be present, even on
