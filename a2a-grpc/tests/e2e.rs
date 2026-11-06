@@ -1,6 +1,7 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +29,13 @@ fn sample_message(role: Role, text: &str) -> Message {
         extensions: None,
         reference_task_ids: None,
     }
+}
+
+fn throttle_fields() -> HashMap<String, serde_json::Value> {
+    HashMap::from([
+        ("hint".to_string(), "slow down".into()),
+        ("retryAfter".to_string(), 30.into()),
+    ])
 }
 
 fn sample_task(id: &str, state: TaskState) -> Task {
@@ -136,6 +144,15 @@ impl RequestHandler for TestHandler {
                     }]),
                 ]),
             );
+        }
+        if req.id == "huge" {
+            let fields = HashMap::from([("blob".to_string(), "x".repeat(64 * 1024).into())]);
+            return Err(A2AError::new(error_code::INTERNAL_ERROR, "too much")
+                .with_details(vec![TypedDetail::from_struct(fields)]));
+        }
+        if req.id == "throttled" {
+            return Err(A2AError::new(error_code::INTERNAL_ERROR, "slow down")
+                .with_details(vec![TypedDetail::from_struct(throttle_fields())]));
         }
         Ok(sample_task(&req.id, TaskState::Completed))
     }
@@ -685,6 +702,65 @@ async fn grpc_transport_decodes_error_details_from_a_real_server() {
             description: "must be a UUID".to_string(),
         }])
     );
+
+    transport.destroy().await.unwrap();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn grpc_transport_receives_struct_details_from_a_real_server() {
+    let (endpoint, handle) = spawn_grpc_server().await;
+    let transport = GrpcTransport::connect(endpoint).await.unwrap();
+
+    let err = transport
+        .get_task(
+            &versioned_params(),
+            &GetTaskRequest {
+                id: "throttled".to_string(),
+                history_length: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, error_code::INTERNAL_ERROR);
+    assert_eq!(err.message, "slow down");
+    let details = err.details.expect("details should reach the client");
+    assert_eq!(details.len(), 2);
+    assert_eq!(details[0].type_url, errordetails::ERROR_INFO_TYPE);
+    assert_eq!(details[1], TypedDetail::from_struct(throttle_fields()));
+
+    transport.destroy().await.unwrap();
+    handle.abort();
+}
+
+/// A 64 KiB detail would exceed hyper's 16 KiB header list limit and turn the error into a
+/// transport failure; the server drops it and the client still gets the error.
+#[tokio::test]
+async fn grpc_transport_still_receives_an_error_whose_detail_is_too_large() {
+    let (endpoint, handle) = spawn_grpc_server().await;
+    let transport = GrpcTransport::connect(endpoint).await.unwrap();
+
+    let err = transport
+        .get_task(
+            &versioned_params(),
+            &GetTaskRequest {
+                id: "huge".to_string(),
+                history_length: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, error_code::INTERNAL_ERROR);
+    assert_eq!(err.message, "too much");
+    let details = err
+        .details
+        .expect("ErrorInfo should still reach the client");
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0].type_url, errordetails::ERROR_INFO_TYPE);
 
     transport.destroy().await.unwrap();
     handle.abort();

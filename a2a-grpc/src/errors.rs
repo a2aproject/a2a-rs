@@ -8,7 +8,32 @@ use a2a::{A2AError, a2a_error_from_details, error_reason, protocol_error_code};
 use prost::Message;
 use tonic_types::{ErrorDetails, FieldViolation as GrpcFieldViolation, StatusExt};
 
-/// Convert an A2A error to a tonic gRPC status code.
+/// Trailer metadata an error response may carry, measured the way HTTP/2 counts a
+/// header list (RFC 9113 §6.5.2: name + value + 32 per field, before HPACK). 8 KiB is
+/// what gRPC clients accept by default: grpc-java's Netty transport fails the RPC above
+/// 8192 (`maxInboundMetadataSize`, soft and hard limit alike), gRPC C-core rejects a
+/// random share of RPCs between 8 KB and 16 KB (`grpc.max_metadata_size` and
+/// `grpc.absolute_max_metadata_size`, over the whole batch of headers), and grpc-go is
+/// moving to 8 KiB (`upcomingDefaultHeaderListSize`); hyper, behind tonic clients,
+/// accepts 16 KiB. The peer's own `SETTINGS_MAX_HEADER_LIST_SIZE`, which grpc-go and
+/// grpc-java check on the sending side, is not visible to a tonic service, so the
+/// default is the budget.
+pub const MAX_ERROR_TRAILER_BYTES: usize = 8 * 1024;
+
+/// The fields of an error response that tonic does not write, as HTTP/2 counts them: the
+/// `:status` pseudo-header every response carries (RFC 9113 §8.3.2) and the `date` an
+/// origin server sends (RFC 9110 §6.6.1; hyper adds it, 29 bytes).
+const RESPONSE_FIELD_BYTES: usize = (7 + 3 + 32) + (4 + 29 + 32);
+
+/// Convert an A2A error to a tonic gRPC status.
+///
+/// `ErrorInfo` (reason from the code, protocol domain, merged metadata) and `BadRequest`
+/// are encoded as their `google.rpc` types, and `google.protobuf.Struct` details as
+/// `Struct` (numbers pass through `f64`, so integers above 2^53 lose precision). A detail
+/// of any other type has no protobuf encoding here and is dropped with a warning rather
+/// than sent under a type URL that is not its own. The trailers are kept within
+/// [`MAX_ERROR_TRAILER_BYTES`], the message and the `ErrorInfo` and `BadRequest` first:
+/// the detail that does not fit and the ones after it are dropped with a warning.
 pub fn a2a_error_to_status(err: &A2AError) -> tonic::Status {
     use a2a::error_code;
     let code = match err.code {
@@ -78,7 +103,75 @@ pub fn a2a_error_to_status(err: &A2AError) -> tonic::Status {
         details.set_bad_request(field_violations);
     }
 
-    tonic::Status::with_error_details(code, &err.message, details)
+    let status = tonic::Status::with_error_details(code, &err.message, details);
+
+    // `ErrorDetails` cannot carry other details, so Struct details go after its
+    // `ErrorInfo` and `BadRequest`.
+    let mut others = err
+        .details
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|detail| {
+            detail.type_url != errordetails::ERROR_INFO_TYPE
+                && detail.type_url != errordetails::BAD_REQUEST_TYPE
+        })
+        .filter_map(|detail| {
+            if detail.type_url != errordetails::STRUCT_TYPE {
+                tracing::warn!(
+                    type_url = %detail.type_url,
+                    "error detail type has no gRPC encoding, dropping it"
+                );
+                return None;
+            }
+            Some(prost_types::Any {
+                type_url: errordetails::STRUCT_TYPE.to_string(),
+                value: a2a_pb::pbconv::to_proto_struct(&detail.value).encode_to_vec(),
+            })
+        })
+        .peekable();
+    if others.peek().is_none() {
+        return status;
+    }
+    let mut rpc_status = tonic_types::pb::Status::decode(status.details())
+        .expect("tonic just encoded this google.rpc.Status");
+    let mut status = status;
+    let mut dropped = 0;
+    for any in others {
+        if dropped == 0 {
+            rpc_status.details.push(any);
+            let candidate =
+                tonic::Status::with_details(code, &err.message, rpc_status.encode_to_vec().into());
+            if trailer_bytes(&candidate) <= MAX_ERROR_TRAILER_BYTES {
+                status = candidate;
+                continue;
+            }
+            rpc_status.details.pop();
+        }
+        dropped += 1;
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            limit = MAX_ERROR_TRAILER_BYTES,
+            "gRPC error trailers over the size limit, dropping the extra details"
+        );
+    }
+    status
+}
+
+/// The HTTP/2 header list size of the response tonic sends for `status`: `content-type`,
+/// `grpc-status`, the percent-encoded `grpc-message` and the base64
+/// `grpc-status-details-bin`, plus [`RESPONSE_FIELD_BYTES`].
+fn trailer_bytes(status: &tonic::Status) -> usize {
+    RESPONSE_FIELD_BYTES
+        + status
+            .clone()
+            .into_http::<()>()
+            .headers()
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.len() + 32)
+            .sum::<usize>()
 }
 
 /// Convert a tonic gRPC status to an A2A error.
@@ -637,5 +730,206 @@ mod tests {
         assert_eq!(decoded.code, error_code::INTERNAL_ERROR);
         assert_eq!(decoded.message, "gRPC Unavailable: try later");
         assert!(decoded.details.is_none());
+    }
+
+    #[test]
+    fn test_struct_details_round_trip_through_a_grpc_status() {
+        let fields = HashMap::from([
+            ("hint".to_string(), "slow down".into()),
+            ("retryAfter".to_string(), 30.into()),
+        ]);
+        let err = A2AError::new(error_code::INTERNAL_ERROR, "boom")
+            .with_details(vec![errordetails::TypedDetail::from_struct(fields.clone())]);
+
+        let decoded = status_to_a2a_error(&a2a_error_to_status(&err));
+
+        assert_eq!(decoded.code, error_code::INTERNAL_ERROR);
+        assert_eq!(decoded.message, "boom");
+        assert_eq!(
+            decoded.details,
+            Some(vec![
+                errordetails::TypedDetail::error_info(
+                    "INTERNAL_ERROR",
+                    errordetails::PROTOCOL_DOMAIN,
+                    None
+                ),
+                errordetails::TypedDetail::from_struct(fields),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_error_info_and_bad_request_stay_first_on_the_wire() {
+        let fields = HashMap::from([("hint".to_string(), "slow down".into())]);
+        let violation = errordetails::FieldViolation {
+            field: "message.parts".to_string(),
+            description: "at least one part is required".to_string(),
+        };
+        let err = A2AError::invalid_params("invalid message").with_details(vec![
+            errordetails::TypedDetail::from_struct(fields.clone()),
+            errordetails::TypedDetail::bad_request(vec![violation.clone()]),
+        ]);
+
+        let status = a2a_error_to_status(&err);
+
+        let rpc_status = tonic_types::pb::Status::decode(status.details()).unwrap();
+        assert_eq!(rpc_status.code, tonic::Code::InvalidArgument as i32);
+        assert_eq!(rpc_status.message, "invalid message");
+        let type_urls: Vec<&str> = rpc_status
+            .details
+            .iter()
+            .map(|any| any.type_url.as_str())
+            .collect();
+        assert_eq!(
+            type_urls,
+            [
+                errordetails::ERROR_INFO_TYPE,
+                errordetails::BAD_REQUEST_TYPE,
+                errordetails::STRUCT_TYPE
+            ]
+        );
+        assert_eq!(
+            status_to_a2a_error(&status).details,
+            Some(vec![
+                errordetails::TypedDetail::error_info(
+                    "INVALID_PARAMS",
+                    errordetails::PROTOCOL_DOMAIN,
+                    None
+                ),
+                errordetails::TypedDetail::bad_request(vec![violation]),
+                errordetails::TypedDetail::from_struct(fields),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_details_of_other_types_are_not_sent_as_structs() {
+        let fields = HashMap::from([("retryDelay".to_string(), "5s".into())]);
+        let err = A2AError::new(error_code::INTERNAL_ERROR, "boom").with_details(vec![
+            errordetails::TypedDetail::new("type.googleapis.com/google.rpc.RetryInfo", fields),
+        ]);
+
+        let decoded = status_to_a2a_error(&a2a_error_to_status(&err));
+
+        assert_eq!(
+            decoded.details,
+            Some(vec![errordetails::TypedDetail::error_info(
+                "INTERNAL_ERROR",
+                errordetails::PROTOCOL_DOMAIN,
+                None
+            )])
+        );
+    }
+
+    #[test]
+    fn test_status_without_other_details_is_unchanged() {
+        let metadata = HashMap::from([("tenant".to_string(), "example".to_string())]);
+        let err = A2AError::invalid_params("invalid message").with_details(vec![
+            errordetails::TypedDetail::error_info(
+                "INVALID_PARAMS",
+                errordetails::PROTOCOL_DOMAIN,
+                Some(metadata.clone()),
+            ),
+            errordetails::TypedDetail::bad_request(vec![errordetails::FieldViolation {
+                field: "message.parts".to_string(),
+                description: "at least one part is required".to_string(),
+            }]),
+        ]);
+        let mut expected = ErrorDetails::with_error_info(
+            "INVALID_PARAMS",
+            errordetails::PROTOCOL_DOMAIN,
+            metadata,
+        );
+        expected.set_bad_request(vec![GrpcFieldViolation::new(
+            "message.parts",
+            "at least one part is required",
+        )]);
+        let expected = tonic::Status::with_error_details(
+            tonic::Code::InvalidArgument,
+            "invalid message",
+            expected,
+        );
+
+        let status = a2a_error_to_status(&err);
+
+        assert_eq!(status.code(), expected.code());
+        assert_eq!(status.message(), expected.message());
+        assert_eq!(status.details(), expected.details());
+    }
+
+    #[test]
+    fn test_error_trailers_stay_within_the_default_grpc_metadata_limit() {
+        let small = HashMap::from([("hint".to_string(), "slow down".into())]);
+        let large = HashMap::from([(
+            "blob".to_string(),
+            "x".repeat(MAX_ERROR_TRAILER_BYTES).into(),
+        )]);
+        let err = A2AError::new(error_code::INTERNAL_ERROR, "boom").with_details(vec![
+            errordetails::TypedDetail::from_struct(small.clone()),
+            errordetails::TypedDetail::from_struct(large),
+            errordetails::TypedDetail::from_struct(small.clone()),
+        ]);
+
+        let status = a2a_error_to_status(&err);
+
+        assert!(trailer_bytes(&status) <= MAX_ERROR_TRAILER_BYTES);
+        assert_eq!(status.message(), "boom");
+        assert_eq!(
+            status_to_a2a_error(&status).details,
+            Some(vec![
+                errordetails::TypedDetail::error_info(
+                    "INTERNAL_ERROR",
+                    errordetails::PROTOCOL_DOMAIN,
+                    None
+                ),
+                errordetails::TypedDetail::from_struct(small),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_the_message_counts_against_the_trailer_budget() {
+        let small = HashMap::from([("hint".to_string(), "slow down".into())]);
+        let long_message = "m".repeat(MAX_ERROR_TRAILER_BYTES - 512);
+        let err = A2AError::new(error_code::INTERNAL_ERROR, long_message.clone())
+            .with_details(vec![errordetails::TypedDetail::from_struct(small.clone())]);
+
+        let with_long_message = a2a_error_to_status(&err);
+        let with_short_message = a2a_error_to_status(
+            &A2AError::new(error_code::INTERNAL_ERROR, "boom")
+                .with_details(vec![errordetails::TypedDetail::from_struct(small.clone())]),
+        );
+
+        assert_eq!(with_long_message.message(), long_message);
+        assert_eq!(
+            status_to_a2a_error(&with_long_message)
+                .details
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            status_to_a2a_error(&with_short_message)
+                .details
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_trailer_bytes_counts_fields_as_http2_does() {
+        let status = tonic::Status::with_details(
+            tonic::Code::Internal,
+            "a b",
+            prost::bytes::Bytes::from_static(b"abc"),
+        );
+
+        // content-type "application/grpc", grpc-status "13", grpc-message "a%20b",
+        // grpc-status-details-bin "YWJj".
+        assert_eq!(
+            trailer_bytes(&status),
+            RESPONSE_FIELD_BYTES + (12 + 16 + 32) + (11 + 2 + 32) + (12 + 5 + 32) + (23 + 4 + 32)
+        );
     }
 }
