@@ -9,8 +9,13 @@ use std::collections::HashMap;
 use crate::middleware::{ServiceParams, User};
 
 /// Context passed to the [`AgentExecutor`] for each execution.
+///
+/// Non-exhaustive: fields are added as the protocol grows (live input is next),
+/// and only the handler builds one.
+#[non_exhaustive]
 pub struct ExecutorContext {
-    /// The message that triggered execution (None for cancellation without message).
+    /// The message that triggered execution. `None` for a cancellation, and for
+    /// a request that carried only `artifactUpdates` for an existing task.
     pub message: Option<Message>,
     /// The task ID being executed.
     pub task_id: TaskId,
@@ -29,6 +34,53 @@ pub struct ExecutorContext {
 }
 
 impl ExecutorContext {
+    /// A context for `task_id` in `context_id` with nothing else set. The
+    /// handler builds the real ones; this is for exercising an executor on its
+    /// own, as the struct is non-exhaustive and cannot be built literally
+    /// outside this crate.
+    pub fn new(task_id: impl Into<TaskId>, context_id: impl Into<String>) -> Self {
+        ExecutorContext {
+            message: None,
+            task_id: task_id.into(),
+            stored_task: None,
+            context_id: context_id.into(),
+            metadata: None,
+            user: None,
+            service_params: ServiceParams::new(),
+            tenant: None,
+        }
+    }
+
+    pub fn with_message(mut self, message: Message) -> Self {
+        self.message = Some(message);
+        self
+    }
+
+    pub fn with_stored_task(mut self, task: Task) -> Self {
+        self.stored_task = Some(task);
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: HashMap<String, Value>) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_user(mut self, user: User) -> Self {
+        self.user = Some(user);
+        self
+    }
+
+    pub fn with_service_params(mut self, service_params: ServiceParams) -> Self {
+        self.service_params = service_params;
+        self
+    }
+
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
+    }
+
     pub fn task_info(&self) -> (TaskId, String) {
         (self.task_id.clone(), self.context_id.clone())
     }
@@ -68,5 +120,30 @@ mod tests {
         let (tid, cid) = ctx.task_info();
         assert_eq!(tid, "t1");
         assert_eq!(cid, "c1");
+    }
+    #[test]
+    fn executor_context_preserves_caller_identity_and_request_data() {
+        let message = Message::new(Role::User, vec![Part::text("follow-up")]);
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": "task", "contextId": "context", "status": {"state": "TASK_STATE_WORKING"}
+        }))
+        .unwrap();
+        let metadata = HashMap::from([("trace".into(), serde_json::json!(42))]);
+        let user = User::authenticated("alice");
+        let params = ServiceParams::from([("authorization".into(), vec!["Bearer caller".into()])]);
+        let ctx = ExecutorContext::new("task", "context")
+            .with_message(message.clone())
+            .with_stored_task(task.clone())
+            .with_metadata(metadata.clone())
+            .with_user(user.clone())
+            .with_service_params(params.clone())
+            .with_tenant("tenant-a");
+        assert_eq!(ctx.task_info(), ("task".into(), "context".into()));
+        assert_eq!(ctx.message, Some(message));
+        assert_eq!(ctx.stored_task, Some(task));
+        assert_eq!(ctx.metadata, Some(metadata));
+        assert_eq!(ctx.user, Some(user));
+        assert_eq!(ctx.service_params, params);
+        assert_eq!(ctx.tenant.as_deref(), Some("tenant-a"));
     }
 }

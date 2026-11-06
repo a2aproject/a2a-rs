@@ -19,6 +19,7 @@ pub fn a2a_error_to_status(err: &A2AError) -> tonic::Status {
         error_code::EXTENDED_CARD_NOT_CONFIGURED => tonic::Code::FailedPrecondition,
         error_code::EXTENSION_SUPPORT_REQUIRED => tonic::Code::FailedPrecondition,
         error_code::VERSION_NOT_SUPPORTED => tonic::Code::FailedPrecondition,
+        error_code::TASK_GENERATION_MISMATCH => tonic::Code::Aborted,
         error_code::PARSE_ERROR => tonic::Code::InvalidArgument,
         error_code::INVALID_REQUEST => tonic::Code::InvalidArgument,
         error_code::METHOD_NOT_FOUND => tonic::Code::Unimplemented,
@@ -88,6 +89,7 @@ pub fn status_to_a2a_error(status: &tonic::Status) -> A2AError {
         .and_then(|detail| reason_to_error_code(&detail.reason))
         .unwrap_or_else(|| match status.code() {
             tonic::Code::NotFound => error_code::TASK_NOT_FOUND,
+            tonic::Code::Aborted => error_code::TASK_GENERATION_MISMATCH,
             tonic::Code::FailedPrecondition => error_code::TASK_NOT_CANCELABLE,
             tonic::Code::Unimplemented => error_code::METHOD_NOT_FOUND,
             tonic::Code::InvalidArgument => error_code::INVALID_PARAMS,
@@ -350,6 +352,7 @@ mod tests {
                 error_code::VERSION_NOT_SUPPORTED,
                 tonic::Code::FailedPrecondition,
             ),
+            (error_code::TASK_GENERATION_MISMATCH, tonic::Code::Aborted),
         ];
 
         for (code, expected_grpc) in cases {
@@ -357,6 +360,23 @@ mod tests {
             let status = a2a_error_to_status(&err);
             assert_eq!(status.code(), expected_grpc);
         }
+    }
+
+    #[test]
+    fn test_aborted_status_maps_back_to_generation_mismatch() {
+        let err = A2AError::task_generation_mismatch("t1", 1, 2);
+        let status = a2a_error_to_status(&err);
+
+        assert_eq!(status.code(), tonic::Code::Aborted);
+        assert_eq!(
+            status_to_a2a_error(&status).code,
+            error_code::TASK_GENERATION_MISMATCH
+        );
+        let bare = tonic::Status::new(tonic::Code::Aborted, "conflict");
+        assert_eq!(
+            status_to_a2a_error(&bare).code,
+            error_code::TASK_GENERATION_MISMATCH
+        );
     }
 
     #[test]

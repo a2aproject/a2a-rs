@@ -16,6 +16,7 @@ a2a = { workspace = true }
 a2a-pb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
@@ -53,5 +54,6 @@ rustls-no-provider = [
 fuzzing = []
 
 [dev-dependencies]
+async-stream = { workspace = true }
 http-body-util = "0.1"
 rustls = { workspace = true }

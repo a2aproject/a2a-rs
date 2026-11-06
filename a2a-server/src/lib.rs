@@ -75,6 +75,29 @@ pub(crate) mod test_util {
         }
     }
 
+    pub(crate) async fn seeded_task_store(id: &str) -> crate::InMemoryTaskStore {
+        use crate::TaskStore;
+        let store = crate::InMemoryTaskStore::new();
+        store
+            .create(Task {
+                id: id.into(),
+                context_id: "c1".into(),
+                generation: 0,
+                status: TaskStatus {
+                    state: TaskState::Submitted,
+                    message: None,
+                    timestamp: None,
+                },
+                history: None,
+                artifacts: None,
+                timeline: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        store
+    }
+
     pub(crate) type CapturedParams = Arc<Mutex<HashMap<&'static str, ServiceParams>>>;
 
     /// `RequestHandler` stub that records the `ServiceParams` it sees per method.
