@@ -242,10 +242,9 @@ attempt is reported on stderr with its cause; stdout carries only the
 protocol events.
 
 An error the agent itself reports on the stream is not a dropped connection
-and is not retried. Over JSON-RPC and REST the client keeps the details such
-an error arrives with, which is how the two are told apart. gRPC and SLIMRPC
-drop them, so there a failure the agent reports is retried as well, until
-`--timeout`.
+and is not retried. The JSON-RPC and REST clients, the two transports
+`a2acli` speaks, keep the details such an error arrives with, which is how the
+two are told apart.
 
 Reconnecting never issues a `task get`: the server's first event after
 resuming is the full current `Task`, which is enough to reconcile state
