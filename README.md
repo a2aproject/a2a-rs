@@ -33,7 +33,7 @@ The workspace supports:
 | `a2a-slimrpc` | SLIMRPC client and server bindings built on `slim_bindings` |
 | [`a2acli-transport-slimrpc`](a2acli-transport-slimrpc/README.md) | SLIMRPC transport plugin for the Go `a2a-cli`, built as `a2a-transport-slimrpc` |
 | `a2acli` | Standalone A2A client CLI, published as `a2a-cli`, for inspecting agent cards, sending messages, managing tasks, and handling push configs |
-| `examples/helloworld` | Minimal runnable example agent |
+| [`examples`](examples/README.md) | Runnable Hello World, TLS, and live-message clients and servers |
 
 ## Supported Bindings
 
@@ -90,10 +90,12 @@ This writes the HTML report to `target/llvm-cov/html/index.html`.
 
 ## Running The Example Agent
 
-The hello world example exposes an echo-style agent over REST and JSON-RPC.
+The Hello World example exposes an echo agent over REST, JSON-RPC, and gRPC.
+Start its server and client in separate terminals:
 
 ```sh
-cargo run -p helloworld
+cargo run -p examples --bin helloworld-server
+cargo run -p examples --bin helloworld-client
 ```
 
 When the example starts, the following endpoints are available:
@@ -101,9 +103,10 @@ When the example starts, the following endpoints are available:
 - Agent card: `http://localhost:3000/.well-known/agent-card.json`
 - JSON-RPC endpoint: `http://localhost:3000/jsonrpc`
 - REST endpoint: `http://localhost:3000/rest`
+- gRPC endpoint: `http://localhost:50051`
 
-The example does not start a gRPC server, but the `a2a-grpc` crate provides the
-client and server bindings needed to add one.
+See [the examples guide](examples/README.md) for TLS and `SendLiveMessage`
+examples, including input to a running executor and resuming a nonterminal task.
 
 ## Installing a2acli
 
@@ -231,7 +234,7 @@ Typical usage is:
 - `a2a-slimrpc/`: SLIMRPC bindings
 - `a2acli/`: standalone A2A client CLI and published binary package
 - `a2acli-transport-slimrpc/`: SLIMRPC plugin for the Go `a2a-cli`, with a local gateway and echo-agent example
-- `examples/helloworld/`: runnable sample agent
+- `examples/`: runnable Hello World, TLS, and live-message clients and servers
 
 ## Contributing
 

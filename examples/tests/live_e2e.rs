@@ -522,6 +522,111 @@ async fn jsonrpc_lets_a_second_client_join_an_open_exchange() {
     .await;
 }
 
+/// Two connections using the same credentials still own independent downlinks.
+/// Rejected requests are private, while accepted task updates reach both.
+async fn independent_clients(first: impl Transport, second: impl Transport) {
+    let mut owner = first
+        .send_live_message(&params(), &send("start", None))
+        .await
+        .unwrap();
+    let StreamResponse::Task(task) = next(&mut owner).await else {
+        panic!("opening task")
+    };
+    next(&mut owner).await; // Working.
+    let subscription = StreamRequest {
+        tenant: None,
+        payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+            id: task.id.clone(),
+            tenant: None,
+            last_seen_generation: None,
+        }),
+    };
+    let mut other = second
+        .send_live_message(&params(), &subscription)
+        .await
+        .unwrap();
+    assert!(matches!(next(&mut other).await, StreamResponse::Task(_)));
+    let mut stale = send("stale", Some(&task.id));
+    let StreamRequestPayload::SendMessage(request) = &mut stale.payload else {
+        unreachable!()
+    };
+    request.configuration = Some(SendMessageConfiguration {
+        if_generation_match: Some(-1),
+        return_immediately: None,
+        timeline_length: None,
+        accepted_output_modes: None,
+        task_push_notification_config: None,
+        history_length: None,
+    });
+    let reference = request.message.message_id.clone();
+    other.sender.send(stale).await.unwrap();
+    let StreamResponse::Error(error) = next(&mut other).await else {
+        panic!("private rejection")
+    };
+    assert_eq!(error.reference_id.as_deref(), Some(reference.as_str()));
+
+    other
+        .sender
+        .send(send("hello", Some(&task.id)))
+        .await
+        .unwrap();
+    for stream in [&mut owner, &mut other] {
+        assert!(
+            matches!(next(stream).await, StreamResponse::MessageUpdate(_)),
+            "another client's rejection must not appear on this stream"
+        );
+        assert_eq!(text_of(&next(stream).await), "got: hello");
+    }
+    owner
+        .sender
+        .send(send("finish", Some(&task.id)))
+        .await
+        .unwrap();
+    for stream in [&mut owner, &mut other] {
+        assert!(matches!(
+            next(stream).await,
+            StreamResponse::MessageUpdate(_)
+        ));
+        assert_eq!(text_of(&next(stream).await), "done");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), stream.events.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn rest_clients_keep_rejections_private_on_a_shared_task() {
+    let (base, _) = spawn_http(true).await;
+    independent_clients(
+        RestTransport::new(Client::new(), format!("{base}/rest")),
+        RestTransport::new(Client::new(), format!("{base}/rest")),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn jsonrpc_clients_keep_rejections_private_on_a_shared_task() {
+    let (base, _) = spawn_http(true).await;
+    independent_clients(
+        JsonRpcTransport::new(Client::new(), format!("{base}/rpc")),
+        JsonRpcTransport::new(Client::new(), format!("{base}/rpc")),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn grpc_clients_keep_rejections_private_on_a_shared_task() {
+    let (base, _) = spawn_grpc(true).await;
+    independent_clients(
+        GrpcTransport::connect(base.clone()).await.unwrap(),
+        GrpcTransport::connect(base).await.unwrap(),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn the_client_opens_an_exchange_through_its_interceptors_and_applies_the_tenant() {
     let (base, _) = spawn_http(true).await;
