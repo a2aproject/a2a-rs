@@ -1044,6 +1044,8 @@ async fn wait_for_task_settled<T: a2a_client::Transport>(
     loop {
         let task = client
             .get_task(&GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: task_id.to_string(),
                 history_length: None,
                 tenant: tenant.clone(),
@@ -1126,7 +1128,7 @@ impl TaskOutcome for StreamResponse {
             StreamResponse::StatusUpdate(event) => {
                 warn_task_outcome(&event.task_id, &event.status.state);
             }
-            StreamResponse::Message(_) | StreamResponse::ArtifactUpdate(_) => {}
+            _ => {}
         }
     }
 }
@@ -1205,6 +1207,8 @@ async fn run_task_command(
             let ResolvedClient { client, tenant, .. } = resolve_client(cli, matches).await?;
             let result = client
                 .get_task(&GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: command.id.clone(),
                     history_length: command.history_length,
                     tenant: tenant.clone(),
@@ -1232,6 +1236,7 @@ async fn run_task_command(
             let ResolvedClient { client, tenant, .. } = resolve_client(cli, matches).await?;
             let result = client
                 .list_tasks(&ListTasksRequest {
+                    timeline_length: None,
                     context_id: command.context_id.clone(),
                     status: command.status.map(TaskState::from),
                     page_size: command.page_size,
@@ -1271,6 +1276,7 @@ async fn run_task_command(
             capabilities.require(Capability::Streaming)?;
             let stream = client
                 .subscribe_to_task(&SubscribeToTaskRequest {
+                    last_seen_generation: None,
                     id: command.id.clone(),
                     tenant: tenant.clone(),
                 })
@@ -1526,6 +1532,8 @@ fn build_send_message_request(
         || command.return_immediately
     {
         Some(SendMessageConfiguration {
+            if_generation_match: None,
+            timeline_length: None,
             accepted_output_modes: (!command.accepted_output_modes.is_empty())
                 .then_some(command.accepted_output_modes.clone()),
             task_push_notification_config: None,
@@ -1537,6 +1545,7 @@ fn build_send_message_request(
     };
 
     SendMessageRequest {
+        artifact_updates: Vec::new(),
         message,
         configuration,
         metadata: None,
@@ -1562,6 +1571,7 @@ fn build_push_notification_config(
         });
 
     Ok(TaskPushNotificationConfig {
+        protocol_version: None,
         task_id: String::new(),
         url: command.url.clone(),
         id: command.config_id.clone(),
@@ -2972,6 +2982,23 @@ impl TextRender for StreamResponse {
                 }
                 out.finish()
             }
+            StreamResponse::MessageUpdate(event) => {
+                let mut out = TextOutput::default();
+                out.field("Task ID", &event.task_id)
+                    .field("Context ID", &event.context_id);
+                out.raw(event.message.render_text());
+                out.finish()
+            }
+            StreamResponse::Error(error) => {
+                let mut out = TextOutput::default();
+                out.field("Error", &error.code);
+                if !error.message.is_empty() {
+                    out.raw(error.message.clone());
+                }
+                out.finish()
+            }
+            // Payload kinds added by a later protocol version.
+            _ => String::new(),
         }
     }
 }
@@ -3140,7 +3167,7 @@ fn stream_response_state(value: &StreamResponse) -> Option<TaskState> {
     match value {
         StreamResponse::Task(task) => Some(task.status.state.clone()),
         StreamResponse::StatusUpdate(event) => Some(event.status.state.clone()),
-        StreamResponse::Message(_) | StreamResponse::ArtifactUpdate(_) => None,
+        _ => None,
     }
 }
 
@@ -3245,6 +3272,7 @@ async fn subscribe_with_resumption<T: a2a_client::Transport>(
 
             match client
                 .subscribe_to_task(&SubscribeToTaskRequest {
+                    last_seen_generation: None,
                     id: task_id.clone(),
                     tenant: tenant.clone(),
                 })
@@ -3554,6 +3582,7 @@ mod tests {
 
             Ok(Box::pin(stream::iter(vec![
                 Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    generation: 0,
                     task_id,
                     context_id,
                     status: TaskStatus {
@@ -3657,6 +3686,7 @@ mod tests {
 
             Ok(Box::pin(stream::iter(vec![
                 Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    generation: 0,
                     task_id: req.id.clone(),
                     context_id: task.context_id.clone(),
                     status: TaskStatus {
@@ -3767,6 +3797,7 @@ mod tests {
                 AgentInterface::new(format!("{base_url}/rest"), TRANSPORT_PROTOCOL_HTTP_JSON),
             ],
             capabilities: AgentCapabilities {
+                user_artifacts: None,
                 streaming: Some(true),
                 push_notifications: Some(true),
                 extensions: None,
@@ -3786,6 +3817,8 @@ mod tests {
 
     fn make_fixture_task(task_id: &str, context_id: &str, state: TaskState, text: &str) -> Task {
         Task {
+            generation: 0,
+            timeline: None,
             id: task_id.to_string(),
             context_id: context_id.to_string(),
             status: TaskStatus {
@@ -4152,9 +4185,13 @@ mod tests {
 
     fn artifact_chunk() -> Result<StreamResponse, A2AError> {
         Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            generation: 0,
             task_id: "t".to_string(),
             context_id: "c".to_string(),
             artifact: Artifact {
+                end_generation: None,
+                role: None,
+                start_generation: None,
                 artifact_id: "a".to_string(),
                 name: None,
                 description: None,
@@ -4327,6 +4364,7 @@ mod tests {
                 .send_message(
                     &params,
                     &SendMessageRequest {
+                        artifact_updates: Vec::new(),
                         message: Message::new(Role::User, vec![Part::text("hello")]),
                         configuration: None,
                         metadata: None,
@@ -4340,6 +4378,7 @@ mod tests {
                 .send_streaming_message(
                     &params,
                     &SendMessageRequest {
+                        artifact_updates: Vec::new(),
                         message: Message::new(Role::User, vec![Part::text("hello")]),
                         configuration: None,
                         metadata: None,
@@ -4353,6 +4392,8 @@ mod tests {
                 .get_task(
                     &params,
                     &GetTaskRequest {
+                        current_generation: None,
+                        timeline_length: None,
                         id: "task-1".to_string(),
                         history_length: None,
                         tenant: None,
@@ -4365,6 +4406,7 @@ mod tests {
                 .list_tasks(
                     &params,
                     &ListTasksRequest {
+                        timeline_length: None,
                         context_id: None,
                         status: None,
                         page_size: None,
@@ -4394,6 +4436,7 @@ mod tests {
                 .subscribe_to_task(
                     &params,
                     &SubscribeToTaskRequest {
+                        last_seen_generation: None,
                         id: "task-1".to_string(),
                         tenant: None,
                     },
@@ -4405,6 +4448,7 @@ mod tests {
                 .create_push_config(
                     &params,
                     &TaskPushNotificationConfig {
+                        protocol_version: None,
                         task_id: "task-1".to_string(),
                         url: "https://example.com/callback".to_string(),
                         id: Some("cfg-1".to_string()),
@@ -4868,6 +4912,7 @@ mod tests {
                 TRANSPORT_PROTOCOL_JSONRPC,
             )],
             capabilities: AgentCapabilities {
+                user_artifacts: None,
                 streaming: Some(true),
                 push_notifications: Some(false),
                 extensions: None,
@@ -4992,6 +5037,7 @@ mod tests {
             version: VERSION.to_string(),
             supported_interfaces: vec![],
             capabilities: AgentCapabilities {
+                user_artifacts: None,
                 streaming: None,
                 push_notifications: None,
                 extensions: None,
@@ -5027,6 +5073,9 @@ mod tests {
         );
         task.artifacts = Some(vec![
             Artifact {
+                end_generation: None,
+                role: None,
+                start_generation: None,
                 artifact_id: "art-1".to_string(),
                 name: Some("summary".to_string()),
                 description: None,
@@ -5035,6 +5084,9 @@ mod tests {
                 extensions: None,
             },
             Artifact {
+                end_generation: None,
+                role: None,
+                start_generation: None,
                 artifact_id: "art-2".to_string(),
                 name: None,
                 description: None,
@@ -5118,6 +5170,7 @@ mod tests {
     #[test]
     fn test_push_config_render_text_includes_token_and_auth_scheme() {
         let config = TaskPushNotificationConfig {
+            protocol_version: None,
             url: "https://example.com/hook".to_string(),
             id: Some("cfg-1".to_string()),
             task_id: "task-1".to_string(),
@@ -5152,6 +5205,7 @@ mod tests {
 
         let populated = ListTaskPushNotificationConfigsResponse {
             configs: vec![TaskPushNotificationConfig {
+                protocol_version: None,
                 url: "https://example.com/hook".to_string(),
                 id: Some("cfg-1".to_string()),
                 task_id: "task-1".to_string(),
@@ -5189,6 +5243,7 @@ mod tests {
     #[test]
     fn test_stream_response_render_text_covers_update_events() {
         let status = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "task-s".to_string(),
             context_id: "ctx-s".to_string(),
             status: TaskStatus {
@@ -5210,6 +5265,7 @@ mod tests {
 
         // A state that isn't interrupted gets no resume line to act on.
         let working = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "task-s".to_string(),
             context_id: "ctx-s".to_string(),
             status: TaskStatus {
@@ -5222,9 +5278,13 @@ mod tests {
         assert!(!working.render_text().contains("Resume with"));
 
         let artifact = StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            generation: 0,
             task_id: "task-s".to_string(),
             context_id: "ctx-s".to_string(),
             artifact: Artifact {
+                end_generation: None,
+                role: None,
+                start_generation: None,
                 artifact_id: "art-9".to_string(),
                 name: None,
                 description: None,
@@ -5864,6 +5924,7 @@ mod tests {
 
         // A streamed status update reads the event's state.
         StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t-2".to_string(),
             context_id: "c-2".to_string(),
             status: TaskStatus {
@@ -5910,5 +5971,36 @@ mod tests {
         assert_eq!(envelope.error.code, "A2ACLI_ERR_USAGE");
         assert_eq!(envelope.error.message, "unexpected argument '--nope' found");
         assert!(envelope.error.hint.unwrap().contains("--help"));
+    }
+    #[test]
+    fn live_updates_render_the_message_and_rejection_details() {
+        let update = StreamResponse::MessageUpdate(TaskMessageUpdateEvent {
+            task_id: "live-task".into(),
+            context_id: "live-context".into(),
+            message: Message::new(Role::User, vec![Part::text("follow-up content")]),
+            generation: 42,
+            metadata: None,
+        });
+        let rendered = update.render_text();
+        for expected in ["live-task", "live-context", "follow-up content"] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected} from {rendered}"
+            );
+        }
+        for message in ["retry this input", ""] {
+            let rejection = StreamResponse::Error(StreamError {
+                task_id: "live-task".into(),
+                code: "UNAVAILABLE".into(),
+                message: message.into(),
+                reference_id: Some("rejected-input".into()),
+                metadata: None,
+            });
+            let rendered = rejection.render_text();
+            assert!(rendered.contains("UNAVAILABLE"));
+            if !message.is_empty() {
+                assert!(rendered.contains(message));
+            }
+        }
     }
 }

@@ -602,6 +602,7 @@ mod tests {
             );
 
             let status_update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "task-1".into(),
                 context_id: "ctx-1".into(),
                 status: TaskStatus {
@@ -660,6 +661,9 @@ mod tests {
             .get_task(
                 &ServiceParams::new(),
                 &GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
+
                     id: "../admin?x=1".into(),
                     history_length: None,
                     tenant: None,
@@ -699,6 +703,8 @@ mod tests {
         let (url, line) = spawn_request_line_server().await;
         let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), url);
         let req = GetTaskRequest {
+            current_generation: None,
+            timeline_length: None,
             id: "t1".into(),
             history_length: None,
             tenant: tenant.clone(),
@@ -731,6 +737,8 @@ mod tests {
         let (url, line) = spawn_request_line_server().await;
         let transport = RestTransport::new(crate::default_reqwest_client(None).unwrap(), url);
         let req = GetTaskRequest {
+            current_generation: None,
+            timeline_length: None,
             id: "t1".into(),
             history_length: None,
             tenant: Some(String::new()),
@@ -750,6 +758,7 @@ mod tests {
             .list_tasks(
                 &ServiceParams::new(),
                 &ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -994,6 +1003,7 @@ mod tests {
             &transport,
             &ServiceParams::new(),
             &SubscribeToTaskRequest {
+                last_seen_generation: None,
                 id: "task-1".into(),
                 tenant: None,
             },

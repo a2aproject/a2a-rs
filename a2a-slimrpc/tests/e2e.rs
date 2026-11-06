@@ -45,6 +45,8 @@ fn sample_message(role: Role, text: &str, task_id: &str) -> Message {
 
 fn sample_task(id: &str, state: TaskState) -> Task {
     Task {
+        generation: 0,
+        timeline: None,
         id: id.to_string(),
         context_id: "ctx-1".to_string(),
         status: TaskStatus {
@@ -60,6 +62,7 @@ fn sample_task(id: &str, state: TaskState) -> Task {
 
 fn sample_push_config(id: &str) -> TaskPushNotificationConfig {
     TaskPushNotificationConfig {
+        protocol_version: None,
         task_id: "task-1".to_string(),
         tenant: None,
         url: "https://example.com/callback".to_string(),
@@ -90,6 +93,7 @@ fn sample_agent_card(target: &str) -> AgentCard {
 
 fn send_message_request(task_id: &str) -> SendMessageRequest {
     SendMessageRequest {
+        artifact_updates: Vec::new(),
         message: sample_message(Role::User, "hello", task_id),
         configuration: None,
         metadata: None,
@@ -260,6 +264,7 @@ impl RequestHandler for TestHandler {
         if req.message.task_id.as_deref() == Some("stream-error") {
             return Ok(Box::pin(stream::iter(vec![
                 Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    generation: 0,
                     task_id: "task-1".to_string(),
                     context_id: "ctx-1".to_string(),
                     status: TaskStatus {
@@ -275,6 +280,7 @@ impl RequestHandler for TestHandler {
 
         Ok(Box::pin(stream::iter(vec![
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "task-1".to_string(),
                 context_id: "ctx-1".to_string(),
                 status: TaskStatus {
@@ -336,6 +342,7 @@ impl RequestHandler for TestHandler {
         }
         Ok(Box::pin(stream::once(async move {
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: req.id,
                 context_id: "ctx-1".to_string(),
                 status: TaskStatus {
@@ -368,6 +375,7 @@ impl RequestHandler for TestHandler {
             return Err(A2AError::task_not_found(&req.id));
         }
         Ok(TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: req.task_id,
             tenant: req.tenant,
             url: "https://example.com/callback".to_string(),
@@ -467,6 +475,8 @@ async fn slimrpc_transport_end_to_end() {
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "task-1".to_string(),
                 history_length: Some(1),
                 tenant: None,
@@ -480,6 +490,7 @@ async fn slimrpc_transport_end_to_end() {
         .list_tasks(
             &ServiceParams::new(),
             &ListTasksRequest {
+                timeline_length: None,
                 context_id: Some("ctx-1".to_string()),
                 status: Some(TaskState::Completed),
                 page_size: Some(1),
@@ -593,6 +604,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
         .subscribe_to_task(
             &ServiceParams::new(),
             &SubscribeToTaskRequest {
+                last_seen_generation: None,
                 id: "task-1".to_string(),
                 tenant: None,
             },
@@ -607,6 +619,8 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
             .get_task(
                 &ServiceParams::new(),
                 &GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: "missing".to_string(),
                     history_length: None,
                     tenant: None,
@@ -665,6 +679,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
         .subscribe_to_task(
             &ServiceParams::new(),
             &SubscribeToTaskRequest {
+                last_seen_generation: None,
                 id: "missing".to_string(),
                 tenant: None,
             },
@@ -746,6 +761,8 @@ async fn slimrpc_transport_reports_malformed_payloads() {
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "task-1".to_string(),
                 history_length: None,
                 tenant: None,

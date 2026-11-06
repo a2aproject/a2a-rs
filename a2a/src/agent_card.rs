@@ -301,6 +301,11 @@ pub struct AgentCapabilities {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extended_agent_card: Option<bool>,
+
+    /// Whether the agent accepts client-written artifacts through
+    /// `SendMessageRequest.artifactUpdates` (A2A 1.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_artifacts: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -618,6 +623,7 @@ mod tests {
             version: "1.0.0".to_string(),
             supported_interfaces: vec![AgentInterface::new("http://localhost:3000", "JSONRPC")],
             capabilities: AgentCapabilities {
+                user_artifacts: None,
                 streaming: Some(true),
                 push_notifications: Some(false),
                 extensions: None,

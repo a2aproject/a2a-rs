@@ -34,6 +34,8 @@ impl AgentExecutor for ArtifactAgent {
         ctx: ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let mut events = vec![Ok(StreamResponse::Task(Task {
+            generation: 0,
+            timeline: None,
             id: ctx.task_id.clone(),
             context_id: ctx.context_id.clone(),
             status: TaskStatus {
@@ -51,6 +53,7 @@ impl AgentExecutor for ArtifactAgent {
                 .enumerate()
                 .map(|(index, (artifact, append))| {
                     Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                        generation: 0,
                         task_id: ctx.task_id.clone(),
                         context_id: ctx.context_id.clone(),
                         artifact: artifact.clone(),
@@ -61,6 +64,7 @@ impl AgentExecutor for ArtifactAgent {
                 }),
         );
         events.push(Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: ctx.task_id,
             context_id: ctx.context_id,
             status: TaskStatus {
@@ -80,6 +84,9 @@ impl AgentExecutor for ArtifactAgent {
 
 fn artifact(id: &str, texts: &[&str]) -> Artifact {
     Artifact {
+        end_generation: None,
+        role: None,
+        start_generation: None,
         artifact_id: id.into(),
         name: None,
         description: None,
@@ -97,6 +104,7 @@ async fn snapshot(updates: Vec<Update>, streaming: bool) -> Result<Task, A2AErro
         InMemoryTaskStore::new(),
     );
     let request = SendMessageRequest {
+        artifact_updates: Vec::new(),
         message: Message::new(Role::User, vec![Part::text("hi")]),
         configuration: None,
         metadata: None,
@@ -120,6 +128,7 @@ async fn snapshot(updates: Vec<Update>, streaming: bool) -> Result<Task, A2AErro
             .iter()
             .enumerate()
             .map(|(index, (artifact, append))| TaskArtifactUpdateEvent {
+                generation: 0,
                 task_id: initial_task.id.clone(),
                 context_id: initial_task.context_id.clone(),
                 artifact: artifact.clone(),
@@ -136,6 +145,8 @@ async fn snapshot(updates: Vec<Update>, streaming: bool) -> Result<Task, A2AErro
             .get_task(
                 &Default::default(),
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: initial_task.id,
                     history_length: None,
                     tenant: None,
@@ -153,6 +164,8 @@ async fn snapshot(updates: Vec<Update>, streaming: bool) -> Result<Task, A2AErro
             .get_task(
                 &Default::default(),
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: task.id.clone(),
                     history_length: None,
                     tenant: None,
@@ -352,6 +365,7 @@ async fn applying_events_to_a_known_task_does_not_read_the_store() {
         },
     );
     let request = SendMessageRequest {
+        artifact_updates: Vec::new(),
         message: Message::new(Role::User, vec![Part::text("hi")]),
         configuration: None,
         metadata: None,
@@ -382,6 +396,8 @@ async fn applying_events_to_a_known_task_does_not_read_the_store() {
         .get_task(
             &Default::default(),
             GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: task_id.unwrap(),
                 history_length: None,
                 tenant: None,

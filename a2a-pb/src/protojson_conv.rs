@@ -7,8 +7,8 @@ use a2a::{
     AgentCard, CancelTaskRequest, DeleteTaskPushNotificationConfigRequest,
     GetExtendedAgentCardRequest, GetTaskPushNotificationConfigRequest, GetTaskRequest,
     ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
-    ListTasksRequest, ListTasksResponse, SendMessageRequest, SendMessageResponse, StreamResponse,
-    SubscribeToTaskRequest, Task, TaskPushNotificationConfig,
+    ListTasksRequest, ListTasksResponse, SendMessageRequest, SendMessageResponse, StreamRequest,
+    StreamResponse, SubscribeToTaskRequest, Task, TaskPushNotificationConfig,
 };
 use prost::Message;
 use serde::{Serialize, de::DeserializeOwned};
@@ -269,6 +269,13 @@ impl_protojson_payload_optional!(
     crate::pbconv::to_proto_send_message_response,
     crate::pbconv::from_proto_send_message_response
 );
+impl_protojson_payload!(
+    StreamRequest,
+    crate::proto::StreamRequest,
+    crate::protojson::StreamRequest,
+    crate::pbconv::to_proto_stream_request,
+    crate::pbconv::from_proto_stream_request
+);
 impl_protojson_payload_optional!(
     StreamResponse,
     crate::proto::StreamResponse,
@@ -372,6 +379,8 @@ mod tests {
 
     fn sample_task_with_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> Task {
         Task {
+            generation: 0,
+            timeline: None,
             id: "task-1".to_string(),
             context_id: "ctx-1".to_string(),
             status: a2a::TaskStatus {
@@ -433,6 +442,7 @@ mod tests {
     #[test]
     fn test_status_timestamp_after_uses_z_suffix() {
         let request = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: None,
@@ -461,6 +471,9 @@ mod tests {
             Value::String(offset.to_string()),
         )]));
         task.artifacts = Some(vec![a2a::Artifact {
+            role: None,
+            start_generation: None,
+            end_generation: None,
             artifact_id: "artifact-1".to_string(),
             name: None,
             description: None,
