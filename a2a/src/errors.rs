@@ -75,6 +75,67 @@ pub fn reason_to_error_code(reason: &str) -> Option<i32> {
     }
 }
 
+/// The A2A error code named by the last protocol-domain `ErrorInfo` detail, if any.
+pub fn protocol_error_code(details: &[TypedDetail]) -> Option<i32> {
+    details
+        .iter()
+        .filter(|detail| {
+            detail.type_url == errordetails::ERROR_INFO_TYPE
+                && detail.value.get("domain").and_then(Value::as_str)
+                    == Some(errordetails::PROTOCOL_DOMAIN)
+        })
+        .filter_map(|detail| reason_to_error_code(detail.value.get("reason")?.as_str()?))
+        .next_back()
+}
+
+/// Builds the client-side [`A2AError`] for an error received with typed details, the
+/// same way on every transport, whatever order the details arrive in: a protocol-domain
+/// `ErrorInfo` reason selects the A2A code; without one, a `BadRequest` promotes
+/// `INTERNAL_ERROR` to `INVALID_PARAMS`; `BadRequest` violations are appended to the
+/// message as `field: description`.
+pub fn a2a_error_from_details(code: i32, message: String, details: Vec<TypedDetail>) -> A2AError {
+    let mut message = message;
+    let mut has_bad_request = false;
+
+    for detail in details
+        .iter()
+        .filter(|detail| detail.type_url == errordetails::BAD_REQUEST_TYPE)
+    {
+        has_bad_request = true;
+        if let Some(Value::Array(violations)) = detail.value.get("fieldViolations") {
+            let violation_strs: Vec<String> = violations
+                .iter()
+                .filter_map(|v| {
+                    let field = v.get("field")?.as_str()?;
+                    let desc = v.get("description")?.as_str()?;
+                    if field.is_empty() {
+                        Some(desc.to_string())
+                    } else {
+                        Some(format!("{field}: {desc}"))
+                    }
+                })
+                .collect();
+            if !violation_strs.is_empty() {
+                message = format!("{}: {}", message, violation_strs.join("; "));
+            }
+        }
+    }
+
+    let code = protocol_error_code(&details).unwrap_or(
+        if has_bad_request && code == error_code::INTERNAL_ERROR {
+            error_code::INVALID_PARAMS
+        } else {
+            code
+        },
+    );
+
+    A2AError {
+        code,
+        message,
+        details: (!details.is_empty()).then_some(details),
+    }
+}
+
 /// An A2A protocol error.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{message}")]
@@ -512,5 +573,53 @@ mod tests {
         let e = A2AError::internal("test");
         let rpc: crate::JsonRpcError = e.into();
         assert_eq!(rpc.code, error_code::INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn test_a2a_error_from_details_folds_violations_and_promotes_a_bare_internal_error() {
+        let details = vec![
+            TypedDetail::bad_request(vec![
+                errordetails::FieldViolation {
+                    field: "message.parts".to_string(),
+                    description: "at least one part is required".to_string(),
+                },
+                errordetails::FieldViolation {
+                    field: String::new(),
+                    description: "body is not JSON".to_string(),
+                },
+            ]),
+            TypedDetail::from_struct(HashMap::new()),
+        ];
+
+        let err =
+            a2a_error_from_details(error_code::INTERNAL_ERROR, "invalid".to_string(), details);
+
+        assert_eq!(err.code, error_code::INVALID_PARAMS);
+        assert_eq!(
+            err.message,
+            "invalid: message.parts: at least one part is required; body is not JSON"
+        );
+        assert_eq!(err.details.map(|d| d.len()), Some(2));
+    }
+
+    #[test]
+    fn test_a2a_error_from_details_takes_the_reason_whatever_the_detail_order() {
+        let bad_request = TypedDetail::new(errordetails::BAD_REQUEST_TYPE, HashMap::new());
+        let error_info =
+            TypedDetail::error_info("INTERNAL_ERROR", errordetails::PROTOCOL_DOMAIN, None);
+
+        for details in [
+            vec![bad_request.clone(), error_info.clone()],
+            vec![error_info, bad_request],
+        ] {
+            let err =
+                a2a_error_from_details(error_code::INTERNAL_ERROR, "boom".to_string(), details);
+            assert_eq!(err.code, error_code::INTERNAL_ERROR);
+            assert_eq!(err.message, "boom");
+        }
+
+        let err = a2a_error_from_details(error_code::PARSE_ERROR, "boom".to_string(), Vec::new());
+        assert_eq!(err.code, error_code::PARSE_ERROR);
+        assert!(err.details.is_none());
     }
 }
