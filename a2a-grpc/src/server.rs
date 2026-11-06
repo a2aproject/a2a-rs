@@ -177,11 +177,25 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
 
     async fn send_live_message(
         &self,
-        _request: tonic::Request<tonic::Streaming<proto::StreamRequest>>,
+        request: tonic::Request<tonic::Streaming<proto::StreamRequest>>,
     ) -> Result<tonic::Response<Self::SendLiveMessageStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "SendLiveMessage is not supported by this server",
-        ))
+        let params = extract_service_params(request.metadata());
+        validate_protocol_version(&params)?;
+        // A request that cannot be read ends the uplink, and with it what the
+        // client can still say; the downlink goes on until the task does.
+        let uplink = request
+            .into_inner()
+            .take_while(|item| futures::future::ready(item.is_ok()))
+            .filter_map(|item| futures::future::ready(item.ok()))
+            .map(|request| pbconv::from_proto_stream_request(&request))
+            .boxed();
+        let stream = self
+            .handler
+            .send_live_message(&params, uplink)
+            .await
+            .map_err(|e| a2a_error_to_status(&e))?;
+        let proto_stream = stream.map(map_proto_stream_item);
+        Ok(tonic::Response::new(Box::pin(proto_stream)))
     }
 
     async fn create_task_push_notification_config(
@@ -308,6 +322,24 @@ mod tests {
     }
 
     #[test]
+    fn test_grpc_protocol_version_validation() {
+        let mut params = a2a_server::middleware::ServiceParams::new();
+        assert_eq!(
+            validate_protocol_version(&params).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        params.insert("a2a-version".into(), vec!["1.1".into()]);
+        assert!(validate_protocol_version(&params).is_ok());
+
+        params.insert("a2a-version".into(), vec!["2.0".into()]);
+        assert_eq!(
+            validate_protocol_version(&params).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[test]
     fn test_grpc_handler_new() {
         use a2a::*;
         use a2a_server::handler::DefaultRequestHandler;
@@ -331,10 +363,14 @@ mod tests {
             }
         }
 
-        let handler = Arc::new(DefaultRequestHandler::new(
-            NoopExecutor,
-            InMemoryTaskStore::new(),
-        ));
+        let handler = Arc::new(
+            DefaultRequestHandler::new(NoopExecutor, InMemoryTaskStore::new()).with_capabilities(
+                a2a::AgentCapabilities {
+                    streaming: Some(true),
+                    ..Default::default()
+                },
+            ),
+        );
         let grpc_handler = GrpcHandler::new(handler);
         // Just verify construction
         let _ = grpc_handler;

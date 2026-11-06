@@ -32,9 +32,10 @@ pub mod fuzz_support {
 pub mod tls;
 
 pub use agent_card::{AgentCardProducer, StaticAgentCard, WELL_KNOWN_AGENT_CARD_PATH};
-pub use executor::{AgentExecutor, ExecutorContext};
+pub use executor::{AgentExecutor, ClientInput, ClientInputSender, ClientInputs, ExecutorContext};
 pub use handler::{
-    DefaultRequestHandler, ExtendedAgentCardResolver, RequestAuthorizer, RequestHandler,
+    DefaultRequestHandler, ExtendedAgentCardResolver, LiveResponse, RequestAuthorizer,
+    RequestHandler,
 };
 pub use middleware::{CallContext, CallInterceptor, InterceptedHandler, ServiceParams, User};
 pub use push::{HttpPushSender, HttpPushSenderConfig, InMemoryPushConfigStore, PushConfigStore};
@@ -109,6 +110,7 @@ pub(crate) mod test_util {
     pub(crate) struct CapturingHandler {
         captured: CapturedParams,
         tenants: Mutex<HashMap<&'static str, Option<String>>>,
+        pub(crate) live_stream_error: Mutex<Option<A2AError>>,
     }
 
     impl CapturingHandler {
@@ -117,6 +119,7 @@ pub(crate) mod test_util {
             let handler = Arc::new(CapturingHandler {
                 captured: captured.clone(),
                 tenants: Mutex::new(HashMap::new()),
+                live_stream_error: Mutex::new(None),
             });
             (handler, captured)
         }
@@ -153,6 +156,24 @@ pub(crate) mod test_util {
         ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
             self.record("send_streaming_message", params, req.tenant.as_deref());
             Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn send_live_request(
+            &self,
+            params: &ServiceParams,
+            request: StreamRequest,
+        ) -> Result<crate::handler::LiveResponse, A2AError> {
+            self.record("send_live_request", params, request.tenant.as_deref());
+            let tenant = match &request.payload {
+                StreamRequestPayload::SendMessage(message) => message.tenant.as_deref(),
+                StreamRequestPayload::Subscribe(request) => request.tenant.as_deref(),
+                _ => None,
+            };
+            self.record("live_payload", params, tenant);
+            let error = self.live_stream_error.lock().unwrap().take();
+            Ok(crate::handler::LiveResponse::Stream(Box::pin(
+                futures::stream::iter(error.map(Err)),
+            )))
         }
 
         async fn get_task(

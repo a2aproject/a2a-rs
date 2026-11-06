@@ -26,15 +26,15 @@ async fn main() {
         )
         .init();
 
-    let handler = Arc::new(DefaultRequestHandler::new(
-        EchoExecutor,
-        InMemoryTaskStore::new(),
-    ));
     let agent_card = build_agent_card(vec![
         AgentInterface::new("http://localhost:3000/jsonrpc", TRANSPORT_PROTOCOL_JSONRPC),
         AgentInterface::new("http://localhost:3000/rest", TRANSPORT_PROTOCOL_HTTP_JSON),
         AgentInterface::new("http://localhost:50051", TRANSPORT_PROTOCOL_GRPC),
     ]);
+    let handler = Arc::new(
+        DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+            .with_capabilities(agent_card.capabilities.clone()),
+    );
     let card_producer = Arc::new(StaticAgentCard::new(agent_card));
 
     let app = axum::Router::new()
