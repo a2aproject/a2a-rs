@@ -41,3 +41,6 @@ a2a-server = { workspace = true }
 assert_cmd = "2"
 axum = { workspace = true }
 base64 = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = "0.26"

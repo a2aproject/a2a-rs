@@ -18,7 +18,7 @@ use clap::parser::ValueSource;
 use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use fileparts::{FilePartSaver, FilePartSource};
 use futures::StreamExt;
-use reqwest::{Client, RequestBuilder};
+use reqwest::{Client, ClientBuilder, RequestBuilder};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -34,7 +34,8 @@ Default behavior (SPEC.md §6.5):
   - Task completion: wait until terminal/interrupted state (--async returns immediately)
   - Output: human-readable text (-o/--output json switches to protocol JSON)
   - Protocol version: highest shared 1.x, from the agent card (--a2a-version pins it)
-  - Transport security: TLS verification on (--insecure disables it, with a warning)"
+  - Transport security: TLS verification on, against the system roots (--ca-cert trusts
+    only the certificates in one file; --insecure disables verification, with a warning)"
 )]
 pub struct Cli {
     /// Load configuration from an explicit .env file in place of the local
@@ -122,6 +123,32 @@ pub struct Cli {
     /// verification silently.
     #[arg(long, global = true, env = "A2ACLI_INSECURE")]
     pub insecure: bool,
+
+    /// Trust only the PEM certificates in this file for TLS connections
+    /// (the card fetch and the JSON-RPC and REST transports), in place of
+    /// the system roots — for an agent behind a private or self-signed CA.
+    /// Cannot be combined with --insecure. Not read from a `.env` found by
+    /// walking up from the working directory.
+    #[arg(
+        long = "ca-cert",
+        global = true,
+        env = "A2ACLI_CA_CERT",
+        value_name = "FILE"
+    )]
+    pub ca_cert: Option<PathBuf>,
+
+    /// Send every HTTP request, the card fetch included, through the Unix
+    /// domain socket at this path. The URL's host is still sent as the
+    /// `Host` header and used as the TLS server name; nothing is resolved.
+    /// Unix only. Not read from a `.env` found by walking up from the
+    /// working directory.
+    #[arg(
+        long = "unix-socket",
+        global = true,
+        env = "A2ACLI_UNIX_SOCKET",
+        value_name = "PATH"
+    )]
+    pub unix_socket: Option<PathBuf>,
 
     /// Verbose diagnostics to stderr: the outcome of each call plus the raw
     /// protocol messages exchanged on the wire — request and response
@@ -1711,18 +1738,19 @@ fn load_dotenv_config(args: &[OsString]) -> HashMap<String, ConfigSource> {
         apply_dotenv_file(
             &global_path,
             ConfigSource::GlobalFile,
+            false,
             &real_env_keys,
             &mut provenance,
         );
     }
 
-    let local_path = find_flag_value(args, "--config")
-        .map(PathBuf::from)
-        .or_else(find_local_dotenv);
-    if let Some(local_path) = local_path {
+    let explicit_path = find_flag_value(args, "--config").map(PathBuf::from);
+    let discovered = explicit_path.is_none();
+    if let Some(local_path) = explicit_path.or_else(find_local_dotenv) {
         apply_dotenv_file(
             &local_path,
             ConfigSource::LocalFile,
+            discovered,
             &real_env_keys,
             &mut provenance,
         );
@@ -1730,6 +1758,11 @@ fn load_dotenv_config(args: &[OsString]) -> HashMap<String, ConfigSource> {
 
     provenance
 }
+
+/// Settings a `.env` found by walking up from the working directory may not
+/// provide, so a cloned repository cannot choose what the CLI trusts or where
+/// it sends traffic. The global file, `--config` and the environment still can.
+const NOT_FROM_DISCOVERED_DOTENV: &[&str] = &["A2ACLI_CA_CERT", "A2ACLI_UNIX_SOCKET"];
 
 /// Look for `--flag value` or `--flag=value` in a raw, unparsed argv —
 /// needed to find `--config` before `Cli` itself has been parsed.
@@ -1779,6 +1812,7 @@ fn find_local_dotenv() -> Option<PathBuf> {
 fn apply_dotenv_file(
     path: &Path,
     source: ConfigSource,
+    discovered: bool,
     real_env_keys: &HashSet<String>,
     provenance: &mut HashMap<String, ConfigSource>,
 ) {
@@ -1789,6 +1823,13 @@ fn apply_dotenv_file(
 
     for (key, value) in parse_dotenv(&contents) {
         if !key.starts_with("A2ACLI_") || real_env_keys.contains(&key) {
+            continue;
+        }
+        if discovered && NOT_FROM_DISCOVERED_DOTENV.contains(&key.as_str()) {
+            eprintln!(
+                "warning: ignoring {key} from {path}; pass --config {path} to use it",
+                path = path.display()
+            );
             continue;
         }
         // SAFETY: this runs synchronously, at the very start of `run_args`,
@@ -1882,6 +1923,13 @@ impl TextRender for ConfigSettings {
 fn redact_secret(value: &Option<String>) -> String {
     match value {
         Some(_) => "(set, redacted)".to_string(),
+        None => "(not set)".to_string(),
+    }
+}
+
+fn path_setting(value: &Option<PathBuf>) -> String {
+    match value {
+        Some(path) => path.display().to_string(),
         None => "(not set)".to_string(),
     }
 }
@@ -1986,6 +2034,18 @@ fn effective_config_settings(
         "insecure",
         cli.insecure.to_string(),
         "A2ACLI_INSECURE",
+    );
+    add(
+        "ca_cert",
+        "ca-cert",
+        path_setting(&cli.ca_cert),
+        "A2ACLI_CA_CERT",
+    );
+    add(
+        "unix_socket",
+        "unix-socket",
+        path_setting(&cli.unix_socket),
+        "A2ACLI_UNIX_SOCKET",
     );
     add("debug", "debug", cli.debug.to_string(), "A2ACLI_DEBUG");
     add(
@@ -2346,14 +2406,14 @@ async fn resolve_client(cli: &Cli, matches: &ArgMatches) -> Result<ResolvedClien
             .collect();
         builder = builder.preferred_bindings(preferred);
     }
-    if cli.insecure {
-        let insecure = build_insecure_reqwest_client()?;
+    if needs_custom_http_client(cli) {
+        let http = build_http_client(cli)?;
         builder = builder
             .register(Arc::new(a2a_client::jsonrpc::JsonRpcTransportFactory::new(
-                Some(insecure.clone()),
+                Some(http.clone()),
             )))
             .register(Arc::new(a2a_client::rest::RestTransportFactory::new(Some(
-                insecure,
+                http,
             ))));
     }
     // Collected rather than handed to the builder, because the version
@@ -2577,11 +2637,7 @@ async fn resolve_agent_card_with_raw(
     match normalize_card_reference(&reference) {
         CardReference::File(path) => read_agent_card_file(&path),
         CardReference::Url(url) => {
-            let client = if cli.insecure {
-                build_insecure_reqwest_client()?
-            } else {
-                Client::new()
-            };
+            let client = build_http_client(cli)?;
             let request = apply_request_auth(client.get(&url), cli);
             let response = request.send().await?.error_for_status()?;
             let raw: Value = response.json().await?;
@@ -2626,20 +2682,87 @@ fn apply_request_auth(mut request: RequestBuilder, cli: &Cli) -> RequestBuilder 
     request
 }
 
+/// Whether a flag asks for connection behaviour the SDK's default HTTP
+/// client does not have.
+fn needs_custom_http_client(cli: &Cli) -> bool {
+    cli.insecure || cli.ca_cert.is_some() || cli.unix_socket.is_some()
+}
+
+/// The HTTP client for the card fetch and the JSON-RPC and REST transports,
+/// shaped by `--insecure`, `--ca-cert` and `--unix-socket`.
+///
+/// Built when a command connects, not at parse time, so a bad path fails that
+/// command with a usage error while `config show` keeps working.
+fn build_http_client(cli: &Cli) -> Result<Client, CliError> {
+    if cli.insecure && cli.ca_cert.is_some() {
+        return Err(CliError::InvalidInput(
+            "--ca-cert and --insecure cannot be combined: --insecure turns certificate \
+             verification off, so the CA file would never be consulted"
+                .to_string(),
+        ));
+    }
+    let mut builder = Client::builder();
+    if cli.insecure {
+        builder = accept_invalid_certs(builder);
+    }
+    if let Some(path) = &cli.ca_cert {
+        builder = trust_only_ca_file(builder, path)?;
+    }
+    if let Some(path) = &cli.unix_socket {
+        builder = through_unix_socket(builder, path)?;
+    }
+    builder.build().map_err(CliError::Http)
+}
+
 /// `--insecure` disables TLS certificate verification (development only).
 #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
-fn build_insecure_reqwest_client() -> Result<Client, CliError> {
-    Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(CliError::Http)
+fn accept_invalid_certs(builder: ClientBuilder) -> ClientBuilder {
+    builder.danger_accept_invalid_certs(true)
 }
 
 /// No TLS backend compiled in: there is no certificate verification to
 /// disable, so `--insecure` is a no-op rather than a build error.
 #[cfg(not(any(feature = "rustls-tls", feature = "native-tls")))]
-fn build_insecure_reqwest_client() -> Result<Client, CliError> {
-    Client::builder().build().map_err(CliError::Http)
+fn accept_invalid_certs(builder: ClientBuilder) -> ClientBuilder {
+    builder
+}
+
+/// `--ca-cert`: the certificates in the file replace the system roots.
+#[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
+fn trust_only_ca_file(builder: ClientBuilder, path: &Path) -> Result<ClientBuilder, CliError> {
+    let unusable = |reason: String| {
+        CliError::InvalidInput(format!("reading --ca-cert {}: {reason}", path.display()))
+    };
+    let pem = std::fs::read(path).map_err(|error| unusable(error.to_string()))?;
+    let certs =
+        reqwest::Certificate::from_pem_bundle(&pem).map_err(|error| unusable(error.to_string()))?;
+    // An empty list would make `tls_certs_only` trust nothing, which reads as
+    // a connection failure rather than as the unusable file it is.
+    if certs.is_empty() {
+        return Err(unusable("no PEM certificates found".to_string()));
+    }
+    Ok(builder.tls_certs_only(certs))
+}
+
+/// Unlike `--insecure`, which has nothing to disable here, ignoring
+/// `--ca-cert` would silently trust the wrong roots, so it is refused.
+#[cfg(not(any(feature = "rustls-tls", feature = "native-tls")))]
+fn trust_only_ca_file(_builder: ClientBuilder, _path: &Path) -> Result<ClientBuilder, CliError> {
+    Err(CliError::InvalidInput(
+        "--ca-cert needs TLS support, which this build does not include".to_string(),
+    ))
+}
+
+#[cfg(unix)]
+fn through_unix_socket(builder: ClientBuilder, path: &Path) -> Result<ClientBuilder, CliError> {
+    Ok(builder.unix_socket(path))
+}
+
+#[cfg(not(unix))]
+fn through_unix_socket(_builder: ClientBuilder, _path: &Path) -> Result<ClientBuilder, CliError> {
+    Err(CliError::InvalidInput(
+        "--unix-socket is only supported on Unix platforms".to_string(),
+    ))
 }
 
 /// §12.1/AUTH_003: never disable TLS verification silently. Warns whenever
@@ -3943,6 +4066,121 @@ mod tests {
         assert_eq!(cli.transport, vec![Binding::Jsonrpc]);
         assert_eq!(cli.svc_params.len(), 1);
         assert!(matches!(cli.command, Command::Send(_)));
+    }
+
+    fn http_client_cli(extra: &[&str]) -> Cli {
+        let mut args = vec!["a2acli"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["config", "show"]);
+        Cli::try_parse_from(args).unwrap()
+    }
+
+    /// A file under the temp dir, unique to this process and `name`.
+    fn scratch_file(name: &str, contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("a2acli-unit-{name}-{}", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// The message of a usage error, which exits with status 2.
+    fn usage_message(error: CliError) -> String {
+        assert_eq!(error.exit_code(), 2, "{error}");
+        error.to_string()
+    }
+
+    #[test]
+    fn test_ca_cert_and_unix_socket_parse_as_paths() {
+        let cli = http_client_cli(&["--ca-cert", "/etc/ca.pem", "--unix-socket", "/run/a2a.sock"]);
+        assert_eq!(cli.ca_cert, Some(PathBuf::from("/etc/ca.pem")));
+        assert_eq!(cli.unix_socket, Some(PathBuf::from("/run/a2a.sock")));
+        assert!(needs_custom_http_client(&cli));
+    }
+
+    #[test]
+    fn test_only_a_connection_flag_asks_for_a_custom_http_client() {
+        assert!(!needs_custom_http_client(&http_client_cli(&[])));
+        assert!(needs_custom_http_client(&http_client_cli(&["--insecure"])));
+        assert!(needs_custom_http_client(&http_client_cli(&[
+            "--ca-cert",
+            "ca.pem"
+        ])));
+        assert!(needs_custom_http_client(&http_client_cli(&[
+            "--unix-socket",
+            "a2a.sock"
+        ])));
+    }
+
+    #[test]
+    fn test_ca_cert_cannot_be_combined_with_insecure() {
+        let cli = http_client_cli(&["--ca-cert", "ca.pem", "--insecure"]);
+        let message = usage_message(build_http_client(&cli).unwrap_err());
+        assert!(message.contains("--ca-cert and --insecure"), "{message}");
+    }
+
+    /// The path is only read when a command connects, so `config show` is
+    /// the one command that still works with a bad `--ca-cert`.
+    #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
+    #[test]
+    fn test_an_unreadable_ca_cert_is_a_usage_error() {
+        let cli = http_client_cli(&["--ca-cert", "/nonexistent/ca.pem"]);
+        let message = usage_message(build_http_client(&cli).unwrap_err());
+        assert!(
+            message.contains("reading --ca-cert /nonexistent/ca.pem: "),
+            "{message}"
+        );
+    }
+
+    #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
+    #[test]
+    fn test_a_ca_cert_file_without_certificates_is_a_usage_error() {
+        let path = scratch_file("ca-empty", "this is not a certificate\n");
+        let cli = http_client_cli(&["--ca-cert", path.to_str().unwrap()]);
+        let message = usage_message(build_http_client(&cli).unwrap_err());
+        let _ = std::fs::remove_file(&path);
+        assert!(message.ends_with("no PEM certificates found"), "{message}");
+    }
+
+    #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
+    #[test]
+    fn test_a_ca_cert_file_with_a_certificate_builds_a_client() {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let pem = params.self_signed(&key).unwrap().pem();
+        let path = scratch_file("ca-valid", &pem);
+        let cli = http_client_cli(&["--ca-cert", path.to_str().unwrap()]);
+        let built = build_http_client(&cli);
+        let _ = std::fs::remove_file(&path);
+        built.unwrap();
+    }
+
+    #[cfg(not(any(feature = "rustls-tls", feature = "native-tls")))]
+    #[test]
+    fn test_ca_cert_is_refused_when_the_build_has_no_tls() {
+        let cli = http_client_cli(&["--ca-cert", "ca.pem"]);
+        let message = usage_message(build_http_client(&cli).unwrap_err());
+        assert!(message.contains("needs TLS support"), "{message}");
+    }
+
+    /// Dropped, not injected: `provenance` records every key that reached
+    /// the environment, so an empty one means neither did.
+    #[test]
+    fn test_a_discovered_dotenv_cannot_set_the_ca_cert_or_the_unix_socket() {
+        let path = scratch_file(
+            "discovered-dotenv",
+            "A2ACLI_CA_CERT=/tmp/ca.pem\nA2ACLI_UNIX_SOCKET=/tmp/a2a.sock\n",
+        );
+        let mut provenance = HashMap::new();
+        apply_dotenv_file(
+            &path,
+            ConfigSource::LocalFile,
+            true,
+            &HashSet::new(),
+            &mut provenance,
+        );
+        let _ = std::fs::remove_file(&path);
+
+        assert!(provenance.is_empty(), "{provenance:?}");
     }
 
     #[test]

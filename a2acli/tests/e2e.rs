@@ -83,6 +83,10 @@ struct ServerState {
     /// Number of `SubscribeToTask` calls the dropped-connection middleware
     /// has seen for each of the fixture ids below.
     dropped_stream_calls: Mutex<BTreeMap<String, u32>>,
+    /// The `Host` header of each request, recorded only by the Unix-socket
+    /// fixture: over a socket it is the one trace of the URL's host.
+    #[cfg(unix)]
+    hosts: Mutex<Vec<String>>,
 }
 
 /// Fixture task ids that settle to `COMPLETED` only after this many
@@ -436,6 +440,25 @@ impl TestServer {
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (app, state) = Self::fixture(&base_url, tenant, capabilities);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        TestServer {
+            base_url,
+            state,
+            handle,
+        }
+    }
+
+    /// The fixture agent's routes and state, advertising `base_url` in its
+    /// cards. Who listens, and how, is up to the caller.
+    fn fixture(
+        base_url: &str,
+        tenant: Option<&str>,
+        capabilities: Option<AgentCapabilities>,
+    ) -> (Router, Arc<ServerState>) {
         let state = Arc::new(ServerState::default());
 
         {
@@ -468,14 +491,14 @@ impl TestServer {
             );
         }
 
-        let mut public_card = make_agent_card(&base_url, "Fixture Agent");
+        let mut public_card = make_agent_card(base_url, "Fixture Agent");
         if let Some(capabilities) = capabilities {
             public_card.capabilities = capabilities;
         }
         if let Some(tenant) = tenant {
             public_card.supported_interfaces[0].tenant = Some(tenant.to_string());
         }
-        let extended_card = make_agent_card(&base_url, "Fixture Agent (extended)");
+        let extended_card = make_agent_card(base_url, "Fixture Agent (extended)");
         let handler = Arc::new(TestHandler {
             state: state.clone(),
             extended_card,
@@ -550,15 +573,7 @@ impl TestServer {
             )
             .nest("/rest", rest_router(handler).layer(record_agent_headers));
 
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        TestServer {
-            base_url,
-            state,
-            handle,
-        }
+        (app, state)
     }
 }
 
@@ -2594,7 +2609,9 @@ impl ConfigScratchDir {
             .env_remove("A2ACLI_TENANT")
             .env_remove("A2ACLI_BASE_URL")
             .env_remove("A2ACLI_AGENT_CARD")
-            .env_remove("A2ACLI_ENDPOINT");
+            .env_remove("A2ACLI_ENDPOINT")
+            .env_remove("A2ACLI_CA_CERT")
+            .env_remove("A2ACLI_UNIX_SOCKET");
         command
     }
 }
@@ -4455,4 +4472,496 @@ async fn task_subscribe_fails_when_the_reconciling_event_cannot_be_saved() {
             .contains("log.txt"),
         "{envelope}"
     );
+}
+
+// ---------------------------------------------------------------------
+// --ca-cert and --unix-socket
+// ---------------------------------------------------------------------
+
+/// A file under the temp dir, removed on drop.
+struct TempFile(std::path::PathBuf);
+
+// Each helper is used only by some feature and platform combinations.
+#[allow(dead_code)]
+impl TempFile {
+    /// A path with nothing at it yet, for a socket to be bound at.
+    fn reserve(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("a2acli-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+
+    fn new(name: &str, contents: &[u8]) -> Self {
+        let file = Self::reserve(name);
+        std::fs::write(&file.0, contents).unwrap();
+        file
+    }
+
+    fn arg(&self) -> &str {
+        self.0.to_str().unwrap()
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// `--ca-cert`, against a server whose certificate comes from a CA made for
+/// the test. None of these CAs is in the system roots, which is what lets a
+/// test tell "trusted because of the flag" from "trusted anyway".
+#[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
+mod ca_cert {
+    use super::*;
+
+    /// A CA and a server certificate it issued for `127.0.0.1`.
+    struct TestCa {
+        pem: String,
+        server_cert: rustls::pki_types::CertificateDer<'static>,
+        server_key: Vec<u8>,
+    }
+
+    impl TestCa {
+        fn generate() -> Self {
+            let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            ca_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "a2acli test CA");
+            let ca_key = rcgen::KeyPair::generate().unwrap();
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+            let mut server_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            server_params
+                .subject_alt_names
+                .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+                    std::net::Ipv4Addr::LOCALHOST,
+                )));
+            server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+            let server_key = rcgen::KeyPair::generate().unwrap();
+            let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+            let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+            Self {
+                pem: ca_cert.pem(),
+                server_cert: server_cert.der().clone(),
+                server_key: server_key.serialize_der(),
+            }
+        }
+
+        fn acceptor(&self) -> tokio_rustls::TlsAcceptor {
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(self.server_key.clone()),
+            );
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let config = rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![self.server_cert.clone()], key)
+                .unwrap();
+            tokio_rustls::TlsAcceptor::from(Arc::new(config))
+        }
+    }
+
+    /// Terminates TLS so `axum::serve` can serve the fixture over HTTPS.
+    struct TlsListener {
+        tcp: TcpListener,
+        acceptor: tokio_rustls::TlsAcceptor,
+    }
+
+    impl axum::serve::Listener for TlsListener {
+        type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+        type Addr = std::net::SocketAddr;
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            loop {
+                let Ok((stream, addr)) = self.tcp.accept().await else {
+                    continue;
+                };
+                // A client that rejects the certificate abandons the
+                // handshake; that is not the server's failure.
+                if let Ok(tls) = self.acceptor.accept(stream).await {
+                    return (tls, addr);
+                }
+            }
+        }
+
+        fn local_addr(&self) -> std::io::Result<Self::Addr> {
+            self.tcp.local_addr()
+        }
+    }
+
+    impl TestServer {
+        async fn spawn_tls(ca: &TestCa) -> Self {
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("https://{}", tcp.local_addr().unwrap());
+            let (app, state) = Self::fixture(&base_url, None, None);
+            let listener = TlsListener {
+                tcp,
+                acceptor: ca.acceptor(),
+            };
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            TestServer {
+                base_url,
+                state,
+                handle,
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ca_cert_reaches_a_server_certified_by_a_private_ca() {
+        let ca = TestCa::generate();
+        let server = TestServer::spawn_tls(&ca).await;
+        let ca_file = TempFile::new("ca-reaches.pem", ca.pem.as_bytes());
+
+        let stdout = run_cli_success(&server, &["--ca-cert", ca_file.arg(), "card", "get"]);
+        let card: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(card["name"], "Fixture Agent");
+
+        // The card fetch and each transport are separate clients' worth of
+        // trust: all three have to carry the file's certificates.
+        for transport in ["jsonrpc", "rest"] {
+            let stdout = run_cli_success(
+                &server,
+                &[
+                    "--ca-cert",
+                    ca_file.arg(),
+                    "--transport",
+                    transport,
+                    "task",
+                    "get",
+                    "task-1",
+                ],
+            );
+            let task: Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(task["id"], "task-1", "{transport}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_private_ca_server_is_rejected_without_ca_cert() {
+        let server = TestServer::spawn_tls(&TestCa::generate()).await;
+
+        let (_stdout, stderr, code) = run_cli_failure_status(&server, &["card", "get"]);
+
+        assert_eq!(code, 3, "{stderr}");
+        assert_eq!(
+            parse_error_envelope(&stderr)["error"]["code"],
+            "A2ACLI_ERR_UNREACHABLE"
+        );
+        assert!(server.state.card_headers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ca_cert_trusts_only_the_certificates_in_the_file() {
+        let server = TestServer::spawn_tls(&TestCa::generate()).await;
+        let other_ca = TempFile::new("ca-other.pem", TestCa::generate().pem.as_bytes());
+
+        let (_stdout, stderr, code) =
+            run_cli_failure_status(&server, &["--ca-cert", other_ca.arg(), "card", "get"]);
+
+        assert_eq!(code, 3, "{stderr}");
+        assert!(server.state.card_headers.lock().unwrap().is_empty());
+    }
+
+    /// The file is read when a command connects, so a bad one breaks that
+    /// command and leaves `config show`, which makes no request, alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unusable_ca_cert_is_a_usage_error_but_config_show_still_works() {
+        let server = TestServer::spawn().await;
+        let not_a_certificate = TempFile::new("ca-garbage.pem", b"not a certificate\n");
+
+        for path in ["/nonexistent/ca.pem", not_a_certificate.arg()] {
+            let (_stdout, stderr, code) =
+                run_cli_failure_status(&server, &["--ca-cert", path, "card", "get"]);
+            assert_eq!(code, 2, "{path}: {stderr}");
+            let envelope = parse_error_envelope(&stderr);
+            assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_USAGE", "{path}");
+            let message = envelope["error"]["message"].as_str().unwrap();
+            assert!(message.contains("reading --ca-cert"), "{message}");
+        }
+        assert!(server.state.card_headers.lock().unwrap().is_empty());
+
+        let scratch = ConfigScratchDir::new("ca-cert-config-show");
+        let stdout = String::from_utf8(
+            scratch
+                .command_without_agent()
+                .args(["--ca-cert", "/nonexistent/ca.pem", "config", "show"])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone(),
+        )
+        .unwrap();
+        assert!(
+            stdout.contains("ca-cert: /nonexistent/ca.pem (source: flag)"),
+            "{stdout}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ca_cert_cannot_be_combined_with_insecure() {
+        let server = TestServer::spawn_tls(&TestCa::generate()).await;
+        let ca_file = TempFile::new("ca-insecure.pem", TestCa::generate().pem.as_bytes());
+
+        let (_stdout, stderr, code) = run_cli_failure_status(
+            &server,
+            &["--ca-cert", ca_file.arg(), "--insecure", "card", "get"],
+        );
+
+        assert_eq!(code, 2, "{stderr}");
+        // `--insecure` warns first; the envelope is the last line.
+        let envelope = parse_error_envelope(stderr.lines().last().unwrap());
+        assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_USAGE");
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--ca-cert and --insecure"),
+            "{envelope}"
+        );
+    }
+
+    /// A cloned repository can carry a `.env`, and must not be able to pick
+    /// the certificates the CLI trusts. Only a file the caller names with
+    /// `--config` is theirs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_discovered_dotenv_cannot_choose_the_ca_cert() {
+        let server = TestServer::spawn().await;
+        let scratch = ConfigScratchDir::new("dotenv-ca-cert");
+        scratch.write_local_env("A2ACLI_CA_CERT=/nonexistent/ca.pem\n");
+
+        let output = scratch
+            .command(&server)
+            .args(["--output", "json", "card", "get"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("warning: ignoring A2ACLI_CA_CERT from "),
+            "{stderr}"
+        );
+        assert!(stderr.contains("; pass --config "), "{stderr}");
+
+        // The same file, named with --config, is the caller's own choice.
+        let env_file = scratch.path.join(".env");
+        let output = scratch
+            .command(&server)
+            .args([
+                "--config",
+                env_file.to_str().unwrap(),
+                "--output",
+                "json",
+                "card",
+                "get",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+    }
+}
+
+/// `--unix-socket`, against a fixture reachable only through a socket.
+#[cfg(unix)]
+mod unix_socket {
+    use super::*;
+
+    impl TestServer {
+        /// Serve the fixture on `socket` and nowhere else. Its cards
+        /// advertise `http://agent.test`, a host that resolves to nothing,
+        /// so a request that arrives went through the socket.
+        async fn spawn_on_unix_socket(socket: &TempFile) -> Self {
+            let listener = tokio::net::UnixListener::bind(&socket.0).unwrap();
+            let base_url = "http://agent.test".to_string();
+            let (app, state) = Self::fixture(&base_url, None, None);
+            let host_state = state.clone();
+            let app = app.layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let state = host_state.clone();
+                    async move {
+                        if let Some(host) = header_value(request.headers(), header::HOST.as_str()) {
+                            state.hosts.lock().unwrap().push(host);
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            TestServer {
+                base_url,
+                state,
+                handle,
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unix_socket_carries_the_card_fetch_and_both_transports() {
+        let socket = TempFile::reserve("uds-transports.sock");
+        let server = TestServer::spawn_on_unix_socket(&socket).await;
+
+        let stdout = run_cli_success(&server, &["--unix-socket", socket.arg(), "card", "get"]);
+        let card: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(card["name"], "Fixture Agent");
+
+        for transport in ["jsonrpc", "rest"] {
+            let stdout = run_cli_success(
+                &server,
+                &[
+                    "--unix-socket",
+                    socket.arg(),
+                    "--transport",
+                    transport,
+                    "task",
+                    "get",
+                    "task-1",
+                ],
+            );
+            let task: Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(task["id"], "task-1", "{transport}");
+        }
+
+        // The URL's host is not resolved, but it is still what the agent
+        // is told it was asked for.
+        let hosts = server.state.hosts.lock().unwrap().clone();
+        assert!(!hosts.is_empty());
+        assert!(hosts.iter().all(|host| host == "agent.test"), "{hosts:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_socket_only_agent_is_unreachable_without_unix_socket() {
+        let socket = TempFile::reserve("uds-without-flag.sock");
+        let server = TestServer::spawn_on_unix_socket(&socket).await;
+
+        let (_stdout, stderr, code) = run_cli_failure_status(&server, &["card", "get"]);
+
+        assert_eq!(code, 3, "{stderr}");
+        assert!(server.state.hosts.lock().unwrap().is_empty());
+    }
+
+    /// A socket that is not there is a failure, not a cue to try the URL's
+    /// own address, which here is a perfectly good server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_unix_socket_does_not_fall_back_to_the_network() {
+        let server = TestServer::spawn().await;
+
+        let (_stdout, stderr, code) = run_cli_failure_status(
+            &server,
+            &["--unix-socket", "/nonexistent/a2a.sock", "card", "get"],
+        );
+
+        assert_eq!(code, 3, "{stderr}");
+        assert_eq!(
+            parse_error_envelope(&stderr)["error"]["code"],
+            "A2ACLI_ERR_UNREACHABLE"
+        );
+        assert!(server.state.card_headers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_discovered_dotenv_cannot_choose_the_unix_socket() {
+        let server = TestServer::spawn().await;
+        let scratch = ConfigScratchDir::new("dotenv-unix-socket");
+        scratch.write_local_env("A2ACLI_UNIX_SOCKET=/nonexistent/a2a.sock\n");
+
+        let output = scratch
+            .command(&server)
+            .args(["--output", "json", "card", "get"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("warning: ignoring A2ACLI_UNIX_SOCKET from "),
+            "{stderr}"
+        );
+        assert!(stderr.contains("; pass --config "), "{stderr}");
+        assert!(!server.state.card_headers.lock().unwrap().is_empty());
+
+        // Reported as unset, not as the value that was ignored.
+        let stdout = String::from_utf8(
+            scratch
+                .command(&server)
+                .args(["config", "show"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(
+            stdout.contains("unix-socket: (not set) (source: built-in default)"),
+            "{stdout}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_explicit_config_file_can_choose_the_unix_socket() {
+        let server = TestServer::spawn().await;
+        let scratch = ConfigScratchDir::new("config-flag-unix-socket");
+        let env_file = scratch.path.join("prod.env");
+        std::fs::write(&env_file, "A2ACLI_UNIX_SOCKET=/nonexistent/a2a.sock\n").unwrap();
+
+        let output = scratch
+            .command(&server)
+            .args([
+                "--config",
+                env_file.to_str().unwrap(),
+                "--output",
+                "json",
+                "card",
+                "get",
+            ])
+            .output()
+            .unwrap();
+        // Honoured: the socket is not there, and the URL is not tried.
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        assert!(server.state.card_headers.lock().unwrap().is_empty());
+
+        let stdout = String::from_utf8(
+            scratch
+                .command(&server)
+                .args(["--config", env_file.to_str().unwrap(), "config", "show"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(
+            stdout.contains("unix-socket: /nonexistent/a2a.sock (source: local .env file)"),
+            "{stdout}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_global_dotenv_can_choose_the_unix_socket() {
+        let socket = TempFile::reserve("uds-global-dotenv.sock");
+        let server = TestServer::spawn_on_unix_socket(&socket).await;
+        let scratch = ConfigScratchDir::new("global-dotenv-unix-socket");
+        let xdg = scratch.write_xdg_env(&format!("A2ACLI_UNIX_SOCKET={}\n", socket.arg()));
+
+        scratch
+            .command_without_agent()
+            .env("XDG_CONFIG_HOME", &xdg)
+            .args([
+                "--agent-card",
+                server.base_url.as_str(),
+                "--output",
+                "json",
+                "card",
+                "get",
+            ])
+            .assert()
+            .success();
+
+        assert!(!server.state.hosts.lock().unwrap().is_empty());
+    }
 }
