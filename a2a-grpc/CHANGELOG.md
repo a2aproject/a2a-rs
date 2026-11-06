@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.12](https://github.com/a2aproject/a2a-rs/compare/a2a-grpc-v0.3.11...a2a-grpc-v0.3.12) - 2026-11-06
+
+### Fixed
+
+- *(grpc)* keep status details and the gRPC code in client errors ([#508](https://github.com/a2aproject/a2a-rs/pull/508))
+- *(grpc)* send every value of a service parameter ([#457](https://github.com/a2aproject/a2a-rs/pull/457))
+- *(server)* enforce A2A-Version on the REST and gRPC bindings ([#443](https://github.com/a2aproject/a2a-rs/pull/443))
+
+### Other
+
+- *(deps)* replace unmaintained rustls-pemfile and serde_yaml ([#461](https://github.com/a2aproject/a2a-rs/pull/461))
+- *(readme)* install the crates with cargo add ([#408](https://github.com/a2aproject/a2a-rs/pull/408))
+
 ## [0.3.11](https://github.com/a2aproject/a2a-rs/compare/a2a-grpc-v0.3.10...a2a-grpc-v0.3.11) - 2026-10-16
 
 ### Other

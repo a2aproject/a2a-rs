@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.5.3...a2a-server-lf-v0.5.4) - 2026-11-06
+
+### Added
+
+- *(rest)* serve and send the /{tenant} path prefix ([#468](https://github.com/a2aproject/a2a-rs/pull/468))
+- *(server)* bound the finished tasks InMemoryTaskStore keeps ([#441](https://github.com/a2aproject/a2a-rs/pull/441))
+
+### Fixed
+
+- *(errors)* write the ErrorInfo timestamp with the Z designator ([#500](https://github.com/a2aproject/a2a-rs/pull/500))
+- *(server)* push the terminal states the handler commits itself ([#498](https://github.com/a2aproject/a2a-rs/pull/498))
+- *(rest)* name an error frame in a stream "error" ([#490](https://github.com/a2aproject/a2a-rs/pull/490))
+- *(rest)* answer a push config deletion with an Empty body ([#489](https://github.com/a2aproject/a2a-rs/pull/489))
+- *(rest)* read status=TASK_STATE_UNSPECIFIED as no filter ([#488](https://github.com/a2aproject/a2a-rs/pull/488))
+- *(server)* refuse a request that skips a required extension ([#495](https://github.com/a2aproject/a2a-rs/pull/495))
+- *(jsonrpc)* accept a request without params ([#494](https://github.com/a2aproject/a2a-rs/pull/494))
+- *(jsonrpc)* read A2A-Version from the query parameter ([#469](https://github.com/a2aproject/a2a-rs/pull/469))
+- *(server)* reject a message that does not answer the request alone ([#464](https://github.com/a2aproject/a2a-rs/pull/464))
+- *(server)* apply historyLength to streamed task snapshots ([#463](https://github.com/a2aproject/a2a-rs/pull/463))
+- *(server)* keep the INPUT_REQUIRED question in task history ([#462](https://github.com/a2aproject/a2a-rs/pull/462))
+- *(server)* mark a task FAILED when its execution fails ([#459](https://github.com/a2aproject/a2a-rs/pull/459))
+- *(rest)* pass CancelTask metadata from the request body ([#458](https://github.com/a2aproject/a2a-rs/pull/458))
+- *(rest)* answer extractor rejections with google.rpc.Status ([#451](https://github.com/a2aproject/a2a-rs/pull/451))
+- *(rest)* send stream errors as google.rpc.Status ([#449](https://github.com/a2aproject/a2a-rs/pull/449))
+- *(server)* send push credentials of any authentication scheme ([#448](https://github.com/a2aproject/a2a-rs/pull/448))
+- *(server)* omit task artifacts from ListTasks unless asked ([#447](https://github.com/a2aproject/a2a-rs/pull/447))
+- *(server)* include tasks stamped at the statusTimestampAfter bound ([#445](https://github.com/a2aproject/a2a-rs/pull/445))
+- *(server)* let SubscribeToTask follow a task that awaits input ([#444](https://github.com/a2aproject/a2a-rs/pull/444))
+- *(server)* enforce A2A-Version on the REST and gRPC bindings ([#443](https://github.com/a2aproject/a2a-rs/pull/443))
+- *(server)* send REST errors as application/json ([#455](https://github.com/a2aproject/a2a-rs/pull/455))
+
+### Other
+
+- *(readme)* install the crates with cargo add ([#408](https://github.com/a2aproject/a2a-rs/pull/408))
+
 ## [0.5.3](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.5.2...a2a-server-lf-v0.5.3) - 2026-10-16
 
 ### Other

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.2.9...a2a-client-lf-v0.2.10) - 2026-11-06
+
+### Added
+
+- *(rest)* serve and send the /{tenant} path prefix ([#468](https://github.com/a2aproject/a2a-rs/pull/468))
+
+### Fixed
+
+- *(grpc)* keep status details and the gRPC code in client errors ([#508](https://github.com/a2aproject/a2a-rs/pull/508))
+- *(client)* send statusTimestampAfter with the Z designator ([#502](https://github.com/a2aproject/a2a-rs/pull/502))
+- *(client)* select the transport in the agent card's order ([#497](https://github.com/a2aproject/a2a-rs/pull/497))
+- *(client)* percent-encode task and config ids in REST paths ([#450](https://github.com/a2aproject/a2a-rs/pull/450))
+- *(rest)* send stream errors as google.rpc.Status ([#449](https://github.com/a2aproject/a2a-rs/pull/449))
+- *(client)* report the HTTP status of a non-JSON-RPC error response ([#439](https://github.com/a2aproject/a2a-rs/pull/439))
+
+### Other
+
+- *(readme)* install the crates with cargo add ([#408](https://github.com/a2aproject/a2a-rs/pull/408))
+
 ## [0.2.9](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.2.8...a2a-client-lf-v0.2.9) - 2026-10-16
 
 ### Other

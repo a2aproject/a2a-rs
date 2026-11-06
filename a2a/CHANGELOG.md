@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/a2aproject/a2a-rs/compare/a2a-lf-v0.4.2...a2a-lf-v0.4.3) - 2026-11-06
+
+### Fixed
+
+- *(grpc)* keep status details and the gRPC code in client errors ([#508](https://github.com/a2aproject/a2a-rs/pull/508))
+- *(errors)* write the ErrorInfo timestamp with the Z designator ([#500](https://github.com/a2aproject/a2a-rs/pull/500))
+- *(server)* refuse a request that skips a required extension ([#495](https://github.com/a2aproject/a2a-rs/pull/495))
+
+### Other
+
+- *(readme)* install the crates with cargo add ([#408](https://github.com/a2aproject/a2a-rs/pull/408))
+
 ## [0.4.2](https://github.com/a2aproject/a2a-rs/compare/a2a-lf-v0.4.1...a2a-lf-v0.4.2) - 2026-10-16
 
 ### Fixed
