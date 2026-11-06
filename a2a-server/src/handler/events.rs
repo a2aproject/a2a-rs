@@ -6,56 +6,96 @@
 #[cfg(test)]
 use super::EXECUTION_BUFFER_CAPACITY;
 use super::TASK_INPUT_CAPACITY;
-use super::protocol::{is_terminal_event, task_id_for_event};
-use crate::executor::{ClientInput, ClientInputSender, ClientInputs, QueuedInput, ReturnedInputs};
+use super::execution::InvocationState;
+use super::protocol::{EventDecision, EventFilter, EventKind};
+use super::task_handle::TaskHandle;
+use crate::executor::{ClientInputSender, ClientInputs};
 use a2a::*;
 use futures::stream::BoxStream;
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{RwLock, broadcast};
+use std::sync::Arc;
+use tokio::sync::{broadcast, watch};
+
+pub(super) type FailureSignal = watch::Sender<Option<A2AError>>;
 
 #[derive(Clone)]
 pub(super) struct ExecutionEvent {
     pub(super) sequence: u64,
     pub(super) result: Result<StreamResponse, A2AError>,
     pub(super) kind: EventKind,
-    pub(super) failure: Option<super::output::FailureSignal>,
+    pub(super) failure: Option<FailureSignal>,
+    /// Captured only for terminal/interrupted status events, shared by readers.
+    pub(super) response_task: Option<Arc<Task>>,
 }
 
-/// How an event is meant to be delivered.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum EventKind {
-    Normal,
-    /// A `Task` snapshot that changed nothing. It sits at a generation that was
-    /// already announced, so streams meant for clients leave it out; the
-    /// blocking send, which only needs to know the executor spoke, keeps it.
-    Repeated,
-    /// Something only a live exchange is told (a `StreamError` about a message
-    /// of its own), not the other subscribers of the task.
-    LiveOnly(Option<uuid::Uuid>),
-    /// The executor's direct reply, with no task: the last thing any stream
-    /// following the execution is sent.
-    Reply,
-}
-
-/// A subscription to an execution's events. One that falls further behind than
-/// the buffer holds can start over from the task as it stands, which is what a
-/// client that sees a gap in the generations does anyway.
 pub(super) struct ExecutionReceiver {
     receiver: broadcast::Receiver<ExecutionEvent>,
     /// Keep the Task source, not the executor invocation, alive.
-    events: Arc<super::task_events::TaskEvents>,
-    finished: tokio_util::sync::CancellationToken,
+    task: TaskHandle,
+    finished: Option<tokio_util::sync::CancellationToken>,
+    opening_message: bool,
     /// Events at or before this subscription opened must not be replayed.
     opened_at: u64,
+    reply: Option<Arc<super::task_handle::ReplyRetention>>,
 }
 
 impl ExecutionReceiver {
-    pub(super) async fn recv(&mut self) -> Result<ExecutionEvent, broadcast::error::RecvError> {
-        tokio::select! {
-            biased;
-            event = self.receiver.recv() => event,
-            _ = self.finished.cancelled() => Err(broadcast::error::RecvError::Closed),
+    /// Subscribe to the task source independently of any executor invocation.
+    pub(super) fn for_task(task: TaskHandle) -> (Self, Option<Task>, u64) {
+        let (receiver, snapshot, sequence, reply) = task.response_subscription();
+        (
+            Self {
+                receiver,
+                task,
+                finished: None,
+                opening_message: false,
+                opened_at: sequence,
+                reply: Some(reply),
+            },
+            snapshot,
+            sequence,
+        )
+    }
+
+    pub(super) fn task(&self) -> TaskHandle {
+        self.task.clone()
+    }
+
+    /// Streaming responses follow the Task source across invocation boundaries.
+    pub(super) fn follow_task(mut self) -> Self {
+        self.finished = None;
+        self
+    }
+
+    /// A streaming send must still produce its opening snapshot if the agent
+    /// ends without emitting a visible event. Then it follows the Task source.
+    pub(super) fn opening_message(mut self) -> Self {
+        self.opening_message = true;
+        self
+    }
+
+    fn opened(&mut self) {
+        if self.opening_message {
+            self.opening_message = false;
+            self.finished = None;
         }
+    }
+
+    pub(super) async fn recv(&mut self) -> Result<ExecutionEvent, broadcast::error::RecvError> {
+        let received = match &self.finished {
+            None => self.receiver.recv().await,
+            Some(finished) => tokio::select! {
+                biased;
+                event = self.receiver.recv() => event,
+                _ = finished.cancelled() => Err(broadcast::error::RecvError::Closed),
+            },
+        };
+        if matches!(received, Err(broadcast::error::RecvError::Lagged(_)))
+            && let Some(retained) = &self.reply
+            && let Some(reply) = retained.reply.get()
+        {
+            return Ok(reply.clone());
+        }
+        received
     }
 
     #[cfg(test)]
@@ -65,163 +105,99 @@ impl ExecutionReceiver {
 
     /// Starts over after the events were lost: the task as it stands, and the
     /// sequence after which events follow it. `None` when no Task exists yet.
-    async fn resync(&mut self, after: u64) -> Result<Option<(Task, u64)>, A2AError> {
-        let (receiver, snapshot, sequence) = self.events.resynchronize(after).await?;
+    fn resync(&mut self, after: u64) -> Result<Option<(Task, u64)>, A2AError> {
+        let (receiver, snapshot, sequence) = self.task.resynchronize(after)?;
         self.receiver = receiver;
         Ok(snapshot.map(|task| (task, sequence)))
     }
 }
 
-#[derive(Default)]
-struct ActiveExecutionState {
-    pending_inputs: Vec<QueuedInput>,
-    returned_inputs: Option<ReturnedInputs>,
-}
-
+/// Shareable invocation controls and published-state projection. Mutable input
+/// bookkeeping is exclusively owned by the task runtime.
 pub(super) struct ActiveExecution {
     pub(super) execution_id: String,
-    pub(super) events: Arc<super::task_events::TaskEvents>,
+    pub(super) task: TaskHandle,
     pub(super) finished: tokio_util::sync::CancellationToken,
     prepared: std::sync::atomic::AtomicBool,
-    state: RwLock<ActiveExecutionState>,
-    /// Serialises every mutation of the task while it executes. The snapshot
-    /// in `events` is the authoritative copy: a writer takes this lock,
-    /// reads the snapshot, applies its change, saves it and publishes the
-    /// result, so executor events, a cancel and a follow-up cannot each work
-    /// from a stale copy of their own.
-    ///
-    /// It is the task's own writer (see
-    /// [`ExecutionManager::writer_for`](super::registry::ExecutionManager::writer_for)), not
-    /// one per execution: a cancel or a follow-up that arrives while no
-    /// execution is running serialises on the same lock.
-    pub(super) writer: Arc<tokio::sync::Mutex<()>>,
     /// Where messages sent to this task go while the executor runs. The queue
     /// belongs to the execution turn and is handed off with unread inputs.
     pub(super) inputs: ClientInputSender,
     /// Completed after the runner has revoked the inbox and rejected unread input.
     pub(super) inputs_drained: tokio_util::sync::CancellationToken,
-    pub(super) push_failure: super::output::FailureSignal,
+    pub(super) push_failure: FailureSignal,
     /// Set while the task this execution is for has not been created: a new
     /// task is created by the executor's first event, and does not exist if
     /// the executor answers with a message alone.
     pub(super) uncreated: std::sync::atomic::AtomicBool,
-    /// The push configuration the request carried, kept until the task exists.
-    pub(super) pending_push: std::sync::Mutex<Option<TaskPushNotificationConfig>>,
 }
 
 impl ActiveExecution {
     #[cfg(test)]
     pub(super) fn new(task: Option<Task>) -> Arc<Self> {
-        Self::with_writer(task, Arc::new(tokio::sync::Mutex::new(()))).0
-    }
-
-    #[cfg(test)]
-    pub(super) fn with_writer(
-        task: Option<Task>,
-        writer: Arc<tokio::sync::Mutex<()>>,
-    ) -> (Arc<Self>, ClientInputs) {
         let prepared = task.is_some();
-        let result = Self::with_events(super::task_events::TaskEvents::new(writer, task));
-        result
-            .0
+        let (active, _inputs, _state) = Self::with_task(TaskHandle::new(
+            task.as_ref()
+                .map(|task| task.id.clone())
+                .unwrap_or_default(),
+            task,
+        ));
+        active
             .prepared
             .store(prepared, std::sync::atomic::Ordering::SeqCst);
-        result
+        active
     }
 
-    pub(super) fn with_events(
-        events: Arc<super::task_events::TaskEvents>,
-    ) -> (Arc<Self>, ClientInputs) {
+    pub(super) fn with_task(task: TaskHandle) -> (Arc<Self>, ClientInputs, InvocationState) {
         let (inputs, receiver, returned_inputs) = ClientInputs::for_execution(TASK_INPUT_CAPACITY);
         (
             Arc::new(Self {
                 execution_id: uuid::Uuid::now_v7().to_string(),
-                writer: events.writer.clone(),
-                events,
+                task,
                 finished: tokio_util::sync::CancellationToken::new(),
                 prepared: std::sync::atomic::AtomicBool::new(false),
-                state: RwLock::new(ActiveExecutionState {
-                    pending_inputs: Vec::new(),
-                    returned_inputs: Some(returned_inputs),
-                }),
                 inputs,
                 inputs_drained: tokio_util::sync::CancellationToken::new(),
                 push_failure: tokio::sync::watch::channel(None).0,
                 uncreated: std::sync::atomic::AtomicBool::new(false),
-                pending_push: std::sync::Mutex::new(None),
             }),
             receiver,
+            InvocationState::new(returned_inputs),
         )
     }
 
-    /// Keep receipts in the existing state lock; recv itself takes no lock.
-    pub(super) async fn track_input(&self, input: ClientInput) -> QueuedInput {
-        let input = QueuedInput::new(input);
-        let mut state = self.state.write().await;
-        state.pending_inputs.retain(QueuedInput::pending);
-        state.pending_inputs.push(input.clone());
-        input
-    }
-
-    /// The task writer excludes new input. Revoke the old reader before
-    /// reclaiming unread receipts, even if a worker still owns that receiver.
-    pub(super) async fn drain_inputs(&self) -> Vec<ClientInput> {
-        self.inputs.revoke();
-        let mut state = self.state.write().await;
-        state.returned_inputs.take();
-        state
-            .pending_inputs
-            .drain(..)
-            .filter_map(QueuedInput::reclaim)
-            .collect()
-    }
-
     /// The most recently published execution event, read under the state lock.
-    pub(super) async fn sequence(&self) -> u64 {
-        self.events.sequence().await
+    pub(super) fn sequence(&self) -> u64 {
+        self.task.sequence()
     }
 
-    pub(super) async fn snapshot(&self) -> Option<Task> {
+    pub(super) fn is_prepared(&self) -> bool {
+        self.prepared.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(super) fn snapshot(&self) -> Option<Task> {
         if self.prepared.load(std::sync::atomic::Ordering::SeqCst) {
-            self.events.snapshot().await
+            self.task.snapshot()
         } else {
             None
         }
     }
 
-    pub(super) async fn set_snapshot(&self, task: Task) {
-        self.events.set_snapshot(task).await;
+    pub(super) fn set_snapshot(&self, task: Task) {
+        self.task.set_snapshot(task);
         self.prepared
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub(super) async fn subscribe(self: &Arc<Self>) -> ExecutionReceiver {
-        let (receiver, sequence) = self.events.subscribe().await;
+    pub(super) fn subscribe(self: &Arc<Self>) -> ExecutionReceiver {
+        let (receiver, _, sequence, reply) = self.task.response_subscription();
         ExecutionReceiver {
             receiver,
-            events: self.events.clone(),
-            finished: self.finished.clone(),
+            task: self.task.clone(),
+            finished: Some(self.finished.clone()),
+            opening_message: false,
             opened_at: sequence,
+            reply: Some(reply),
         }
-    }
-
-    pub(super) async fn resubscribe(self: &Arc<Self>) -> (ExecutionReceiver, Option<Task>, u64) {
-        let (receiver, snapshot, sequence) = self.events.resubscribe().await;
-        let snapshot = self
-            .prepared
-            .load(std::sync::atomic::Ordering::SeqCst)
-            .then_some(snapshot)
-            .flatten();
-        (
-            ExecutionReceiver {
-                receiver,
-                events: self.events.clone(),
-                finished: self.finished.clone(),
-                opened_at: sequence,
-            },
-            snapshot,
-            sequence,
-        )
     }
 
     pub(super) async fn publish(
@@ -247,6 +223,15 @@ impl ActiveExecution {
         self.publish_kind(result, snapshot_task, kind).await;
     }
 
+    /// Publish an already-persisted input batch with its final snapshot.
+    pub(super) async fn publish_input(&self, task: Task, events: &[StreamResponse]) {
+        self.prepared
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.task
+            .publish_input(task, events, self.push_failure.clone())
+            .await;
+    }
+
     pub(super) async fn publish_kind(
         &self,
         result: Result<&StreamResponse, &A2AError>,
@@ -257,15 +242,14 @@ impl ActiveExecution {
             self.prepared
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        self.events
+        self.task
             .publish(result, snapshot_task, kind, Some(self.push_failure.clone()))
             .await;
     }
 
-    pub(super) async fn snapshot_is_terminal(&self) -> bool {
-        self.events
+    pub(super) fn snapshot_is_terminal(&self) -> bool {
+        self.task
             .snapshot()
-            .await
             .as_ref()
             .is_some_and(|task| task.status.state.is_terminal())
     }
@@ -290,10 +274,7 @@ pub(super) fn subscription_stream(
     receiver: ExecutionReceiver,
     snapshot_task: Option<Task>,
     min_sequence: u64,
-    include_repeats: bool,
-    message_updates: bool,
-    live: bool,
-    response_id: Option<uuid::Uuid>,
+    filter: EventFilter,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
     let min_sequence = min_sequence.max(receiver.opened_at);
     Box::pin(futures::stream::unfold(
@@ -309,6 +290,7 @@ pub(super) fn subscription_stream(
             }
 
             if let Some(task) = state.snapshot_task.take() {
+                state.receiver.opened();
                 if task.status.state.is_terminal() {
                     state.done = true;
                 }
@@ -318,45 +300,48 @@ pub(super) fn subscription_stream(
             loop {
                 match state.receiver.recv().await {
                     Ok(event) if event.sequence <= state.min_sequence => continue,
-                    Ok(event) if event.kind == EventKind::Repeated && !include_repeats => {
-                        state.min_sequence = event.sequence;
-                        continue;
-                    }
-                    Ok(event)
-                        if matches!(event.kind, EventKind::LiveOnly(recipient)
-                        if !live || recipient != response_id) =>
-                    {
-                        state.min_sequence = event.sequence;
-                        continue;
-                    }
-                    // A message appended to the task is a payload kind a 1.0
-                    // client does not know; only one that announced 1.1 or later
-                    // is sent it, and reconciles the generation gap otherwise.
-                    Ok(event)
-                        if !message_updates
-                            && matches!(&event.result, Ok(StreamResponse::MessageUpdate(_))) =>
-                    {
-                        state.min_sequence = event.sequence;
-                        continue;
-                    }
                     Ok(event) => {
                         state.min_sequence = event.sequence;
-                        match &event.result {
-                            Ok(item) if is_terminal_event(item) => state.done = true,
-                            Err(_) => state.done = true,
-                            _ if event.kind == EventKind::Reply => state.done = true,
-                            _ => {}
+                        let decision = filter.decide(event.kind, &event.result);
+                        if matches!(decision, EventDecision::Skip) {
+                            continue;
                         }
-                        return Some((event.result.clone(), state));
+                        state.receiver.opened();
+                        state.done = matches!(decision, EventDecision::DeliverAndClose);
+                        let result = if filter.task_snapshots {
+                            event.response_task.as_ref().map_or_else(
+                                || event.result.clone(),
+                                |task| Ok(StreamResponse::Task((**task).clone())),
+                            )
+                        } else {
+                            event.result.clone()
+                        };
+                        return Some((result, state));
                     }
                     // Events were lost: start over from the task as it stands.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        match state.receiver.resync(state.min_sequence).await {
+                        match state.receiver.resync(state.min_sequence) {
                             Ok(Some((task, sequence))) => {
+                                state.receiver.opened();
                                 state.min_sequence = sequence;
                                 if task.status.state.is_terminal() {
                                     state.done = true;
                                 }
+                                return Some((Ok(StreamResponse::Task(task)), state));
+                            }
+                            Ok(None) => return None,
+                            Err(error) => {
+                                state.done = true;
+                                return Some((Err(error), state));
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) if state.receiver.opening_message => {
+                        match state.receiver.resync(state.min_sequence) {
+                            Ok(Some((task, sequence))) => {
+                                state.receiver.opened();
+                                state.min_sequence = sequence;
+                                state.done = task.status.state.is_terminal();
                                 return Some((Ok(StreamResponse::Task(task)), state));
                             }
                             Ok(None) => return None,
@@ -371,81 +356,6 @@ pub(super) fn subscription_stream(
             }
         },
     ))
-}
-
-/// Tells whoever is watching a task that it changed: a long-poll for its next
-/// generation, an idle live exchange. Per task, so a change wakes only the
-/// watchers of that task, and a watcher is woken by every change since it last
-/// looked, however it timed its look.
-#[derive(Default)]
-pub(super) struct TaskChanges {
-    watched: std::sync::Mutex<HashMap<TaskId, std::sync::Weak<tokio::sync::watch::Sender<u64>>>>,
-}
-
-/// A watcher of one task; keeps the task's channel open while it lives.
-pub(super) struct TaskWatch {
-    _channel: Arc<tokio::sync::watch::Sender<u64>>,
-    changes: tokio::sync::watch::Receiver<u64>,
-}
-
-impl TaskWatch {
-    /// Waits until the task has changed since this watcher last looked.
-    pub(super) async fn changed(&mut self) {
-        // The sender is held by this watcher, so the channel does not close.
-        let _ = self.changes.changed().await;
-    }
-}
-
-impl TaskChanges {
-    #[cfg(test)]
-    pub(super) fn watcher_count(&self) -> usize {
-        self.watched
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .filter(|watcher| watcher.strong_count() > 0)
-            .count()
-    }
-
-    pub(super) fn watch(&self, task_id: &str) -> TaskWatch {
-        let mut watched = self
-            .watched
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        watched.retain(|_, channel| channel.strong_count() > 0);
-        let channel = match watched.get(task_id).and_then(std::sync::Weak::upgrade) {
-            Some(channel) => channel,
-            None => {
-                let channel = Arc::new(tokio::sync::watch::channel(0).0);
-                watched.insert(task_id.to_string(), Arc::downgrade(&channel));
-                channel
-            }
-        };
-        TaskWatch {
-            changes: channel.subscribe(),
-            _channel: channel,
-        }
-    }
-
-    /// `task_id` changed.
-    pub(super) fn notify(&self, task_id: &str) {
-        let channel = self
-            .watched
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(task_id)
-            .and_then(std::sync::Weak::upgrade);
-        if let Some(channel) = channel {
-            channel.send_modify(|version| *version += 1);
-        }
-    }
-
-    /// The task `event` is about changed.
-    pub(super) fn notify_event(&self, event: &StreamResponse) {
-        if let Some(task_id) = task_id_for_event(event) {
-            self.notify(task_id);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -474,7 +384,8 @@ mod tests {
         let event = StreamResponse::Task(task.clone());
         active.publish(Ok(&event), Some(task)).await;
 
-        let (mut receiver, snapshot_task, sequence) = active.resubscribe().await;
+        let (mut receiver, snapshot_task, sequence) =
+            ExecutionReceiver::for_task(active.task.clone());
         assert_eq!(snapshot_task.unwrap().id, "t-buffering");
         assert_eq!(sequence, 1);
         assert!(receiver.try_recv().is_err());
@@ -497,7 +408,7 @@ mod tests {
             metadata: None,
         };
         let active = ActiveExecution::new(Some(task));
-        let mut receiver = active.subscribe().await;
+        let mut receiver = active.subscribe();
         let error = A2AError::internal("execution failed");
 
         active.publish(Err(&error), None).await;
@@ -530,7 +441,8 @@ mod tests {
         active.publish(Err(&error), Some(task.clone())).await;
 
         // Resubscribe to verify snapshot was updated but no event was buffered
-        let (mut receiver, snapshot_task, sequence) = active.resubscribe().await;
+        let (mut receiver, snapshot_task, sequence) =
+            ExecutionReceiver::for_task(active.task.clone());
         assert_eq!(snapshot_task.unwrap().id, "t-error-no-sub");
         assert_eq!(sequence, 1);
         assert!(receiver.try_recv().is_err());
@@ -553,7 +465,7 @@ mod tests {
             metadata: None,
         };
         let active = ActiveExecution::new(Some(initial_task.clone()));
-        let mut receiver = active.subscribe().await;
+        let mut receiver = active.subscribe();
 
         let updated_task = Task {
             generation: 0,
@@ -584,7 +496,7 @@ mod tests {
         }
 
         // Verify snapshot was updated
-        let (_, snapshot_task, sequence) = active.resubscribe().await;
+        let (_, snapshot_task, sequence) = ExecutionReceiver::for_task(active.task.clone());
         assert_eq!(snapshot_task.unwrap().id, "t-snapshot-update");
         assert_eq!(sequence, 1);
     }
@@ -608,8 +520,8 @@ mod tests {
         let active = ActiveExecution::new(Some(task.clone()));
 
         // Create two subscribers
-        let mut sub1 = active.subscribe().await;
-        let mut sub2 = active.subscribe().await;
+        let mut sub1 = active.subscribe();
+        let mut sub2 = active.subscribe();
 
         let event = StreamResponse::Task(task);
         active.publish(Ok(&event), None).await;
@@ -659,7 +571,7 @@ mod tests {
             generation: 7,
         };
         let active = ActiveExecution::new(Some(task));
-        let receiver = active.subscribe().await;
+        let receiver = active.subscribe();
         let probe = |text: &str| {
             StreamResponse::Message(a2a::Message {
                 message_id: text.to_string(),
@@ -672,11 +584,24 @@ mod tests {
                 reference_task_ids: None,
             })
         };
-        for i in 0..(EXECUTION_BUFFER_CAPACITY * 3) {
-            active.publish(Ok(&probe(&format!("lost-{i}"))), None).await;
+        for _ in 0..(EXECUTION_BUFFER_CAPACITY * 3) {
+            active
+                .publish(Ok(&StreamResponse::Task(active.snapshot().unwrap())), None)
+                .await;
         }
 
-        let mut stream = subscription_stream(receiver, None, 0, true, false, false, None);
+        let mut stream = subscription_stream(
+            receiver,
+            None,
+            0,
+            EventFilter {
+                include_repeats: true,
+                task_snapshots: false,
+                message_updates: false,
+                live: false,
+                response_id: None,
+            },
+        );
         let first = stream.next().await.expect("an item").expect("not an error");
         assert!(
             matches!(&first, StreamResponse::Task(task) if task.generation == 7),
@@ -697,7 +622,7 @@ mod tests {
             let mut task = task_with_history("terminal-snapshot", "context", 0);
             task.status.state = TaskState::Working;
             let active = ActiveExecution::new(Some(task.clone()));
-            let receiver = active.subscribe().await;
+            let receiver = active.subscribe();
             if lagged {
                 for _ in 0..EXECUTION_BUFFER_CAPACITY + 2 {
                     active
@@ -711,7 +636,18 @@ mod tests {
                 .publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()))
                 .await;
             let opening = (!lagged).then_some(task);
-            let mut events = subscription_stream(receiver, opening, 0, false, true, false, None);
+            let mut events = subscription_stream(
+                receiver,
+                opening,
+                0,
+                EventFilter {
+                    include_repeats: false,
+                    task_snapshots: false,
+                    message_updates: true,
+                    live: false,
+                    response_id: None,
+                },
+            );
             assert!(
                 matches!(events.next().await.unwrap().unwrap(), StreamResponse::Task(task) if task.status.state == TaskState::Completed && task.generation == 99)
             );
@@ -723,24 +659,33 @@ mod tests {
     }
     #[tokio::test]
     async fn lagged_subscribers_recover_errors_across_executor_handoffs() {
-        use crate::handler::registry::ExecutionManager;
+        use crate::handler::test_support::make_handler;
         use futures::StreamExt;
-        let manager = ExecutionManager::default();
+        let manager = make_handler().tasks;
         let mut task = task_with_history("handoff-error", "context", 0);
         task.status.state = TaskState::Working;
-        let (first, _inputs, writer) = manager.reserve(&task.id).await.unwrap();
-        first.set_snapshot(task.clone()).await;
-        let (receiver, _, sequence) = first.resubscribe().await;
-        let mut old_response =
-            subscription_stream(receiver, None, sequence, false, true, false, None);
+        let (first, _inputs, _invocation) = manager.task(&task.id).reserve().unwrap();
+        first.set_snapshot(task.clone());
+        let (receiver, _, sequence) = ExecutionReceiver::for_task(first.task.clone());
+        let mut old_response = subscription_stream(
+            receiver,
+            None,
+            sequence,
+            EventFilter {
+                include_repeats: false,
+                task_snapshots: false,
+                message_updates: true,
+                live: false,
+                response_id: None,
+            },
+        );
         let error = A2AError::internal("executor failed");
         first.publish(Err(&error), None).await;
-        manager.finish(&task.id, &first).await;
-        drop(writer);
+        manager.task(&task.id).unregister(&first);
         drop(first);
 
-        let (second, _inputs, writer) = manager.reserve(&task.id).await.unwrap();
-        second.set_snapshot(task.clone()).await;
+        let (second, _inputs, _invocation) = manager.task(&task.id).reserve().unwrap();
+        second.set_snapshot(task.clone());
         for _ in 0..EXECUTION_BUFFER_CAPACITY + 1 {
             task.generation += 1;
             second
@@ -753,9 +698,19 @@ mod tests {
         assert!(old_response.next().await.is_none());
 
         // A response opened after the error follows the new turn normally.
-        let receiver = second.subscribe().await;
-        let mut new_response =
-            subscription_stream(receiver, Some(task.clone()), 0, false, true, false, None);
+        let receiver = second.subscribe();
+        let mut new_response = subscription_stream(
+            receiver,
+            Some(task.clone()),
+            0,
+            EventFilter {
+                include_repeats: false,
+                task_snapshots: false,
+                message_updates: true,
+                live: false,
+                response_id: None,
+            },
+        );
         assert!(matches!(
             new_response.next().await,
             Some(Ok(StreamResponse::Task(_)))
@@ -770,7 +725,6 @@ mod tests {
             new_response.next().await,
             Some(Ok(StreamResponse::Task(snapshot))) if snapshot.generation == task.generation
         ));
-        manager.finish("handoff-error", &second).await;
-        drop(writer);
+        manager.task("handoff-error").unregister(&second);
     }
 }

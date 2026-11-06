@@ -255,10 +255,18 @@ async fn p1_starting_a_turn_does_not_drop_the_previous_turns_buffered_events() {
             continue;
         }
         let mut seen = Vec::new();
+        let mut observed = Vec::new();
         let mut last_gen = task.generation;
         let mut gap = false;
         loop {
-            let e = next(&mut down).await;
+            let e = match tokio::time::timeout(Duration::from_secs(5), down.next()).await {
+                Ok(Some(Ok(event))) => event,
+                other => panic!(
+                    "followup stalled: {other:?}; observed={observed:?}; stored={:?}",
+                    get(&h, &task.id).await
+                ),
+            };
+            observed.push(e.clone());
             if let Some(g) = gen_of(&e) {
                 if g != last_gen + 1 && !matches!(e, StreamResponse::Task(_)) {
                     gap = true;
@@ -355,9 +363,10 @@ async fn p3_call_from_another_client_reaches_the_task_input_queue() {
     );
 }
 
-/// a session that dies (panic) ends the opener's downlink: is it told?
+/// A failed store read must not silently end a response. A Task-scoped
+/// subscription can deliver the committed cancellation without rereading storage.
 #[tokio::test]
-async fn p4_session_panic_tells_the_downlink() {
+async fn p4_cancellation_is_observable_even_when_a_store_read_panics() {
     let (h, store) = handler_with();
     let p = params("1.1", "a");
     let (up, rx) = mpsc::channel(8);
@@ -371,8 +380,8 @@ async fn p4_session_panic_tells_the_downlink() {
         other => panic!("{other:?}"),
     };
     next(&mut down).await; // INPUT_REQUIRED
-    // Another client cancels the task: the idle session wakes and reads it, and
-    // the store panics on that read.
+    // Another client cancels the task. A response that rereads storage may
+    // fail; one following the Task broadcast can observe cancellation directly.
     store.panic_on_canceled.store(true, Ordering::SeqCst);
     let canceller = h.clone();
     tokio::spawn(async move {
@@ -390,9 +399,23 @@ async fn p4_session_panic_tells_the_downlink() {
     let end = tokio::time::timeout(Duration::from_secs(3), down.next())
         .await
         .expect("the downlink ends");
+    let observable = match &end {
+        Some(Err(error)) => error.code == a2a::error_code::INTERNAL_ERROR,
+        Some(Ok(StreamResponse::Task(task))) => task.status.state == TaskState::Canceled,
+        Some(Ok(StreamResponse::StatusUpdate(update))) => {
+            update.status.state == TaskState::Canceled
+        }
+        _ => false,
+    };
     assert!(
-        matches!(end, Some(Err(_))),
-        "the downlink ended silently: {end:?}"
+        observable,
+        "neither cancellation nor its failure was delivered: {end:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), down.next())
+            .await
+            .expect("a terminal update or error closes the downlink")
+            .is_none()
     );
 }
 

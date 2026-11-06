@@ -1,102 +1,166 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Ordered per-endpoint delivery, with a handler-wide HTTP concurrency bound.
+//! One handler-wide task polls ordered, concurrent webhook HTTP futures.
 
 use super::events::ExecutionEvent;
-use super::protocol::is_at_least_1_1;
-use super::push_delivery::{NotificationSettings, PUSH_QUEUE_CAPACITY};
+use super::push_delivery::PUSH_QUEUE_CAPACITY;
+use super::task_handle::TaskHandle;
 use a2a::*;
-use std::{collections::HashMap, sync::Arc};
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
+
+const MAX_PUSH_DELIVERIES: usize = 16;
+type Endpoint = (TaskId, String);
+
+pub(super) struct Notification {
+    pub(super) config: TaskPushNotificationConfig,
+    pub(super) event: Arc<ExecutionEvent>,
+    pub(super) sender: Arc<crate::HttpPushSender>,
+    // Retain the source across intake retirement until accepted work drains.
+    pub(super) source: TaskHandle,
+}
+
+impl Notification {
+    fn endpoint(&self) -> Endpoint {
+        (self.config.task_id.clone(), self.config.url.clone())
+    }
+
+    fn fail(&self, error: A2AError) {
+        tracing::warn!(task_id = %self.config.task_id, config_id = ?self.config.id, %error, "webhook delivery failed");
+        signal_failure(&self.sender, &self.event, error);
+    }
+
+    async fn deliver(self) -> Endpoint {
+        let endpoint = self.endpoint();
+        let gate = self.source.pushes().map(|settings| {
+            settings.gate(
+                &self.config.task_id,
+                self.config.id.as_deref().unwrap_or_default(),
+            )
+        });
+        loop {
+            let guard = match &gate {
+                Some(gate) => Some(gate.lock().await),
+                None => None,
+            };
+            if let Some(settings) = self.source.pushes() {
+                let current = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    settings.store().get(
+                        &self.config.task_id,
+                        self.config.id.as_deref().unwrap_or_default(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(A2AError::internal("webhook configuration lookup timed out"))
+                });
+                match current {
+                    Ok(current) if current == self.config => {}
+                    Ok(_) => return endpoint,
+                    Err(error) if error.code == error_code::TASK_NOT_FOUND => return endpoint,
+                    Err(error) => {
+                        // Let deletion proceed between failed lookups. A store
+                        // outage must not hold this registration's gate forever.
+                        drop(guard);
+                        self.fail(error);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
+            }
+            if let Ok(event) = &self.event.result
+                && let Err(error) = self.sender.send_push(&self.config, event.clone()).await
+            {
+                self.fail(error);
+            }
+            break;
+        }
+        // This lease also keeps a successor intake on the same Task source.
+        drop(self.source);
+        endpoint
+    }
+}
 
 pub(super) fn signal_failure(
-    settings: &NotificationSettings,
+    sender: &crate::HttpPushSender,
     event: &ExecutionEvent,
     error: A2AError,
 ) {
-    if settings.sender.fail_on_error()
+    if sender.fail_on_error()
         && let Some(signal) = &event.failure
     {
         signal.send_replace(Some(error));
     }
 }
 
-pub(super) async fn deliver_notifications(
-    settings: NotificationSettings,
-    mut events: mpsc::Receiver<ExecutionEvent>,
-    previous: Option<CancellationToken>,
-    done: CancellationToken,
-) {
-    let _done = done.drop_guard();
-    if let Some(previous) = previous {
-        previous.cancelled().await;
+pub(super) struct PushDispatcher {
+    queue: mpsc::Sender<Notification>,
+}
+
+impl PushDispatcher {
+    pub(super) fn spawn(background_tasks: &super::background_tasks::BackgroundTasks) -> Self {
+        let (queue, receiver) = mpsc::channel(PUSH_QUEUE_CAPACITY);
+        background_tasks.spawn(dispatch(receiver, MAX_PUSH_DELIVERIES, PUSH_QUEUE_CAPACITY));
+        Self { queue }
     }
-    let mut endpoints =
-        HashMap::<String, mpsc::Sender<(TaskPushNotificationConfig, Arc<ExecutionEvent>)>>::new();
-    let mut workers = JoinSet::new();
-    while let Some(event) = events.recv().await {
-        while let Some(result) = workers.try_join_next() {
-            if let Err(error) = result {
-                tracing::error!(task_id = %settings.task_id, %error, "webhook worker failed");
-            }
+
+    pub(super) async fn submit(&self, notification: Notification) -> bool {
+        if let Err(error) = self.queue.send(notification).await {
+            error
+                .0
+                .fail(A2AError::internal("webhook queue unavailable"));
+            return false;
         }
-        let configs = match settings.store.list(&settings.task_id).await {
-            Ok(configs) => configs,
-            Err(error) => {
-                signal_failure(&settings, &event, error.clone());
-                tracing::warn!(task_id = %settings.task_id, %error, "could not load webhook configurations");
-                continue;
-            }
-        };
-        // Keep one queued payload even when many endpoints subscribe to it.
-        let event = Arc::new(event);
-        for config in configs {
-            if matches!(event.result, Ok(StreamResponse::MessageUpdate(_)))
-                && !is_at_least_1_1(config.protocol_version.as_deref().unwrap_or("1.0"))
-            {
-                continue;
-            }
-            let tx = endpoints.entry(config.url.clone()).or_insert_with(|| {
-                let (tx, rx) = mpsc::channel(PUSH_QUEUE_CAPACITY);
-                workers.spawn(deliver_endpoint(settings.clone(), rx));
-                tx
-            });
-            if let Err(error) = tx.try_send((config, event.clone())) {
-                tracing::warn!(task_id = %settings.task_id, %error, "webhook endpoint queue unavailable; dropping a notification");
-                signal_failure(
-                    &settings,
-                    &event,
-                    A2AError::internal("webhook endpoint queue unavailable"),
-                );
-            }
-        }
+        true
     }
-    drop(endpoints);
-    while let Some(result) = workers.join_next().await {
-        if let Err(error) = result {
-            tracing::error!(task_id = %settings.task_id, %error, "webhook worker failed");
-        }
+
+    #[cfg(test)]
+    pub(super) fn channel(capacity: usize) -> (Self, mpsc::Receiver<Notification>) {
+        let (queue, receiver) = mpsc::channel(capacity);
+        (Self { queue }, receiver)
     }
 }
 
-async fn deliver_endpoint(
-    settings: NotificationSettings,
-    mut jobs: mpsc::Receiver<(TaskPushNotificationConfig, Arc<ExecutionEvent>)>,
-) {
-    while let Some((config, event)) = jobs.recv().await {
-        // One queue per Task/URL preserves ordering across configuration IDs.
-        // Await permits here, never in broadcast intake or task mutation.
-        let Ok(_permit) = settings.permits.acquire().await else {
-            return;
-        };
-        if let Ok(item) = &event.result
-            && let Err(error) = settings.sender.send_push(&config, item.clone()).await
-        {
-            tracing::warn!(task_id = %settings.task_id, config_id = ?config.id, %error, "webhook delivery failed");
-            signal_failure(&settings, &event, error);
+async fn dispatch(mut queue: mpsc::Receiver<Notification>, concurrency: usize, capacity: usize) {
+    let mut pending = VecDeque::<Notification>::new();
+    // At most `concurrency` keys are busy; scanning them borrows URL strings.
+    let mut busy = Vec::<Endpoint>::new();
+    let mut requests = FuturesUnordered::<BoxFuture<'static, Endpoint>>::new();
+    let mut closed = false;
+    loop {
+        // Start the oldest eligible job. A slow endpoint never holds up other
+        // keys, and only one HTTP request per Task/URL can run at once.
+        while requests.len() < concurrency {
+            let Some(index) = pending.iter().position(|job| {
+                !busy
+                    .iter()
+                    .any(|(task, url)| task == &job.config.task_id && url == &job.config.url)
+            }) else {
+                break;
+            };
+            let job = pending
+                .remove(index)
+                .expect("index came from the pending queue");
+            busy.push(job.endpoint());
+            requests.push(Box::pin(job.deliver()));
+        }
+        if closed && requests.is_empty() {
+            break;
+        }
+        tokio::select! {
+            completed = requests.next(), if !requests.is_empty() => {
+                let completed = completed.expect("nonempty request set");
+                busy.retain(|endpoint| endpoint != &completed);
+            }
+            next = queue.recv(), if !closed && pending.len() < capacity => {
+                match next {
+                    Some(job) => pending.push_back(job),
+                    None => closed = true,
+                }
+            }
         }
     }
 }
@@ -104,185 +168,262 @@ async fn deliver_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PushConfigStore;
-    use crate::handler::events::EventKind;
+    use crate::handler::protocol::EventKind;
     use crate::handler::test_support::*;
     use axum::Json;
 
-    #[tokio::test]
-    async fn slow_endpoints_do_not_block_others_and_each_endpoint_keeps_order() {
-        install_crypto_provider();
-        let (slow_tx, mut slow_rx) = mpsc::unbounded_channel();
-        let (fast_tx, mut fast_rx) = mpsc::unbounded_channel();
-        let app = Router::new()
-            .route(
-                "/slow",
-                post(move |Json(event): Json<StreamResponse>| {
-                    let tx = slow_tx.clone();
-                    async move {
-                        let StreamResponse::Task(task) = event else {
-                            panic!("expected Task");
-                        };
-                        let (release, wait) = tokio::sync::oneshot::channel();
-                        tx.send((task.generation, release)).unwrap();
-                        let _ = wait.await;
-                        StatusCode::OK
-                    }
-                }),
-            )
-            .route(
-                "/fast",
-                post(move |Json(event): Json<StreamResponse>| {
-                    let tx = fast_tx.clone();
-                    async move {
-                        let StreamResponse::Task(task) = event else {
-                            panic!("expected Task");
-                        };
-                        tx.send(task.generation).unwrap();
-                        StatusCode::OK
-                    }
-                }),
-            );
+    type Seen = (TaskId, i64, Option<oneshot::Sender<()>>);
+
+    async fn endpoint(
+        gate_all: bool,
+    ) -> (
+        String,
+        mpsc::UnboundedReceiver<Seen>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (sent, received) = mpsc::unbounded_channel();
+        let app = Router::new().fallback(post(move |Json(event): Json<StreamResponse>| {
+            let sent = sent.clone();
+            async move {
+                let StreamResponse::Task(task) = event else {
+                    panic!("expected Task")
+                };
+                if gate_all || (task.id == "a" && task.generation == 1) {
+                    let (release, wait) = oneshot::channel();
+                    sent.send((task.id, task.generation, Some(release)))
+                        .unwrap();
+                    let _ = wait.await;
+                } else {
+                    sent.send((task.id, task.generation, None)).unwrap();
+                }
+                StatusCode::NO_CONTENT
+            }
+        }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let store = Arc::new(InMemoryPushConfigStore::new());
-        for name in ["slow", "fast"] {
-            let mut config = push_config("task");
-            config.id = Some(name.into());
-            config.url = format!("{url}/{name}");
-            store.save(config).await.unwrap();
-        }
-        let settings = NotificationSettings {
-            task_id: "task".into(),
-            store,
-            sender: Arc::new(crate::HttpPushSender::new(Some(
-                crate::HttpPushSenderConfig {
-                    validate_urls: false,
-                    timeout: Duration::from_secs(5),
-                    fail_on_error: true,
-                },
-            ))),
-            permits: Arc::new(tokio::sync::Semaphore::new(2)),
-        };
-        let (tx, rx) = mpsc::channel(4);
-        let done = CancellationToken::new();
-        let previous = CancellationToken::new();
-        let mut delivery = Box::pin(deliver_notifications(
-            settings,
-            rx,
-            Some(previous.clone()),
-            done.clone(),
-        ));
-        for generation in [1, 2] {
-            let mut task = task_with_history("task", "context", 0);
-            task.generation = generation;
-            tx.send(ExecutionEvent {
+        (url, received, server)
+    }
+
+    fn sender() -> Arc<crate::HttpPushSender> {
+        install_crypto_provider();
+        Arc::new(crate::HttpPushSender::new(Some(
+            crate::HttpPushSenderConfig {
+                validate_urls: false,
+                fail_on_error: true,
+                timeout: Duration::from_secs(5),
+            },
+        )))
+    }
+
+    fn notification(
+        task_id: &str,
+        generation: i64,
+        url: &str,
+        sender: &Arc<crate::HttpPushSender>,
+        source: &TaskHandle,
+    ) -> Notification {
+        let mut task = task_with_history(task_id, "context", 0);
+        task.generation = generation;
+        let mut config = push_config(task_id);
+        config.url = url.into();
+        Notification {
+            config,
+            event: Arc::new(ExecutionEvent {
                 sequence: generation as u64,
-                result: Ok(StreamResponse::Task(task)),
                 kind: EventKind::Normal,
+                result: Ok(StreamResponse::Task(task)),
                 failure: None,
-            })
-            .await
-            .unwrap();
+                response_task: None,
+            }),
+            sender: sender.clone(),
+            source: source.clone(),
         }
-        drop(tx);
-        assert!(futures::poll!(delivery.as_mut()).is_pending());
-        assert!(slow_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_in_flight_http_and_releases_queued_task_handles() {
+        let background_tasks = Arc::new(super::super::background_tasks::BackgroundTasks::default());
+        let sender = sender();
+        let (url, mut seen, server) = endpoint(true).await;
+        let source =
+            TaskHandle::with_background_tasks("task".into(), None, background_tasks.clone());
+        let weak = source.downgrade();
+        let dispatcher = PushDispatcher::spawn(&background_tasks);
         assert!(
-            fast_rx.try_recv().is_err(),
-            "successor work overtook its predecessor"
+            dispatcher
+                .submit(notification("task", 1, &url, &sender, &source))
+                .await
         );
-        previous.cancel();
-        let delivery = tokio::spawn(delivery);
-        let (first, release) = tokio::time::timeout(Duration::from_secs(2), slow_rx.recv())
+        assert!(
+            dispatcher
+                .submit(notification("task", 2, &url, &sender, &source))
+                .await
+        );
+        let (_, _, release) = timeout(Duration::from_secs(2), seen.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(first, 1);
-        for expected in [1, 2] {
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(2), fast_rx.recv())
-                    .await
-                    .unwrap(),
-                Some(expected)
-            );
-        }
+        drop(source);
         assert!(
-            slow_rx.try_recv().is_err(),
-            "a later delivery overtook the blocked first request"
+            weak.upgrade().is_some(),
+            "in-flight and queued notifications retain their Task"
         );
+        timeout(Duration::from_secs(1), background_tasks.shutdown())
+            .await
+            .expect("shutdown must not wait for the HTTP request timeout");
         assert!(
-            !done.is_cancelled(),
-            "retirement must wait for accepted HTTP deliveries"
+            weak.upgrade().is_none(),
+            "shutdown drops both HTTP futures and queued notifications"
         );
-        release.send(()).unwrap();
-        let (second, release) = tokio::time::timeout(Duration::from_secs(2), slow_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(second, 2);
-        release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), delivery)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(done.is_cancelled());
+        assert!(dispatcher.queue.is_closed());
+        drop(release);
         server.abort();
     }
 
     #[tokio::test]
-    async fn a_full_endpoint_queue_signals_failure_and_pool_shutdown_drains_workers() {
-        install_crypto_provider();
-        let store = Arc::new(InMemoryPushConfigStore::new());
-        store.save(push_config("task")).await.unwrap();
-        let permits = Arc::new(tokio::sync::Semaphore::new(0));
-        let settings = NotificationSettings {
-            task_id: "task".into(),
-            store,
-            sender: Arc::new(crate::HttpPushSender::new(Some(
-                crate::HttpPushSenderConfig {
-                    fail_on_error: true,
-                    validate_urls: false,
-                    ..Default::default()
-                },
-            ))),
-            permits: permits.clone(),
-        };
-        let (tx, rx) = mpsc::channel(PUSH_QUEUE_CAPACITY + 2);
-        let done = CancellationToken::new();
-        let delivery = tokio::spawn(deliver_notifications(settings, rx, None, done.clone()));
-        let (failure, mut observed) = tokio::sync::watch::channel(None);
-        for sequence in 0..PUSH_QUEUE_CAPACITY as u64 + 2 {
-            tx.send(ExecutionEvent {
-                sequence,
-                kind: EventKind::Normal,
-                result: Ok(StreamResponse::Task(task_with_history(
-                    "task", "context", 0,
-                ))),
-                failure: Some(failure.clone()),
-            })
-            .await
-            .unwrap();
+    async fn one_dispatcher_preserves_task_url_order_while_other_keys_progress() {
+        let sender = sender();
+        let (url, mut seen, server) = endpoint(false).await;
+        let source = TaskHandle::new("task".into(), None);
+        let retained = source.downgrade();
+        let (queue, receiver) = PushDispatcher::channel(8);
+        for (task, generation, path) in [
+            ("a", 1, "/slow"),
+            ("a", 2, "/slow"),
+            ("b", 3, "/slow"),
+            ("a", 4, "/fast"),
+        ] {
+            assert!(
+                queue
+                    .submit(notification(
+                        task,
+                        generation,
+                        &format!("{url}{path}"),
+                        &sender,
+                        &source
+                    ))
+                    .await
+            );
         }
-        drop(tx);
-        tokio::time::timeout(Duration::from_secs(2), observed.changed())
+        drop(source);
+        drop(queue);
+        let delivery = tokio::spawn(dispatch(receiver, 2, 8));
+        let mut release_first = None;
+        let mut independent = Vec::new();
+        for _ in 0..3 {
+            let (task, generation, release) = timeout(Duration::from_secs(2), seen.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if generation == 1 {
+                release_first = release;
+            } else {
+                independent.push((task, generation));
+            }
+        }
+        independent.sort();
+        assert_eq!(independent, [("a".into(), 4), ("b".into(), 3)]);
+        assert!(
+            seen.try_recv().is_err(),
+            "the second a/slow delivery cannot overtake its first"
+        );
+        assert!(
+            retained.upgrade().is_some(),
+            "accepted work retains its Task source"
+        );
+        release_first.unwrap().send(()).unwrap();
+        let (task, generation, _) = timeout(Duration::from_secs(2), seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((task.as_str(), generation), ("a", 2));
+        timeout(Duration::from_secs(2), delivery)
             .await
             .unwrap()
             .unwrap();
         assert!(
-            observed
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .message
-                .contains("endpoint queue")
+            retained.upgrade().is_none(),
+            "drained work releases the source"
         );
-        permits.close();
-        tokio::time::timeout(Duration::from_secs(2), delivery)
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn the_http_concurrency_limit_applies_across_tasks_and_drains_on_close() {
+        let sender = sender();
+        let (url, mut seen, server) = endpoint(true).await;
+        let source = TaskHandle::new("task".into(), None);
+        let (queue, receiver) = PushDispatcher::channel(8);
+        for task in ["a", "b", "c", "d"] {
+            queue
+                .submit(notification(task, 1, &url, &sender, &source))
+                .await;
+        }
+        drop(queue);
+        let delivery = tokio::spawn(dispatch(receiver, 2, 8));
+        let (_, _, first) = timeout(Duration::from_secs(2), seen.recv())
             .await
             .unwrap()
             .unwrap();
-        assert!(done.is_cancelled());
+        let (_, _, second) = timeout(Duration::from_secs(2), seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), seen.recv())
+                .await
+                .is_err(),
+            "no third HTTP request may start while two are in flight"
+        );
+        first.unwrap().send(()).unwrap();
+        let (_, _, third) = timeout(Duration::from_secs(2), seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        second.unwrap().send(()).unwrap();
+        let (_, _, fourth) = timeout(Duration::from_secs(2), seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        third.unwrap().send(()).unwrap();
+        fourth.unwrap().send(()).unwrap();
+        timeout(Duration::from_secs(2), delivery)
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_work_backpressures_and_every_notification_is_attempted() {
+        let sender = sender();
+        let (url, mut seen, server) = endpoint(true).await;
+        let source = TaskHandle::new("task".into(), None);
+        let (queue, receiver) = PushDispatcher::channel(1);
+        let delivery = tokio::spawn(dispatch(receiver, 1, 1));
+        let producer = tokio::spawn(async move {
+            for generation in 1..=5 {
+                assert!(
+                    queue
+                        .submit(notification("task", generation, &url, &sender, &source))
+                        .await
+                );
+            }
+        });
+        for generation in 1..=5 {
+            let (_, received, release) = timeout(Duration::from_secs(2), seen.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received, generation);
+            release.unwrap().send(()).unwrap();
+        }
+        producer.await.unwrap();
+        timeout(Duration::from_secs(2), delivery)
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
     }
 }

@@ -311,6 +311,8 @@ fn version_requires_numeric_major_minor_and_optional_patch() {
         "1",
         "1.",
         "1.2.3.4",
+        "1.42",
+        "1.999",
         "1.-2",
         "1.+2",
         "2.0",
@@ -325,7 +327,7 @@ fn version_requires_numeric_major_minor_and_optional_patch() {
     let duplicates =
         ServiceParams::from([(SVC_PARAM_VERSION.into(), vec!["1.1".into(), "1.bad".into()])]);
     assert!(a2a_server::middleware::check_a2a_version(&duplicates).is_err());
-    for version in ["1.0", "1.1", "1.42", "1.1.3"] {
+    for version in ["1.0", "1.1", "1.1.3"] {
         let headers = ServiceParams::from([(SVC_PARAM_VERSION.into(), vec![version.into()])]);
         assert!(
             a2a_server::middleware::check_a2a_version(&headers).is_ok(),

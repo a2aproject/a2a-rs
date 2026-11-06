@@ -348,20 +348,43 @@ async fn configuration_lookup_failures_follow_policy_and_allow_later_notificatio
                     ..Default::default()
                 })),
             );
-        let mut downlink = working(&handler).await;
+        let mut downlink = handler
+            .send_streaming_message(&ServiceParams::new(), request())
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), listed.notified())
             .await
             .unwrap();
         assert!(!fail_next_list.load(std::sync::atomic::Ordering::SeqCst));
         if fail_on_error {
-            let error = tokio::time::timeout(Duration::from_secs(5), downlink.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap_err();
+            // TaskService can publish the admitted input before the executor's
+            // first status. Failure policy applies to either notification.
+            let error = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match downlink.next().await {
+                        Some(Err(error)) => break error,
+                        Some(Ok(_)) => {}
+                        None => panic!("a failed lookup must report the policy error"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
             assert_eq!(error.code, error_code::INTERNAL_ERROR);
             assert!(downlink.next().await.is_none());
         } else {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if matches!(
+                        downlink.next().await.unwrap().unwrap(),
+                        StreamResponse::StatusUpdate(_)
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), downlink.next())
                     .await
