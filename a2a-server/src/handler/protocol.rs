@@ -518,6 +518,19 @@ impl ResponsePolicy {
             && should_interrupt_non_streaming(self.return_immediately(), event).is_some())
     }
 
+    /// A stored interruption can predate this input. Only an executor event
+    /// carrying input progress can complete a blocking answer with a question.
+    pub(super) fn reloads_task(self, task: &Task, seen_generation: i64) -> bool {
+        task.status.state.is_terminal()
+            || (task.generation > seen_generation
+                && (self.mode != StartMode::Blocking
+                    || self.return_immediately()
+                    || !matches!(
+                        task.status.state,
+                        TaskState::InputRequired | TaskState::AuthRequired
+                    )))
+    }
+
     pub(super) fn response_id(self) -> Option<uuid::Uuid> {
         self.response_id
     }
@@ -554,7 +567,9 @@ impl ResponsePolicy {
             } else {
                 InputCursor::After
             },
-            wait_for_first_output: self.mode != StartMode::Bidi,
+            // Streaming needs an opening snapshot if a silent invocation ends.
+            // A blocking answer follows the task until its own input has output.
+            wait_for_first_output: self.mode == StartMode::Streaming,
         }
     }
     pub(super) fn event_filter(self) -> EventFilter {

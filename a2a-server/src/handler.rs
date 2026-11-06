@@ -11,6 +11,8 @@ use futures::stream::BoxStream;
 mod admission;
 mod background_tasks;
 #[cfg(test)]
+mod blocking_handoff_tests;
+#[cfg(test)]
 mod blocking_input_tests;
 mod cancellation;
 #[cfg(test)]

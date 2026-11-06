@@ -387,11 +387,11 @@ pub(super) fn task_response(
                 yield item;
             }
         }
-        // An invocation ending does not end a task. Resolve its final snapshot
-        // once, then continue on the receiver registered above.
+        // An invocation ending does not end a task. Recover a newer snapshot,
+        // but do not mistake a stored question for output answering this input.
         match handler.tasks.load(task.id()).await {
             Ok(task) => {
-                if task.generation > last_generation || policy.completes(&StreamResponse::Task(task.clone())) {
+                if policy.reloads_task(&task, last_generation) {
                     yield Ok(StreamResponse::Task(task));
                 }
             }
