@@ -45,11 +45,6 @@ pub(super) enum Delivery {
     Started {
         task: Task,
         receiver: ExecutionReceiver,
-        /// What the request recorded before the turn began, as events: the
-        /// message as it was appended, then each artifact. A stream that
-        /// already holds the task is told them; the first request's opening
-        /// snapshot already reflects them.
-        recorded: Vec<StreamResponse>,
     },
     /// The message went into the execution that was running.
     Injected {

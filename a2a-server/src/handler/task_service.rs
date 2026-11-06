@@ -9,16 +9,16 @@
 
 use super::DefaultRequestHandler;
 use super::background_tasks::BackgroundTasks;
-use super::cancellation::CancellationStart;
 use super::delivery::{AuthorizedMessage, Delivery};
 use super::events::{ActiveExecution, ExecutionReceiver};
-use super::execution::{ExecutionRequest, InvocationState, TurnEnd};
+use super::execution::{ExecutionRequest, InvocationState};
+use super::protocol::ResponsePolicy;
 use super::protocol::{ProtocolError, Rejection, StartMode, request_task_id};
 use super::push_delivery::PushService;
-use super::response_preparation::SubscriptionAttachment;
+use super::response::{TaskEvents, event_stream};
 #[cfg(test)]
 use super::task_handle::TaskController;
-use super::task_handle::{OutputAction, TaskOperation, TaskSender};
+use super::task_handle::{TaskCommand, TaskOperation, TaskSender};
 use super::task_handle::{TaskHandle, WeakTaskHandle};
 use super::updates;
 use crate::middleware::{ServiceParams, User};
@@ -171,11 +171,10 @@ impl TaskService {
                 // Re-read and reserve in one task operation, skipping already active tasks.
                 let started = self
                     .task(&id)
-                    .submit(TaskOperation::Input, {
-                        let handler = handler.clone();
-                        move |state| {
-                            Box::pin(async move { state.restart(&handler, &task.id).await })
-                        }
+                    .request(TaskOperation::Input, |reply| TaskCommand::Restart {
+                        handler: handler.clone(),
+                        id: task.id,
+                        reply,
                     })
                     .await??;
                 if let Some(started) = started {
@@ -209,8 +208,12 @@ impl TaskService {
         let task_id = request_task_id(&message.request).unwrap_or_else(new_task_id);
         let id = task_id.clone();
         self.task(&task_id)
-            .submit(TaskOperation::Input, move |state| {
-                Box::pin(async move { state.admit(&handler, message, mode, id).await })
+            .request(TaskOperation::Input, |reply| TaskCommand::Admit {
+                handler,
+                message: Box::new(message),
+                mode,
+                id,
+                reply,
             })
             .await
             .map_err(Rejection::Interrupted)?
@@ -222,11 +225,16 @@ impl TaskService {
         &self,
         handler: DefaultRequestHandler,
         request: SubscribeToTaskRequest,
-    ) -> Result<SubscriptionAttachment, A2AError> {
+        policy: ResponsePolicy,
+    ) -> Result<TaskEvents, A2AError> {
         let task = self.task(&request.id);
         task.clone()
-            .submit(TaskOperation::Subscribe, move |_| {
-                Box::pin(async move { handler.tasks.capture_subscription(task, request).await })
+            .request(TaskOperation::Subscribe, |reply| TaskCommand::Subscribe {
+                handler,
+                task,
+                request,
+                policy,
+                reply,
             })
             .await?
     }
@@ -253,92 +261,6 @@ impl TaskService {
                 A2AError::internal("cancellation operation failed unexpectedly")
             })?
             .ok_or_else(|| A2AError::internal("handler is shutting down"))?
-    }
-
-    pub(super) async fn begin_cancel(
-        &self,
-        handler: DefaultRequestHandler,
-        params: ServiceParams,
-        request: CancelTaskRequest,
-        user: Option<User>,
-    ) -> Result<CancellationStart, A2AError> {
-        self.task(&request.id)
-            .submit(TaskOperation::Cancel, move |state| {
-                Box::pin(async move { state.begin_cancel(&handler, &params, request, user).await })
-            })
-            .await?
-    }
-
-    pub(super) async fn cancel_update(
-        &self,
-        handler: DefaultRequestHandler,
-        task_id: &str,
-        event: StreamResponse,
-    ) -> Result<(), A2AError> {
-        self.task(task_id)
-            .submit(TaskOperation::Cancel, move |state| {
-                Box::pin(async move { state.cancel_update(&handler, event).await })
-            })
-            .await?
-    }
-
-    pub(super) async fn cancel_finished(
-        &self,
-        handler: DefaultRequestHandler,
-        task_id: &str,
-        failure: Option<A2AError>,
-    ) -> Result<(), A2AError> {
-        self.task(task_id)
-            .submit(TaskOperation::Cancel, move |state| {
-                Box::pin(async move { state.cancel_finished(&handler, failure).await })
-            })
-            .await?
-    }
-
-    pub(super) async fn output(
-        &self,
-        handler: DefaultRequestHandler,
-        active: Arc<ActiveExecution>,
-        event: StreamResponse,
-    ) -> Result<OutputAction, A2AError> {
-        active
-            .task
-            .clone()
-            .submit(TaskOperation::Output, move |state| {
-                Box::pin(async move { state.output(&handler, active, event).await })
-            })
-            .await?
-    }
-
-    pub(super) async fn finished(
-        &self,
-        handler: DefaultRequestHandler,
-        active: Arc<ActiveExecution>,
-        end: TurnEnd,
-    ) -> Result<(), A2AError> {
-        let id = active.task.id().clone();
-        active
-            .task
-            .clone()
-            .submit(TaskOperation::Finished, move |state| {
-                Box::pin(async move { state.finished(&handler, id, active, end).await })
-            })
-            .await
-    }
-
-    pub(super) async fn panicked(
-        &self,
-        handler: DefaultRequestHandler,
-        active: Arc<ActiveExecution>,
-    ) -> Result<(), A2AError> {
-        let id = active.task.id().clone();
-        active
-            .task
-            .clone()
-            .submit(TaskOperation::Finished, move |state| {
-                Box::pin(async move { state.panicked(&handler, active, id).await })
-            })
-            .await
     }
 
     pub(super) async fn load(&self, task_id: &str) -> Result<Task, A2AError> {
@@ -399,7 +321,7 @@ impl TaskService {
         event: &mut StreamResponse,
     ) -> Result<bool, A2AError> {
         let (snapshot, repeated) = self.persist(base, event, false).await?;
-        active.publish_marked(Ok(event), snapshot, repeated);
+        active.publish_marked(Ok(event), snapshot, repeated).await;
         Ok(!repeated)
     }
     /// Persist executor output before the task broadcast and long-poll wakeup.
@@ -420,11 +342,16 @@ impl TaskService {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         let (snapshot, repeated) = applied?;
         if creating {
+            // Preserve the committed generation even if configuration persistence
+            // fails, so error finalization cannot overwrite a newer snapshot.
+            if let Some(snapshot) = &snapshot {
+                active.set_snapshot(snapshot.clone());
+            }
             if let Some(pushes) = pushes {
-                pushes.save_pending(&mut invocation.pending_push).await;
+                pushes.save_pending(&mut invocation.pending_push).await?;
             }
         }
-        active.publish_marked(Ok(event), snapshot, repeated);
+        active.publish_marked(Ok(event), snapshot, repeated).await;
         Ok(())
     }
 
@@ -432,33 +359,32 @@ impl TaskService {
         &self,
         handle: TaskHandle,
         req: SubscribeToTaskRequest,
-    ) -> Result<SubscriptionAttachment, A2AError> {
+        policy: ResponsePolicy,
+    ) -> Result<TaskEvents, A2AError> {
         // Resolve a snapshot and receiver together inside the task's operation queue.
         let (receiver, snapshot, sequence) = self.subscription_source(&handle, &req.id).await?;
 
         let plan = super::protocol::subscription_plan(snapshot, &req)?;
-        Ok(SubscriptionAttachment {
-            task: handle,
-            receiver,
-            opening: plan.opening,
-            sequence,
-            seen_generation: plan.seen_generation,
-        })
+        let events = event_stream(policy, receiver, plan.opening, sequence);
+        Ok((handle, events))
     }
 
     async fn subscription_source(
         &self,
         handle: &TaskHandle,
         task_id: &str,
-    ) -> Result<(Option<ExecutionReceiver>, Task, u64), A2AError> {
+    ) -> Result<(ExecutionReceiver, Task, u64), A2AError> {
         // A deferred Task is private until the executor actually creates it.
         if let Some(active) = handle.active()
             && active.uncreated.load(std::sync::atomic::Ordering::SeqCst)
         {
             return Err(ProtocolError::TaskNotFound(task_id).into());
         }
-        if let Some((receiver, Some(snapshot), sequence)) = handle.resubscribe_active() {
-            return Ok((Some(receiver), snapshot, sequence));
+        let (receiver, snapshot, sequence) = ExecutionReceiver::for_task(handle.clone());
+        if handle.active().is_some()
+            && let Some(snapshot) = snapshot
+        {
+            return Ok((receiver, snapshot, sequence));
         }
         // No active snapshot can mean an idle task or an abandoned reservation.
         // Storage distinguishes those cases from a task that never existed.
@@ -467,7 +393,7 @@ impl TaskService {
             .get(task_id)
             .await?
             .ok_or(ProtocolError::TaskNotFound(task_id))?;
-        Ok((None, task, 0))
+        Ok((receiver, task, sequence))
     }
 
     pub(super) async fn get(&self, task_id: &str) -> Result<Option<Task>, A2AError> {
@@ -491,26 +417,26 @@ impl TaskService {
 
     pub(super) async fn commit_input(
         &self,
-        input: &super::admission::PreparedInput,
+        task: &Task,
+        existed: bool,
         handler: &DefaultRequestHandler,
         message: &AuthorizedMessage,
         lazy: bool,
         invocation: &mut InvocationState,
     ) -> Result<(), A2AError> {
         let (params, request) = (&message.params, &message.request);
-        if lazy && !input.existed {
-            invocation.pending_push =
-                handler.request_push_config(params, &input.task.id, request)?;
+        if lazy && !existed {
+            invocation.pending_push = handler.request_push_config(params, &task.id, request)?;
         } else {
             handler
-                .save_request_push_config(params, &input.task.id, request)
+                .save_request_push_config(params, &task.id, request)
                 .await?;
         }
         // Configuration must be accepted before input becomes committed.
-        if input.existed {
-            self.store.update(input.task.clone()).await?;
+        if existed {
+            self.store.update(task.clone()).await?;
         } else if !lazy {
-            self.store.create(input.task.clone()).await?;
+            self.store.create(task.clone()).await?;
         }
         Ok(())
     }
@@ -822,12 +748,14 @@ mod serialization_tests {
         );
         let retained = tasks.task("task");
         assert_eq!(retained.snapshot(), Some(snapshot.clone()));
-        retained.publish(
-            Ok(&StreamResponse::Task(snapshot.clone())),
-            None,
-            super::super::protocol::EventKind::Normal,
-            None,
-        );
+        retained
+            .publish(
+                Ok(&StreamResponse::Task(snapshot.clone())),
+                None,
+                super::super::protocol::EventKind::Normal,
+                None,
+            )
+            .await;
         assert!(matches!(events.recv().await.unwrap().result,
             Ok(StreamResponse::Task(task)) if task == snapshot));
         retained.notify();

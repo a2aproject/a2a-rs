@@ -2405,7 +2405,7 @@ async fn a_cancel_is_visible_at_its_own_generation_from_the_start() {
     let canceled = canceling.await.unwrap().unwrap();
     assert_eq!(
         canceled.generation, during.generation,
-        "the executor's status is the same entry, not another mutation"
+        "cleanup must not create another mutation"
     );
     assert_eq!(
         canceled_entries(&canceled),
@@ -2413,12 +2413,10 @@ async fn a_cancel_is_visible_at_its_own_generation_from_the_start() {
         "{:?}",
         timeline_of(&canceled)
     );
-    let last = timeline_of(&canceled).last().unwrap();
-    assert!(matches!(
-        &last.content,
-        TimelineContent::Status(status)
-            if status.message.as_ref().and_then(|m| m.text()) == Some("canceled")
-    ));
+    assert_eq!(
+        canceled, during,
+        "cleanup must not amend an observable terminal snapshot"
+    );
 
     // The subscriber is told once, at that generation.
     let mut announced = Vec::new();
@@ -2527,13 +2525,18 @@ async fn announced_generations(
 }
 
 #[tokio::test]
-async fn a_cancel_that_only_produces_an_artifact_never_repeats_a_generation() {
+async fn a_cancel_rejects_post_terminal_artifacts_without_repeating_a_generation() {
     let (handler, release) = script_handler(CancelMode::ArtifactOnly);
     let (task_id, held) = open_held_task(&handler).await;
     let collecting = tokio::spawn(announced_generations(held));
 
-    let canceled = handler
+    let error = handler
         .cancel_task(&ServiceParams::new(), cancel(&task_id))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, a2a::error_code::INVALID_AGENT_RESPONSE);
+    let canceled = handler
+        .get_task(&ServiceParams::new(), get(&task_id))
         .await
         .unwrap();
     release.notify_one();
@@ -2545,11 +2548,14 @@ async fn a_cancel_that_only_produces_an_artifact_never_repeats_a_generation() {
     );
     assert_eq!(generations.last().copied(), Some(canceled.generation));
     assert_eq!(canceled.status.state, TaskState::Canceled);
-    assert!(canceled.artifacts.is_some(), "the artifact was kept");
+    assert!(
+        canceled.artifacts.is_none(),
+        "post-terminal output must not be stored"
+    );
 }
 
 #[tokio::test]
-async fn an_idle_cancel_that_only_produces_an_artifact_never_repeats_a_generation() {
+async fn an_idle_cancel_rejects_post_terminal_artifacts_without_repeating_a_generation() {
     let (handler, _) = script_handler(CancelMode::ArtifactOnly);
     let params = ServiceParams::new();
     let first = task_of(
@@ -2559,13 +2565,15 @@ async fn an_idle_cancel_that_only_produces_an_artifact_never_repeats_a_generatio
             .unwrap(),
     );
 
-    let canceled = handler
+    let error = handler
         .cancel_task(&params, cancel(&first.id))
         .await
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(error.code, a2a::error_code::INVALID_AGENT_RESPONSE);
+    let canceled = handler.get_task(&params, get(&first.id)).await.unwrap();
+    assert!(canceled.artifacts.is_none());
 
-    // Store entry, artifact, then the cancellation recorded again: each
-    // mutation has a generation of its own.
+    // Cancellation is recorded once; the rejected artifact adds no generation.
     let generations: Vec<_> = timeline_of(&canceled)
         .iter()
         .map(|e| e.generation)

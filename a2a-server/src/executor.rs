@@ -135,8 +135,8 @@ impl ExecutorContext {
 /// a [`Message`] is a direct reply, nothing is saved, and whatever the
 /// executor's output stream is dropped immediately after that reply. An executor that fails or panics before it has said anything
 /// leaves no task; one that ends without an event leaves the task as the
-/// request prepared it. Opening a live exchange is the exception: that task
-/// is created up front. See [`Agent`] for the same contract as a typed return
+/// request prepared it. Live openings and unary `returnImmediately` calls
+/// create the task up front. See [`Agent`] for the same contract as a typed return
 /// value.
 #[async_trait::async_trait]
 pub trait AgentExecutor: Send + Sync + 'static {
@@ -158,7 +158,12 @@ pub trait AgentExecutor: Send + Sync + 'static {
         None
     }
 
-    /// Cancel an in-progress task. Returns a stream of events.
+    /// Clean up a task whose cancellation has already been committed.
+    ///
+    /// `ctx.stored_task` is CANCELED. Canceled Task/status outputs acknowledge
+    /// cleanup; their status message and timestamp do not modify that terminal
+    /// snapshot. Artifact updates and contradictory states are rejected.
+    /// The handler announces the committed cancellation after cleanup finishes.
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>>;
 }
 
@@ -251,7 +256,8 @@ pub trait Agent: Send + Sync + 'static {
         None
     }
 
-    /// Cancels an in-progress task. Returns a stream of events.
+    /// Clean up an already-canceled task. Returned canceled Task/status events
+    /// acknowledge cleanup and cannot modify its committed terminal snapshot.
     fn cancel(&self, ctx: ExecutorContext) -> EventStream {
         let _ = ctx;
         Box::pin(futures::stream::once(async {

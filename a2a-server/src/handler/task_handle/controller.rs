@@ -10,12 +10,12 @@ use super::super::execution::{
     self, ExecutionState, Invocation, TurnEnd, reject_unread_inputs, release_execution,
     save_pending_push_config,
 };
+use super::super::protocol::is_artifact_only;
 use super::super::protocol::{
     self, EventKind, ExecutionFailure, OutputKind, ProtocolError, Rejection, StartMode,
-    classify_output, request_task_id, validate_event_identity,
+    classify_output, prepare_agent_reply, request_task_id,
 };
 use super::super::{DefaultRequestHandler, admission, cancellation};
-use super::prepared_execution::PreparedExecution;
 use crate::User;
 use crate::middleware::ServiceParams;
 use a2a::*;
@@ -123,45 +123,62 @@ impl TaskController {
         mode: StartMode,
         reserved_id: TaskId,
     ) -> Result<Delivery, Rejection> {
-        // Reserve the invocation and commit input before making it observable.
-        let mut prepared = self
-            .prepare_execution(handler, &message, mode, &reserved_id)
-            .await?;
+        let (active, inputs) = self.reserve(handler, &reserved_id).await?;
+        let result = async {
+            // Validate and persist input under this task's mailbox reservation.
+            let (task, existed, events) =
+                admission::prepare(handler, &message.request, &reserved_id).await?;
+            let policy = protocol::ResponsePolicy::message(mode, &message.params, &message.request);
+            let lazy = policy.defer_task_creation();
+            let invocation = self
+                .execution
+                .bookkeeping(&active)
+                .expect("reserved invocation");
+            handler
+                .tasks
+                .commit_input(&task, existed, handler, &message, lazy, invocation)
+                .await?;
+            active.set_snapshot(task.clone());
+            active
+                .uncreated
+                .store(lazy && !existed, std::sync::atomic::Ordering::SeqCst);
 
-        // Publish input and attach its receiver before the driver can emit output.
-        let delivery = prepared.attach_delivery(handler);
-
-        // Move the prepared input and caller context into the separate driver.
-        let active = prepared.active().clone();
-        let context = prepared.into_executor_context(message);
-        handler
-            .tasks
-            .spawn_execution(handler.clone(), active, context);
-        Ok(delivery)
-    }
-
-    async fn prepare_execution(
-        &mut self,
-        handler: &DefaultRequestHandler,
-        message: &AuthorizedMessage,
-        mode: StartMode,
-        task_id: &str,
-    ) -> Result<PreparedExecution, A2AError> {
-        let (active, inputs) = self.reserve(handler, task_id).await?;
-        let invocation = self
-            .execution
-            .bookkeeping(&active)
-            .expect("reserved invocation");
-        match PreparedExecution::prepare(handler, message, mode, active.clone(), inputs, invocation)
-            .await
-        {
-            Ok(prepared) => Ok(prepared),
-            Err(error) => {
-                // No driver was started, so the controller releases the reservation.
-                self.release(&active);
-                Err(error)
+            // Attach delivery before the driver can publish its first output.
+            handler.attach_pushes(&active.task);
+            if existed || !lazy {
+                active.publish_input(task.clone(), &events).await;
+            } else {
+                active.task.notify();
             }
+            let delivery = Delivery::Started {
+                task: task.clone(),
+                receiver: active.subscribe(),
+            };
+
+            // The invocation owns its inbox and caller context independently of this request.
+            let context = crate::ExecutorContext {
+                execution_id: active.execution_id.clone(),
+                message: (!is_artifact_only(&message.request)).then_some(message.request.message),
+                task_id: task.id.clone(),
+                context_id: task.context_id.clone(),
+                stored_task: (existed || mode == StartMode::Blocking).then_some(task),
+                metadata: message.request.metadata,
+                user: message.user,
+                service_params: message.params,
+                tenant: message.request.tenant,
+                inputs,
+                new_task: !existed,
+            };
+            handler
+                .tasks
+                .spawn_execution(handler.clone(), active.clone(), context);
+            Ok(delivery)
         }
+        .await;
+        if result.is_err() {
+            self.release(&active);
+        }
+        result
     }
 
     pub(in crate::handler) async fn begin_cancel(
@@ -202,15 +219,11 @@ impl TaskController {
         Ok(plan)
     }
 
-    pub(in crate::handler) async fn cancel_update(
-        &mut self,
-        handler: &DefaultRequestHandler,
-        event: StreamResponse,
-    ) -> Result<(), A2AError> {
-        let ExecutionState::Canceling { progress, .. } = &mut self.execution else {
+    pub(in crate::handler) fn cancel_output(&self, event: StreamResponse) -> Result<(), A2AError> {
+        let ExecutionState::Canceling { progress, .. } = &self.execution else {
             return Err(A2AError::internal("no cancellation in progress"));
         };
-        progress.apply(handler, event).await.map(|_| ())
+        progress.acknowledge(event)
     }
 
     pub(in crate::handler) async fn cancel_finished(
@@ -244,10 +257,16 @@ impl TaskController {
         }
         if classify_output(&event) == OutputKind::Reply {
             if let Some(task) = active.snapshot() {
-                validate_event_identity(&task, &event)?;
+                prepare_agent_reply(
+                    &task,
+                    &mut event,
+                    !active.uncreated.load(std::sync::atomic::Ordering::SeqCst),
+                )?;
             }
             if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
-                active.publish_kind(Ok(&event), None, EventKind::Reply);
+                active
+                    .publish_kind(Ok(&event), None, EventKind::Reply)
+                    .await;
             } else {
                 // A reply closes response streams. Reject unread input first,
                 // then finish this invocation even if its Task is nonterminal.
@@ -371,7 +390,15 @@ impl TaskController {
             return;
         };
         match handler.tasks.save(task, true).await {
-            Ok(_) => save_pending_push_config(active, handler, self).await,
+            Ok(task) => {
+                active.set_snapshot(task.clone());
+                if let Err(error) = save_pending_push_config(active, handler, self).await {
+                    execution::publish_failure(handler, active, task_id, &error).await;
+                    return;
+                }
+                let event = StreamResponse::Task(task.clone());
+                active.publish(Ok(&event), Some(task)).await;
+            }
             Err(error) => {
                 tracing::warn!(task_id = %task_id, %error, "could not create the task");
             }
@@ -394,10 +421,12 @@ impl TaskController {
         tracing::error!(task_id = %task_id, "the agent executor panicked; failing the task");
         let registered = self.execution.is_current(&active);
         if registered && active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
-            active.publish(
-                Err(&A2AError::internal("the agent failed unexpectedly")),
-                None,
-            );
+            active
+                .publish(
+                    Err(&A2AError::internal("the agent failed unexpectedly")),
+                    None,
+                )
+                .await;
         } else if registered
             && let Some(base) = active.snapshot()
             && !base.status.state.is_terminal()
@@ -410,7 +439,7 @@ impl TaskController {
                 .apply_and_publish(&active, Some(base), &mut event)
                 .await
             {
-                active.publish(Err(&error), None);
+                active.publish(Err(&error), None).await;
             }
         }
         // Identity-checked cleanup cannot unregister a successor invocation.
@@ -422,6 +451,139 @@ impl TaskController {
 pub(in crate::handler) enum OutputAction {
     Continue,
     Stopped,
+}
+
+#[cfg(test)]
+type TestTransition =
+    Box<dyn for<'a> FnOnce(&'a mut TaskController) -> futures::future::BoxFuture<'a, ()> + Send>;
+
+/// The operations allowed to mutate one task; user execution and HTTP I/O run elsewhere.
+pub(in crate::handler) enum TaskCommand {
+    Admit {
+        handler: DefaultRequestHandler,
+        message: Box<AuthorizedMessage>,
+        mode: StartMode,
+        id: TaskId,
+        reply: super::CommandReply<Result<Delivery, Rejection>>,
+    },
+    Subscribe {
+        handler: DefaultRequestHandler,
+        task: super::TaskHandle,
+        request: SubscribeToTaskRequest,
+        policy: protocol::ResponsePolicy,
+        reply: super::CommandReply<Result<super::super::response::TaskEvents, A2AError>>,
+    },
+    Restart {
+        handler: DefaultRequestHandler,
+        id: TaskId,
+        reply: super::CommandReply<Result<Option<tokio::sync::oneshot::Receiver<bool>>, A2AError>>,
+    },
+    BeginCancel {
+        handler: DefaultRequestHandler,
+        params: ServiceParams,
+        request: CancelTaskRequest,
+        user: Option<User>,
+        reply: super::CommandReply<Result<CancellationStart, A2AError>>,
+    },
+    CancelOutput {
+        event: Box<StreamResponse>,
+        reply: super::CommandReply<Result<(), A2AError>>,
+    },
+    CancelFinished {
+        handler: DefaultRequestHandler,
+        failure: Option<A2AError>,
+        reply: super::CommandReply<Result<(), A2AError>>,
+    },
+    Output {
+        handler: DefaultRequestHandler,
+        active: Arc<ActiveExecution>,
+        event: Box<StreamResponse>,
+        reply: super::CommandReply<Result<OutputAction, A2AError>>,
+    },
+    Finished {
+        handler: DefaultRequestHandler,
+        active: Arc<ActiveExecution>,
+        end: TurnEnd,
+        reply: super::CommandReply<()>,
+    },
+    Panicked {
+        handler: DefaultRequestHandler,
+        active: Arc<ActiveExecution>,
+        reply: super::CommandReply<()>,
+    },
+    #[cfg(test)]
+    Test(TestTransition),
+}
+
+impl TaskCommand {
+    pub(super) async fn run(self, state: &mut TaskController) {
+        match self {
+            Self::Admit {
+                handler,
+                message,
+                mode,
+                id,
+                reply,
+            } => reply.complete(state.admit(&handler, *message, mode, id).await),
+            Self::Subscribe {
+                handler,
+                task,
+                request,
+                policy,
+                reply,
+            } => reply.complete(
+                handler
+                    .tasks
+                    .capture_subscription(task, request, policy)
+                    .await,
+            ),
+            Self::Restart { handler, id, reply } => {
+                reply.complete(state.restart(&handler, &id).await)
+            }
+            Self::BeginCancel {
+                handler,
+                params,
+                request,
+                user,
+                reply,
+            } => reply.complete(state.begin_cancel(&handler, &params, request, user).await),
+            Self::CancelOutput { event, reply } => reply.complete(state.cancel_output(*event)),
+            Self::CancelFinished {
+                handler,
+                failure,
+                reply,
+            } => reply.complete(state.cancel_finished(&handler, failure).await),
+            Self::Output {
+                handler,
+                active,
+                event,
+                reply,
+            } => reply.complete(state.output(&handler, active, *event).await),
+            Self::Finished {
+                handler,
+                active,
+                end,
+                reply,
+            } => {
+                state
+                    .finished(&handler, active.task.id().clone(), active, end)
+                    .await;
+                reply.complete(());
+            }
+            Self::Panicked {
+                handler,
+                active,
+                reply,
+            } => {
+                state
+                    .panicked(&handler, active.clone(), active.task.id().clone())
+                    .await;
+                reply.complete(());
+            }
+            #[cfg(test)]
+            Self::Test(transition) => transition(state).await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -583,11 +745,7 @@ mod invalid_lifecycle_tests {
         assert_eq!(error.code, error_code::INVALID_REQUEST);
         let event = StreamResponse::Task(task_with_history("task", "context", 0));
         assert_eq!(
-            runtime
-                .cancel_update(&handler, event)
-                .await
-                .unwrap_err()
-                .message,
+            runtime.cancel_output(event).unwrap_err().message,
             "no cancellation in progress"
         );
         assert_eq!(

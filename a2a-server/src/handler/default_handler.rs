@@ -10,8 +10,9 @@ use super::protocol::{
     apply_lengths, request_task_id, requested_protocol_version,
 };
 use super::push_delivery::PushService;
-use super::response::{Events, Run};
-use super::response_preparation::{MessageResponse, PreparedResponse, SubscriptionAttachment};
+use super::response::{
+    ResponseStream, Run, TaskEvents, message_response, task_response, unary_response,
+};
 use super::task_handle::TaskHandle;
 use super::task_service::TaskService;
 use super::uplink::{HttpLiveResponses, Uplink};
@@ -224,28 +225,13 @@ impl DefaultRequestHandler {
         }
     }
 
-    /// Ordinary sends resolve to a Message or a Task; transport setup stays outside.
-    async fn send(
-        &self,
-        params: &ServiceParams,
-        request: SendMessageRequest,
-        policy: ResponsePolicy,
-    ) -> Result<MessageResponse, A2AError> {
-        let prepared = self
-            .prepare_message(params, MessageInput::Raw(request), policy)
-            .await?;
-        let task = prepared.task.clone();
-        let events = self.response_stream(params, prepared, None, None);
-        MessageResponse::receive(self.tasks.clone(), task, events).await
-    }
-
     /// Live transports supply an opening request and retain their input stream.
     async fn start_live_response(
         &self,
         params: &ServiceParams,
         mut uplink: Uplink,
         registration: Option<RegistrationLease>,
-    ) -> Result<Events, A2AError> {
+    ) -> Result<ResponseStream, A2AError> {
         let first = tokio::select! {
             biased;
             () = self.tasks.background_tasks.cancelled() => {
@@ -254,54 +240,55 @@ impl DefaultRequestHandler {
             first = uplink.next() => first
                 .ok_or(ProtocolError::MissingOpeningRequest)?,
         };
-        let prepared = match first.request {
+        let policy = match &first.request {
             IncomingRequest::Message(input) => {
-                let policy = ResponsePolicy::message(StartMode::Bidi, params, input.request());
-                self.prepare_message(params, *input, policy).await?
+                ResponsePolicy::message(StartMode::Bidi, params, input.request())
             }
+            _ => ResponsePolicy::subscription(StartMode::Bidi, params),
+        };
+        let response = match first.request {
+            IncomingRequest::Message(input) => self.admit_message(params, *input, policy).await?,
             IncomingRequest::Subscribe(request) => {
-                let attachment = self.attach_subscription(params, request).await?;
-                let policy = ResponsePolicy::subscription(StartMode::Bidi, params);
-                PreparedResponse::subscription(attachment, policy)
+                self.attach_subscription(params, request, policy).await?
             }
             IncomingRequest::Invalid => {
                 return Err(ProtocolError::UnknownStreamRequest.into());
             }
         };
-        Ok(self.response_stream(params, prepared, Some(uplink), registration))
+        Ok(self.response_stream(params, response, policy, Some(uplink), registration))
     }
 
-    /// Every opening message or subscription starts exactly one response Run.
+    /// Ordinary responses are polled directly; live responses own an uplink runner.
     fn response_stream(
         &self,
         params: &ServiceParams,
-        prepared: PreparedResponse,
+        (task, events): TaskEvents,
+        policy: ResponsePolicy,
         uplink: Option<Uplink>,
         registration: Option<RegistrationLease>,
-    ) -> Events {
-        Run::new(
-            self.clone(),
-            params.clone(),
-            prepared.task,
-            prepared.settings,
-        )
-        .with_uplink(uplink, registration)
-        .start(prepared.opening, prepared.events, prepared.seen_generation)
+    ) -> ResponseStream {
+        if policy.is_live() {
+            Run::new(self.clone(), params.clone(), task, policy)
+                .with_uplink(uplink, registration)
+                .start(None, Some(events), 0)
+        } else {
+            task_response(self.clone(), task, policy, None, Some(events), 0)
+        }
     }
 
     /// All message modes use the same authorization, validation, and task admission.
-    async fn prepare_message(
+    async fn admit_message(
         &self,
         params: &ServiceParams,
         input: MessageInput,
         policy: ResponsePolicy,
-    ) -> Result<PreparedResponse, A2AError> {
+    ) -> Result<TaskEvents, A2AError> {
         let requested_task = request_task_id(input.request());
         let delivery = self
             .receive_message(params, input, policy.mode(), None, policy.response_id())
             .await
             .map_err(|rejection| policy.opening_error(rejection, requested_task.as_deref()))?;
-        Ok(PreparedResponse::message(delivery, policy))
+        Ok(message_response(delivery, policy))
     }
 
     /// Bind and authorize each message once, using its caller rather than
@@ -354,10 +341,11 @@ impl DefaultRequestHandler {
         &self,
         params: &ServiceParams,
         req: SubscribeToTaskRequest,
-    ) -> Result<SubscriptionAttachment, A2AError> {
+        policy: ResponsePolicy,
+    ) -> Result<TaskEvents, A2AError> {
         self.authorize(params, Some(&req.id))?;
         self.require_streaming()?;
-        self.tasks.subscribe(self.clone(), req).await
+        self.tasks.subscribe(self.clone(), req, policy).await
     }
 
     // Push delivery.
@@ -409,16 +397,11 @@ impl RequestHandler for DefaultRequestHandler {
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
         let policy = ResponsePolicy::message(StartMode::Blocking, params, &req);
-        let mut response = match self.send(params, req, policy).await? {
-            MessageResponse::Message(message) => SendMessageResponse::Message(message),
-            MessageResponse::Task(task) => {
-                if !policy.return_immediately() {
-                    task.wait().await?
-                } else {
-                    SendMessageResponse::Task(task.snapshot().await?)
-                }
-            }
-        };
+        let (task, events) = self
+            .admit_message(params, MessageInput::Raw(req), policy)
+            .await?;
+        let events = self.response_stream(params, (task.clone(), events), policy, None, None);
+        let mut response = unary_response(self.tasks.clone(), task, events).await?;
         if let SendMessageResponse::Task(task) = &mut response {
             policy.trim(task);
         }
@@ -432,10 +415,10 @@ impl RequestHandler for DefaultRequestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         let policy = ResponsePolicy::message(StartMode::Streaming, params, &req);
         self.require_streaming()?;
-        let prepared = self
-            .prepare_message(params, MessageInput::Raw(req), policy)
+        let response = self
+            .admit_message(params, MessageInput::Raw(req), policy)
             .await?;
-        let events = self.response_stream(params, prepared, None, None);
+        let events = self.response_stream(params, response, policy, None, None);
         Ok(Box::pin(events.map(move |item| {
             item.map(|mut event| {
                 if let StreamResponse::Task(task) = &mut event {
@@ -541,10 +524,9 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let attachment = self.attach_subscription(params, req).await?;
         let policy = ResponsePolicy::subscription(StartMode::Streaming, params);
-        let prepared = PreparedResponse::subscription(attachment, policy);
-        Ok(self.response_stream(params, prepared, None, None))
+        let response = self.attach_subscription(params, req, policy).await?;
+        Ok(self.response_stream(params, response, policy, None, None))
     }
 
     async fn send_live_request(
@@ -553,8 +535,19 @@ impl RequestHandler for DefaultRequestHandler {
         request: StreamRequest,
     ) -> Result<LiveResponse, A2AError> {
         self.require_streaming()?;
+        let policy = match &request.payload {
+            StreamRequestPayload::SendMessage(request) => {
+                Some(ResponsePolicy::message(StartMode::Bidi, params, request))
+            }
+            _ => None,
+        };
         match http_exchange::open(self, params, request).await? {
-            HttpOpening::Acknowledged(task) => Ok(LiveResponse::Ack(task)),
+            HttpOpening::Acknowledged(mut task) => {
+                if let Some(policy) = policy {
+                    policy.trim(&mut task);
+                }
+                Ok(LiveResponse::Ack(task))
+            }
             HttpOpening::Attached {
                 registration,
                 uplink,
@@ -600,11 +593,9 @@ impl RequestHandler for DefaultRequestHandler {
         req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
         self.authorize(params, Some(&req.task_id))?;
-        let mut configs = self
-            .push_service_checked()?
-            .store()
-            .list(&req.task_id)
-            .await?;
+        let pushes = self.push_service_checked()?;
+        self.tasks.load(&req.task_id).await?;
+        let mut configs = pushes.store().list(&req.task_id).await?;
         configs.sort_by(|left, right| left.id.cmp(&right.id));
 
         // Paging for push configs is done here, not in the store: the store
@@ -629,10 +620,9 @@ impl RequestHandler for DefaultRequestHandler {
         req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
         self.authorize(params, Some(&req.task_id))?;
-        self.push_service_checked()?
-            .store()
-            .delete(&req.task_id, &req.id)
-            .await
+        let pushes = self.push_service_checked()?;
+        self.tasks.load(&req.task_id).await?;
+        pushes.delete(&req.task_id, &req.id).await
     }
 
     async fn get_extended_agent_card(
@@ -1411,7 +1401,7 @@ mod tests {
 
         match response {
             SendMessageResponse::Task(task) => {
-                assert_eq!(task.status.state, TaskState::Working);
+                assert_eq!(task.status.state, TaskState::Submitted);
             }
             _ => panic!("expected Task response"),
         }
@@ -1428,13 +1418,16 @@ mod tests {
             .await
             .unwrap();
 
-        let snapshot = subscription.next().await.unwrap().unwrap();
-        match snapshot {
-            StreamResponse::Task(task) => assert_eq!(task.status.state, TaskState::Working),
-            _ => panic!("expected snapshot task"),
+        // Admission can return before the executor's first WORKING event.
+        loop {
+            match subscription.next().await.unwrap().unwrap() {
+                StreamResponse::Task(task) if task.status.state == TaskState::Working => break,
+                StreamResponse::Task(task) => assert_eq!(task.status.state, TaskState::Submitted),
+                other => panic!("expected task snapshot: {other:?}"),
+            }
         }
 
-        release.notify_waiters();
+        release.notify_one();
 
         let terminal = subscription.next().await.unwrap().unwrap();
         match terminal {
@@ -1519,15 +1512,16 @@ mod tests {
             .await
             .unwrap();
         let active = ActiveExecution::new(Some(canceled.clone()));
-        let mut progress =
+        let progress =
             cancellation::Cancellation::new(active.clone(), canceled.clone(), false, false);
-        let published = progress
-            .apply(&handler, StreamResponse::Task(canceled))
-            .await
+        let sequence = active.sequence();
+        progress
+            .acknowledge(StreamResponse::Task(canceled))
             .unwrap();
-        assert!(
-            !published,
-            "a snapshot that changes nothing is not published"
+        assert_eq!(
+            active.sequence(),
+            sequence,
+            "cleanup acknowledgements are not published"
         );
         assert_eq!(active.snapshot().unwrap().generation, 3);
     }
@@ -2769,7 +2763,7 @@ mod tests {
                 .await
                 .unwrap();
             let active = ActiveExecution::new(Some(canceled.clone()));
-            let progress =
+            let mut progress =
                 cancellation::Cancellation::new(active.clone(), canceled.clone(), false, running);
             progress.record_if_missing(&handler).await.unwrap();
             let task = handler.tasks.load("legacy-cancel").await.unwrap();
@@ -3319,7 +3313,7 @@ mod tests {
             .expect("the subscription outlived the canceled task");
         assert!(matches!(
             events.as_slice(),
-            [Ok(StreamResponse::Task(stored)), Ok(StreamResponse::Task(last))]
+            [Ok(StreamResponse::Task(stored)), Ok(StreamResponse::StatusUpdate(last))]
                 if stored.status.state == TaskState::InputRequired
                     && last.status.state == TaskState::Canceled
         ));
@@ -3377,7 +3371,7 @@ mod tests {
                 .expect("the subscription outlived the canceled task");
             assert!(matches!(
                 events.as_slice(),
-                [Ok(StreamResponse::Task(stored)), Ok(StreamResponse::Task(last))]
+                [Ok(StreamResponse::Task(stored)), Ok(StreamResponse::StatusUpdate(last))]
                     if stored.status.state == TaskState::InputRequired
                         && last.status.state == TaskState::Canceled
             ));
@@ -3558,10 +3552,23 @@ mod subscription_attachment_tests {
                     task.status.state = TaskState::Completed;
                     handler.tasks.store().update(task.clone()).await.unwrap();
                     if let Some((active, _inputs)) = execution {
-                        active.publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()));
+                        active
+                            .publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()))
+                            .await;
                         handler.tasks.task("task").unregister(&active);
                     }
-                    handler.tasks.task("task").notify();
+                    if !running {
+                        handler
+                            .tasks
+                            .task("task")
+                            .publish(
+                                Ok(&StreamResponse::Task(task.clone())),
+                                Some(task.clone()),
+                                protocol::EventKind::Normal,
+                                None,
+                            )
+                            .await;
+                    }
                     let remaining = timeout(Duration::from_secs(2), events.collect::<Vec<_>>())
                         .await
                         .unwrap();

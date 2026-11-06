@@ -15,19 +15,11 @@ use a2a::*;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// The prepared input snapshot and the events it adds. Context identity
-/// comes from the Task rather than a second, independently carried value.
-pub(super) struct PreparedInput {
-    pub(super) task: Task,
-    pub(super) existed: bool,
-    pub(super) events: Vec<StreamResponse>,
-}
-
 pub(super) async fn prepare(
     handler: &DefaultRequestHandler,
     req: &SendMessageRequest,
     task_id: &str,
-) -> Result<PreparedInput, A2AError> {
+) -> Result<(Task, bool, Vec<StreamResponse>), A2AError> {
     // A2A §3.4.2: a client-provided taskId MUST reference an existing task,
     // and client-provided ids for *creating* tasks are not supported. Only
     // an absent taskId may mint a new one.
@@ -67,11 +59,7 @@ pub(super) async fn prepare(
         task
     };
 
-    Ok(PreparedInput {
-        task,
-        existed,
-        events,
-    })
+    Ok((task, existed, events))
 }
 
 pub(super) async fn inject_input(
@@ -88,7 +76,7 @@ pub(super) async fn inject_input(
     let (task, recorded) = persist_input(handler, message, task_id, task).await?;
 
     // Publish the complete batch before handing the message to user code.
-    let delivery = publish_input(active, task, &recorded.events);
+    let delivery = publish_input(active, task, &recorded.events).await;
     deliver_input(permit, recorded.message_generation, message, invocation);
     Ok(delivery)
 }
@@ -140,10 +128,14 @@ async fn persist_input(
     Ok((task, recorded))
 }
 
-fn publish_input(active: &Arc<ActiveExecution>, task: Task, events: &[StreamResponse]) -> Delivery {
+async fn publish_input(
+    active: &Arc<ActiveExecution>,
+    task: Task,
+    events: &[StreamResponse],
+) -> Delivery {
     let sequence_before = active.sequence();
     let receiver = active.subscribe();
-    active.publish_input(task.clone(), events);
+    active.publish_input(task.clone(), events).await;
     Delivery::Injected {
         task,
         receiver,

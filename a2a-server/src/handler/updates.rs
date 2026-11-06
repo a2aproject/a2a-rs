@@ -89,6 +89,10 @@ mod tests {
                 }))
                 .unwrap(),
             ]);
+            let forged = &mut task.artifacts.as_mut().unwrap()[0];
+            forged.start_generation = Some(999999);
+            forged.end_generation = Some(999999);
+            forged.role = Some(Role::User);
             let mut event = StreamResponse::Task(task);
             let saved = apply_event_to_new_or_stored_task(&store, None, &mut event, true)
                 .await
@@ -96,6 +100,7 @@ mod tests {
                 .unwrap();
             assert_eq!(saved.generation, 1);
             let artifact = &saved.artifacts.as_ref().unwrap()[0];
+            assert_eq!(artifact.role, Some(Role::Agent));
             assert_eq!(artifact.start_generation, Some(1));
             assert_eq!(artifact.end_generation, state.is_terminal().then_some(1));
             assert_eq!(store.get("new-task").await.unwrap().unwrap(), saved);

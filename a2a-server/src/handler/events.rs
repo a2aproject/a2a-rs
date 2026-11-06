@@ -23,6 +23,8 @@ pub(super) struct ExecutionEvent {
     pub(super) result: Result<StreamResponse, A2AError>,
     pub(super) kind: EventKind,
     pub(super) failure: Option<FailureSignal>,
+    /// Captured only for terminal/interrupted status events, shared by readers.
+    pub(super) response_task: Option<Arc<Task>>,
 }
 
 pub(super) struct ExecutionReceiver {
@@ -33,9 +35,27 @@ pub(super) struct ExecutionReceiver {
     opening_message: bool,
     /// Events at or before this subscription opened must not be replayed.
     opened_at: u64,
+    reply: Option<Arc<super::task_handle::ReplyRetention>>,
 }
 
 impl ExecutionReceiver {
+    /// Subscribe to the task source independently of any executor invocation.
+    pub(super) fn for_task(task: TaskHandle) -> (Self, Option<Task>, u64) {
+        let (receiver, snapshot, sequence, reply) = task.response_subscription();
+        (
+            Self {
+                receiver,
+                task,
+                finished: None,
+                opening_message: false,
+                opened_at: sequence,
+                reply: Some(reply),
+            },
+            snapshot,
+            sequence,
+        )
+    }
+
     pub(super) fn task(&self) -> TaskHandle {
         self.task.clone()
     }
@@ -61,14 +81,21 @@ impl ExecutionReceiver {
     }
 
     pub(super) async fn recv(&mut self) -> Result<ExecutionEvent, broadcast::error::RecvError> {
-        let Some(finished) = &self.finished else {
-            return self.receiver.recv().await;
+        let received = match &self.finished {
+            None => self.receiver.recv().await,
+            Some(finished) => tokio::select! {
+                biased;
+                event = self.receiver.recv() => event,
+                _ = finished.cancelled() => Err(broadcast::error::RecvError::Closed),
+            },
         };
-        tokio::select! {
-            biased;
-            event = self.receiver.recv() => event,
-            _ = finished.cancelled() => Err(broadcast::error::RecvError::Closed),
+        if matches!(received, Err(broadcast::error::RecvError::Lagged(_)))
+            && let Some(retained) = &self.reply
+            && let Some(reply) = retained.reply.get()
+        {
+            return Ok(reply.clone());
         }
+        received
     }
 
     #[cfg(test)]
@@ -162,45 +189,27 @@ impl ActiveExecution {
     }
 
     pub(super) fn subscribe(self: &Arc<Self>) -> ExecutionReceiver {
-        let (receiver, sequence) = self.task.subscribe();
+        let (receiver, _, sequence, reply) = self.task.response_subscription();
         ExecutionReceiver {
             receiver,
             task: self.task.clone(),
             finished: Some(self.finished.clone()),
             opening_message: false,
             opened_at: sequence,
+            reply: Some(reply),
         }
     }
 
-    pub(super) fn resubscribe(self: &Arc<Self>) -> (ExecutionReceiver, Option<Task>, u64) {
-        let (receiver, snapshot, sequence) = self.task.resubscribe();
-        let snapshot = self
-            .prepared
-            .load(std::sync::atomic::Ordering::SeqCst)
-            .then_some(snapshot)
-            .flatten();
-        (
-            ExecutionReceiver {
-                receiver,
-                task: self.task.clone(),
-                finished: Some(self.finished.clone()),
-                opening_message: false,
-                opened_at: sequence,
-            },
-            snapshot,
-            sequence,
-        )
-    }
-
-    pub(super) fn publish(
+    pub(super) async fn publish(
         &self,
         result: Result<&StreamResponse, &A2AError>,
         snapshot_task: Option<Task>,
     ) {
-        self.publish_kind(result, snapshot_task, EventKind::Normal);
+        self.publish_kind(result, snapshot_task, EventKind::Normal)
+            .await;
     }
 
-    pub(super) fn publish_marked(
+    pub(super) async fn publish_marked(
         &self,
         result: Result<&StreamResponse, &A2AError>,
         snapshot_task: Option<Task>,
@@ -211,18 +220,19 @@ impl ActiveExecution {
         } else {
             EventKind::Normal
         };
-        self.publish_kind(result, snapshot_task, kind);
+        self.publish_kind(result, snapshot_task, kind).await;
     }
 
     /// Publish an already-persisted input batch with its final snapshot.
-    pub(super) fn publish_input(&self, task: Task, events: &[StreamResponse]) {
+    pub(super) async fn publish_input(&self, task: Task, events: &[StreamResponse]) {
         self.prepared
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.task
-            .publish_input(task, events, self.push_failure.clone());
+            .publish_input(task, events, self.push_failure.clone())
+            .await;
     }
 
-    pub(super) fn publish_kind(
+    pub(super) async fn publish_kind(
         &self,
         result: Result<&StreamResponse, &A2AError>,
         snapshot_task: Option<Task>,
@@ -233,7 +243,8 @@ impl ActiveExecution {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         self.task
-            .publish(result, snapshot_task, kind, Some(self.push_failure.clone()));
+            .publish(result, snapshot_task, kind, Some(self.push_failure.clone()))
+            .await;
     }
 
     pub(super) fn snapshot_is_terminal(&self) -> bool {
@@ -297,7 +308,15 @@ pub(super) fn subscription_stream(
                         }
                         state.receiver.opened();
                         state.done = matches!(decision, EventDecision::DeliverAndClose);
-                        return Some((event.result.clone(), state));
+                        let result = if filter.task_snapshots {
+                            event.response_task.as_ref().map_or_else(
+                                || event.result.clone(),
+                                |task| Ok(StreamResponse::Task((**task).clone())),
+                            )
+                        } else {
+                            event.result.clone()
+                        };
+                        return Some((result, state));
                     }
                     // Events were lost: start over from the task as it stands.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -363,9 +382,10 @@ mod tests {
         let active = ActiveExecution::new(Some(task.clone()));
 
         let event = StreamResponse::Task(task.clone());
-        active.publish(Ok(&event), Some(task));
+        active.publish(Ok(&event), Some(task)).await;
 
-        let (mut receiver, snapshot_task, sequence) = active.resubscribe();
+        let (mut receiver, snapshot_task, sequence) =
+            ExecutionReceiver::for_task(active.task.clone());
         assert_eq!(snapshot_task.unwrap().id, "t-buffering");
         assert_eq!(sequence, 1);
         assert!(receiver.try_recv().is_err());
@@ -391,7 +411,7 @@ mod tests {
         let mut receiver = active.subscribe();
         let error = A2AError::internal("execution failed");
 
-        active.publish(Err(&error), None);
+        active.publish(Err(&error), None).await;
 
         let event = receiver.recv().await.unwrap();
         assert_eq!(event.sequence, 1);
@@ -418,10 +438,11 @@ mod tests {
         let error = A2AError::internal("execution failed");
 
         // Publish error without any subscribers
-        active.publish(Err(&error), Some(task.clone()));
+        active.publish(Err(&error), Some(task.clone())).await;
 
         // Resubscribe to verify snapshot was updated but no event was buffered
-        let (mut receiver, snapshot_task, sequence) = active.resubscribe();
+        let (mut receiver, snapshot_task, sequence) =
+            ExecutionReceiver::for_task(active.task.clone());
         assert_eq!(snapshot_task.unwrap().id, "t-error-no-sub");
         assert_eq!(sequence, 1);
         assert!(receiver.try_recv().is_err());
@@ -462,7 +483,7 @@ mod tests {
         };
 
         let event = StreamResponse::Task(updated_task.clone());
-        active.publish(Ok(&event), Some(updated_task.clone()));
+        active.publish(Ok(&event), Some(updated_task.clone())).await;
 
         // Verify event was published to subscriber
         let published = receiver.recv().await.unwrap();
@@ -475,7 +496,7 @@ mod tests {
         }
 
         // Verify snapshot was updated
-        let (_, snapshot_task, sequence) = active.resubscribe();
+        let (_, snapshot_task, sequence) = ExecutionReceiver::for_task(active.task.clone());
         assert_eq!(snapshot_task.unwrap().id, "t-snapshot-update");
         assert_eq!(sequence, 1);
     }
@@ -503,7 +524,7 @@ mod tests {
         let mut sub2 = active.subscribe();
 
         let event = StreamResponse::Task(task);
-        active.publish(Ok(&event), None);
+        active.publish(Ok(&event), None).await;
 
         // Both subscribers should receive the same event
         let evt1 = sub1.recv().await.unwrap();
@@ -563,8 +584,10 @@ mod tests {
                 reference_task_ids: None,
             })
         };
-        for i in 0..(EXECUTION_BUFFER_CAPACITY * 3) {
-            active.publish(Ok(&probe(&format!("lost-{i}"))), None);
+        for _ in 0..(EXECUTION_BUFFER_CAPACITY * 3) {
+            active
+                .publish(Ok(&StreamResponse::Task(active.snapshot().unwrap())), None)
+                .await;
         }
 
         let mut stream = subscription_stream(
@@ -573,6 +596,7 @@ mod tests {
             0,
             EventFilter {
                 include_repeats: true,
+                task_snapshots: false,
                 message_updates: false,
                 live: false,
                 response_id: None,
@@ -584,7 +608,7 @@ mod tests {
             "{first:?}"
         );
         // And what is published afterwards follows.
-        active.publish(Ok(&probe("after")), None);
+        active.publish(Ok(&probe("after")), None).await;
         let next = stream.next().await.expect("an item").expect("not an error");
         assert!(
             matches!(&next, StreamResponse::Message(m) if m.message_id == "after"),
@@ -601,12 +625,16 @@ mod tests {
             let receiver = active.subscribe();
             if lagged {
                 for _ in 0..EXECUTION_BUFFER_CAPACITY + 2 {
-                    active.publish(Ok(&StreamResponse::Task(task.clone())), None);
+                    active
+                        .publish(Ok(&StreamResponse::Task(task.clone())), None)
+                        .await;
                 }
             }
             task.status.state = TaskState::Completed;
             task.generation = 99;
-            active.publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()));
+            active
+                .publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()))
+                .await;
             let opening = (!lagged).then_some(task);
             let mut events = subscription_stream(
                 receiver,
@@ -614,6 +642,7 @@ mod tests {
                 0,
                 EventFilter {
                     include_repeats: false,
+                    task_snapshots: false,
                     message_updates: true,
                     live: false,
                     response_id: None,
@@ -637,20 +666,21 @@ mod tests {
         task.status.state = TaskState::Working;
         let (first, _inputs, _invocation) = manager.task(&task.id).reserve().unwrap();
         first.set_snapshot(task.clone());
-        let (receiver, _, sequence) = first.resubscribe();
+        let (receiver, _, sequence) = ExecutionReceiver::for_task(first.task.clone());
         let mut old_response = subscription_stream(
             receiver,
             None,
             sequence,
             EventFilter {
                 include_repeats: false,
+                task_snapshots: false,
                 message_updates: true,
                 live: false,
                 response_id: None,
             },
         );
         let error = A2AError::internal("executor failed");
-        first.publish(Err(&error), None);
+        first.publish(Err(&error), None).await;
         manager.task(&task.id).unregister(&first);
         drop(first);
 
@@ -658,7 +688,9 @@ mod tests {
         second.set_snapshot(task.clone());
         for _ in 0..EXECUTION_BUFFER_CAPACITY + 1 {
             task.generation += 1;
-            second.publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()));
+            second
+                .publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()))
+                .await;
         }
         let recovered = old_response.next().await.unwrap().unwrap_err();
         assert_eq!(recovered.code, error.code);
@@ -673,6 +705,7 @@ mod tests {
             0,
             EventFilter {
                 include_repeats: false,
+                task_snapshots: false,
                 message_updates: true,
                 live: false,
                 response_id: None,
@@ -684,7 +717,9 @@ mod tests {
         ));
         for _ in 0..EXECUTION_BUFFER_CAPACITY + 1 {
             task.generation += 1;
-            second.publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()));
+            second
+                .publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()))
+                .await;
         }
         assert!(matches!(
             new_response.next().await,

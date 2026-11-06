@@ -5,10 +5,8 @@
 
 use super::DefaultRequestHandler;
 use super::events::ActiveExecution;
-use super::protocol::{
-    self, CancelEntry, CancellationMutation, CancellationNotification, backfill_status_timestamp,
-    is_terminal_event,
-};
+use super::protocol::{self, CancelEntry, CancellationNotification, is_terminal_event};
+use super::task_handle::{TaskCommand, TaskOperation};
 use crate::middleware::ServiceParams;
 use crate::{ClientInputs, User};
 use a2a::*;
@@ -136,44 +134,24 @@ impl Cancellation {
         }
     }
 
-    pub(super) async fn apply(
-        &mut self,
-        handler: &DefaultRequestHandler,
-        mut event: StreamResponse,
-    ) -> Result<bool, A2AError> {
-        backfill_status_timestamp(&mut event);
+    /// Hook results are validated acknowledgements, never task mutations.
+    pub(super) fn acknowledge(&self, mut event: StreamResponse) -> Result<(), A2AError> {
         let base = self
             .active
             .snapshot()
             .ok_or_else(|| A2AError::internal("cancellation has no task"))?;
-        let published = match self.entry.plan_update(base, &mut event)? {
-            CancellationMutation::Amend(amended) => {
-                let saved = handler.tasks.save(amended, false).await?;
-                self.active.publish_marked(Ok(&event), Some(saved), false);
-                self.entry.announced = true;
-                true
-            }
-            CancellationMutation::Apply(base) => {
-                let published = handler
-                    .tasks
-                    .apply_and_publish(&self.active, Some(base), &mut event)
-                    .await?;
-                self.entry.note_published(published, &event);
-                published
-            }
-        };
-        Ok(published)
+        protocol::validate_cancel_acknowledgement(&base, &mut event)
     }
 
     pub(super) async fn finish(
-        self,
+        mut self,
         handler: &DefaultRequestHandler,
         failure: Option<A2AError>,
     ) -> Result<(), A2AError> {
         let recorded = self.record_if_missing(handler).await;
         if let Some(error) = failure {
             if self.signal_failure {
-                self.active.publish(Err(&error), None);
+                self.active.publish(Err(&error), None).await;
             }
             return Err(error);
         }
@@ -181,12 +159,12 @@ impl Cancellation {
     }
 
     pub(super) async fn record_if_missing(
-        &self,
+        &mut self,
         handler: &DefaultRequestHandler,
     ) -> Result<(), A2AError> {
         match self.entry.notification(self.active.snapshot()) {
             CancellationNotification::None => {}
-            CancellationNotification::Publish(event) => self.active.publish(Ok(&event), None),
+            CancellationNotification::Publish(event) => self.active.publish(Ok(&event), None).await,
             CancellationNotification::Persist { task, mut event } => {
                 handler
                     .tasks
@@ -195,6 +173,7 @@ impl Cancellation {
             }
         }
 
+        self.entry.announced = true;
         Ok(())
     }
 }
@@ -210,8 +189,15 @@ pub(super) async fn cancel(
     let task_id = request.id.clone();
     let plan = match handler
         .tasks
-        .begin_cancel(handler.clone(), params, request, user)
-        .await?
+        .task(&task_id)
+        .request(TaskOperation::Cancel, |reply| TaskCommand::BeginCancel {
+            handler: handler.clone(),
+            params,
+            request,
+            user,
+            reply,
+        })
+        .await??
     {
         CancellationStart::Unchanged(task) => return Ok(*task),
         CancellationStart::Started(plan) => *plan,
@@ -241,8 +227,12 @@ pub(super) async fn run(
             let terminal = is_terminal_event(&event);
             handler
                 .tasks
-                .cancel_update(handler.clone(), &task_id, event)
-                .await?;
+                .task(&task_id)
+                .request(TaskOperation::Cancel, |reply| TaskCommand::CancelOutput {
+                    event: Box::new(event),
+                    reply,
+                })
+                .await??;
             if terminal {
                 return Ok(());
             }
@@ -255,8 +245,13 @@ pub(super) async fn run(
     };
     handler
         .tasks
-        .cancel_finished(handler.clone(), &task_id, failure)
-        .await
+        .task(&task_id)
+        .request(TaskOperation::Cancel, |reply| TaskCommand::CancelFinished {
+            handler: handler.clone(),
+            failure,
+            reply,
+        })
+        .await?
 }
 
 #[cfg(test)]

@@ -166,11 +166,17 @@ async fn pushes_of_a_later_turn_and_a_cancel_wait_for_the_last_push_of_the_turn_
     let o2 = order.clone();
     tokio::spawn(async move {
         while let Some((body, d)) = rx.recv().await {
-            let tag = ["reply-to-one", "w-two", "reply-to-two", "\"c\""]
-                .iter()
-                .find(|k| body.contains(*k))
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "?".into());
+            // Cleanup text is not persisted; identify cancellation by its state.
+            let tag = [
+                "reply-to-one",
+                "w-two",
+                "reply-to-two",
+                "TASK_STATE_CANCELED",
+            ]
+            .iter()
+            .find(|k| body.contains(*k))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "?".into());
             o2.lock().unwrap().push(format!("arrive:{tag}"));
             let o3 = o2.clone();
             tokio::spawn(async move {
@@ -243,7 +249,7 @@ async fn pushes_of_a_later_turn_and_a_cancel_wait_for_the_last_push_of_the_turn_
     let order = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let seen = order.lock().unwrap().clone();
-            if seen.iter().any(|s| s == "done:\"c\"") {
+            if seen.iter().any(|s| s == "done:TASK_STATE_CANCELED") {
                 return seen;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -268,7 +274,7 @@ async fn pushes_of_a_later_turn_and_a_cancel_wait_for_the_last_push_of_the_turn_
             "arrive:reply-to-one",
             "arrive:w-two",
             "arrive:reply-to-two",
-            "arrive:\"c\""
+            "arrive:TASK_STATE_CANCELED"
         ],
         "{order:?}"
     );

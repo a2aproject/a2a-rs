@@ -563,7 +563,7 @@ fn push_handler() -> (Arc<DefaultRequestHandler>, Arc<Mutex<Vec<String>>>) {
     (Arc::new(handler), ids)
 }
 
-async fn push_configs(handler: &DefaultRequestHandler, task_id: &str) -> usize {
+async fn push_configs(handler: &DefaultRequestHandler, task_id: &str) -> Result<usize, A2AError> {
     handler
         .list_push_configs(
             &params(),
@@ -575,9 +575,7 @@ async fn push_configs(handler: &DefaultRequestHandler, task_id: &str) -> usize {
             },
         )
         .await
-        .unwrap()
-        .configs
-        .len()
+        .map(|response| response.configs.len())
 }
 
 #[tokio::test]
@@ -590,7 +588,11 @@ async fn a_push_configuration_is_kept_only_for_a_task_that_exists() {
             .send_message(&params(), with_push_config(send(text)))
             .await;
         let id = ids.lock().unwrap().last().unwrap().clone();
-        assert_eq!(push_configs(&handler, &id).await, 0, "{text}");
+        assert_eq!(
+            push_configs(&handler, &id).await.unwrap_err().code,
+            a2a::error_code::TASK_NOT_FOUND,
+            "{text}"
+        );
     }
 
     // A task the executor creates keeps the one the request carried.
@@ -600,7 +602,7 @@ async fn a_push_configuration_is_kept_only_for_a_task_that_exists() {
     let SendMessageResponse::Task(task) = response else {
         panic!("a task is returned");
     };
-    assert_eq!(push_configs(&handler, &task.id).await, 1);
+    assert_eq!(push_configs(&handler, &task.id).await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -658,19 +660,30 @@ async fn a_task_the_executor_has_not_created_yet_is_not_found() {
 #[tokio::test]
 async fn a_first_artifact_event_creates_the_task() {
     let (handler, _) = handler();
-    let mut request = send("artifact");
-    request.configuration = Some(SendMessageConfiguration {
-        return_immediately: Some(true),
-        accepted_output_modes: None,
-        task_push_notification_config: None,
-        history_length: None,
-        timeline_length: None,
-        if_generation_match: None,
-    });
-    let response = handler.send_message(&params(), request).await.unwrap();
-    let SendMessageResponse::Task(task) = response else {
-        panic!("a task is returned");
+    let mut events = handler
+        .send_streaming_message(&params(), send("artifact"))
+        .await
+        .unwrap();
+    let StreamResponse::Task(opening) = events.next().await.unwrap().unwrap() else {
+        panic!("opening task");
     };
+    assert!(matches!(
+        events.next().await.unwrap().unwrap(),
+        StreamResponse::ArtifactUpdate(_)
+    ));
+    let task = handler
+        .get_task(
+            &params(),
+            GetTaskRequest {
+                id: opening.id,
+                tenant: None,
+                history_length: None,
+                timeline_length: None,
+                current_generation: None,
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(task.artifacts.as_ref().map(Vec::len), Some(1));
     assert_eq!(tasks(&handler).await, 1);
 }

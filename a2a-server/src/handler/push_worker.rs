@@ -34,10 +34,49 @@ impl Notification {
 
     async fn deliver(self) -> Endpoint {
         let endpoint = self.endpoint();
-        if let Ok(event) = &self.event.result
-            && let Err(error) = self.sender.send_push(&self.config, event.clone()).await
-        {
-            self.fail(error);
+        let gate = self.source.pushes().map(|settings| {
+            settings.gate(
+                &self.config.task_id,
+                self.config.id.as_deref().unwrap_or_default(),
+            )
+        });
+        loop {
+            let guard = match &gate {
+                Some(gate) => Some(gate.lock().await),
+                None => None,
+            };
+            if let Some(settings) = self.source.pushes() {
+                let current = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    settings.store().get(
+                        &self.config.task_id,
+                        self.config.id.as_deref().unwrap_or_default(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(A2AError::internal("webhook configuration lookup timed out"))
+                });
+                match current {
+                    Ok(current) if current == self.config => {}
+                    Ok(_) => return endpoint,
+                    Err(error) if error.code == error_code::TASK_NOT_FOUND => return endpoint,
+                    Err(error) => {
+                        // Let deletion proceed between failed lookups. A store
+                        // outage must not hold this registration's gate forever.
+                        drop(guard);
+                        self.fail(error);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
+            }
+            if let Ok(event) = &self.event.result
+                && let Err(error) = self.sender.send_push(&self.config, event.clone()).await
+            {
+                self.fail(error);
+            }
+            break;
         }
         // This lease also keeps a successor intake on the same Task source.
         drop(self.source);
@@ -68,18 +107,14 @@ impl PushDispatcher {
         Self { queue }
     }
 
-    pub(super) fn submit(&self, notification: Notification) -> bool {
-        match self.queue.try_send(notification) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(job)) => {
-                job.fail(A2AError::internal("webhook queue full"));
-                true
-            }
-            Err(mpsc::error::TrySendError::Closed(job)) => {
-                job.fail(A2AError::internal("webhook queue unavailable"));
-                false
-            }
+    pub(super) async fn submit(&self, notification: Notification) -> bool {
+        if let Err(error) = self.queue.send(notification).await {
+            error
+                .0
+                .fail(A2AError::internal("webhook queue unavailable"));
+            return false;
         }
+        true
     }
 
     #[cfg(test)]
@@ -120,10 +155,9 @@ async fn dispatch(mut queue: mpsc::Receiver<Notification>, concurrency: usize, c
                 let completed = completed.expect("nonempty request set");
                 busy.retain(|endpoint| endpoint != &completed);
             }
-            next = queue.recv(), if !closed => {
+            next = queue.recv(), if !closed && pending.len() < capacity => {
                 match next {
-                    Some(job) if pending.len() < capacity => pending.push_back(job),
-                    Some(job) => job.fail(A2AError::internal("webhook pending queue full")),
+                    Some(job) => pending.push_back(job),
                     None => closed = true,
                 }
             }
@@ -200,6 +234,7 @@ mod tests {
                 kind: EventKind::Normal,
                 result: Ok(StreamResponse::Task(task)),
                 failure: None,
+                response_task: None,
             }),
             sender: sender.clone(),
             source: source.clone(),
@@ -215,8 +250,16 @@ mod tests {
             TaskHandle::with_background_tasks("task".into(), None, background_tasks.clone());
         let weak = source.downgrade();
         let dispatcher = PushDispatcher::spawn(&background_tasks);
-        assert!(dispatcher.submit(notification("task", 1, &url, &sender, &source)));
-        assert!(dispatcher.submit(notification("task", 2, &url, &sender, &source)));
+        assert!(
+            dispatcher
+                .submit(notification("task", 1, &url, &sender, &source))
+                .await
+        );
+        assert!(
+            dispatcher
+                .submit(notification("task", 2, &url, &sender, &source))
+                .await
+        );
         let (_, _, release) = timeout(Duration::from_secs(2), seen.recv())
             .await
             .unwrap()
@@ -251,13 +294,17 @@ mod tests {
             ("b", 3, "/slow"),
             ("a", 4, "/fast"),
         ] {
-            assert!(queue.submit(notification(
-                task,
-                generation,
-                &format!("{url}{path}"),
-                &sender,
-                &source
-            )));
+            assert!(
+                queue
+                    .submit(notification(
+                        task,
+                        generation,
+                        &format!("{url}{path}"),
+                        &sender,
+                        &source
+                    ))
+                    .await
+            );
         }
         drop(source);
         drop(queue);
@@ -309,7 +356,9 @@ mod tests {
         let source = TaskHandle::new("task".into(), None);
         let (queue, receiver) = PushDispatcher::channel(8);
         for task in ["a", "b", "c", "d"] {
-            queue.submit(notification(task, 1, &url, &sender, &source));
+            queue
+                .submit(notification(task, 1, &url, &sender, &source))
+                .await;
         }
         drop(queue);
         let delivery = tokio::spawn(dispatch(receiver, 2, 8));
@@ -347,32 +396,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_work_is_bounded_and_overflow_signals_the_execution() {
+    async fn pending_work_backpressures_and_every_notification_is_attempted() {
         let sender = sender();
         let (url, mut seen, server) = endpoint(true).await;
         let source = TaskHandle::new("task".into(), None);
-        let (failure, mut observed) = tokio::sync::watch::channel(None);
-        let (queue, receiver) = PushDispatcher::channel(8);
-        for generation in 1..=3 {
-            let mut job = notification("task", generation, &url, &sender, &source);
-            Arc::get_mut(&mut job.event).unwrap().failure = Some(failure.clone());
-            queue.submit(job);
-        }
-        drop(queue);
+        let (queue, receiver) = PushDispatcher::channel(1);
         let delivery = tokio::spawn(dispatch(receiver, 1, 1));
-        timeout(Duration::from_secs(2), observed.changed())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            observed
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .message
-                .contains("pending queue full")
-        );
-        for generation in [1, 2] {
+        let producer = tokio::spawn(async move {
+            for generation in 1..=5 {
+                assert!(
+                    queue
+                        .submit(notification("task", generation, &url, &sender, &source))
+                        .await
+                );
+            }
+        });
+        for generation in 1..=5 {
             let (_, received, release) = timeout(Duration::from_secs(2), seen.recv())
                 .await
                 .unwrap()
@@ -380,14 +419,11 @@ mod tests {
             assert_eq!(received, generation);
             release.unwrap().send(()).unwrap();
         }
+        producer.await.unwrap();
         timeout(Duration::from_secs(2), delivery)
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            seen.try_recv().is_err(),
-            "the rejected notification was never sent"
-        );
         server.abort();
     }
 }

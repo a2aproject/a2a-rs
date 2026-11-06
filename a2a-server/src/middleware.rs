@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_protocol_version_accepts_supported_versions() {
-        for version in ["1.0", "1.1", "1.4", "1.1.99"] {
+        for version in ["1.0", "1.1", "1.1.99"] {
             let params = ServiceParams::from([("a2a-version".to_string(), vec![version.into()])]);
             assert!(check_a2a_version(&params).is_ok(), "{version}");
         }
@@ -178,7 +178,7 @@ mod tests {
         );
 
         for version in [
-            "", "1", "1.", ".1", "1..1", "1.1.x", "0.3", "2.0", "invalid",
+            "", "1", "1.", ".1", "1..1", "1.1.x", "0.3", "1.4", "1.999", "2.0", "invalid",
         ] {
             let params = ServiceParams::from([("a2a-version".to_string(), vec![version.into()])]);
             assert_eq!(
