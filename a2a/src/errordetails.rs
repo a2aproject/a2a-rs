@@ -23,6 +23,10 @@ pub struct FieldViolation {
 /// Each detail object carries a `@type` URL identifying its schema and
 /// a map of additional fields. When serialized to JSON, `@type` is
 /// flattened into the object alongside the value fields.
+///
+/// Over gRPC the details travel in the response trailers, which gRPC clients cap at
+/// 8 KiB by default: the gRPC server always sends the `ErrorInfo` and `BadRequest` and
+/// drops the details that do not fit (`a2a_grpc::errors::MAX_ERROR_TRAILER_BYTES`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedDetail {
     pub type_url: String,
