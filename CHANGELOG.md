@@ -14,6 +14,55 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.4.5...a2a-cli-v0.5.0) - 2026-11-06
+
+### Added
+
+- *(a2acli)* add --ca-cert and --unix-socket ([#513](https://github.com/a2aproject/a2a-rs/pull/513))
+- *(a2acli)* add --save-fileparts to write raw file parts to disk ([#505](https://github.com/a2aproject/a2a-rs/pull/505))
+- *(rest)* serve and send the /{tenant} path prefix ([#468](https://github.com/a2aproject/a2a-rs/pull/468))
+- *(server)* bound the finished tasks InMemoryTaskStore keeps ([#441](https://github.com/a2aproject/a2a-rs/pull/441))
+
+### Fixed
+
+- *(a2acli)* reconnect task subscribe after a connection fails mid-stream ([#511](https://github.com/a2aproject/a2a-rs/pull/511))
+- *(grpc)* keep status details and the gRPC code in client errors ([#508](https://github.com/a2aproject/a2a-rs/pull/508))
+- *(errors)* write the ErrorInfo timestamp with the Z designator ([#500](https://github.com/a2aproject/a2a-rs/pull/500))
+- *(server)* refuse a request that skips a required extension ([#495](https://github.com/a2aproject/a2a-rs/pull/495))
+- *(pb)* write timestamps in wire form where they are serialized ([#501](https://github.com/a2aproject/a2a-rs/pull/501))
+- *(a2a-pb)* keep the REQUIRED fields of ListTasksResponse and AgentCard ([#446](https://github.com/a2aproject/a2a-rs/pull/446))
+- *(a2a-pb)* decode integral Value numbers as integers ([#440](https://github.com/a2aproject/a2a-rs/pull/440))
+- *(a2a-pb)* generate the gRPC code into OUT_DIR ([#409](https://github.com/a2aproject/a2a-rs/pull/409))
+- *(client)* send statusTimestampAfter with the Z designator ([#502](https://github.com/a2aproject/a2a-rs/pull/502))
+- *(client)* select the transport in the agent card's order ([#497](https://github.com/a2aproject/a2a-rs/pull/497))
+- *(client)* percent-encode task and config ids in REST paths ([#450](https://github.com/a2aproject/a2a-rs/pull/450))
+- *(rest)* send stream errors as google.rpc.Status ([#449](https://github.com/a2aproject/a2a-rs/pull/449))
+- *(client)* report the HTTP status of a non-JSON-RPC error response ([#439](https://github.com/a2aproject/a2a-rs/pull/439))
+- *(server)* push the terminal states the handler commits itself ([#498](https://github.com/a2aproject/a2a-rs/pull/498))
+- *(rest)* name an error frame in a stream "error" ([#490](https://github.com/a2aproject/a2a-rs/pull/490))
+- *(rest)* answer a push config deletion with an Empty body ([#489](https://github.com/a2aproject/a2a-rs/pull/489))
+- *(rest)* read status=TASK_STATE_UNSPECIFIED as no filter ([#488](https://github.com/a2aproject/a2a-rs/pull/488))
+- *(jsonrpc)* accept a request without params ([#494](https://github.com/a2aproject/a2a-rs/pull/494))
+- *(jsonrpc)* read A2A-Version from the query parameter ([#469](https://github.com/a2aproject/a2a-rs/pull/469))
+- *(server)* reject a message that does not answer the request alone ([#464](https://github.com/a2aproject/a2a-rs/pull/464))
+- *(server)* apply historyLength to streamed task snapshots ([#463](https://github.com/a2aproject/a2a-rs/pull/463))
+- *(server)* keep the INPUT_REQUIRED question in task history ([#462](https://github.com/a2aproject/a2a-rs/pull/462))
+- *(server)* mark a task FAILED when its execution fails ([#459](https://github.com/a2aproject/a2a-rs/pull/459))
+- *(rest)* pass CancelTask metadata from the request body ([#458](https://github.com/a2aproject/a2a-rs/pull/458))
+- *(rest)* answer extractor rejections with google.rpc.Status ([#451](https://github.com/a2aproject/a2a-rs/pull/451))
+- *(server)* send push credentials of any authentication scheme ([#448](https://github.com/a2aproject/a2a-rs/pull/448))
+- *(server)* omit task artifacts from ListTasks unless asked ([#447](https://github.com/a2aproject/a2a-rs/pull/447))
+- *(server)* include tasks stamped at the statusTimestampAfter bound ([#445](https://github.com/a2aproject/a2a-rs/pull/445))
+- *(server)* let SubscribeToTask follow a task that awaits input ([#444](https://github.com/a2aproject/a2a-rs/pull/444))
+- *(server)* enforce A2A-Version on the REST and gRPC bindings ([#443](https://github.com/a2aproject/a2a-rs/pull/443))
+- *(server)* send REST errors as application/json ([#455](https://github.com/a2aproject/a2a-rs/pull/455))
+- *(grpc)* send every value of a service parameter ([#457](https://github.com/a2aproject/a2a-rs/pull/457))
+
+### Other
+
+- *(readme)* install the crates with cargo add ([#408](https://github.com/a2aproject/a2a-rs/pull/408))
+- *(deps)* replace unmaintained rustls-pemfile and serde_yaml ([#461](https://github.com/a2aproject/a2a-rs/pull/461))
+
 ## [0.4.5](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.4.4...a2a-cli-v0.4.5) - 2026-10-18
 
 ### Other
