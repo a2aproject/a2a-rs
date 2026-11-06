@@ -21,8 +21,8 @@ use crate::common::{
     A2A_COLLABORATIVE_CHANNEL_SERVICE, A2A_SLIMRPC_SERVICE, METHOD_CANCEL_TASK, METHOD_COLLABORATE,
     METHOD_CREATE_PUSH_CONFIG, METHOD_DELETE_PUSH_CONFIG, METHOD_GET_EXTENDED_AGENT_CARD,
     METHOD_GET_PUSH_CONFIG, METHOD_GET_TASK, METHOD_LIST_PUSH_CONFIGS, METHOD_LIST_TASKS,
-    METHOD_SEND_MESSAGE, METHOD_SEND_STREAMING_MESSAGE, METHOD_SUBSCRIBE_TO_TASK,
-    SLIM_SRC_METADATA_KEY, decode_proto_response, encode_proto_message,
+    METHOD_SEND_LIVE_MESSAGE, METHOD_SEND_MESSAGE, METHOD_SEND_STREAMING_MESSAGE,
+    METHOD_SUBSCRIBE_TO_TASK, SLIM_SRC_METADATA_KEY, decode_proto_response, encode_proto_message,
     service_params_to_metadata_opt,
 };
 use crate::errors::rpc_error_to_a2a_error;
@@ -177,6 +177,25 @@ impl SlimRpcTransport {
     }
 }
 
+/// The uplink of a live exchange over SLIMRPC: requests are written to the
+/// stream the call opened. It closes when the last sender is dropped.
+struct SlimLiveUplink {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+#[async_trait]
+impl a2a_client::LiveUplink for SlimLiveUplink {
+    async fn send(&self, request: StreamRequest) -> Result<a2a_client::LiveAck, A2AError> {
+        self.sender
+            .send(encode_proto_message(&pbconv::to_proto_stream_request(
+                &request,
+            )))
+            .await
+            .map_err(|_| A2AError::invalid_request("the live exchange is no longer open"))?;
+        Ok(a2a_client::LiveAck::Sent)
+    }
+}
+
 #[async_trait]
 impl Transport for SlimRpcTransport {
     async fn send_message(
@@ -216,6 +235,56 @@ impl Transport for SlimRpcTransport {
         Ok(Box::pin(stream.filter_map(|item| {
             std::future::ready(decode_stream_item(item))
         })))
+    }
+
+    async fn send_live_message(
+        &self,
+        params: &ServiceParams,
+        first: &StreamRequest,
+    ) -> Result<a2a_client::LiveConnection, A2AError> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        sender
+            .send(encode_proto_message(&pbconv::to_proto_stream_request(
+                first,
+            )))
+            .await
+            .map_err(|_| A2AError::internal("could not queue the first live request"))?;
+
+        // As for the other streaming calls, the channel is owned by the
+        // generator so the returned stream is `'static`.
+        let channel = self.channel.clone();
+        let metadata = service_params_to_metadata_opt(params);
+        let events = async_stream::stream! {
+            let inner = channel.stream_stream::<Vec<u8>, Vec<u8>>(
+                A2A_SLIMRPC_SERVICE,
+                METHOD_SEND_LIVE_MESSAGE,
+                tokio_stream::wrappers::ReceiverStream::new(receiver),
+                None,
+                metadata,
+            );
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().await {
+                match item {
+                    Ok(data) => match decode_proto_response::<a2a_pb::proto::StreamResponse>(
+                        data,
+                        "StreamResponse",
+                    ) {
+                        // Payload kinds this client does not know are skipped.
+                        Ok(response) => {
+                            if let Some(event) = pbconv::from_proto_stream_response(&response) {
+                                yield Ok(event);
+                            }
+                        }
+                        Err(error) => yield Err(error),
+                    },
+                    Err(error) => yield Err(rpc_error_to_a2a_error(&error)),
+                }
+            }
+        };
+        Ok(a2a_client::LiveConnection {
+            events: Box::pin(events),
+            sender: a2a_client::LiveSender::new(Arc::new(SlimLiveUplink { sender })),
+        })
     }
 
     async fn get_task(
@@ -505,5 +574,34 @@ mod stream_decode_tests {
     fn stream_error_is_reported() {
         let item = decode_stream_item(Err(A2AError::internal("boom")));
         assert!(matches!(item, Some(Err(_))));
+    }
+    #[tokio::test]
+    async fn live_uplink_preserves_routing_and_reports_a_closed_exchange() {
+        use a2a_client::LiveUplink;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let uplink = SlimLiveUplink { sender };
+        let request = StreamRequest {
+            tenant: Some("tenant-a".into()),
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: Some("tenant-a".into()),
+                last_seen_generation: Some(i64::MAX),
+            }),
+        };
+        assert!(matches!(
+            uplink.send(request.clone()).await.unwrap(),
+            a2a_client::LiveAck::Sent
+        ));
+        let wire = receiver.recv().await.unwrap();
+        let wire =
+            decode_proto_response::<a2a_pb::proto::StreamRequest>(wire, "StreamRequest").unwrap();
+        assert_eq!(pbconv::from_proto_stream_request(&wire), request);
+        drop(receiver);
+        let error = uplink
+            .send(request)
+            .await
+            .err()
+            .expect("closed uplink must reject the request");
+        assert_eq!(error.code, error_code::INVALID_REQUEST);
     }
 }

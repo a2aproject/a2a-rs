@@ -34,7 +34,9 @@ mod wire;
 pub use client::A2AClient;
 pub use factory::A2AClientFactory;
 pub use futures::stream::BoxStream;
-pub use transport::{ServiceParams, Transport, TransportFactory};
+pub use transport::{
+    LiveAck, LiveConnection, LiveSender, LiveUplink, ServiceParams, Transport, TransportFactory,
+};
 
 #[cfg(any(feature = "rustls-tls", feature = "rustls-no-provider"))]
 pub use rustls;
