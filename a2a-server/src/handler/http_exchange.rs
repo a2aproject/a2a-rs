@@ -185,7 +185,7 @@ async fn route(
 mod tests {
     use super::*;
     use crate::handler::protocol::{ResponsePolicy, StartMode};
-    use crate::handler::response::{Events, Run};
+    use crate::handler::response::{ResponseStream, Run};
     use crate::handler::test_support::*;
     use crate::handler::uplink::Receipt;
     use tokio::sync::oneshot;
@@ -254,7 +254,7 @@ mod tests {
     async fn runner_panic_releases_the_lease_before_reporting_the_error() {
         let handler = make_handler();
         let run = bound_run(&handler).await;
-        let events: Events =
+        let events: ResponseStream =
             futures::stream::once(async { panic!("response stream panicked") }).boxed();
         let mut output = run.start(None, Some(events), 0);
         assert!(matches!(

@@ -9,7 +9,7 @@ use super::events::ActiveExecution;
 use super::protocol::{
     self, EventKind, ExecutionFailure, ExecutionProtocol, OutputKind, Rejection,
 };
-use super::task_handle::TaskController;
+use super::task_handle::{TaskCommand, TaskController, TaskOperation};
 use crate::executor::{ClientInput, ClientInputSender, QueuedInput, ReturnedInputs};
 use a2a::*;
 use futures::StreamExt;
@@ -130,9 +130,15 @@ async fn drive_execution(
     request: ExecutionRequest,
 ) {
     let end = poll_executor(&handler, &active, request).await;
-    handler
-        .tasks
-        .finished(handler.clone(), active, end)
+    active
+        .task
+        .clone()
+        .request(TaskOperation::Finished, |reply| TaskCommand::Finished {
+            handler: handler.clone(),
+            active,
+            end,
+            reply,
+        })
         .await
         .expect("execution completion must reach the task service");
 }
@@ -188,10 +194,16 @@ async fn poll_executor(
                     Err(error) => return TurnEnd::Failed(error),
                     _ => {}
                 }
-                let action = handler
-                    .tasks
-                    .output(handler.clone(), active.clone(), event)
-                    .await;
+                let action = active
+                    .task
+                    .request(TaskOperation::Output, |reply| TaskCommand::Output {
+                        handler: handler.clone(),
+                        active: active.clone(),
+                        event: Box::new(event),
+                        reply,
+                    })
+                    .await
+                    .and_then(std::convert::identity);
                 match action {
                     Ok(super::task_handle::OutputAction::Continue) => {}
                     Ok(super::task_handle::OutputAction::Stopped) => return TurnEnd::Stopped,
@@ -225,7 +237,15 @@ pub(super) async fn drive_execution_guarded(
         return;
     }
 
-    let _ = recovery.tasks.panicked(recovery.clone(), active).await;
+    let _ = active
+        .task
+        .clone()
+        .request(TaskOperation::Finished, |reply| TaskCommand::Panicked {
+            handler: recovery,
+            active,
+            reply,
+        })
+        .await;
 }
 
 /// Starts the invocation that takes over `unread` inside the completion
@@ -290,11 +310,12 @@ pub(super) async fn save_pending_push_config(
     active: &ActiveExecution,
     handler: &DefaultRequestHandler,
     state: &mut TaskController,
-) {
+) -> Result<(), A2AError> {
     if let (Some(invocation), Some(pushes)) = (state.execution.bookkeeping(active), &handler.pushes)
     {
-        pushes.save_pending(&mut invocation.pending_push).await;
+        pushes.save_pending(&mut invocation.pending_push).await?;
     }
+    Ok(())
 }
 
 /// Closes the task-input queue and tells the exchanges about each
@@ -328,7 +349,9 @@ pub(super) async fn reject_inputs(
     for input in inputs {
         let event = Rejection::unread_input()
             .into_stream_error(task_id, Some(input.message.message_id.clone()));
-        active.publish_kind(Ok(&event), None, EventKind::LiveOnly(input.response_id));
+        active
+            .publish_kind(Ok(&event), None, EventKind::LiveOnly(input.response_id))
+            .await;
     }
 }
 
@@ -368,10 +391,10 @@ pub(super) async fn publish_failure(
     error: &A2AError,
 ) {
     let failed = persist_failure(handler, active, task_id, error).await;
-    active.publish(Err(error), failed.clone());
+    active.publish(Err(error), failed.clone()).await;
     if let Some(task) = failed {
         let event = protocol::current_status_event(task);
-        active.publish(Ok(&event), None);
+        active.publish(Ok(&event), None).await;
     }
 }
 
@@ -993,18 +1016,26 @@ mod turn_tests {
             active: active.clone(),
             bookkeeping: invocation,
         });
-        save_pending_push_config(&active, &runtime, &mut state).await;
+        assert!(
+            save_pending_push_config(&active, &runtime, &mut state)
+                .await
+                .is_err()
+        );
         assert!(
             state
                 .execution
                 .bookkeeping(&active)
                 .unwrap()
                 .pending_push
-                .is_none()
+                .is_some()
         );
         assert_eq!(store.list("configured").await.unwrap().len(), 50);
         assert!(store.get("configured", "50").await.is_err());
-        save_pending_push_config(&active, &runtime, &mut state).await;
+        assert!(
+            save_pending_push_config(&active, &runtime, &mut state)
+                .await
+                .is_err()
+        );
         assert_eq!(store.list("configured").await.unwrap().len(), 50);
     }
 

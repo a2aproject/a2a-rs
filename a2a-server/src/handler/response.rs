@@ -1,31 +1,26 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Follow task output with a shared runner and shared response settings.
+//! Deliver task streams directly; run live uplinks independently of execution.
 
+use super::delivery::Delivery;
+use super::events::{ExecutionReceiver, subscription_stream};
 use super::http_exchange::RegistrationLease;
 #[cfg(test)]
 use super::protocol::StartMode;
 use super::protocol::{
-    DeliveryAttachment, IncomingRequest, Rejection, ResponsePolicy, StreamDecision, generation_of,
+    self, IncomingRequest, InputCursor, OpeningPolicy, Rejection, ResponsePolicy, StreamDecision,
+    generation_of,
 };
-use super::response_preparation::{attach_delivery, event_stream};
 use super::task_handle::TaskHandle;
+use super::task_service::TaskService;
 use super::uplink::{Incoming, Receipt, Uplink};
 use super::{DefaultRequestHandler, RESPONSE_BUFFER_CAPACITY};
 use crate::middleware::ServiceParams;
 use a2a::*;
 use futures::{FutureExt, StreamExt, stream::BoxStream};
+use std::sync::Arc;
 use tokio::sync::mpsc;
-
-/// What looking at an idle task found.
-enum Reattach {
-    /// The exchange is over (the task ended, or is gone).
-    End,
-    /// The exchange follows a running execution now, or was told of a change.
-    Changed,
-    Unchanged,
-}
 
 /// Follows task events and optionally accepts requests through an uplink.
 pub(super) struct Run {
@@ -42,8 +37,7 @@ pub(super) struct Run {
     settings: ResponsePolicy,
 }
 
-pub(super) type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
-type ResponseSender = mpsc::Sender<Result<StreamResponse, A2AError>>;
+pub(super) type ResponseStream = BoxStream<'static, Result<StreamResponse, A2AError>>;
 
 impl Run {
     pub(super) fn new(
@@ -80,9 +74,19 @@ impl Run {
     pub(super) fn start(
         self,
         opening: Option<Task>,
-        inner: Option<Events>,
+        inner: Option<ResponseStream>,
         seen_generation: i64,
-    ) -> Events {
+    ) -> ResponseStream {
+        if !self.settings.is_live() {
+            return task_response(
+                self.handler,
+                self.task,
+                self.settings,
+                opening,
+                inner,
+                seen_generation,
+            );
+        }
         let (out, downlink) = mpsc::channel(RESPONSE_BUFFER_CAPACITY);
         let source = self.task.clone();
         self.spawn(opening, inner, seen_generation, out);
@@ -98,9 +102,9 @@ impl Run {
     fn spawn(
         self,
         opening: Option<Task>,
-        inner: Option<Events>,
+        inner: Option<ResponseStream>,
         seen_generation: i64,
-        out: ResponseSender,
+        out: mpsc::Sender<Result<StreamResponse, A2AError>>,
     ) {
         let failure_sink = out.clone();
         let background_tasks = self.handler.tasks.background_tasks.clone();
@@ -117,19 +121,18 @@ impl Run {
         });
     }
 
-    fn completes(&self, event: &StreamResponse) -> bool {
-        self.settings.completes(event)
-    }
-
     /// Forward one event, keeping generation tracking and response completion
     /// identical whether it arrives normally or while flushing queued output.
     /// Returns false after completion or when the downlink is closed.
     async fn forward(
         &mut self,
-        item: Result<StreamResponse, A2AError>,
+        mut item: Result<StreamResponse, A2AError>,
         last_generation: &mut i64,
-        out: &ResponseSender,
+        out: &mpsc::Sender<Result<StreamResponse, A2AError>>,
     ) -> bool {
+        if let Ok(StreamResponse::Task(task)) = &mut item {
+            self.settings.trim(task);
+        }
         let keep_open = self.settings.after_event(&item) == StreamDecision::KeepOpen;
         if let Some(generation) = item.as_ref().ok().and_then(generation_of) {
             *last_generation = (*last_generation).max(generation);
@@ -140,13 +143,11 @@ impl Run {
     fn run(
         mut self,
         opening: Option<Task>,
-        mut inner: Option<Events>,
+        mut inner: Option<ResponseStream>,
         seen_generation: i64,
-        out: ResponseSender,
+        out: mpsc::Sender<Result<StreamResponse, A2AError>>,
     ) -> futures::future::BoxFuture<'static, ()> {
         Box::pin(async move {
-            // Register before the first state read so intervening changes are observed.
-            let mut watch = self.task.watch();
             let mut last_generation = seen_generation;
             let mut uplink_open = self.uplink.is_some();
             if !self
@@ -170,9 +171,12 @@ impl Run {
                             break;
                         }
                     },
-                    () = watch.changed(), if inner.is_none() ||
-                        (self.settings.is_live() && !uplink_open) => {
-                        if !self.handle_task_change(&mut inner, &mut last_generation, &out, uplink_open).await {
+                    () = async {
+                        let finished = self.task.active().map(|active| active.finished.clone());
+                        if let Some(finished) = finished { finished.cancelled().await; }
+                    }, if !uplink_open => {
+                        if self.task.active().is_none() {
+                            self.flush(&mut inner, &mut last_generation, &out).await;
                             break;
                         }
                     },
@@ -195,9 +199,9 @@ impl Run {
     async fn initialize_response(
         &mut self,
         opening: Option<Task>,
-        inner: &mut Option<Events>,
+        inner: &mut Option<ResponseStream>,
         last_generation: &mut i64,
-        out: &ResponseSender,
+        out: &mpsc::Sender<Result<StreamResponse, A2AError>>,
     ) -> bool {
         if let Some(task) = opening
             && !self
@@ -206,61 +210,49 @@ impl Run {
         {
             return false;
         }
-        inner.is_some()
-            || !matches!(
-                self.reattach(inner, last_generation, out).await,
-                Reattach::End
-            )
+        if inner.is_none() {
+            let (receiver, _, sequence) =
+                super::events::ExecutionReceiver::for_task(self.task.clone());
+            match self.handler.tasks.load(self.task.id()).await {
+                Ok(task) => {
+                    if !self
+                        .forward(Ok(StreamResponse::Task(task)), last_generation, out)
+                        .await
+                    {
+                        return false;
+                    }
+                    *inner = Some(event_stream(self.settings, receiver, None, sequence));
+                }
+                Err(error) => {
+                    self.forward(Err(error), last_generation, out).await;
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     async fn handle_output(
         &mut self,
         event: Option<Result<StreamResponse, A2AError>>,
-        inner: &mut Option<Events>,
+        _inner: &mut Option<ResponseStream>,
         last_generation: &mut i64,
-        out: &ResponseSender,
-        uplink_open: bool,
+        out: &mpsc::Sender<Result<StreamResponse, A2AError>>,
+        _uplink_open: bool,
     ) -> bool {
-        if let Some(event) = event {
-            return self.forward(event, last_generation, out).await;
+        match event {
+            Some(event) => self.forward(event, last_generation, out).await,
+            None => false,
         }
-        // An invocation ending need not end the task or its client response.
-        *inner = None;
-        if self.settings.is_live() && !uplink_open {
-            return false;
-        }
-        !matches!(
-            self.reattach(inner, last_generation, out).await,
-            Reattach::End
-        )
-    }
-
-    async fn handle_task_change(
-        &mut self,
-        inner: &mut Option<Events>,
-        last_generation: &mut i64,
-        out: &ResponseSender,
-        uplink_open: bool,
-    ) -> bool {
-        if inner.is_some() && !uplink_open && self.task.active().is_none() {
-            // A closed uplink finishes after the invocation and buffered output.
-            self.flush(inner, last_generation, out).await;
-            return false;
-        }
-        inner.is_some()
-            || !matches!(
-                self.reattach(inner, last_generation, out).await,
-                Reattach::End
-            )
     }
 
     async fn handle_uplink(
         &mut self,
         item: Option<Incoming>,
         uplink_open: &mut bool,
-        inner: &mut Option<Events>,
+        inner: &mut Option<ResponseStream>,
         last_generation: &mut i64,
-        out: &ResponseSender,
+        out: &mpsc::Sender<Result<StreamResponse, A2AError>>,
     ) -> bool {
         if let Some(item) = item {
             return self.handle(item, inner, last_generation, out).await;
@@ -286,57 +278,14 @@ impl Run {
         }
     }
 
-    /// Looks at the task while the exchange follows no execution. Follows a new
-    /// one if it has started, tells the client of changes it was not there for
-    /// (and that the task has ended). `false` when the exchange is over.
-    async fn reattach(
-        &mut self,
-        inner: &mut Option<Events>,
-        last_generation: &mut i64,
-        out: &ResponseSender,
-    ) -> Reattach {
-        if let Some((receiver, Some(snapshot), sequence)) = self.task.resubscribe_active() {
-            let event = StreamResponse::Task(snapshot.clone());
-            let ends = self.completes(&event);
-            let opening =
-                (snapshot.generation > *last_generation || ends).then_some(snapshot.clone());
-            *last_generation = (*last_generation).max(snapshot.generation);
-            *inner = Some(event_stream(self.settings, receiver, opening, sequence));
-            return Reattach::Changed;
-        }
-        let task = match self.handler.tasks.load(self.task.id()).await {
-            Ok(task) => task,
-            Err(error) => {
-                self.forward(Err(error), last_generation, out).await;
-                return Reattach::End;
-            }
-        };
-        let ended = self.completes(&StreamResponse::Task(task.clone()));
-        let changed = task.generation > *last_generation;
-        if (ended || changed)
-            && !self
-                .forward(Ok(StreamResponse::Task(task)), last_generation, out)
-                .await
-        {
-            return Reattach::End;
-        }
-        if ended {
-            Reattach::End
-        } else if changed {
-            Reattach::Changed
-        } else {
-            Reattach::Unchanged
-        }
-    }
-
     /// Carries out one request that arrived after the exchange opened. Returns
     /// `false` when the downlink is gone.
     async fn handle(
         &mut self,
         item: Incoming,
-        inner: &mut Option<Events>,
+        inner: &mut Option<ResponseStream>,
         last_generation: &mut i64,
-        out: &ResponseSender,
+        out: &mpsc::Sender<Result<StreamResponse, A2AError>>,
     ) -> bool {
         let Incoming { request, receipt } = item;
         // Mark processing before delivery: a lost task now leaves an unknown
@@ -368,9 +317,9 @@ impl Run {
     /// exchange ended with a terminal event.
     async fn flush(
         &mut self,
-        inner: &mut Option<Events>,
+        inner: &mut Option<ResponseStream>,
         last_generation: &mut i64,
-        out: &ResponseSender,
+        out: &mpsc::Sender<Result<StreamResponse, A2AError>>,
     ) -> bool {
         while let Some(events) = inner.as_mut() {
             match events.next().now_or_never() {
@@ -389,12 +338,18 @@ impl Run {
     async fn deliver(
         &mut self,
         request: IncomingRequest,
-        inner: &mut Option<Events>,
-        last_generation: &mut i64,
-        out: &ResponseSender,
+        inner: &mut Option<ResponseStream>,
+        _last_generation: &mut i64,
+        out: &mpsc::Sender<Result<StreamResponse, A2AError>>,
     ) -> Result<bool, Rejection> {
-        let delivery = self
-            .handler
+        // The response is already subscribed to the task before admitting input.
+        // Even a formerly idle task publishes into this same receiver.
+        if inner.is_none() {
+            let (receiver, _, sequence) =
+                super::events::ExecutionReceiver::for_task(self.task.clone());
+            *inner = Some(event_stream(self.settings, receiver, None, sequence));
+        }
+        self.handler
             .receive_message(
                 &self.params,
                 request.into_message()?,
@@ -403,35 +358,270 @@ impl Run {
                 self.settings.response_id(),
             )
             .await?;
-        // The source belongs to the Task, so this subscription also receives
-        // a newly started turn's input and output. Keep its buffered events:
-        // replacing it or replaying recorded inputs would duplicate updates.
-        if inner.is_some() {
-            return Ok(true);
+        Ok(!out.is_closed())
+    }
+}
+
+/// Poll a task response directly in the caller, without spawning a response worker.
+pub(super) fn task_response(
+    handler: DefaultRequestHandler,
+    task: TaskHandle,
+    policy: ResponsePolicy,
+    opening: Option<Task>,
+    inner: Option<ResponseStream>,
+    seen_generation: i64,
+) -> ResponseStream {
+    let background = handler.tasks.background_tasks.clone();
+    let stream = async_stream::stream! {
+        let (receiver, _, sequence) = super::events::ExecutionReceiver::for_task(task.clone());
+        let mut last_generation = seen_generation;
+        if let Some(task) = opening {
+            last_generation = last_generation.max(task.generation);
+            yield Ok(StreamResponse::Task(task));
         }
-        let subscription = attach_delivery(self.settings, delivery, DeliveryAttachment::FollowUp);
-        *inner = Some(subscription.events);
-        // This response was detached when input was published. Announce the
-        // recorded input once; the newly attached receiver starts after it.
-        for event in subscription.recorded {
-            if matches!(event, StreamResponse::MessageUpdate(_))
-                && !self.settings.wants_message_updates()
-            {
+        if let Some(mut events) = inner {
+            while let Some(item) = events.next().await {
+                if let Some(generation) = item.as_ref().ok().and_then(generation_of) {
+                    last_generation = last_generation.max(generation);
+                }
+                yield item;
+            }
+        }
+        // An invocation ending does not end a task. Resolve its final snapshot
+        // once, then continue on the receiver registered above.
+        match handler.tasks.load(task.id()).await {
+            Ok(task) => {
+                if task.generation > last_generation || policy.completes(&StreamResponse::Task(task.clone())) {
+                    yield Ok(StreamResponse::Task(task));
+                }
+            }
+            Err(error) => { yield Err(error); return; }
+        }
+        let mut events = event_stream(policy, receiver, None, sequence);
+        while let Some(item) = events.next().await {
+            if item.as_ref().ok().and_then(generation_of).is_some_and(|g| g <= last_generation) {
                 continue;
             }
-            if !self.forward(Ok(event), last_generation, out).await {
-                return Ok(false);
-            }
+            yield item;
         }
-        Ok(true)
+    };
+    let stream = std::panic::AssertUnwindSafe(stream).catch_unwind();
+    futures::stream::unfold(
+        (Box::pin(stream), false, background),
+        move |(mut stream, done, background)| async move {
+            if done {
+                return None;
+            }
+            let item = tokio::select! {
+                () = background.cancelled() => return None,
+                item = stream.next() => item?,
+            };
+            let item =
+                item.unwrap_or_else(|_| Err(A2AError::internal("the response runner failed")));
+            let done = policy.after_event(&item) == StreamDecision::Close;
+            Some((item, (stream, done, background)))
+        },
+    )
+    .boxed()
+}
+
+/// Consume the response until its policy closes it, returning its captured Task.
+/// A direct reply requires no stored task; retention may remove a terminal task.
+pub(super) async fn unary_response(
+    tasks: Arc<TaskService>,
+    task: TaskHandle,
+    mut events: ResponseStream,
+) -> Result<SendMessageResponse, A2AError> {
+    let mut snapshot = None;
+    while let Some(event) = events.next().await {
+        match event? {
+            StreamResponse::Message(message) => return Ok(SendMessageResponse::Message(message)),
+            StreamResponse::Task(task) => snapshot = Some(task),
+            // A raw delta invalidates the preceding snapshot. Production unary
+            // subscriptions supply a full snapshot for their completion event.
+            _ => snapshot = None,
+        }
     }
+    if let Some(snapshot) = snapshot {
+        return Ok(SendMessageResponse::Task(snapshot));
+    }
+    let snapshot = match tasks.load(task.id()).await {
+        Ok(snapshot) => snapshot,
+        Err(error) if error.code == error_code::TASK_NOT_FOUND => match task.snapshot() {
+            Some(snapshot) if snapshot.status.state.is_terminal() => snapshot,
+            _ => return Err(error),
+        },
+        Err(error) => return Err(error),
+    };
+    Ok(SendMessageResponse::Task(snapshot))
+}
+
+pub(super) type TaskEvents = (TaskHandle, ResponseStream);
+
+/// Turn one admission result into its operation's opening and task stream.
+pub(super) fn message_response(delivery: Delivery, settings: ResponsePolicy) -> TaskEvents {
+    let handle = delivery.handle();
+    let (task, events) = attach_delivery(settings, delivery);
+    let events = match settings.opening() {
+        OpeningPolicy::None => events,
+        OpeningPolicy::OnFirstEvent => with_opening_task(events, task),
+        OpeningPolicy::Snapshot => {
+            futures::stream::once(async move { Ok(StreamResponse::Task(task)) })
+                .chain(events)
+                .boxed()
+        }
+    };
+    (handle, events)
+}
+
+/// Opens a stream with the task, as A2A requires of a streaming send
+/// (§3.1.2). An agent that answers with a message alone gets a stream that is
+/// that message and nothing else, and one whose first event is already a task
+/// snapshot needs no other opening. Otherwise (a status or artifact update
+/// first) the server's own snapshot goes first, so a client never has to guess
+/// the task's state from a partial event.
+pub(super) fn with_opening_task(
+    stream: BoxStream<'static, Result<StreamResponse, A2AError>>,
+    opening: Task,
+) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    Box::pin(
+        futures::stream::once(async move {
+            let mut stream = stream;
+            let Some(first) = stream.next().await else {
+                // The executor said nothing a client should see (it only
+                // restated the task, or ended): the stream is the task.
+                return futures::stream::iter([Ok(StreamResponse::Task(opening))]).boxed();
+            };
+            let head = if protocol::needs_opening_task(&first) {
+                vec![Ok(StreamResponse::Task(opening)), first]
+            } else {
+                vec![first]
+            };
+            futures::stream::iter(head).chain(stream).boxed()
+        })
+        .flatten(),
+    )
+}
+
+/// Attach the protocol-selected cursor to the actual task event receiver.
+pub(super) fn event_stream(
+    policy: ResponsePolicy,
+    receiver: ExecutionReceiver,
+    opening: Option<Task>,
+    sequence: u64,
+) -> ResponseStream {
+    let receiver = receiver.follow_task();
+    subscription_stream_with_policy(policy, receiver, opening, sequence)
+}
+
+fn subscription_stream_with_policy(
+    policy: ResponsePolicy,
+    receiver: ExecutionReceiver,
+    opening: Option<Task>,
+    sequence: u64,
+) -> ResponseStream {
+    let filter = policy.event_filter();
+    subscription_stream(receiver, opening, sequence, filter)
+}
+
+pub(super) fn attach_delivery(
+    policy: ResponsePolicy,
+    delivery: Delivery,
+) -> (Task, ResponseStream) {
+    let plan = policy.delivery_plan();
+    let (task, receiver, sequence) = match delivery {
+        Delivery::Started { task, receiver } => (task, plan.attach_receiver.then_some(receiver), 0),
+        Delivery::Injected {
+            task,
+            receiver,
+            sequence_before,
+            sequence_after,
+        } => {
+            let sequence = match plan.cursor {
+                InputCursor::Before => sequence_before,
+                InputCursor::After => sequence_after,
+            };
+            (task, plan.attach_receiver.then_some(receiver), sequence)
+        }
+    };
+    let events = match receiver {
+        Some(receiver) if plan.wait_for_first_output => {
+            subscription_stream_with_policy(policy, receiver.opening_message(), None, sequence)
+        }
+        Some(receiver) => event_stream(policy, receiver, None, sequence),
+        None => futures::stream::once({
+            let task = task.clone();
+            async move { Ok(StreamResponse::Task(task)) }
+        })
+        .boxed(),
+    };
+    (task, events)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::response_preparation::MessageResponse;
+    use crate::handler::response::unary_response;
     use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn ordinary_subscriptions_do_not_spawn_response_workers() {
+        let release = Arc::new(Notify::new());
+        let handler = DefaultRequestHandler::new(
+            ResumableExecutor {
+                release: release.clone(),
+            },
+            InMemoryTaskStore::new(),
+        )
+        .with_capabilities(AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        });
+        let mut request = send_req(None, None);
+        request.configuration =
+            Some(serde_json::from_value(serde_json::json!({"returnImmediately":true})).unwrap());
+        let SendMessageResponse::Task(task) = handler
+            .send_message(&ServiceParams::new(), request)
+            .await
+            .unwrap()
+        else {
+            panic!("expected task");
+        };
+        let before = handler.tasks.background_tasks.count();
+        assert_eq!(before, 2, "only the controller and executor run");
+        let subscribe = || SubscribeToTaskRequest {
+            id: task.id.clone(),
+            tenant: None,
+            last_seen_generation: None,
+        };
+        let mut first = handler
+            .subscribe_to_task(&ServiceParams::new(), subscribe())
+            .await
+            .unwrap();
+        let mut second = handler
+            .subscribe_to_task(&ServiceParams::new(), subscribe())
+            .await
+            .unwrap();
+        assert!(matches!(
+            first.next().await,
+            Some(Ok(StreamResponse::Task(_)))
+        ));
+        assert!(matches!(
+            second.next().await,
+            Some(Ok(StreamResponse::Task(_)))
+        ));
+        assert_eq!(handler.tasks.background_tasks.count(), before);
+        drop((first, second));
+        release.notify_one();
+        timeout(Duration::from_secs(2), async {
+            while handler.tasks.background_tasks.count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        handler.shutdown().await;
+    }
 
     #[tokio::test]
     async fn blocking_response_waits_after_a_working_turn_ends() {
@@ -455,12 +645,7 @@ mod tests {
         let events = run.start(None, Some(events), 0);
         let tasks = handler.tasks.clone();
         let mut response = tokio::spawn(async move {
-            let MessageResponse::Task(task) =
-                MessageResponse::receive(tasks.clone(), tasks.task("working"), events).await?
-            else {
-                panic!("expected a task response");
-            };
-            task.wait().await
+            unary_response(tasks.clone(), tasks.task("working"), events).await
         });
         drained.notified().await;
         assert!(
@@ -496,7 +681,7 @@ mod tests {
         seed_task(&handler, "task", "context").await;
         let task = handler.tasks.load("task").await.unwrap();
         for mode in [StartMode::Blocking, StartMode::Streaming, StartMode::Bidi] {
-            let events = || -> Events {
+            let events = || -> ResponseStream {
                 futures::stream::iter(
                     [
                         TaskState::Working,
@@ -615,17 +800,14 @@ mod tests {
             async move { Ok(StreamResponse::Message(message)) }
         })
         .boxed();
-        let response =
-            MessageResponse::receive(handler.tasks.clone(), handler.tasks.task("missing"), events)
-                .await
-                .unwrap();
-        assert!(matches!(response, MessageResponse::Message(reply) if reply == message));
+        let response = unary_response(handler.tasks.clone(), handler.tasks.task("missing"), events)
+            .await
+            .unwrap();
+        assert!(matches!(response, SendMessageResponse::Message(reply) if reply == message));
         let events = stream::once(async { Err(A2AError::internal("executor error")) }).boxed();
-        let error =
-            MessageResponse::receive(handler.tasks.clone(), handler.tasks.task("missing"), events)
-                .await
-                .err()
-                .expect("executor error");
+        let error = unary_response(handler.tasks.clone(), handler.tasks.task("missing"), events)
+            .await
+            .expect_err("executor error");
         assert_eq!(error.message, "executor error");
     }
 
@@ -735,10 +917,14 @@ mod delivery_tests {
                     });
                 assert_eq!(keep_open, !disconnected);
                 assert!(inner.is_some(), "the followup must attach task output");
+                run.flush(&mut inner, &mut generation, &out).await;
                 if let Some(received) = &mut received {
                     let mut updates = Vec::new();
                     while let Ok(event) = received.try_recv() {
-                        updates.push(event.unwrap());
+                        let event = event.unwrap();
+                        if generation_of(&event).is_some_and(|generation| generation <= 2) {
+                            updates.push(event);
+                        }
                     }
                     assert_eq!(updates.len(), if wants_messages { 2 } else { 1 });
                     assert!(
@@ -749,7 +935,7 @@ mod delivery_tests {
                             matches!(&updates[0], StreamResponse::MessageUpdate(update) if update.message.message_id == message_id)
                         );
                     }
-                    assert_eq!(generation, 2);
+                    assert!(generation >= 2);
                 }
                 let task = handler.tasks.load("task").await.unwrap();
                 assert_eq!(
@@ -808,7 +994,7 @@ mod delivery_tests {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
-    use crate::handler::response_preparation::MessageResponse;
+    use crate::handler::response::unary_response;
     use crate::handler::test_support::*;
 
     #[tokio::test]
@@ -821,14 +1007,9 @@ mod recovery_tests {
                 task.status.state = TaskState::Working;
                 source.set_snapshot(task);
             }
-            let response =
-                MessageResponse::receive(handler.tasks.clone(), source, stream::empty().boxed())
-                    .await
-                    .unwrap();
-            let MessageResponse::Task(response) = response else {
-                panic!("an empty stream is not a direct reply")
-            };
-            let error = response.wait().await.unwrap_err();
+            let error = unary_response(handler.tasks.clone(), source, stream::empty().boxed())
+                .await
+                .unwrap_err();
             assert_eq!(error.code, error_code::TASK_NOT_FOUND);
             handler.shutdown().await;
         }
@@ -850,10 +1031,10 @@ mod recovery_tests {
         drop(receiver);
         let mut inner = None;
         let mut generation = 0;
-        assert!(matches!(
-            run.reattach(&mut inner, &mut generation, &sender).await,
-            Reattach::End
-        ));
+        assert!(
+            !run.initialize_response(None, &mut inner, &mut generation, &sender)
+                .await
+        );
         assert_eq!(generation, 2);
         assert!(inner.is_none());
         handler.shutdown().await;
@@ -879,5 +1060,61 @@ mod recovery_tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
         handler.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod task_response_tests {
+    use super::*;
+    use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn task_completion_propagates_errors_after_the_initial_task() {
+        let handler = make_handler();
+        seed_task(&handler, "task", "context").await;
+        let task = handler.tasks.load("task").await.unwrap();
+        let events = stream::iter([
+            Ok(StreamResponse::Task(task)),
+            Err(A2AError::internal("executor failed after starting")),
+        ])
+        .boxed();
+        let error = unary_response(handler.tasks.clone(), handler.tasks.task("task"), events)
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "executor failed after starting");
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn immediate_unary_joins_return_a_snapshot_without_waiting_for_executor_events() {
+        use crate::handler::test_support::task_with_history;
+        let task = task_with_history("task", "context", 0);
+        let active = super::super::events::ActiveExecution::new(Some(task.clone()));
+        let delivery = Delivery::Injected {
+            task: task.clone(),
+            receiver: active.subscribe(),
+            sequence_before: 0,
+            sequence_after: 0,
+        };
+        let mut request = crate::handler::test_support::send_request();
+        request.configuration = Some(SendMessageConfiguration {
+            return_immediately: Some(true),
+            accepted_output_modes: None,
+            task_push_notification_config: None,
+            history_length: None,
+            timeline_length: None,
+            if_generation_match: None,
+        });
+        let settings =
+            ResponsePolicy::message(StartMode::Blocking, &crate::ServiceParams::new(), &request);
+        let (_, mut events) = attach_delivery(settings, delivery);
+        assert!(
+            matches!(events.next().await.unwrap().unwrap(), StreamResponse::Task(snapshot) if snapshot == task)
+        );
+        assert!(events.next().await.is_none());
     }
 }

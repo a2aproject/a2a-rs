@@ -50,6 +50,11 @@ impl BackgroundTasks {
         }))
     }
 
+    #[cfg(test)]
+    pub(super) fn count(&self) -> usize {
+        self.tasks.len()
+    }
+
     pub(super) async fn shutdown(&self) {
         self.stopping.cancel();
         self.tasks.close();

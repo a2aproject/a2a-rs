@@ -46,7 +46,7 @@ pub(crate) fn validate_protocol_version(params: &ServiceParams) -> Result<(), A2
                 && part.bytes().all(|byte| byte.is_ascii_digit())
                 && part.parse::<u32>().is_ok()
         });
-    if numeric && parts[0].parse::<u32>() == Ok(1) {
+    if numeric && parts[0].parse::<u32>() == Ok(1) && matches!(parts[1].parse::<u32>(), Ok(0 | 1)) {
         Ok(())
     } else {
         Err(A2AError::version_not_supported(requested))
@@ -139,6 +139,14 @@ impl<'a> RequestRules<'a> {
                 "the agent card does not declare userArtifacts",
             ));
         }
+        for update in &request.artifact_updates {
+            if update.artifact.artifact_id.is_empty() || update.artifact.parts.is_empty() {
+                return Err(A2AError::invalid_params(
+                    "artifact updates require an artifactId and at least one part",
+                ));
+            }
+            self.validate_input_parts(&update.artifact.parts)?;
+        }
         if is_artifact_only(request) {
             return request_task_id(request).map(|_| ()).ok_or_else(|| {
                 A2AError::invalid_params(
@@ -147,19 +155,23 @@ impl<'a> RequestRules<'a> {
             });
         }
         let message = &request.message;
+        self.validate_input_parts(&message.parts)?;
+        if message.message_id.is_empty() || message.parts.is_empty() || message.role != Role::User {
+            return Err(A2AError::invalid_params(
+                "client messages require a messageId, user role and at least one part",
+            ));
+        }
+        Ok(())
+    }
+    fn validate_input_parts(&self, parts: &[Part]) -> Result<(), A2AError> {
         if !self.input_modes.is_empty()
-            && !message.parts.iter().all(|part| {
+            && !parts.iter().all(|part| {
                 part.media_type.as_deref().is_none_or(|media_type| {
                     media_type.is_empty() || self.input_modes.iter().any(|mode| mode == media_type)
                 })
             })
         {
             return Err(A2AError::content_type_not_supported());
-        }
-        if message.message_id.is_empty() || message.parts.is_empty() || message.role != Role::User {
-            return Err(A2AError::invalid_params(
-                "client messages require a messageId, user role and at least one part",
-            ));
         }
         Ok(())
     }
@@ -427,13 +439,6 @@ pub(super) enum OpeningPolicy {
     Snapshot,
 }
 
-pub(super) enum DeliveryAttachment {
-    /// Start a response; streaming modes announce the input in their opening snapshot.
-    Opening,
-    /// An existing response must observe the follow-up's input events.
-    FollowUp,
-}
-
 #[derive(Clone, Copy)]
 pub(super) enum InputCursor {
     Before,
@@ -495,6 +500,12 @@ impl ResponsePolicy {
         self.options.return_immediately
     }
 
+    /// An immediate unary reply needs a persisted Task before execution starts.
+    pub(super) fn defer_task_creation(self) -> bool {
+        self.mode != StartMode::Bidi
+            && !(self.mode == StartMode::Blocking && self.return_immediately())
+    }
+
     pub(super) fn trim(self, task: &mut Task) {
         self.options.trim(task);
     }
@@ -505,10 +516,6 @@ impl ResponsePolicy {
             OutputKind::Reply | OutputKind::Terminal
         ) || (self.mode == StartMode::Blocking
             && should_interrupt_non_streaming(self.return_immediately(), event).is_some())
-    }
-
-    pub(super) fn wants_message_updates(self) -> bool {
-        self.wants_message_updates
     }
 
     pub(super) fn response_id(self) -> Option<uuid::Uuid> {
@@ -539,28 +546,21 @@ impl ResponsePolicy {
             StartMode::Bidi => OpeningPolicy::Snapshot,
         }
     }
-    pub(super) fn follows_task(self) -> bool {
-        self.mode != StartMode::Blocking
-    }
-    pub(super) fn delivery_plan(self, attachment: DeliveryAttachment) -> DeliveryPlan {
+    pub(super) fn delivery_plan(self) -> DeliveryPlan {
         DeliveryPlan {
-            attach_receiver: !(self.mode == StartMode::Blocking
-                && self.return_immediately()
-                && matches!(attachment, DeliveryAttachment::Opening)),
-            cursor: if self.mode == StartMode::Blocking
-                || matches!(attachment, DeliveryAttachment::FollowUp)
-            {
+            attach_receiver: !(self.mode == StartMode::Blocking && self.return_immediately()),
+            cursor: if self.mode == StartMode::Blocking {
                 InputCursor::Before
             } else {
                 InputCursor::After
             },
-            wait_for_first_output: self.mode == StartMode::Streaming
-                && matches!(attachment, DeliveryAttachment::Opening),
+            wait_for_first_output: self.mode != StartMode::Bidi,
         }
     }
     pub(super) fn event_filter(self) -> EventFilter {
         EventFilter {
             include_repeats: self.mode == StartMode::Blocking,
+            task_snapshots: self.mode == StartMode::Blocking,
             message_updates: self.mode != StartMode::Blocking && self.wants_message_updates,
             live: self.mode == StartMode::Bidi,
             response_id: self.response_id,
@@ -577,6 +577,8 @@ pub(super) enum StreamDecision {
 #[derive(Clone, Copy)]
 pub(super) struct EventFilter {
     pub(super) include_repeats: bool,
+    /// Unary replies need the snapshot at their completion event's generation.
+    pub(super) task_snapshots: bool,
     pub(super) message_updates: bool,
     pub(super) live: bool,
     pub(super) response_id: Option<uuid::Uuid>,
@@ -735,7 +737,6 @@ fn stream_error_code(error: &A2AError) -> String {
 
 pub(super) struct SubscriptionPlan {
     pub(super) opening: Option<Task>,
-    pub(super) seen_generation: i64,
 }
 
 /// A current cursor resumes directly; a stale cursor recovers from a snapshot.
@@ -748,7 +749,6 @@ pub(super) fn subscription_plan(
     }
     Ok(SubscriptionPlan {
         opening: (request.last_seen_generation != Some(snapshot.generation)).then_some(snapshot),
-        seen_generation: request.last_seen_generation.unwrap_or(0),
     })
 }
 
@@ -763,7 +763,7 @@ pub(super) fn cancel_requires_transition(task: &Task) -> Result<bool, A2AError> 
     }
 }
 
-/// Where a cancellation stands while its executor's events are applied.
+/// Tracks the committed cancellation while executor cleanup completes.
 pub(super) struct CancelEntry {
     /// The store gave the transition its generation and timeline entry.
     pub(super) recorded_by_store: bool,
@@ -773,57 +773,51 @@ pub(super) struct CancelEntry {
     pub(super) announced: bool,
 }
 
+/// Cancellation already committed its terminal snapshot. Hook output may
+/// acknowledge cleanup, but cannot replace the committed status or timeline.
+pub(super) fn validate_cancel_acknowledgement(
+    base: &Task,
+    event: &mut StreamResponse,
+) -> Result<(), A2AError> {
+    validate_event_identity(base, event)?;
+    prepare_task_event(event)?;
+    if base.status.state != TaskState::Canceled {
+        return Err(A2AError::invalid_agent_response());
+    }
+    if matches!(event, StreamResponse::StatusUpdate(update) if update.status.state == TaskState::Canceled)
+    {
+        return Ok(());
+    }
+    if let StreamResponse::Task(task) = event
+        && task.status.state == base.status.state
+        && task
+            .artifacts
+            .as_ref()
+            .is_none_or(|value| Some(value) == base.artifacts.as_ref())
+        && task
+            .history
+            .as_ref()
+            .is_none_or(|value| Some(value) == base.history.as_ref())
+        && task
+            .timeline
+            .as_ref()
+            .is_none_or(|value| Some(value) == base.timeline.as_ref())
+        && task
+            .metadata
+            .as_ref()
+            .is_none_or(|value| Some(value) == base.metadata.as_ref())
+    {
+        // Returning the canceled snapshot acknowledges cleanup. It must
+        // neither mutate the terminal task nor announce a second update.
+        return Ok(());
+    }
+    Err(A2AError::invalid_agent_response())
+}
+
 impl CancelEntry {
-    /// Whether `event` is the executor's own status for the cancellation, which
-    /// belongs in the store's entry rather than in one of its own: the task has
-    /// not moved on since (nothing else advanced the generation).
-    pub(super) fn can_amend(&self, base: &Task, event: &StreamResponse) -> bool {
-        self.recorded_by_store
-            && !self.announced
-            && base.generation == self.generation
-            && matches!(
-                event,
-                StreamResponse::StatusUpdate(update) if update.status.state == TaskState::Canceled
-            )
-    }
-
-    /// Validate hook output and preserve the store's cancellation generation.
-    pub(super) fn plan_update(
-        &self,
-        base: Task,
-        event: &mut StreamResponse,
-    ) -> Result<CancellationMutation, A2AError> {
-        validate_event_identity(&base, event)?;
-        let contradicts = match event {
-            StreamResponse::Task(task) => task.status.state != TaskState::Canceled,
-            StreamResponse::StatusUpdate(update) => update.status.state != TaskState::Canceled,
-            _ => false,
-        };
-        if contradicts {
-            return Err(A2AError::invalid_agent_response());
-        }
-        if !self.can_amend(&base, event) {
-            return Ok(CancellationMutation::Apply(base));
-        }
-        let StreamResponse::StatusUpdate(update) = event else {
-            unreachable!("can_amend matches a status")
-        };
-        let mut amended = base;
-        amended.status = update.status.clone();
-        if let Some(TimelineEntry {
-            content: TimelineContent::Status(status),
-            ..
-        }) = amended.timeline.iter_mut().flatten().last()
-        {
-            *status = update.status.clone();
-        }
-        update.generation = amended.generation;
-        Ok(CancellationMutation::Amend(amended))
-    }
-
     /// Decide whether finalization still owes subscribers a CANCELED update.
     pub(super) fn notification(&self, base: Option<Task>) -> CancellationNotification {
-        if self.recorded_by_store && self.announced {
+        if self.announced {
             return CancellationNotification::None;
         }
         let Some(base) = base else {
@@ -854,21 +848,6 @@ impl CancelEntry {
             }
         }
     }
-
-    /// Notes that a published event announced the canceled state.
-    pub(super) fn note_published(&mut self, published: bool, event: &StreamResponse) {
-        let canceled = match event {
-            StreamResponse::StatusUpdate(update) => update.status.state == TaskState::Canceled,
-            StreamResponse::Task(task) => task.status.state == TaskState::Canceled,
-            _ => false,
-        };
-        self.announced |= published && canceled;
-    }
-}
-
-pub(super) enum CancellationMutation {
-    Amend(Task),
-    Apply(Task),
 }
 
 pub(super) enum CancellationNotification {
@@ -966,6 +945,8 @@ pub(super) fn apply_task_mutation(
     current: Option<Task>,
     event: &mut StreamResponse,
 ) -> Result<TaskMutation, A2AError> {
+    // Normalize the event before cloning its status into storage or timeline.
+    prepare_task_event(event)?;
     match event {
         StreamResponse::Task(task) => {
             match current {
@@ -975,7 +956,7 @@ pub(super) fn apply_task_mutation(
                     task.timeline = None;
                     let generation = record_status(task, task.status.clone());
                     for artifact in task.artifacts.iter_mut().flatten() {
-                        artifact.start_generation.get_or_insert(generation);
+                        stamp_snapshot_artifact(artifact, None, generation);
                     }
                     if task.status.state.is_terminal() {
                         close_open_artifacts(task, generation);
@@ -995,7 +976,7 @@ pub(super) fn apply_task_mutation(
         }
         StreamResponse::ArtifactUpdate(update) => {
             let mut task = current.ok_or_else(|| A2AError::task_not_found(&update.task_id))?;
-            update.generation = merge_artifact(&mut task, update)?;
+            update.generation = merge_artifact(&mut task, update, Role::Agent)?;
             Ok(TaskMutation::Save(task))
         }
         StreamResponse::MessageUpdate(_) | StreamResponse::Error(_) => {
@@ -1016,6 +997,82 @@ pub(super) fn prepare_task_for_storage(task: &mut Task) {
     if task.status.timestamp.is_none() {
         task.status.timestamp = Some(chrono::Utc::now());
     }
+}
+
+/// Complete a direct agent reply using the context established at admission.
+pub(super) fn prepare_agent_reply(
+    task: &Task,
+    event: &mut StreamResponse,
+    task_created: bool,
+) -> Result<(), A2AError> {
+    // Check supplied identities before normalizing optional fields.
+    validate_event_identity(task, event)?;
+    if let StreamResponse::Message(message) = event {
+        if message.role != Role::Agent {
+            return Err(A2AError::invalid_agent_response());
+        }
+        prepare_message(message, &task.id, &task.context_id, task_created)?;
+    }
+    Ok(())
+}
+
+/// Validate and normalize executor-owned payloads before copying them into
+/// storage or the timeline. Echoed client messages keep optional identities.
+fn prepare_task_event(event: &mut StreamResponse) -> Result<(), A2AError> {
+    let (status, task_id, context_id) = match event {
+        StreamResponse::Task(task) => {
+            for message in task.history.iter_mut().flatten() {
+                prepare_message(message, &task.id, &task.context_id, true)?;
+            }
+            let mut artifact_ids = std::collections::HashSet::new();
+            for artifact in task.artifacts.iter().flatten() {
+                validate_agent_artifact(artifact)?;
+                if !artifact_ids.insert(artifact.artifact_id.as_str()) {
+                    return Err(A2AError::invalid_agent_response());
+                }
+            }
+            (&mut task.status, &task.id, &task.context_id)
+        }
+        StreamResponse::StatusUpdate(update) => {
+            (&mut update.status, &update.task_id, &update.context_id)
+        }
+        _ => return Ok(()),
+    };
+    if let Some(message) = &mut status.message {
+        // A task-bearing event creates or updates this task, so its ID is valid
+        // for any enclosed message once the event is committed.
+        prepare_message(message, task_id, context_id, true)?;
+    }
+    Ok(())
+}
+
+fn prepare_message(
+    message: &mut Message,
+    task_id: &str,
+    context_id: &str,
+    task_created: bool,
+) -> Result<(), A2AError> {
+    if message.message_id.is_empty()
+        || message.parts.is_empty()
+        || !matches!(message.role, Role::User | Role::Agent)
+        || message.task_id.as_deref().is_some_and(|id| id != task_id)
+        || message
+            .context_id
+            .as_deref()
+            .is_some_and(|id| id != context_id)
+    {
+        return Err(A2AError::invalid_agent_response());
+    }
+    if message.role == Role::Agent {
+        message
+            .context_id
+            .get_or_insert_with(|| context_id.to_owned());
+        if !task_created {
+            // A direct reply must not expose an uncreated, provisional Task.
+            message.task_id = None;
+        }
+    }
+    Ok(())
 }
 
 /// An execution may only publish or mutate its bound task and context.
@@ -1086,6 +1143,15 @@ pub(super) fn record_status(task: &mut Task, status: TaskStatus) -> i64 {
 pub(super) fn rebase_snapshot(task: &mut Task, previous: Task) {
     let status_changed = task.status.state != previous.status.state
         || task.status.message != previous.status.message;
+    if !status_changed {
+        // A snapshot restating the same status must not silently move its
+        // timestamp. Explicit status-update events still record a new update.
+        task.status.timestamp = previous.status.timestamp.or(task.status.timestamp);
+    }
+    let metadata_changed = task
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| Some(metadata) != previous.metadata.as_ref());
     // The artifacts the client wrote are the server's to keep: an executor
     // lists what it produced, not what the client sent it.
     let supplied = task.artifacts.take().map(|mut new| {
@@ -1110,6 +1176,7 @@ pub(super) fn rebase_snapshot(task: &mut Task, previous: Task) {
     task.generation = previous.generation;
     // Recorded messages are append-only. A snapshot built before a later
     // client input must not erase that input from the compatibility history.
+    let mut history_changed = false;
     task.history = match (previous.history, task.history.take()) {
         (Some(mut current), Some(supplied)) => {
             for message in supplied {
@@ -1118,11 +1185,16 @@ pub(super) fn rebase_snapshot(task: &mut Task, previous: Task) {
                     .any(|kept| kept.message_id == message.message_id)
                 {
                     current.push(message);
+                    history_changed = true;
                 }
             }
             Some(current)
         }
-        (current, supplied) => supplied.or(current),
+        (None, Some(supplied)) => {
+            history_changed = true;
+            Some(supplied)
+        }
+        (current, None) => current,
     };
     if task.metadata.is_none() {
         task.metadata = previous.metadata;
@@ -1133,7 +1205,7 @@ pub(super) fn rebase_snapshot(task: &mut Task, previous: Task) {
         _ => stored_artifacts.clone(),
     };
 
-    if status_changed || artifacts_changed {
+    if status_changed || artifacts_changed || history_changed || metadata_changed {
         task.generation += 1;
         let generation = task.generation;
         if status_changed {
@@ -1149,17 +1221,7 @@ pub(super) fn rebase_snapshot(task: &mut Task, previous: Task) {
             let before = stored
                 .iter()
                 .find(|stored| stored.artifact_id == artifact.artifact_id);
-            artifact.start_generation = artifact
-                .start_generation
-                .or(before.and_then(|stored| stored.start_generation))
-                .or(Some(generation));
-            artifact.end_generation = artifact
-                .end_generation
-                .or(before.and_then(|stored| stored.end_generation));
-            artifact.role = artifact
-                .role
-                .clone()
-                .or_else(|| before.and_then(|stored| stored.role.clone()));
+            stamp_snapshot_artifact(artifact, before, generation);
         }
     }
     if task.status.state.is_terminal() {
@@ -1167,28 +1229,57 @@ pub(super) fn rebase_snapshot(task: &mut Task, previous: Task) {
     }
 }
 
-/// Merges an artifact update into the task, advancing the generation. The
-/// stored artifact is stamped with the generations at which it started and
-/// completed; the update itself is left as sent apart from the generation it
-/// is assigned. Returns the generation after the mutation.
-pub(super) fn merge_artifact(
+/// Full snapshots cannot supply authoritative artifact stamps or ownership.
+/// Completion is recorded by lastChunk updates or the terminal Task transition.
+fn stamp_snapshot_artifact(artifact: &mut Artifact, previous: Option<&Artifact>, generation: i64) {
+    let changed = previous.is_none_or(|previous| {
+        artifacts_differ(
+            std::slice::from_ref(artifact),
+            std::slice::from_ref(previous),
+        )
+    });
+    artifact.start_generation = Some(
+        previous
+            .and_then(|artifact| artifact.start_generation)
+            .unwrap_or(generation),
+    );
+    artifact.end_generation = if changed {
+        None
+    } else {
+        previous.and_then(|artifact| artifact.end_generation)
+    };
+    artifact.role = Some(
+        previous
+            .and_then(|artifact| artifact.role.clone())
+            .unwrap_or(Role::Agent),
+    );
+}
+
+/// Apply an artifact chunk using its actual origin, then stamp both the stored
+/// artifact and the outgoing chunk. The chunk keeps its own parts and metadata.
+fn merge_artifact(
     task: &mut Task,
     update: &mut TaskArtifactUpdateEvent,
+    origin: Role,
 ) -> Result<i64, A2AError> {
-    task.generation += 1;
-    let generation = task.generation;
+    validate_agent_artifact(&update.artifact)?;
     let append = update.append.unwrap_or(false);
-    // The wire cannot tell an unset `lastChunk` from `false`, so only an
-    // explicit `true` completes an artifact here; one left open is closed when
-    // the task reaches a terminal state.
     let complete = update.last_chunk == Some(true);
-
     let artifacts = task.artifacts.get_or_insert_with(Vec::new);
     let existing = artifacts
         .iter_mut()
         .find(|artifact| artifact.artifact_id == update.artifact.artifact_id);
+    let owner = existing.as_ref().map_or_else(
+        || origin.clone(),
+        |artifact| artifact.role.clone().unwrap_or(Role::Agent),
+    );
+    if (origin == Role::User && owner != Role::User) || (append && existing.is_none()) {
+        return Err(A2AError::invalid_agent_response());
+    }
+    task.generation += 1;
+    let generation = task.generation;
     if append {
-        let artifact = existing.ok_or_else(A2AError::invalid_agent_response)?;
+        let artifact = existing.expect("append requires an existing artifact");
         artifact.parts.extend(update.artifact.parts.iter().cloned());
         if let Some(metadata) = &update.artifact.metadata {
             artifact
@@ -1196,16 +1287,12 @@ pub(super) fn merge_artifact(
                 .get_or_insert_with(Default::default)
                 .extend(metadata.clone());
         }
-        if complete {
-            artifact.end_generation = Some(generation);
-        }
+        artifact.start_generation.get_or_insert(generation);
+        artifact.end_generation = complete.then_some(generation);
+        artifact.role = Some(owner);
     } else {
         let mut replacement = update.artifact.clone();
-        // Replacing an artifact keeps who wrote it.
-        replacement.role = replacement
-            .role
-            .clone()
-            .or_else(|| existing.as_ref().and_then(|artifact| artifact.role.clone()));
+        replacement.role = Some(owner);
         replacement.start_generation = Some(
             existing
                 .as_ref()
@@ -1218,7 +1305,21 @@ pub(super) fn merge_artifact(
             None => artifacts.push(replacement),
         }
     }
+    let stored = artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_id == update.artifact.artifact_id)
+        .expect("the artifact was just written");
+    update.artifact.start_generation = stored.start_generation;
+    update.artifact.end_generation = stored.end_generation;
+    update.artifact.role = stored.role.clone();
     Ok(generation)
+}
+
+fn validate_agent_artifact(artifact: &Artifact) -> Result<(), A2AError> {
+    if artifact.artifact_id.is_empty() || artifact.parts.is_empty() {
+        return Err(A2AError::invalid_agent_response());
+    }
+    Ok(())
 }
 
 /// Applies the artifacts a client wrote in `artifactUpdates`, in list order,
@@ -1235,9 +1336,9 @@ pub(super) fn apply_client_artifacts(
 ) -> Result<Vec<TaskArtifactUpdateEvent>, A2AError> {
     let mut applied = Vec::with_capacity(req.artifact_updates.len());
     for update in &req.artifact_updates {
-        if update.artifact.artifact_id.is_empty() {
+        if update.artifact.artifact_id.is_empty() || update.artifact.parts.is_empty() {
             return Err(A2AError::invalid_params(
-                "an artifact update needs an artifactId",
+                "an artifact update needs an artifactId and at least one part",
             ));
         }
         let mut update = update.clone();
@@ -1267,10 +1368,9 @@ pub(super) fn apply_client_artifacts(
                 update.artifact.artifact_id
             )));
         }
-        update.artifact.role = Some(Role::User);
         update.task_id = task.id.clone();
         update.context_id = task.context_id.clone();
-        update.generation = merge_artifact(task, &mut update).map_err(|_| {
+        update.generation = merge_artifact(task, &mut update, Role::User).map_err(|_| {
             A2AError::invalid_params(format!(
                 "cannot append to unknown artifact {}",
                 update.artifact.artifact_id
@@ -1952,7 +2052,7 @@ mod policy_tests {
     }
 
     #[test]
-    fn cancellation_amends_and_announces_the_committed_generation_once() {
+    fn cancellation_acknowledgements_preserve_the_committed_snapshot() {
         let mut task = task_with_history("task", "context", 0);
         task.status.state = TaskState::Canceled;
         task.generation = 8;
@@ -1961,29 +2061,19 @@ mod policy_tests {
             generation: 8,
             announced: false,
         };
-        assert!(!cancel_requires_transition(&task).unwrap());
+        let original = task.clone();
         let mut event = status(TaskState::Canceled);
-        let CancellationMutation::Amend(amended) =
-            entry.plan_update(task.clone(), &mut event).unwrap()
-        else {
-            panic!("the hook must amend the store's cancellation");
-        };
-        assert_eq!(amended.generation, 8);
-        assert_eq!(generation_of(&event), Some(8));
+        validate_cancel_acknowledgement(&task, &mut event).unwrap();
+        assert_eq!(task, original);
+        assert!(
+            matches!(entry.notification(Some(task.clone())), CancellationNotification::Publish(event) if generation_of(&event) == Some(8))
+        );
+        entry.announced = true;
         assert!(matches!(
             entry.notification(Some(task.clone())),
-            CancellationNotification::Publish(_)
-        ));
-        entry.note_published(true, &event);
-        assert!(matches!(
-            entry.notification(Some(task)),
             CancellationNotification::None
         ));
-        assert!(
-            entry
-                .plan_update(amended, &mut status(TaskState::Working))
-                .is_err()
-        );
+        assert!(validate_cancel_acknowledgement(&task, &mut status(TaskState::Working)).is_err());
     }
 }
 

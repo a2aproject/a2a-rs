@@ -135,6 +135,10 @@ async fn snapshot(updates: Vec<Update>, streaming: bool) -> Result<Task, A2AErro
             next += 1;
             assert_eq!(update.generation, next, "streaming={streaming}");
             update.generation = 0;
+            assert_eq!(update.artifact.role, Some(Role::Agent));
+            update.artifact.start_generation = None;
+            update.artifact.end_generation = None;
+            update.artifact.role = None;
         }
         let expected_updates: Vec<_> = updates
             .iter()
@@ -151,7 +155,7 @@ async fn snapshot(updates: Vec<Update>, streaming: bool) -> Result<Task, A2AErro
             .collect();
         assert_eq!(
             live_updates, expected_updates,
-            "Live deltas must stay unchanged"
+            "Live chunk content and metadata must stay unchanged"
         );
         handler
             .get_task(
@@ -191,7 +195,11 @@ async fn snapshot(updates: Vec<Update>, streaming: bool) -> Result<Task, A2AErro
     Ok(task)
 }
 
-async fn assert_snapshot(updates: Vec<Update>, expected: Vec<Artifact>) {
+async fn assert_snapshot(updates: Vec<Update>, mut expected: Vec<Artifact>) {
+    // The server assigns the origin of executor-produced artifacts.
+    for artifact in &mut expected {
+        artifact.role = Some(Role::Agent);
+    }
     for streaming in [false, true] {
         let task =
             tokio::time::timeout(Duration::from_secs(5), snapshot(updates.clone(), streaming))

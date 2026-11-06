@@ -11,6 +11,8 @@ use futures::stream::BoxStream;
 mod admission;
 mod background_tasks;
 mod cancellation;
+#[cfg(test)]
+mod conformance_tests;
 mod default_handler;
 mod delivery;
 mod events;
@@ -20,7 +22,6 @@ pub(crate) mod protocol;
 mod push_delivery;
 mod push_worker;
 mod response;
-mod response_preparation;
 mod task_handle;
 mod task_service;
 mod updates;
@@ -28,7 +29,7 @@ mod uplink;
 
 pub use default_handler::DefaultRequestHandler;
 
-const EXECUTION_BUFFER_CAPACITY: usize = 32;
+const EXECUTION_BUFFER_CAPACITY: usize = 128;
 
 /// How many requests may queue on a live exchange's uplink.
 const LIVE_UPLINK_CAPACITY: usize = 32;
