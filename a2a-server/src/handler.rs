@@ -10,6 +10,8 @@ use futures::stream::BoxStream;
 
 mod admission;
 mod background_tasks;
+#[cfg(test)]
+mod blocking_input_tests;
 mod cancellation;
 #[cfg(test)]
 mod conformance_tests;

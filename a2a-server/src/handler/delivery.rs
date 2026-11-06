@@ -55,6 +55,7 @@ pub(super) enum Delivery {
         /// latter, one that joins now takes them from the former.
         sequence_before: u64,
         sequence_after: u64,
+        input_generation: Option<i64>,
     },
 }
 

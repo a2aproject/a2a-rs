@@ -184,6 +184,7 @@ async fn poll_executor(
         let Some(result) = result else {
             return TurnEnd::Finished;
         };
+        active.emitted_output();
         if active.snapshot_is_terminal() {
             return TurnEnd::Stopped;
         }
@@ -262,6 +263,7 @@ pub(super) async fn start_next_turn(
     };
     next.set_snapshot(snapshot.clone());
     let first = unread.remove(0);
+    next.inputs.received(first.generation);
     for input in unread {
         if let Ok(permit) = next.inputs.sender.clone().try_reserve_owned() {
             permit.send(

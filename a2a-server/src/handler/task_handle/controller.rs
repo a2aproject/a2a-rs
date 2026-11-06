@@ -156,6 +156,7 @@ impl TaskController {
             };
 
             // The invocation owns its inbox and caller context independently of this request.
+            active.inputs.received(task.generation);
             let context = crate::ExecutorContext {
                 execution_id: active.execution_id.clone(),
                 message: (!is_artifact_only(&message.request)).then_some(message.request.message),

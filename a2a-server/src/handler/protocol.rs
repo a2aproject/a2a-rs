@@ -591,6 +591,19 @@ pub(super) enum EventDecision {
 }
 
 impl EventFilter {
+    /// An interrupted status cannot answer an input the executor had not yet read.
+    /// Terminal states and errors still complete a response regardless of input progress.
+    pub(super) fn waits_for_input(
+        self,
+        required: i64,
+        received: i64,
+        event: &StreamResponse,
+    ) -> bool {
+        self.task_snapshots
+            && received < required
+            && should_interrupt_non_streaming(false, event).is_some()
+    }
+
     pub(super) fn decide(
         self,
         kind: EventKind,

@@ -320,6 +320,7 @@ mod tests {
                     None,
                     EventKind::Normal,
                     Some(failure),
+                    0,
                 )
                 .await;
             entered.notified().await;
@@ -425,6 +426,7 @@ mod tests {
                 None,
                 EventKind::Normal,
                 None,
+                0,
             )
             .await;
         let notification = timeout(Duration::from_secs(2), queue.recv())
@@ -456,6 +458,7 @@ mod tests {
                 .submit(Notification {
                     config: config.clone(),
                     event: Arc::new(ExecutionEvent {
+                        input_generation: 0,
                         sequence: 1,
                         result: Ok(StreamResponse::Task(task_with_history(
                             "task", "context", 0
@@ -491,6 +494,7 @@ mod tests {
                 None,
                 EventKind::Reply,
                 None,
+                0,
             )
             .await;
         source
@@ -499,6 +503,7 @@ mod tests {
                 None,
                 EventKind::Normal,
                 None,
+                0,
             )
             .await;
         assert!(source.webhook_subscription().cursor.is_none());
@@ -537,7 +542,7 @@ mod tests {
         ];
         events.push((EventKind::Normal, Ok(StreamResponse::Task(task))));
         for (kind, result) in events {
-            source.publish(result.as_ref(), None, kind, None).await;
+            source.publish(result.as_ref(), None, kind, None, 0).await;
         }
         assert_eq!(
             timeout(Duration::from_secs(1), rx.recv())
@@ -572,6 +577,7 @@ mod tests {
                             EventKind::Repeated
                         },
                         None,
+                        0,
                     )
                     .await;
             }
@@ -1150,7 +1156,7 @@ mod tests {
         handler.attach_pushes(&source);
         let event = StreamResponse::Task(task_with_history("task", "context", 0));
         source
-            .publish(Ok(&event), None, EventKind::Normal, None)
+            .publish(Ok(&event), None, EventKind::Normal, None, 0)
             .await;
         for _ in 0..16 {
             tokio::task::yield_now().await;
@@ -1161,7 +1167,7 @@ mod tests {
         }
         assert!(source.webhook_subscription().cursor.is_none());
         source
-            .publish(Ok(&event), None, EventKind::Normal, None)
+            .publish(Ok(&event), None, EventKind::Normal, None, 0)
             .await;
         assert!(source.webhook_subscription().cursor.is_some());
         assert!(source.ptr_eq(&handler.tasks.task("task")));
@@ -1179,6 +1185,7 @@ mod tests {
                 None,
                 EventKind::Normal,
                 None,
+                0,
             )
             .await;
         for _ in 0..16 {

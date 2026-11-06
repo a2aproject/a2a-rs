@@ -10,7 +10,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicI64, AtomicU8, Ordering},
     },
 };
 use tokio::sync::{mpsc, oneshot};
@@ -88,6 +88,7 @@ pub struct ClientInputs {
     closed: CancellationToken,
     revoked: CancellationToken,
     returned: Option<oneshot::Sender<mpsc::Receiver<QueuedInput>>>,
+    received_generation: Arc<AtomicI64>,
 }
 
 impl ClientInputs {
@@ -96,17 +97,20 @@ impl ClientInputs {
         let (sender, receiver) = mpsc::channel(capacity);
         let closed = CancellationToken::new();
         let revoked = CancellationToken::new();
+        let received_generation = Arc::new(AtomicI64::new(0));
         (
             ClientInputSender {
                 sender,
                 closed: closed.clone(),
                 revoked: revoked.clone(),
+                received_generation: received_generation.clone(),
             },
             ClientInputs {
                 receiver: Some(receiver),
                 closed,
                 revoked,
                 returned: None,
+                received_generation,
             },
         )
     }
@@ -147,6 +151,8 @@ impl ClientInputs {
                 return None;
             }
             if let Some(input) = input.claim() {
+                self.received_generation
+                    .fetch_max(input.generation, Ordering::AcqRel);
                 return Some(input);
             }
         }
@@ -165,7 +171,10 @@ impl ClientInputs {
         if self.revoked.is_cancelled() {
             return None;
         }
-        input.claim()
+        let input = input.claim()?;
+        self.received_generation
+            .fetch_max(input.generation, Ordering::AcqRel);
+        Some(input)
     }
 
     #[cfg(test)]
@@ -244,9 +253,20 @@ pub struct ClientInputSender {
     pub(crate) sender: mpsc::Sender<QueuedInput>,
     pub(crate) closed: CancellationToken,
     revoked: CancellationToken,
+    received_generation: Arc<AtomicI64>,
 }
 
 impl ClientInputSender {
+    /// The opening message is delivered through ExecutorContext, outside the inbox.
+    pub(crate) fn received(&self, generation: i64) {
+        self.received_generation
+            .fetch_max(generation, Ordering::AcqRel);
+    }
+
+    pub(crate) fn received_generation(&self) -> i64 {
+        self.received_generation.load(Ordering::Acquire)
+    }
+
     /// Queues `input`. `Err` gives it back when the channel is full or closed.
     pub fn try_send(&self, input: ClientInput) -> Result<(), Box<ClientInput>> {
         if self.closed.is_cancelled() {
@@ -288,6 +308,32 @@ mod tests {
             },
             1,
         )
+    }
+
+    #[tokio::test]
+    async fn input_progress_advances_only_when_the_executor_reads_input() {
+        let (sender, mut inputs) = ClientInputs::channel(2);
+        sender
+            .try_send(ClientInput::new(input("first").message, 3))
+            .unwrap();
+        sender
+            .try_send(ClientInput::new(input("second").message, 5))
+            .unwrap();
+        assert_eq!(
+            sender.received_generation(),
+            0,
+            "queue admission is not receipt"
+        );
+        inputs.recv().await.unwrap();
+        assert_eq!(sender.received_generation(), 3);
+        sender.received(2);
+        assert_eq!(
+            sender.received_generation(),
+            3,
+            "an earlier opening cannot move progress backwards"
+        );
+        inputs.try_recv().unwrap();
+        assert_eq!(sender.received_generation(), 5);
     }
 
     #[tokio::test]

@@ -3566,6 +3566,7 @@ mod subscription_attachment_tests {
                                 Some(task.clone()),
                                 protocol::EventKind::Normal,
                                 None,
+                                0,
                             )
                             .await;
                     }

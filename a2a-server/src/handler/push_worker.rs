@@ -230,6 +230,7 @@ mod tests {
         Notification {
             config,
             event: Arc::new(ExecutionEvent {
+                input_generation: 0,
                 sequence: generation as u64,
                 kind: EventKind::Normal,
                 result: Ok(StreamResponse::Task(task)),

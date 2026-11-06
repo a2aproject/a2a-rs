@@ -20,6 +20,8 @@ pub(super) type FailureSignal = watch::Sender<Option<A2AError>>;
 #[derive(Clone)]
 pub(super) struct ExecutionEvent {
     pub(super) sequence: u64,
+    /// Highest input generation read when this output was emitted, not when it was delivered.
+    pub(super) input_generation: i64,
     pub(super) result: Result<StreamResponse, A2AError>,
     pub(super) kind: EventKind,
     pub(super) failure: Option<FailureSignal>,
@@ -36,6 +38,7 @@ pub(super) struct ExecutionReceiver {
     /// Events at or before this subscription opened must not be replayed.
     opened_at: u64,
     reply: Option<Arc<super::task_handle::ReplyRetention>>,
+    required_input: i64,
 }
 
 impl ExecutionReceiver {
@@ -50,6 +53,7 @@ impl ExecutionReceiver {
                 opening_message: false,
                 opened_at: sequence,
                 reply: Some(reply),
+                required_input: 0,
             },
             snapshot,
             sequence,
@@ -58,6 +62,11 @@ impl ExecutionReceiver {
 
     pub(super) fn task(&self) -> TaskHandle {
         self.task.clone()
+    }
+
+    pub(super) fn for_input(mut self, generation: i64) -> Self {
+        self.required_input = generation;
+        self
     }
 
     /// Streaming responses follow the Task source across invocation boundaries.
@@ -105,10 +114,10 @@ impl ExecutionReceiver {
 
     /// Starts over after the events were lost: the task as it stands, and the
     /// sequence after which events follow it. `None` when no Task exists yet.
-    fn resync(&mut self, after: u64) -> Result<Option<(Task, u64)>, A2AError> {
-        let (receiver, snapshot, sequence) = self.task.resynchronize(after)?;
+    fn resync(&mut self, after: u64) -> Result<Option<(Task, u64, i64)>, A2AError> {
+        let (receiver, snapshot, sequence, input_generation) = self.task.resynchronize(after)?;
         self.receiver = receiver;
-        Ok(snapshot.map(|task| (task, sequence)))
+        Ok(snapshot.map(|task| (task, sequence, input_generation)))
     }
 }
 
@@ -129,6 +138,7 @@ pub(super) struct ActiveExecution {
     /// task is created by the executor's first event, and does not exist if
     /// the executor answers with a message alone.
     pub(super) uncreated: std::sync::atomic::AtomicBool,
+    output_input_generation: std::sync::atomic::AtomicI64,
 }
 
 impl ActiveExecution {
@@ -159,6 +169,7 @@ impl ActiveExecution {
                 inputs_drained: tokio_util::sync::CancellationToken::new(),
                 push_failure: tokio::sync::watch::channel(None).0,
                 uncreated: std::sync::atomic::AtomicBool::new(false),
+                output_input_generation: std::sync::atomic::AtomicI64::new(0),
             }),
             receiver,
             InvocationState::new(returned_inputs),
@@ -197,6 +208,7 @@ impl ActiveExecution {
             opening_message: false,
             opened_at: sequence,
             reply: Some(reply),
+            required_input: 0,
         }
     }
 
@@ -207,6 +219,14 @@ impl ActiveExecution {
     ) {
         self.publish_kind(result, snapshot_task, EventKind::Normal)
             .await;
+    }
+
+    /// Capture causality before persistence or publication can await other work.
+    pub(super) fn emitted_output(&self) {
+        self.output_input_generation.store(
+            self.inputs.received_generation(),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     pub(super) async fn publish_marked(
@@ -243,7 +263,14 @@ impl ActiveExecution {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         self.task
-            .publish(result, snapshot_task, kind, Some(self.push_failure.clone()))
+            .publish(
+                result,
+                snapshot_task,
+                kind,
+                Some(self.push_failure.clone()),
+                self.output_input_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
             .await;
     }
 
@@ -306,6 +333,15 @@ pub(super) fn subscription_stream(
                         if matches!(decision, EventDecision::Skip) {
                             continue;
                         }
+                        if event.result.as_ref().is_ok_and(|output| {
+                            filter.waits_for_input(
+                                state.receiver.required_input,
+                                event.input_generation,
+                                output,
+                            )
+                        }) {
+                            continue;
+                        }
                         state.receiver.opened();
                         state.done = matches!(decision, EventDecision::DeliverAndClose);
                         let result = if filter.task_snapshots {
@@ -321,7 +357,15 @@ pub(super) fn subscription_stream(
                     // Events were lost: start over from the task as it stands.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         match state.receiver.resync(state.min_sequence) {
-                            Ok(Some((task, sequence))) => {
+                            Ok(Some((task, sequence, input_generation))) => {
+                                if filter.waits_for_input(
+                                    state.receiver.required_input,
+                                    input_generation,
+                                    &StreamResponse::Task(task.clone()),
+                                ) {
+                                    state.min_sequence = sequence;
+                                    continue;
+                                }
                                 state.receiver.opened();
                                 state.min_sequence = sequence;
                                 if task.status.state.is_terminal() {
@@ -338,7 +382,18 @@ pub(super) fn subscription_stream(
                     }
                     Err(broadcast::error::RecvError::Closed) if state.receiver.opening_message => {
                         match state.receiver.resync(state.min_sequence) {
-                            Ok(Some((task, sequence))) => {
+                            Ok(Some((task, sequence, input_generation))) => {
+                                if filter.waits_for_input(
+                                    state.receiver.required_input,
+                                    input_generation,
+                                    &StreamResponse::Task(task.clone()),
+                                ) {
+                                    // This invocation ended without answering this input. A successor
+                                    // can still consume it, so follow the task instead of the old turn.
+                                    state.receiver.finished = None;
+                                    state.min_sequence = sequence;
+                                    continue;
+                                }
                                 state.receiver.opened();
                                 state.min_sequence = sequence;
                                 state.done = task.status.state.is_terminal();

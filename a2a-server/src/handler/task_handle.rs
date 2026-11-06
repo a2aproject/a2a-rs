@@ -67,6 +67,7 @@ struct State {
     sequence: u64,
     snapshot: Option<Task>,
     last_error: Option<(u64, A2AError)>,
+    interrupted_input_generation: i64,
     // Only outstanding receivers retain their first direct reply. No task-wide
     // reply history survives after those receivers are dropped.
     replies: Vec<Weak<ReplyRetention>>,
@@ -369,7 +370,7 @@ impl TaskHandle {
     pub(super) fn resynchronize(
         &self,
         after: u64,
-    ) -> Result<(broadcast::Receiver<ExecutionEvent>, Option<Task>, u64), A2AError> {
+    ) -> Result<(broadcast::Receiver<ExecutionEvent>, Option<Task>, u64, i64), A2AError> {
         let receiver = self.inner.sender.subscribe();
         let state = self.inner.state.read();
         if let Some((sequence, error)) = &state.last_error
@@ -377,7 +378,12 @@ impl TaskHandle {
         {
             return Err(error.clone());
         }
-        Ok((receiver, state.snapshot.clone(), state.sequence))
+        Ok((
+            receiver,
+            state.snapshot.clone(),
+            state.sequence,
+            state.interrupted_input_generation,
+        ))
     }
 
     /// Cache and broadcast a persisted update before waking task readers.
@@ -387,11 +393,13 @@ impl TaskHandle {
         snapshot: Option<Task>,
         kind: EventKind,
         failure: Option<FailureSignal>,
+        input_generation: i64,
     ) {
         let changed = snapshot.is_some()
             || (kind == EventKind::Normal
                 && result.is_ok_and(|event| super::protocol::task_id_for_event(event).is_some()));
-        self.publish_event(result, snapshot, kind, failure).await;
+        self.publish_event(result, snapshot, kind, failure, Some(input_generation))
+            .await;
         if changed {
             self.notify();
         }
@@ -415,6 +423,7 @@ impl TaskHandle {
                     snapshot,
                     EventKind::Normal,
                     Some(failure.clone()),
+                    None,
                 )
                 .await;
             }
@@ -428,11 +437,18 @@ impl TaskHandle {
         snapshot: Option<Task>,
         kind: EventKind,
         failure: Option<FailureSignal>,
+        input_generation: Option<i64>,
     ) {
         let event = {
             let mut state = self.inner.state.write();
             if let Some(task) = snapshot {
                 state.snapshot = Some(task);
+            }
+            if result.is_ok_and(|event| {
+                super::protocol::should_interrupt_non_streaming(false, event).is_some()
+            }) && let Some(input_generation) = input_generation
+            {
+                state.interrupted_input_generation = input_generation;
             }
             state.sequence += 1;
             if let Err(error) = result {
@@ -440,6 +456,7 @@ impl TaskHandle {
             }
             let event = ExecutionEvent {
                 sequence: state.sequence,
+                input_generation: input_generation.unwrap_or(0),
                 result: result.cloned().map_err(Clone::clone),
                 kind,
                 failure,
@@ -548,6 +565,7 @@ mod tests {
             Some(snapshot.clone()),
             EventKind::Normal,
             None,
+            0,
         )
         .await;
         let (cached, event) = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
@@ -569,14 +587,20 @@ mod tests {
             reference_id: None,
             metadata: None,
         });
-        task.publish(Ok(&rejection), None, EventKind::LiveOnly(None), None)
+        task.publish(Ok(&rejection), None, EventKind::LiveOnly(None), None, 0)
             .await;
         assert!(!watch.changes.has_changed().unwrap());
         let mut failed = task_with_history("task", "context", 0);
         failed.status.state = TaskState::Failed;
         let error = A2AError::internal("execution failed");
-        task.publish(Err(&error), Some(failed.clone()), EventKind::Normal, None)
-            .await;
+        task.publish(
+            Err(&error),
+            Some(failed.clone()),
+            EventKind::Normal,
+            None,
+            0,
+        )
+        .await;
         tokio::time::timeout(std::time::Duration::from_secs(1), watch.changed())
             .await
             .unwrap();
@@ -624,6 +648,7 @@ mod tests {
                 None,
                 EventKind::Reply,
                 None,
+                0,
             )
             .await;
         assert!(retained.reply.get().is_some());

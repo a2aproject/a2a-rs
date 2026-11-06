@@ -76,7 +76,7 @@ pub(super) async fn inject_input(
     let (task, recorded) = persist_input(handler, message, task_id, task).await?;
 
     // Publish the complete batch before handing the message to user code.
-    let delivery = publish_input(active, task, &recorded.events).await;
+    let delivery = publish_input(active, task, &recorded.events, recorded.message_generation).await;
     deliver_input(permit, recorded.message_generation, message, invocation);
     Ok(delivery)
 }
@@ -132,6 +132,7 @@ async fn publish_input(
     active: &Arc<ActiveExecution>,
     task: Task,
     events: &[StreamResponse],
+    input_generation: Option<i64>,
 ) -> Delivery {
     let sequence_before = active.sequence();
     let receiver = active.subscribe();
@@ -141,6 +142,7 @@ async fn publish_input(
         receiver,
         sequence_before,
         sequence_after: active.sequence(),
+        input_generation,
     }
 }
 

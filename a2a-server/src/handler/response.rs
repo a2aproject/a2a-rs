@@ -530,18 +530,27 @@ pub(super) fn attach_delivery(
 ) -> (Task, ResponseStream) {
     let plan = policy.delivery_plan();
     let (task, receiver, sequence) = match delivery {
-        Delivery::Started { task, receiver } => (task, plan.attach_receiver.then_some(receiver), 0),
+        Delivery::Started { task, receiver } => {
+            let receiver = receiver.for_input(task.generation);
+            (task, plan.attach_receiver.then_some(receiver), 0)
+        }
         Delivery::Injected {
             task,
             receiver,
             sequence_before,
             sequence_after,
+            input_generation,
         } => {
             let sequence = match plan.cursor {
                 InputCursor::Before => sequence_before,
                 InputCursor::After => sequence_after,
             };
-            (task, plan.attach_receiver.then_some(receiver), sequence)
+            (
+                task,
+                plan.attach_receiver
+                    .then_some(receiver.for_input(input_generation.unwrap_or(0))),
+                sequence,
+            )
         }
     };
     let events = match receiver {
@@ -1099,6 +1108,7 @@ mod subscription_tests {
             receiver: active.subscribe(),
             sequence_before: 0,
             sequence_after: 0,
+            input_generation: None,
         };
         let mut request = crate::handler::test_support::send_request();
         request.configuration = Some(SendMessageConfiguration {

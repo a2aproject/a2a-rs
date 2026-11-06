@@ -754,6 +754,7 @@ mod serialization_tests {
                 None,
                 super::super::protocol::EventKind::Normal,
                 None,
+                0,
             )
             .await;
         assert!(matches!(events.recv().await.unwrap().result,
