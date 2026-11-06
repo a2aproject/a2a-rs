@@ -11,6 +11,8 @@ use slim_datapath::api::ProtoName;
 use crate::error::PluginError;
 
 mod connect;
+#[cfg(test)]
+mod scratch;
 
 pub use connect::run;
 
@@ -125,6 +127,7 @@ fn load_config(path: &str) -> Result<PluginConfig, PluginError> {
 mod tests {
     use a2a::{TRANSPORT_PROTOCOL_GRPC, VERSION};
 
+    use super::scratch::ScratchFile;
     use super::*;
 
     const VALID_CONFIG_YAML: &str = r#"
@@ -141,28 +144,6 @@ app:
     id: "my-id"
     data: "secret"
 "#;
-
-    /// A scratch file under the OS temp dir, removed on drop. Avoids adding
-    /// a `tempfile` dependency for what's otherwise a one-line write+read.
-    struct ScratchFile(std::path::PathBuf);
-
-    impl ScratchFile {
-        fn new(name: &str, contents: &str) -> Self {
-            let path = std::env::temp_dir().join(name);
-            std::fs::write(&path, contents).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &str {
-            self.0.to_str().unwrap()
-        }
-    }
-
-    impl Drop for ScratchFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
 
     #[test]
     fn test_load_config_parses_the_documented_example() {

@@ -127,6 +127,16 @@ impl RequestHandler for TestHandler {
         if req.id == "missing" {
             return Err(A2AError::task_not_found(&req.id));
         }
+        if req.id == "invalid" {
+            return Err(
+                A2AError::invalid_params("invalid task id").with_details(vec![
+                    TypedDetail::bad_request(vec![FieldViolation {
+                        field: "id".to_string(),
+                        description: "must be a UUID".to_string(),
+                    }]),
+                ]),
+            );
+        }
         Ok(sample_task(&req.id, TaskState::Completed))
     }
 
@@ -640,6 +650,41 @@ async fn grpc_transport_rejects_unsupported_a2a_version() {
         };
         assert_eq!(err.code, error_code::VERSION_NOT_SUPPORTED, "{params:?}");
     }
+
+    transport.destroy().await.unwrap();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn grpc_transport_decodes_error_details_from_a_real_server() {
+    let (endpoint, handle) = spawn_grpc_server().await;
+    let transport = GrpcTransport::connect(endpoint).await.unwrap();
+
+    let err = transport
+        .get_task(
+            &versioned_params(),
+            &GetTaskRequest {
+                id: "invalid".to_string(),
+                history_length: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, error_code::INVALID_PARAMS);
+    assert_eq!(err.message, "invalid task id: id: must be a UUID");
+    let details = err.details.expect("details should reach the client");
+    assert_eq!(details.len(), 2);
+    assert_eq!(details[0].type_url, errordetails::ERROR_INFO_TYPE);
+    assert_eq!(details[0].value["reason"], "INVALID_PARAMS");
+    assert_eq!(
+        details[1],
+        TypedDetail::bad_request(vec![FieldViolation {
+            field: "id".to_string(),
+            description: "must be a UUID".to_string(),
+        }])
+    );
 
     transport.destroy().await.unwrap();
     handle.abort();

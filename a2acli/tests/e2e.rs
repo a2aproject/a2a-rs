@@ -19,6 +19,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -79,6 +80,9 @@ struct ServerState {
     /// resumption fixture task ids below, so each reconnect gets the next
     /// canned event sequence in that id's list.
     subscribe_attempts: Mutex<BTreeMap<String, u32>>,
+    /// Number of `SubscribeToTask` calls the dropped-connection middleware
+    /// has seen for each of the fixture ids below.
+    dropped_stream_calls: Mutex<BTreeMap<String, u32>>,
 }
 
 /// Fixture task ids that settle to `COMPLETED` only after this many
@@ -111,6 +115,154 @@ const SUBSCRIBE_STUCK_ID: &str = "task-subscribe-stuck";
 /// settles. Exercises that a failure re-establishing the subscription is
 /// retried under the same budget, not surfaced as a distinct error.
 const SUBSCRIBE_RESUBSCRIBE_FAILS_ONCE_ID: &str = "task-subscribe-resubscribe-fails-once";
+
+/// A subscription cut after one chunk of a file artifact; the reconnect
+/// re-delivers the complete task at the same state (so it is not printed
+/// again) and then settles. The file has to come out as the complete one.
+const SUBSCRIBE_CUT_FILE_ID: &str = "task-subscribe-cut-file";
+
+/// Like [`SUBSCRIBE_CUT_FILE_ID`], but nothing is written before the cut.
+const SUBSCRIBE_CUT_FILE_LATE_ID: &str = "task-subscribe-cut-file-late";
+
+/// Dropped-connection fixtures. The first `SubscribeToTask` for each of
+/// these is answered by [`drop_subscribe_connections`] with a stream whose
+/// connection breaks mid-body, which is how a network failure reaches the
+/// client; a canned `Err` item cannot stand in for it, because the server
+/// would send that as an error event carrying details.
+///
+/// Drops after a `Working` update; the reconnect settles the task.
+const SUBSCRIBE_DROPPED_ID: &str = "task-subscribe-dropped";
+/// Like [`SUBSCRIBE_DROPPED_ID`], but the stream is open and quiet for longer
+/// than any `--timeout` the test gives before it drops.
+const SUBSCRIBE_DROPPED_SLOW_ID: &str = "task-subscribe-dropped-slow";
+/// Delivers the settled task and then drops, so there is nothing to
+/// reconnect for.
+const SUBSCRIBE_DROPPED_SETTLED_ID: &str = "task-subscribe-dropped-settled";
+/// Every connection drops after a `Working` update.
+const SUBSCRIBE_ALWAYS_DROPPED_ID: &str = "task-subscribe-always-dropped";
+
+/// How long [`SUBSCRIBE_DROPPED_SLOW_ID`]'s first stream stays open.
+const SLOW_STREAM_HEALTHY_FOR: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// What the dropped-connection fixtures send before breaking the connection
+/// on `call` (1 on the first), after waiting: an event, or only a keep-alive
+/// comment when `None`.
+fn dropped_stream_event(
+    task_id: &str,
+    call: u32,
+) -> Option<(Option<StreamResponse>, std::time::Duration)> {
+    let none = std::time::Duration::ZERO;
+    let working = || Some(working_status_update(task_id).unwrap());
+    match task_id {
+        SUBSCRIBE_DROPPED_ID if call == 1 => Some((working(), none)),
+        SUBSCRIBE_DROPPED_SLOW_ID if call == 1 => Some((None, SLOW_STREAM_HEALTHY_FOR)),
+        SUBSCRIBE_DROPPED_SETTLED_ID if call == 1 => Some((
+            Some(task_event(task_id, TaskState::Completed).unwrap()),
+            none,
+        )),
+        SUBSCRIBE_ALWAYS_DROPPED_ID => Some((working(), none)),
+        _ => None,
+    }
+}
+
+/// Answers a dropped-connection fixture's `SubscribeToTask` itself, with an
+/// event stream that ends in an I/O error so the connection is aborted;
+/// everything else goes on to the handler.
+async fn drop_subscribe_connections(
+    state: Arc<ServerState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let rpc: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+
+    if rpc["method"] == "SubscribeToTask" {
+        let task_id = rpc["params"]["id"].as_str().unwrap_or_default().to_string();
+        let call = {
+            let mut calls = state.dropped_stream_calls.lock().unwrap();
+            let counter = calls.entry(task_id.clone()).or_insert(0);
+            *counter += 1;
+            *counter
+        };
+        if let Some((event, wait)) = dropped_stream_event(&task_id, call) {
+            state
+                .received_calls
+                .lock()
+                .unwrap()
+                .push("subscribe_to_task");
+            let first = match event {
+                Some(event) => {
+                    let message = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": rpc["id"],
+                        "result": serde_json::to_value(&event).unwrap(),
+                    });
+                    format!("data: {message}\n\n")
+                }
+                None => ": keep-alive\n\n".to_string(),
+            };
+            let first = axum::body::Bytes::from(first);
+            let events = stream::iter(vec![Ok::<_, std::io::Error>(first)]).chain(stream::once(
+                async move {
+                    tokio::time::sleep(wait).await;
+                    Err(std::io::Error::other("connection reset"))
+                },
+            ));
+            return axum::response::Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(axum::body::Body::from_stream(events))
+                .unwrap();
+        }
+    }
+
+    next.run(axum::extract::Request::from_parts(
+        parts,
+        axum::body::Body::from(bytes),
+    ))
+    .await
+}
+
+fn raw_file_part(bytes: &[u8], filename: Option<&str>) -> Part {
+    Part {
+        content: PartContent::Raw(bytes.to_vec()),
+        filename: filename.map(str::to_string),
+        media_type: None,
+        metadata: None,
+    }
+}
+
+fn file_artifact(name: &str, bytes: &[u8]) -> Artifact {
+    Artifact {
+        artifact_id: "file-1".to_string(),
+        name: Some(name.to_string()),
+        description: None,
+        parts: vec![raw_file_part(bytes, None)],
+        metadata: None,
+        extensions: None,
+    }
+}
+
+fn file_chunk(task_id: &str, bytes: &[u8], append: bool) -> Result<StreamResponse, A2AError> {
+    Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+        task_id: task_id.to_string(),
+        context_id: format!("{task_id}-ctx"),
+        artifact: file_artifact("log.txt", bytes),
+        append: Some(append),
+        last_chunk: None,
+        metadata: None,
+    }))
+}
+
+fn task_with_file(
+    task_id: &str,
+    state: TaskState,
+    bytes: &[u8],
+) -> Result<StreamResponse, A2AError> {
+    let mut task = make_task(task_id, &format!("{task_id}-ctx"), state, "with a file");
+    task.artifacts = Some(vec![file_artifact("log.txt", bytes)]);
+    Ok(StreamResponse::Task(task))
+}
 
 fn artifact_update(task_id: &str) -> Result<StreamResponse, A2AError> {
     Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
@@ -167,6 +319,10 @@ fn subscribe_resumption_events(
         SUBSCRIBE_CUT_UNCHANGED_ID,
         SUBSCRIBE_STUCK_ID,
         SUBSCRIBE_RESUBSCRIBE_FAILS_ONCE_ID,
+        SUBSCRIBE_CUT_FILE_ID,
+        SUBSCRIBE_CUT_FILE_LATE_ID,
+        SUBSCRIBE_DROPPED_ID,
+        SUBSCRIBE_DROPPED_SLOW_ID,
     ]
     .contains(&task_id)
     {
@@ -202,6 +358,23 @@ fn subscribe_resumption_events(
                 artifact_update(task_id),
                 task_event(task_id, TaskState::Completed),
             ]
+        }
+        SUBSCRIBE_CUT_FILE_LATE_ID if attempt == 1 => vec![working_status_update(task_id)],
+        SUBSCRIBE_CUT_FILE_ID if attempt == 1 => {
+            vec![
+                file_chunk(task_id, b"first ", false),
+                working_status_update(task_id),
+            ]
+        }
+        SUBSCRIBE_CUT_FILE_ID | SUBSCRIBE_CUT_FILE_LATE_ID => {
+            vec![
+                task_with_file(task_id, TaskState::Working, b"first and second"),
+                task_event(task_id, TaskState::Completed),
+            ]
+        }
+        // Only reached by the reconnect: the middleware took the first call.
+        SUBSCRIBE_DROPPED_ID | SUBSCRIBE_DROPPED_SLOW_ID => {
+            vec![task_event(task_id, TaskState::Completed)]
         }
         SUBSCRIBE_CUT_UNCHANGED_ID if attempt == 1 => {
             vec![task_event(task_id, TaskState::Working)]
@@ -333,6 +506,13 @@ impl TestServer {
             },
         );
 
+        let dropping_state = state.clone();
+        let drop_connections = axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                drop_subscribe_connections(dropping_state.clone(), request, next)
+            },
+        );
+
         let app = Router::new()
             .route(
                 WELL_KNOWN_AGENT_CARD_PATH,
@@ -364,7 +544,9 @@ impl TestServer {
             )
             .nest(
                 "/jsonrpc",
-                jsonrpc_router(handler.clone()).layer(record_agent_headers.clone()),
+                jsonrpc_router(handler.clone())
+                    .layer(record_agent_headers.clone())
+                    .layer(drop_connections),
             )
             .nest("/rest", rest_router(handler).layer(record_agent_headers));
 
@@ -518,6 +700,15 @@ impl RequestHandler for TestHandler {
             return Ok(Box::pin(stream::once(async {
                 Err(A2AError::internal("stream failed"))
             })));
+        }
+        if text == "stream-file-chunks" {
+            // One artifact sent in three chunks, then the finished task.
+            return Ok(Box::pin(stream::iter(vec![
+                file_chunk(&task_id, b"one ", false),
+                file_chunk(&task_id, b"two ", true),
+                file_chunk(&task_id, b"three", true),
+                task_event(&task_id, TaskState::Completed),
+            ])));
         }
         if text == "stream-open-error" {
             // Unlike "stream-error" (a stream that opens, then yields an
@@ -1246,6 +1437,124 @@ async fn task_subscribe_retries_a_failed_resubscribe_attempt() {
         3,
         "expected the failed attempt plus two that opened a stream: {calls:?}"
     );
+}
+
+fn subscribe_calls(server: &TestServer) -> usize {
+    calls(server)
+        .iter()
+        .filter(|call| **call == "subscribe_to_task")
+        .count()
+}
+
+/// Runs `task subscribe <id>` with a short poll interval; returns the
+/// parsed stdout events, stderr and the process's success.
+fn subscribe_dropped(server: &TestServer, extra: &[&str], id: &str) -> (Vec<Value>, String, bool) {
+    let mut args = vec!["--output", "json", "--compact", "--poll-interval", "10ms"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["task", "subscribe", id]);
+    let output = run_cli_output(server, &args);
+    (
+        parse_json_lines(&String::from_utf8(output.stdout).unwrap()),
+        String::from_utf8(output.stderr).unwrap(),
+        output.status.success(),
+    )
+}
+
+/// A connection that breaks in the middle of the stream -- how a proxy or a
+/// sleeping laptop actually ends a long subscription -- is reconnected like a
+/// clean end of stream, and the warning names what went wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_reconnects_after_the_connection_drops_mid_stream() {
+    let server = TestServer::spawn().await;
+
+    let (events, stderr, success) = subscribe_dropped(&server, &[], SUBSCRIBE_DROPPED_ID);
+
+    assert!(success, "{stderr}");
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(
+        events[0]["statusUpdate"]["status"]["state"],
+        "TASK_STATE_WORKING"
+    );
+    assert_eq!(events[1]["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+    assert!(
+        stderr.contains("SSE stream error") && stderr.contains("reconnecting"),
+        "expected the cause and a reconnect warning: {stderr}"
+    );
+    assert_eq!(subscribe_calls(&server), 2);
+}
+
+/// `--timeout` is for the outage, so a stream that was open for longer than
+/// it still gets its reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_reconnects_after_a_healthy_stream_outlasts_the_timeout() {
+    let server = TestServer::spawn().await;
+
+    let (events, stderr, success) =
+        subscribe_dropped(&server, &["--timeout", "300ms"], SUBSCRIBE_DROPPED_SLOW_ID);
+
+    assert!(success, "{stderr}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+    assert_eq!(subscribe_calls(&server), 2);
+}
+
+/// Once the task has settled, a connection that fails afterwards loses
+/// nothing, so there is nothing to reconnect for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_does_not_reconnect_for_a_drop_after_the_task_settled() {
+    let server = TestServer::spawn().await;
+
+    let (events, stderr, success) = subscribe_dropped(
+        &server,
+        &["--timeout", "300ms"],
+        SUBSCRIBE_DROPPED_SETTLED_ID,
+    );
+
+    assert!(success, "{stderr}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(subscribe_calls(&server), 1);
+}
+
+/// A connection that keeps dropping is retried for as long as `--timeout`
+/// allows, then reported as a timeout, as a stream that keeps ending is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_gives_up_on_a_connection_that_keeps_dropping() {
+    let server = TestServer::spawn().await;
+
+    let output = run_cli_output(
+        &server,
+        &[
+            "--output",
+            "json",
+            "--timeout",
+            "300ms",
+            "--poll-interval",
+            "20ms",
+            "task",
+            "subscribe",
+            SUBSCRIBE_ALWAYS_DROPPED_ID,
+        ],
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(5), "{stderr}");
+    let envelope = parse_error_envelope(stderr.lines().next_back().unwrap());
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_TIMEOUT");
+    assert!(subscribe_calls(&server) > 1, "{:?}", calls(&server));
+}
+
+/// An error the agent reports on the stream is its answer, not a failed
+/// connection: it is shown at once, with no reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_does_not_retry_an_error_the_agent_reported() {
+    let server = TestServer::spawn().await;
+
+    let (_stdout, stderr) = run_cli_failure(&server, &["task", "subscribe", "stream-error"]);
+
+    let envelope = parse_error_envelope(stderr.lines().next_back().unwrap());
+    assert_eq!(envelope["error"]["message"], "stream failed");
+    assert!(!stderr.contains("reconnecting"), "{stderr}");
+    assert_eq!(subscribe_calls(&server), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3809,5 +4118,341 @@ async fn wire_logging_is_silent_without_debug() {
     assert!(
         !stderr.contains("A2A wire"),
         "wire logging leaked without --debug: {stderr}"
+    );
+}
+
+// --save-fileparts (a2aproject/a2a-cli#61): raw file parts of a response are
+// written to disk; stdout still carries the protocol payload and stderr names
+// each new file.
+
+/// A scratch directory for one test: not created until asked, removed on drop.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "a2acli-save-fileparts-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        Self(path)
+    }
+
+    fn create(&self) -> &Self {
+        std::fs::create_dir_all(&self.0).unwrap();
+        self
+    }
+
+    fn join(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+
+    fn arg(&self) -> &str {
+        self.0.to_str().unwrap()
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Run `a2acli` against `server` and hand back the output whatever its status.
+fn run_cli_output(server: &TestServer, args: &[&str]) -> std::process::Output {
+    StdCommand::cargo_bin("a2acli")
+        .unwrap()
+        .args(["--agent-card", server.base_url.as_str()])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// `send` with a text part and a file part, so the fixture echoes the file
+/// back in the task's status message.
+fn send_with_file_part(
+    server: &TestServer,
+    input: &ScratchDir,
+    extra: &[&str],
+) -> std::process::Output {
+    input.create();
+    std::fs::write(input.join("note.bin"), b"binary payload").unwrap();
+    let file = input.join("note.bin");
+    let mut args = vec![
+        "--output",
+        "json",
+        "--compact",
+        "send",
+        "--text-part",
+        "hi",
+        "--file-part",
+        file.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    run_cli_output(server, &args)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_saves_the_raw_file_parts_of_the_response() {
+    let server = TestServer::spawn().await;
+    let input = ScratchDir::new("send-in");
+    let out = ScratchDir::new("send-out");
+
+    let output = send_with_file_part(&server, &input, &["--save-fileparts", out.arg()]);
+    assert!(output.status.success(), "{output:?}");
+
+    assert_eq!(
+        std::fs::read(out.join("note.bin")).unwrap(),
+        b"binary payload"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("saved file part:"), "{stderr}");
+    assert!(stderr.contains("note.bin"), "{stderr}");
+    // The payload is unchanged: the part is still in the JSON on stdout.
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let parts = response["task"]["status"]["message"]["parts"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        BASE64.decode(parts[1]["raw"].as_str().unwrap()).unwrap(),
+        b"binary payload"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_is_written_without_the_flag() {
+    let server = TestServer::spawn().await;
+    let input = ScratchDir::new("noflag-in");
+
+    let output = send_with_file_part(&server, &input, &[]);
+    assert!(output.status.success(), "{output:?}");
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("saved file part"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_target_directory_is_created_only_when_there_is_something_to_save() {
+    let server = TestServer::spawn().await;
+    let out = ScratchDir::new("lazy-out");
+
+    let output = run_cli_output(&server, &["send", "hello", "--save-fileparts", out.arg()]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !out.0.exists(),
+        "created a directory with nothing to put in it"
+    );
+
+    let input = ScratchDir::new("lazy-in");
+    let nested = out.join("nested");
+    let output = send_with_file_part(
+        &server,
+        &input,
+        &["--save-fileparts", nested.to_str().unwrap()],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(out.join("nested").join("note.bin").is_file());
+}
+
+/// Chunks marked `append` extend the file; the closing task here carries no
+/// artifacts, so only the appends can have produced the content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_stream_appends_the_chunks_of_one_artifact() {
+    let server = TestServer::spawn().await;
+    let out = ScratchDir::new("stream-out");
+
+    let output = run_cli_output(
+        &server,
+        &[
+            "--output",
+            "json",
+            "send",
+            "stream-file-chunks",
+            "--stream",
+            "--save-fileparts",
+            out.arg(),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    assert_eq!(
+        std::fs::read(out.join("log.txt")).unwrap(),
+        b"one two three"
+    );
+    // Named once, on its first write, not once per chunk.
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.matches("saved file part:").count(), 1, "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_get_saves_the_raw_file_parts_of_the_task() {
+    let server = TestServer::spawn().await;
+    let input = ScratchDir::new("get-in");
+    let out = ScratchDir::new("get-out");
+    let sent = send_with_file_part(&server, &input, &[]);
+    assert!(sent.status.success(), "{sent:?}");
+
+    let output = run_cli_output(
+        &server,
+        &["task", "get", "task-send", "--save-fileparts", out.arg()],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    assert_eq!(
+        std::fs::read(out.join("note.bin")).unwrap(),
+        b"binary payload"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_saves_the_raw_file_parts_of_the_events() {
+    let server = TestServer::spawn().await;
+    let input = ScratchDir::new("sub-in");
+    let out = ScratchDir::new("sub-out");
+    let sent = send_with_file_part(&server, &input, &[]);
+    assert!(sent.status.success(), "{sent:?}");
+
+    let output = run_cli_output(
+        &server,
+        &[
+            "task",
+            "subscribe",
+            "task-send",
+            "--save-fileparts",
+            out.arg(),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    assert_eq!(
+        std::fs::read(out.join("note.bin")).unwrap(),
+        b"binary payload"
+    );
+}
+
+/// After a cut the reconnect re-delivers the whole task. That event is not
+/// printed a second time, but its artifacts are what completes the file: the
+/// task that settles it carries none, so only the suppressed event can have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_saves_from_the_reconciling_event_it_does_not_print() {
+    let server = TestServer::spawn().await;
+    let out = ScratchDir::new("cut-out");
+
+    let output = run_cli_output(
+        &server,
+        &[
+            "--output",
+            "json",
+            "--compact",
+            "--poll-interval",
+            "10ms",
+            "task",
+            "subscribe",
+            SUBSCRIBE_CUT_FILE_ID,
+            "--save-fileparts",
+            out.arg(),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    assert_eq!(
+        std::fs::read(out.join("log.txt")).unwrap(),
+        b"first and second"
+    );
+    // The chunk, the Working update, then the settling task: the echo of
+    // Working was suppressed.
+    let events = parse_json_lines(&String::from_utf8(output.stdout).unwrap());
+    assert_eq!(events.len(), 3, "{events:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_save_target_that_is_a_file_is_a_usage_error_before_any_request() {
+    let server = TestServer::spawn().await;
+    let scratch = ScratchDir::new("usage");
+    scratch.create();
+    let file = scratch.join("not-a-dir");
+    std::fs::write(&file, b"").unwrap();
+
+    let output = run_cli_output(
+        &server,
+        &["send", "hello", "--save-fileparts", file.to_str().unwrap()],
+    );
+
+    assert_eq!(output.status.code(), Some(2));
+    let envelope = parse_error_envelope(&String::from_utf8(output.stderr).unwrap());
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_USAGE");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--save-fileparts must point to a directory"),
+        "{envelope}"
+    );
+    assert!(server.state.card_headers.lock().unwrap().is_empty());
+    assert!(server.state.received_calls.lock().unwrap().is_empty());
+}
+
+/// A part that cannot be written fails the command, but the result it was
+/// part of has already been printed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_part_that_cannot_be_written_fails_after_the_result_is_printed() {
+    let server = TestServer::spawn().await;
+    let input = ScratchDir::new("fail-in");
+    let out = ScratchDir::new("fail-out");
+    // A directory where the file should go.
+    std::fs::create_dir_all(out.join("note.bin")).unwrap();
+
+    let output = send_with_file_part(&server, &input, &["--save-fileparts", out.arg()]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let envelope = parse_error_envelope(&String::from_utf8(output.stderr).unwrap());
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_INTERNAL");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("note.bin"),
+        "{envelope}"
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+}
+
+/// A part that cannot be written while saving from the reconciling event
+/// ends the command with the write error, not a reconnect or a timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_fails_when_the_reconciling_event_cannot_be_saved() {
+    let server = TestServer::spawn().await;
+    let out = ScratchDir::new("cut-late-out");
+    // A directory where the file should go.
+    std::fs::create_dir_all(out.join("log.txt")).unwrap();
+
+    let output = run_cli_output(
+        &server,
+        &[
+            "--output",
+            "json",
+            "--compact",
+            "--poll-interval",
+            "10ms",
+            "task",
+            "subscribe",
+            SUBSCRIBE_CUT_FILE_LATE_ID,
+            "--save-fileparts",
+            out.arg(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    // The reconnect warning comes first; the envelope is the last line.
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let envelope = parse_error_envelope(stderr.lines().last().unwrap());
+    assert_eq!(envelope["error"]["code"], "A2ACLI_ERR_INTERNAL");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("log.txt"),
+        "{envelope}"
     );
 }
