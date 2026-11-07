@@ -834,6 +834,25 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// `Part.content` is a required oneof in a2a.proto: a part that carries
+    /// none is a 400, not an empty text part.
+    #[tokio::test]
+    async fn test_send_message_rejects_part_without_content() {
+        let app = make_app();
+        let body = serde_json::json!({
+            "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{}]}
+        });
+        let req = Request::builder()
+            .header("a2a-version", "1.0")
+            .uri(REST_SEND_MESSAGE_PATH)
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn test_send_message_response_content_type_is_a2a_json() {
         // ACTS REST-CT-001, spec §9: a REST success response's Content-Type

@@ -98,7 +98,7 @@ impl SlimRpcTransport {
             let item = item.map_err(|error| rpc_error_to_a2a_error(&error))?;
             let proto_message =
                 decode_proto_response::<a2a_pb::proto::Message>(item.message, "Message")?;
-            let mut message = pbconv::from_proto_message(&proto_message);
+            let mut message = pbconv::from_proto_message(&proto_message)?;
             message
                 .metadata
                 .get_or_insert_with(std::collections::HashMap::new)
@@ -194,7 +194,7 @@ impl Transport for SlimRpcTransport {
             )
             .await?;
 
-        pbconv::from_proto_send_message_response(&response)
+        pbconv::from_proto_send_message_response(&response)?
             .ok_or_else(|| A2AError::internal("empty SendMessageResponse payload"))
     }
 
@@ -215,7 +215,7 @@ impl Transport for SlimRpcTransport {
 
         Ok(Box::pin(stream.map(|item| {
             item.and_then(|response| {
-                pbconv::from_proto_stream_response(&response)
+                pbconv::from_proto_stream_response(&response)?
                     .ok_or_else(|| A2AError::internal("empty StreamResponse payload"))
             })
         })))
@@ -230,7 +230,7 @@ impl Transport for SlimRpcTransport {
         let response = self
             .call_unary::<_, a2a_pb::proto::Task>(params, METHOD_GET_TASK, &request, "Task")
             .await?;
-        Ok(pbconv::from_proto_task(&response))
+        pbconv::from_proto_task(&response)
     }
 
     async fn list_tasks(
@@ -247,7 +247,7 @@ impl Transport for SlimRpcTransport {
                 "ListTasksResponse",
             )
             .await?;
-        Ok(pbconv::from_proto_list_tasks_response(&response))
+        pbconv::from_proto_list_tasks_response(&response)
     }
 
     async fn cancel_task(
@@ -259,7 +259,7 @@ impl Transport for SlimRpcTransport {
         let response = self
             .call_unary::<_, a2a_pb::proto::Task>(params, METHOD_CANCEL_TASK, &request, "Task")
             .await?;
-        Ok(pbconv::from_proto_task(&response))
+        pbconv::from_proto_task(&response)
     }
 
     async fn subscribe_to_task(
@@ -279,7 +279,7 @@ impl Transport for SlimRpcTransport {
 
         Ok(Box::pin(stream.map(|item| {
             item.and_then(|response| {
-                pbconv::from_proto_stream_response(&response)
+                pbconv::from_proto_stream_response(&response)?
                     .ok_or_else(|| A2AError::internal("empty StreamResponse payload"))
             })
         })))

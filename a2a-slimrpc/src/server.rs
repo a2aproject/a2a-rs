@@ -40,7 +40,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
             "SendMessageRequest",
             pbconv::from_proto_send_message_request,
             |handler, params, request| {
-                Box::pin(async move { handler.send_message(&params, request).await })
+                Box::pin(async move { handler.send_message(&params, request?).await })
             },
             |response| encode_proto_message(&pbconv::to_proto_send_message_response(response)),
         );
@@ -187,8 +187,9 @@ where
                         if let Ok(bytes) = item
                             && let Ok(proto_message) =
                                 decode_proto_request::<a2a_pb::proto::Message>(bytes, "Message")
+                            && let Ok(message) = pbconv::from_proto_message(&proto_message)
                         {
-                            on_message(pbconv::from_proto_message(&proto_message));
+                            on_message(message);
                         }
                     }
                 });
@@ -259,7 +260,8 @@ where
                     "SendMessageRequest",
                 )?;
                 let params = context_to_service_params(&context);
-                let request = pbconv::from_proto_send_message_request(&proto_request);
+                let request = pbconv::from_proto_send_message_request(&proto_request)
+                    .map_err(|error| a2a_error_to_rpc_error(&error))?;
                 let stream = handler
                     .send_streaming_message(&params, request)
                     .await

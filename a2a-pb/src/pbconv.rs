@@ -7,6 +7,7 @@
 //! in the `a2a` crate and the prost-generated types from `a2a.proto`.
 
 use crate::proto;
+use a2a::A2AError;
 use a2a::agent_card::*;
 use a2a::event::*;
 use a2a::types::*;
@@ -215,20 +216,23 @@ pub fn to_proto_part(p: &Part) -> proto::Part {
     }
 }
 
-pub fn from_proto_part(p: &proto::Part) -> Part {
+/// `Part.content` is a required oneof, so a part that carries none is
+/// invalid input (INVALID_PARAMS, as a2a-go answers it), not an empty text
+/// part.
+pub fn from_proto_part(p: &proto::Part) -> Result<Part, A2AError> {
     let content = match &p.content {
         Some(proto::part::Content::Text(t)) => PartContent::Text(t.clone()),
         Some(proto::part::Content::Raw(r)) => PartContent::Raw(r.clone()),
         Some(proto::part::Content::Url(u)) => PartContent::Url(u.clone()),
         Some(proto::part::Content::Data(d)) => PartContent::Data(proto_value_to_json_value(d)),
-        None => PartContent::Text(String::new()),
+        None => return Err(A2AError::invalid_params("part content is required")),
     };
-    Part {
+    Ok(Part {
         content,
         filename: empty_to_none(&p.filename),
         media_type: empty_to_none(&p.media_type),
         metadata: opt_metadata_from_proto(&p.metadata),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -248,13 +252,17 @@ pub fn to_proto_message(m: &Message) -> proto::Message {
     }
 }
 
-pub fn from_proto_message(m: &proto::Message) -> Message {
-    Message {
+pub fn from_proto_message(m: &proto::Message) -> Result<Message, A2AError> {
+    Ok(Message {
         message_id: m.message_id.clone(),
         context_id: empty_to_none(&m.context_id),
         task_id: empty_to_none(&m.task_id),
         role: from_proto_role(m.role),
-        parts: m.parts.iter().map(from_proto_part).collect(),
+        parts: m
+            .parts
+            .iter()
+            .map(from_proto_part)
+            .collect::<Result<_, _>>()?,
         metadata: opt_metadata_from_proto(&m.metadata),
         extensions: if m.extensions.is_empty() {
             None
@@ -266,7 +274,7 @@ pub fn from_proto_message(m: &proto::Message) -> Message {
         } else {
             Some(m.reference_task_ids.clone())
         },
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -281,12 +289,12 @@ pub fn to_proto_task_status(s: &TaskStatus) -> proto::TaskStatus {
     }
 }
 
-pub fn from_proto_task_status(s: &proto::TaskStatus) -> TaskStatus {
-    TaskStatus {
+pub fn from_proto_task_status(s: &proto::TaskStatus) -> Result<TaskStatus, A2AError> {
+    Ok(TaskStatus {
         state: from_proto_task_state(s.state),
-        message: s.message.as_ref().map(from_proto_message),
+        message: s.message.as_ref().map(from_proto_message).transpose()?,
         timestamp: s.timestamp.as_ref().and_then(from_proto_timestamp),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -304,19 +312,23 @@ pub fn to_proto_artifact(a: &Artifact) -> proto::Artifact {
     }
 }
 
-pub fn from_proto_artifact(a: &proto::Artifact) -> Artifact {
-    Artifact {
+pub fn from_proto_artifact(a: &proto::Artifact) -> Result<Artifact, A2AError> {
+    Ok(Artifact {
         artifact_id: a.artifact_id.clone(),
         name: empty_to_none(&a.name),
         description: empty_to_none(&a.description),
-        parts: a.parts.iter().map(from_proto_part).collect(),
+        parts: a
+            .parts
+            .iter()
+            .map(from_proto_part)
+            .collect::<Result<_, _>>()?,
         metadata: opt_metadata_from_proto(&a.metadata),
         extensions: if a.extensions.is_empty() {
             None
         } else {
             Some(a.extensions.clone())
         },
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -342,14 +354,15 @@ pub fn to_proto_task(t: &Task) -> proto::Task {
     }
 }
 
-pub fn from_proto_task(t: &proto::Task) -> Task {
-    Task {
+pub fn from_proto_task(t: &proto::Task) -> Result<Task, A2AError> {
+    Ok(Task {
         id: t.id.clone(),
         context_id: t.context_id.clone(),
         status: t
             .status
             .as_ref()
             .map(from_proto_task_status)
+            .transpose()?
             .unwrap_or(TaskStatus {
                 state: TaskState::Unspecified,
                 message: None,
@@ -358,15 +371,25 @@ pub fn from_proto_task(t: &proto::Task) -> Task {
         artifacts: if t.artifacts.is_empty() {
             None
         } else {
-            Some(t.artifacts.iter().map(from_proto_artifact).collect())
+            Some(
+                t.artifacts
+                    .iter()
+                    .map(from_proto_artifact)
+                    .collect::<Result<_, _>>()?,
+            )
         },
         history: if t.history.is_empty() {
             None
         } else {
-            Some(t.history.iter().map(from_proto_message).collect())
+            Some(
+                t.history
+                    .iter()
+                    .map(from_proto_message)
+                    .collect::<Result<_, _>>()?,
+            )
         },
         metadata: opt_metadata_from_proto(&t.metadata),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -476,20 +499,23 @@ pub fn to_proto_send_message_request(r: &SendMessageRequest) -> proto::SendMessa
     }
 }
 
-pub fn from_proto_send_message_request(r: &proto::SendMessageRequest) -> SendMessageRequest {
-    SendMessageRequest {
+pub fn from_proto_send_message_request(
+    r: &proto::SendMessageRequest,
+) -> Result<SendMessageRequest, A2AError> {
+    Ok(SendMessageRequest {
         tenant: empty_to_none(&r.tenant),
         message: r
             .message
             .as_ref()
             .map(from_proto_message)
+            .transpose()?
             .unwrap_or_else(|| Message::new(Role::User, vec![])),
         configuration: r
             .configuration
             .as_ref()
             .map(from_proto_send_message_configuration),
         metadata: opt_metadata_from_proto(&r.metadata),
-    }
+    })
 }
 
 pub fn to_proto_get_task_request(r: &GetTaskRequest) -> proto::GetTaskRequest {
@@ -553,13 +579,19 @@ pub fn to_proto_list_tasks_response(r: &ListTasksResponse) -> proto::ListTasksRe
     }
 }
 
-pub fn from_proto_list_tasks_response(r: &proto::ListTasksResponse) -> ListTasksResponse {
-    ListTasksResponse {
-        tasks: r.tasks.iter().map(from_proto_task).collect(),
+pub fn from_proto_list_tasks_response(
+    r: &proto::ListTasksResponse,
+) -> Result<ListTasksResponse, A2AError> {
+    Ok(ListTasksResponse {
+        tasks: r
+            .tasks
+            .iter()
+            .map(from_proto_task)
+            .collect::<Result<_, _>>()?,
         next_page_token: r.next_page_token.clone(),
         page_size: r.page_size,
         total_size: r.total_size,
-    }
+    })
 }
 
 pub fn to_proto_cancel_task_request(r: &CancelTaskRequest) -> proto::CancelTaskRequest {
@@ -726,16 +758,16 @@ pub fn to_proto_send_message_response(r: &SendMessageResponse) -> proto::SendMes
 
 pub fn from_proto_send_message_response(
     r: &proto::SendMessageResponse,
-) -> Option<SendMessageResponse> {
-    match &r.payload {
+) -> Result<Option<SendMessageResponse>, A2AError> {
+    Ok(match &r.payload {
         Some(proto::send_message_response::Payload::Task(t)) => {
-            Some(SendMessageResponse::Task(from_proto_task(t)))
+            Some(SendMessageResponse::Task(from_proto_task(t)?))
         }
         Some(proto::send_message_response::Payload::Message(m)) => {
-            Some(SendMessageResponse::Message(from_proto_message(m)))
+            Some(SendMessageResponse::Message(from_proto_message(m)?))
         }
         None => None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -755,21 +787,22 @@ pub fn to_proto_task_status_update_event(
 
 pub fn from_proto_task_status_update_event(
     e: &proto::TaskStatusUpdateEvent,
-) -> TaskStatusUpdateEvent {
-    TaskStatusUpdateEvent {
+) -> Result<TaskStatusUpdateEvent, A2AError> {
+    Ok(TaskStatusUpdateEvent {
         task_id: e.task_id.clone(),
         context_id: e.context_id.clone(),
         status: e
             .status
             .as_ref()
             .map(from_proto_task_status)
+            .transpose()?
             .unwrap_or(TaskStatus {
                 state: TaskState::Unspecified,
                 message: None,
                 timestamp: None,
             }),
         metadata: opt_metadata_from_proto(&e.metadata),
-    }
+    })
 }
 
 pub fn to_proto_task_artifact_update_event(
@@ -787,14 +820,15 @@ pub fn to_proto_task_artifact_update_event(
 
 pub fn from_proto_task_artifact_update_event(
     e: &proto::TaskArtifactUpdateEvent,
-) -> TaskArtifactUpdateEvent {
-    TaskArtifactUpdateEvent {
+) -> Result<TaskArtifactUpdateEvent, A2AError> {
+    Ok(TaskArtifactUpdateEvent {
         task_id: e.task_id.clone(),
         context_id: e.context_id.clone(),
         artifact: e
             .artifact
             .as_ref()
             .map(from_proto_artifact)
+            .transpose()?
             .unwrap_or(Artifact {
                 artifact_id: String::new(),
                 name: None,
@@ -806,7 +840,7 @@ pub fn from_proto_task_artifact_update_event(
         append: if e.append { Some(true) } else { None },
         last_chunk: if e.last_chunk { Some(true) } else { None },
         metadata: opt_metadata_from_proto(&e.metadata),
-    }
+    })
 }
 
 pub fn to_proto_stream_response(r: &StreamResponse) -> proto::StreamResponse {
@@ -825,22 +859,24 @@ pub fn to_proto_stream_response(r: &StreamResponse) -> proto::StreamResponse {
     proto::StreamResponse { payload }
 }
 
-pub fn from_proto_stream_response(r: &proto::StreamResponse) -> Option<StreamResponse> {
-    match &r.payload {
+pub fn from_proto_stream_response(
+    r: &proto::StreamResponse,
+) -> Result<Option<StreamResponse>, A2AError> {
+    Ok(match &r.payload {
         Some(proto::stream_response::Payload::Task(t)) => {
-            Some(StreamResponse::Task(from_proto_task(t)))
+            Some(StreamResponse::Task(from_proto_task(t)?))
         }
         Some(proto::stream_response::Payload::Message(m)) => {
-            Some(StreamResponse::Message(from_proto_message(m)))
+            Some(StreamResponse::Message(from_proto_message(m)?))
         }
         Some(proto::stream_response::Payload::StatusUpdate(s)) => Some(
-            StreamResponse::StatusUpdate(from_proto_task_status_update_event(s)),
+            StreamResponse::StatusUpdate(from_proto_task_status_update_event(s)?),
         ),
         Some(proto::stream_response::Payload::ArtifactUpdate(a)) => Some(
-            StreamResponse::ArtifactUpdate(from_proto_task_artifact_update_event(a)),
+            StreamResponse::ArtifactUpdate(from_proto_task_artifact_update_event(a)?),
         ),
         None => None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1347,7 +1383,7 @@ mod tests {
     fn test_part_text_roundtrip() {
         let part = Part::text("hello world");
         let proto_part = to_proto_part(&part);
-        let back = from_proto_part(&proto_part);
+        let back = from_proto_part(&proto_part).unwrap();
         assert_eq!(part, back);
     }
 
@@ -1355,7 +1391,7 @@ mod tests {
     fn test_part_raw_roundtrip() {
         let part = Part::raw(vec![1, 2, 3, 4]);
         let proto_part = to_proto_part(&part);
-        let back = from_proto_part(&proto_part);
+        let back = from_proto_part(&proto_part).unwrap();
         assert_eq!(part, back);
     }
 
@@ -1370,7 +1406,7 @@ mod tests {
             metadata: Some(meta),
         };
         let proto_part = to_proto_part(&part);
-        let back = from_proto_part(&proto_part);
+        let back = from_proto_part(&proto_part).unwrap();
         assert_eq!(part, back);
     }
 
@@ -1387,7 +1423,7 @@ mod tests {
             reference_task_ids: None,
         };
         let proto_msg = to_proto_message(&msg);
-        let back = from_proto_message(&proto_msg);
+        let back = from_proto_message(&proto_msg).unwrap();
         assert_eq!(msg, back);
     }
 
@@ -1413,7 +1449,7 @@ mod tests {
             metadata: None,
         };
         let proto_task = to_proto_task(&task);
-        let back = from_proto_task(&proto_task);
+        let back = from_proto_task(&proto_task).unwrap();
         // Compare fields individually since Message has random message_id
         assert_eq!(task.id, back.id);
         assert_eq!(task.context_id, back.context_id);
@@ -1434,7 +1470,7 @@ mod tests {
             metadata: None,
         });
         let proto_sr = to_proto_stream_response(&sr);
-        let back = from_proto_stream_response(&proto_sr).unwrap();
+        let back = from_proto_stream_response(&proto_sr).unwrap().unwrap();
         assert!(matches!(back, StreamResponse::StatusUpdate(_)));
     }
 
@@ -1453,7 +1489,9 @@ mod tests {
             metadata: None,
         });
         let proto_resp = to_proto_send_message_response(&resp);
-        let back = from_proto_send_message_response(&proto_resp).unwrap();
+        let back = from_proto_send_message_response(&proto_resp)
+            .unwrap()
+            .unwrap();
         assert!(matches!(back, SendMessageResponse::Task(_)));
     }
 
@@ -1566,7 +1604,7 @@ mod tests {
             tenant: Some("my-tenant".to_string()),
         };
         let proto = to_proto_send_message_request(&req);
-        let back = from_proto_send_message_request(&proto);
+        let back = from_proto_send_message_request(&proto).unwrap();
         assert_eq!(req.tenant, back.tenant);
         assert_eq!(req.message.message_id, back.message.message_id);
         assert_eq!(
@@ -1591,7 +1629,7 @@ mod tests {
             configuration: None,
             metadata: None,
         };
-        let back = from_proto_send_message_request(&proto);
+        let back = from_proto_send_message_request(&proto).unwrap();
         assert!(back.tenant.is_none());
         assert_eq!(back.message.role, Role::User);
     }
@@ -1669,7 +1707,7 @@ mod tests {
             total_size: 1,
         };
         let proto = to_proto_list_tasks_response(&resp);
-        let back = from_proto_list_tasks_response(&proto);
+        let back = from_proto_list_tasks_response(&proto).unwrap();
         assert_eq!(resp.tasks.len(), back.tasks.len());
         assert_eq!(resp.next_page_token, back.next_page_token);
         assert_eq!(resp.page_size, back.page_size);
@@ -1772,14 +1810,14 @@ mod tests {
         let msg = Message::new(Role::Agent, vec![Part::text("hi")]);
         let resp = SendMessageResponse::Message(msg);
         let proto = to_proto_send_message_response(&resp);
-        let back = from_proto_send_message_response(&proto).unwrap();
+        let back = from_proto_send_message_response(&proto).unwrap().unwrap();
         assert!(matches!(back, SendMessageResponse::Message(_)));
     }
 
     #[test]
     fn test_send_message_response_none() {
         let proto = proto::SendMessageResponse { payload: None };
-        assert!(from_proto_send_message_response(&proto).is_none());
+        assert!(from_proto_send_message_response(&proto).unwrap().is_none());
     }
 
     #[test]
@@ -1798,7 +1836,7 @@ mod tests {
         };
         let sr = StreamResponse::Task(task);
         let proto = to_proto_stream_response(&sr);
-        let back = from_proto_stream_response(&proto).unwrap();
+        let back = from_proto_stream_response(&proto).unwrap().unwrap();
         assert!(matches!(back, StreamResponse::Task(_)));
     }
 
@@ -1807,7 +1845,7 @@ mod tests {
         let msg = Message::new(Role::Agent, vec![Part::text("hi")]);
         let sr = StreamResponse::Message(msg);
         let proto = to_proto_stream_response(&sr);
-        let back = from_proto_stream_response(&proto).unwrap();
+        let back = from_proto_stream_response(&proto).unwrap().unwrap();
         assert!(matches!(back, StreamResponse::Message(_)));
     }
 
@@ -1829,14 +1867,14 @@ mod tests {
             metadata: None,
         });
         let proto = to_proto_stream_response(&sr);
-        let back = from_proto_stream_response(&proto).unwrap();
+        let back = from_proto_stream_response(&proto).unwrap().unwrap();
         assert!(matches!(back, StreamResponse::ArtifactUpdate(_)));
     }
 
     #[test]
     fn test_stream_response_none() {
         let proto = proto::StreamResponse { payload: None };
-        assert!(from_proto_stream_response(&proto).is_none());
+        assert!(from_proto_stream_response(&proto).unwrap().is_none());
     }
 
     #[test]
@@ -2114,7 +2152,7 @@ mod tests {
             proto.timestamp.is_none(),
             "out-of-range timestamp is dropped, not emitted"
         );
-        let back = from_proto_task_status(&proto);
+        let back = from_proto_task_status(&proto).unwrap();
         assert!(back.timestamp.is_none());
     }
 
@@ -2126,7 +2164,7 @@ mod tests {
             timestamp: chrono::DateTime::from_timestamp(1700000000, 0),
         };
         let proto = to_proto_task_status(&ts);
-        let back = from_proto_task_status(&proto);
+        let back = from_proto_task_status(&proto).unwrap();
         assert_eq!(ts.state, back.state);
         assert!(back.timestamp.is_some());
         assert!(back.message.is_some());
@@ -2154,7 +2192,7 @@ mod tests {
             }),
         };
         let proto = to_proto_task(&task);
-        let back = from_proto_task(&proto);
+        let back = from_proto_task(&proto).unwrap();
         assert!(back.history.is_some());
         assert_eq!(back.history.unwrap().len(), 2);
         assert!(back.metadata.is_some());
@@ -2169,7 +2207,7 @@ mod tests {
             metadata: None,
         };
         let proto = to_proto_part(&part);
-        let back = from_proto_part(&proto);
+        let back = from_proto_part(&proto).unwrap();
         assert_eq!(part, back);
     }
 
@@ -2183,7 +2221,7 @@ mod tests {
             metadata: None,
         };
         let proto = to_proto_part(&part);
-        let back = from_proto_part(&proto);
+        let back = from_proto_part(&proto).unwrap();
         assert_eq!(part, back);
     }
 
@@ -2195,9 +2233,8 @@ mod tests {
             media_type: String::new(),
             metadata: None,
         };
-        let back = from_proto_part(&proto);
-        // None content maps to empty text
-        assert!(matches!(back.content, PartContent::Text(ref s) if s.is_empty()));
+        let err = from_proto_part(&proto).unwrap_err();
+        assert_eq!(err.code, a2a::error_code::INVALID_PARAMS);
     }
 
     #[test]
