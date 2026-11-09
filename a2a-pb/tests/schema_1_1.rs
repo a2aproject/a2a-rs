@@ -129,6 +129,105 @@ fn unknown_timeline_entry_kind_is_dropped() {
 }
 
 #[test]
+fn timeline_decoding_has_one_empty_representation_across_wire_formats() {
+    use prost::Message as _;
+
+    let unknown = json!({"futureEvent":{"data":"unrecognized"}, "generation":"5"});
+    let later_unknown = json!({"anotherFutureEvent":{}, "generation":"9"});
+    let message = json!({"message":{
+        "messageId":"input", "role":"ROLE_USER", "parts":[{"text":"input"}]
+    }, "generation":"2"});
+    let status = json!({"status":{"state":"TASK_STATE_WORKING"}, "generation":"7"});
+    for (timeline, expected_generations) in [
+        (None, vec![]),
+        (Some(json!(null)), vec![]),
+        (
+            Some(json!([unknown.clone(), later_unknown.clone()])),
+            vec![],
+        ),
+        (Some(json!([])), vec![]),
+        (
+            Some(json!([
+                unknown.clone(),
+                status.clone(),
+                later_unknown.clone()
+            ])),
+            vec![7],
+        ),
+        (
+            Some(json!([message, unknown, status, later_unknown])),
+            vec![2, 7],
+        ),
+    ] {
+        let mut wire = json!({
+            "id":"task", "contextId":"context", "status":{"state":"TASK_STATE_WORKING"},
+            "generation":"9"
+        });
+        if let Some(timeline) = timeline {
+            wire["timeline"] = timeline;
+        }
+        let native: Task = serde_json::from_value(wire.clone()).unwrap();
+        let protojson: Task = protojson_conv::from_value(wire.clone()).unwrap();
+        let generated: a2a_pb::protojson::Task = serde_json::from_value(wire.clone()).unwrap();
+        let encoded = generated.encode_to_vec();
+        let protobuf =
+            pbconv::from_proto_task(&a2a_pb::proto::Task::decode(encoded.as_slice()).unwrap());
+        assert_eq!(native, protojson, "native and ProtoJSON differ: {wire}");
+        assert_eq!(native, protobuf, "native and protobuf differ: {wire}");
+        assert_eq!(
+            native.generation, 9,
+            "skipped entries must not reset the task generation"
+        );
+        assert_eq!(native.timeline.is_none(), expected_generations.is_empty());
+        let generations: Vec<_> = native
+            .timeline
+            .iter()
+            .flatten()
+            .map(|entry| entry.generation)
+            .collect();
+        assert_eq!(generations, expected_generations);
+        for encoded in [
+            serde_json::to_value(&native).unwrap(),
+            protojson_conv::to_value(&native).unwrap(),
+        ] {
+            if expected_generations.is_empty() {
+                assert!(
+                    encoded.get("timeline").is_none(),
+                    "empty timelines use the omitted form: {encoded}"
+                );
+            }
+            assert_eq!(
+                serde_json::from_value::<Task>(encoded.clone()).unwrap(),
+                native
+            );
+            assert_eq!(protojson_conv::from_value::<Task>(encoded).unwrap(), native);
+        }
+    }
+}
+
+#[test]
+fn unknown_binary_timeline_entries_leave_the_task_generation_intact() {
+    use a2a_pb::proto;
+    use prost::Message as _;
+
+    // A future oneof member at field 4, followed by generation 9 at field 3.
+    let unknown = proto::TimelineEntry::decode(&[0x22, 0x00, 0x18, 0x09][..]).unwrap();
+    assert!(unknown.entry.is_none());
+    assert_eq!(unknown.generation, 9);
+    let mut task = pbconv::to_proto_task(&sample_task());
+    task.timeline = vec![unknown];
+    task.generation = 9;
+    let decoded = pbconv::from_proto_task(&task);
+    assert!(decoded.timeline.is_none());
+    assert_eq!(decoded.generation, 9);
+    assert_eq!(
+        serde_json::from_value::<Task>(serde_json::to_value(&decoded).unwrap()).unwrap(),
+        decoded
+    );
+    assert_eq!(proto_json_round_trip(&decoded), decoded);
+}
+
+#[test]
 fn request_fields_survive_protobuf_and_protojson() {
     let send = SendMessageRequest {
         message: Message::new(Role::User, vec![Part::text("hi")]),

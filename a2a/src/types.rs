@@ -447,6 +447,7 @@ pub struct Task {
 
     /// The generation-ordered record of the interaction: agent status
     /// entries and client messages (A2A 1.1, ADR-002).
+    /// Decoding uses `None` when no recognized entries remain, matching protobuf.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -505,7 +506,7 @@ fn timeline_entries<'de, D: Deserializer<'de>>(
         .filter(|entry| entry.get("message").is_some() || entry.get("status").is_some())
         .map(|entry| serde_json::from_value(entry).map_err(serde::de::Error::custom))
         .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+        .map(|entries| (!entries.is_empty()).then_some(entries))
 }
 
 pub(crate) fn is_zero(value: &i64) -> bool {
@@ -1409,7 +1410,7 @@ mod tests {
         unknown["timeline"] = serde_json::json!([{"futureEvent": {"generation": "5"}}]);
         assert_eq!(
             serde_json::from_value::<Task>(unknown).unwrap().timeline,
-            Some(vec![])
+            None
         );
     }
 
