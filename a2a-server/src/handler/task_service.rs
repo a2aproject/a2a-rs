@@ -150,6 +150,7 @@ impl TaskService {
         let mut pages = std::collections::HashSet::new();
         let mut seen = std::collections::HashSet::new();
         let mut restarted = 0;
+        let mut failure = None;
         loop {
             let request = ListTasksRequest {
                 page_size: Some(100),
@@ -167,26 +168,22 @@ impl TaskService {
                 if task.status.state.is_terminal() || !seen.insert(task.id.clone()) {
                     continue;
                 }
-                let id = task.id.clone();
-                // Re-read and reserve in one task operation, skipping already active tasks.
-                let started = self
-                    .task(&id)
-                    .request(TaskOperation::Input, |reply| TaskCommand::Restart {
-                        handler: handler.clone(),
-                        id: task.id,
-                        reply,
-                    })
-                    .await??;
-                if let Some(started) = started {
-                    if started.await.map_err(|_| {
-                        A2AError::internal("executor restart failed before accepting the task")
-                    })? {
-                        restarted += 1;
+                match self.restart_task(&handler, &task.id).await {
+                    Ok(true) => restarted += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        // Shutdown affects the whole scan, not just this task.
+                        self.background_tasks.check_running()?;
+                        // One broken task must not prevent recovery of the rest
+                        // of this page or later pages. Keep the error visible to
+                        // startup callers after the complete scan.
+                        tracing::error!(task_id = %task.id, %error, "task recovery failed");
+                        failure.get_or_insert(error);
                     }
                 }
             }
             if page.next_page_token.is_empty() {
-                return Ok(restarted);
+                return failure.map_or(Ok(restarted), Err);
             }
             if !pages.insert(page.next_page_token.clone()) {
                 return Err(A2AError::internal(
@@ -194,6 +191,28 @@ impl TaskService {
                 ));
             }
             token = Some(page.next_page_token);
+        }
+    }
+
+    async fn restart_task(
+        &self,
+        handler: &DefaultRequestHandler,
+        task_id: &str,
+    ) -> Result<bool, A2AError> {
+        // Re-read and reserve in one task operation, skipping already active tasks.
+        let started = self
+            .task(task_id)
+            .request(TaskOperation::Input, |reply| TaskCommand::Restart {
+                handler: handler.clone(),
+                id: task_id.to_owned(),
+                reply,
+            })
+            .await??;
+        match started {
+            Some(started) => started.await.map_err(|_| {
+                A2AError::internal("executor restart failed before accepting the task")
+            }),
+            None => Ok(false),
         }
     }
 

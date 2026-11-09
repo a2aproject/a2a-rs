@@ -92,6 +92,10 @@ impl DefaultRequestHandler {
     /// Missing, terminal, already-running, and unsupported tasks are skipped. The store
     /// must persist across process restarts. This does not provide distributed ownership
     /// across server processes, restore caller credentials, or replay previous messages.
+    /// Per-task failures are logged and recovery continues through all pages before
+    /// returning the first task error. Listing errors and handler shutdown stop the scan.
+    /// Successfully restarted tasks remain running even if this returns an error;
+    /// retrying skips those executions.
     ///
     /// ```no_run
     /// # async fn startup(handler: a2a_server::DefaultRequestHandler) -> Result<(), a2a::A2AError> {

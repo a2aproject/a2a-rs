@@ -11,9 +11,12 @@ use a2a_server::{
 };
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 use tokio::{
     sync::mpsc,
@@ -26,6 +29,8 @@ struct Store {
     lists: Arc<AtomicUsize>,
     repeat_token: Arc<AtomicBool>,
     cancel_during_scan: Arc<AtomicBool>,
+    get_errors: Arc<Mutex<HashMap<TaskId, A2AError>>>,
+    list_error_at: Arc<AtomicUsize>,
 }
 #[async_trait]
 impl TaskStore for Store {
@@ -36,10 +41,16 @@ impl TaskStore for Store {
         self.inner.update(task).await
     }
     async fn get(&self, id: &str) -> Result<Option<Task>, A2AError> {
+        if let Some(error) = self.get_errors.lock().unwrap().remove(id) {
+            return Err(error);
+        }
         self.inner.get(id).await
     }
     async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
-        self.lists.fetch_add(1, Ordering::SeqCst);
+        let page = self.lists.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.list_error_at.load(Ordering::SeqCst) == page {
+            return Err(A2AError::internal("recovery listing failed"));
+        }
         let request = if self.repeat_token.load(Ordering::SeqCst) {
             ListTasksRequest {
                 page_token: None,
@@ -382,6 +393,148 @@ async fn recovery_paginates_and_uses_the_typed_agent_restart_hook_only_for_nonte
     .await
     .unwrap();
     assert_eq!(server.restart_tasks().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn recovery_attempts_later_tasks_and_pages_after_reload_errors_then_allows_retry() {
+    let store = Store::default();
+    for i in 0..105 {
+        seed(&store, &format!("task-{i:03}"), TaskState::Working).await;
+    }
+    let details = vec![TypedDetail::error_info(
+        "RESTORE_FAILED",
+        "recovery-test",
+        None,
+    )];
+    for (id, error) in [
+        (
+            "task-000",
+            A2AError::internal("first reload failure").with_details(details.clone()),
+        ),
+        (
+            "task-002",
+            A2AError::unsupported_operation("second reload failure"),
+        ),
+        ("task-100", A2AError::internal("later page reload failure")),
+    ] {
+        store.get_errors.lock().unwrap().insert(id.into(), error);
+    }
+    let (sent, mut observed) = mpsc::unbounded_channel();
+    let server = handler(Executor(sent), store.clone());
+    let error = timeout(Duration::from_secs(2), server.restart_tasks())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, error_code::INTERNAL_ERROR);
+    assert_eq!(error.message, "first reload failure");
+    assert_eq!(error.details, Some(details));
+    assert_eq!(store.lists.load(Ordering::SeqCst), 2);
+    assert!(store.get_errors.lock().unwrap().is_empty());
+    let recovered: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok())
+        .map(|event| event.task.id)
+        .collect();
+    let expected: Vec<_> = (0..105)
+        .filter(|i| ![0, 2, 100].contains(i))
+        .map(|i| format!("task-{i:03}"))
+        .collect();
+    assert_eq!(recovered, expected);
+
+    // Healthy executions survive the error return. Only the failed reloads
+    // start on retry; no already-running executor receives a second invocation.
+    assert_eq!(server.restart_tasks().await.unwrap(), 3);
+    let mut retried: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok())
+        .map(|event| event.task.id)
+        .collect();
+    retried.sort();
+    assert_eq!(retried, ["task-000", "task-002", "task-100"]);
+    assert_eq!(server.restart_tasks().await.unwrap(), 0);
+    assert!(observed.try_recv().is_err());
+    server.shutdown().await;
+}
+
+struct PanicOnFirstTask(Executor);
+impl AgentExecutor for PanicOnFirstTask {
+    fn execute(
+        &self,
+        ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        self.0.execute(ctx)
+    }
+    fn restart(
+        &self,
+        ctx: ExecutorContext,
+    ) -> Option<BoxStream<'static, Result<StreamResponse, A2AError>>> {
+        assert_ne!(ctx.task_id, "a-broken", "private recovery failure");
+        self.0.restart(ctx)
+    }
+    fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        self.0.cancel(ctx)
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_restart_hook_does_not_prevent_recovery_of_the_next_task() {
+    let store = Store::default();
+    seed(&store, "a-broken", TaskState::Working).await;
+    seed(&store, "b-healthy", TaskState::Working).await;
+    let (sent, mut observed) = mpsc::unbounded_channel();
+    let server = handler(PanicOnFirstTask(Executor(sent)), store.clone());
+    let error = timeout(Duration::from_secs(2), server.restart_tasks())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        error.message,
+        "executor restart failed before accepting the task"
+    );
+    assert_eq!(observed.try_recv().unwrap().task.id, "b-healthy");
+    assert!(observed.try_recv().is_err());
+    timeout(Duration::from_secs(2), async {
+        while store.get("a-broken").await.unwrap().unwrap().status.state != TaskState::Failed {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(server.restart_tasks().await.unwrap(), 0);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_listing_error_stops_recovery_without_undoing_successful_restarts() {
+    let store = Store::default();
+    for i in 0..105 {
+        seed(&store, &format!("task-{i:03}"), TaskState::Working).await;
+    }
+    store.list_error_at.store(2, Ordering::SeqCst);
+    let (sent, mut observed) = mpsc::unbounded_channel();
+    let server = handler(Executor(sent), store.clone());
+    let error = timeout(Duration::from_secs(2), server.restart_tasks())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.message, "recovery listing failed");
+    assert_eq!(store.lists.load(Ordering::SeqCst), 2);
+    let recovered: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok())
+        .map(|event| event.task.id)
+        .collect();
+    assert_eq!(
+        recovered,
+        (0..100).map(|i| format!("task-{i:03}")).collect::<Vec<_>>()
+    );
+
+    store.list_error_at.store(0, Ordering::SeqCst);
+    assert_eq!(server.restart_tasks().await.unwrap(), 5);
+    let recovered: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok())
+        .map(|event| event.task.id)
+        .collect();
+    assert_eq!(
+        recovered,
+        (100..105)
+            .map(|i| format!("task-{i:03}"))
+            .collect::<Vec<_>>()
+    );
+    server.shutdown().await;
 }
 
 struct Broken {

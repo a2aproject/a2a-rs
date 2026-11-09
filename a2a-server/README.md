@@ -85,6 +85,10 @@ After configuring a handler backed by a persistent `TaskStore`, call
 It scans all pages of nonterminal tasks and returns the number whose executors
 accepted recovery. Tasks already running in this handler and terminal tasks are
 skipped. Nothing runs automatically from the synchronous handler constructor.
+If restarting one task fails, recovery logs the failure and continues through the
+remaining tasks and pages, then returns the first task error. Listing errors and
+handler shutdown stop the scan. Successfully restarted tasks keep running even when
+the scan returns an error; retrying skips those executions.
 
 Executors opt in by implementing `AgentExecutor::restart(ctx)` and returning
 `Some(event_stream)`. Typed agents can implement `Agent::restart(ctx)` instead.
