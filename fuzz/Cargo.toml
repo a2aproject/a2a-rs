@@ -22,7 +22,7 @@ url = "2"
 [[bin]]
 name = "sse_framing"
 path = "fuzz_targets/sse_framing.rs"
-test = false
+test = true
 doc = false
 bench = false
 

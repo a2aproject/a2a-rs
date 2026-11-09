@@ -4,12 +4,39 @@
 
 //! SSE framing over arbitrary bytes. See #238; the bug class is #198.
 
-#![no_main]
+#![cfg_attr(not(test), no_main)]
 
 use a2a_client::fuzz_support::{find_event_boundary, parse_stream_tail};
+#[cfg(not(test))]
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| {
+fn skipped_unknown_result(text: &str) -> bool {
+    let Ok(response) = serde_json::from_str::<a2a::JsonRpcResponse>(text.trim()) else {
+        return false;
+    };
+    if response.error.is_some() {
+        return false;
+    }
+    let Some(serde_json::Value::Object(fields)) = response.result else {
+        return false;
+    };
+    // Presence of a known field must never excuse a dropped event, even when
+    // its payload is null. Only entirely unknown payload kinds are skippable.
+    !fields.is_empty()
+        && fields.keys().all(|field| {
+            !matches!(
+                field.as_str(),
+                "task"
+                    | "message"
+                    | "statusUpdate"
+                    | "status_update"
+                    | "artifactUpdate"
+                    | "artifact_update"
+            )
+        })
+}
+
+fn check_framing(data: &[u8]) {
     // Oracle 1: the boundary the caller slices on must be in range and
     // ordered. `parse_sse_bytes` does `buf.drain(..end)` then
     // `&event_bytes[..start]`, so a violation here is a panic there.
@@ -35,18 +62,81 @@ fuzz_target!(|data: &[u8]| {
         // A well-formed JSON-RPC success whose result carries only an event
         // kind this client does not know is skipped on purpose (stream readers
         // MUST ignore unrecognised payloads); everything else must surface.
-        let skipped_on_purpose =
-            serde_json::from_str::<serde_json::Value>(text.trim()).is_ok_and(|v| {
-                v.get("error").is_none()
-                    && v.get("result")
-                        .and_then(|result| result.as_object())
-                        .is_some_and(|result| !result.is_empty())
-            });
         if !text.trim().is_empty()
             && !text.lines().any(|l| l.starts_with("data:"))
-            && !skipped_on_purpose
+            && !skipped_unknown_result(text)
         {
             assert!(tail.is_some(), "non-empty tail silently dropped: {text:?}");
         }
     }
-});
+}
+
+#[cfg(not(test))]
+fuzz_target!(|data: &[u8]| check_framing(data));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn known_payloads_never_qualify_for_the_unknown_event_exemption() {
+        for field in [
+            "task",
+            "message",
+            "statusUpdate",
+            "status_update",
+            "artifactUpdate",
+            "artifact_update",
+        ] {
+            for value in [json!(null), json!({}), json!(false)] {
+                for extra_unknown in [false, true] {
+                    let mut result = json!({field: value});
+                    if extra_unknown {
+                        result["futureEvent"] = json!({});
+                    }
+                    let envelope = json!({"jsonrpc":"2.0", "id":1, "result":result}).to_string();
+                    assert!(!skipped_unknown_result(&envelope), "{envelope}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_well_formed_unknown_result_envelopes_are_exempt() {
+        for value in [json!(null), json!({}), json!(42)] {
+            for null_error in [false, true] {
+                let mut envelope = json!({"jsonrpc":"2.0", "id":1, "result":{"futureEvent":value}});
+                if null_error {
+                    envelope["error"] = json!(null);
+                }
+                assert!(skipped_unknown_result(&envelope.to_string()), "{envelope}");
+            }
+        }
+        for envelope in [
+            json!({"result":{"futureEvent":{}}}),
+            json!({"jsonrpc":"2.0", "id":1, "result":{}}),
+            json!({"jsonrpc":"2.0", "id":1, "result":null}),
+            json!({"jsonrpc":"2.0", "id":1, "result":[]}),
+            json!({"jsonrpc":"2.0", "id":1, "result":{"futureEvent":{}}, "error":{"code":-1,"message":"failed"}}),
+        ] {
+            assert!(!skipped_unknown_result(&envelope.to_string()), "{envelope}");
+        }
+    }
+
+    #[test]
+    fn framing_oracle_accepts_the_regression_corpus() {
+        for seed in [
+            include_bytes!("../seeds/sse_framing/known-null-task").as_slice(),
+            include_bytes!("../seeds/sse_framing/known-null-status"),
+            include_bytes!("../seeds/sse_framing/known-null-with-unknown"),
+            include_bytes!("../seeds/sse_framing/unknown-result"),
+            include_bytes!("../seeds/sse_framing/unknown-result-null-error"),
+            include_bytes!("../seeds/sse_framing/empty-result"),
+            include_bytes!("../seeds/sse_framing/known-task"),
+            include_bytes!("../seeds/sse_framing/invalid-envelope"),
+        ] {
+            check_framing(seed);
+        }
+    }
+}
