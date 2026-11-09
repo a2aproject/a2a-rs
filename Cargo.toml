@@ -64,7 +64,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors"] }
 http = "1"
 hyper = "1"
-axum-server = {version = "0.8", default-features = false }
+axum-server = {version = "0.9", default-features = false }
 rustls = "0.23"
 
 # gRPC + protobuf
