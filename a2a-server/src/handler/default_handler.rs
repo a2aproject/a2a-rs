@@ -47,6 +47,7 @@ pub struct DefaultRequestHandler {
     authorizer: Option<Arc<dyn RequestAuthorizer>>,
     extended_agent_card: Option<Arc<dyn ExtendedAgentCardResolver>>,
     long_poll_timeout: Duration,
+    blocking_response_timeout: Option<Duration>,
     pub(super) cancel_hook_timeout: Duration,
     pub(super) http_live_responses: Arc<HttpLiveResponses>,
 }
@@ -62,6 +63,7 @@ impl DefaultRequestHandler {
             authorizer: None,
             extended_agent_card: None,
             long_poll_timeout: DEFAULT_LONG_POLL_TIMEOUT,
+            blocking_response_timeout: None,
             cancel_hook_timeout: DEFAULT_CANCEL_HOOK_TIMEOUT,
             http_live_responses: Arc::new(HttpLiveResponses::default()),
         }
@@ -112,6 +114,17 @@ impl DefaultRequestHandler {
     /// state, which the spec allows.
     pub fn with_long_poll_timeout(mut self, timeout: Duration) -> Self {
         self.long_poll_timeout = timeout;
+        self
+    }
+
+    /// Bounds a blocking `SendMessage` response after input admission.
+    ///
+    /// The default has no deadline: A2A requires waiting for completion or
+    /// interruption. Expiry returns an internal error and drops the response;
+    /// admitted task execution continues. Streaming, live, and `returnImmediately`
+    /// responses use their own completion policies and have no such deadline.
+    pub fn with_blocking_response_timeout(mut self, timeout: Duration) -> Self {
+        self.blocking_response_timeout = Some(timeout);
         self
     }
 
@@ -401,7 +414,16 @@ impl RequestHandler for DefaultRequestHandler {
             .admit_message(params, MessageInput::Raw(req), policy)
             .await?;
         let events = self.response_stream(params, (task.clone(), events), policy, None, None);
-        let mut response = unary_response(self.tasks.clone(), task, events).await?;
+        let response = unary_response(self.tasks.clone(), task, events);
+        let mut response = match self
+            .blocking_response_timeout
+            .filter(|_| !policy.return_immediately())
+        {
+            Some(timeout) => tokio::time::timeout(timeout, response)
+                .await
+                .map_err(|_| A2AError::from(ProtocolError::BlockingResponseTimedOut))??,
+            None => response.await?,
+        };
         if let SendMessageResponse::Task(task) = &mut response {
             policy.trim(task);
         }

@@ -1555,6 +1555,7 @@ pub(super) enum ProtocolError<'a> {
     TaskNotFound(&'a str),
     TaskTerminated(&'a str),
     ExecutionInProgress,
+    BlockingResponseTimedOut,
     // Stream openings and follow-up inputs.
     MissingOpeningRequest,
     UnknownStreamRequest,
@@ -1580,6 +1581,9 @@ impl From<ProtocolError<'_>> for A2AError {
             )),
             ProtocolError::ExecutionInProgress => {
                 Self::invalid_request("task execution is already in progress")
+            }
+            ProtocolError::BlockingResponseTimedOut => {
+                Self::internal("blocking response timed out")
             }
             ProtocolError::MissingOpeningRequest => {
                 Self::invalid_request("a response needs a first request")
@@ -2139,6 +2143,11 @@ mod error_policy_tests {
                 ProtocolError::ExecutionInProgress,
                 error_code::INVALID_REQUEST,
                 "task execution is already in progress",
+            ),
+            (
+                ProtocolError::BlockingResponseTimedOut,
+                error_code::INTERNAL_ERROR,
+                "blocking response timed out",
             ),
             (
                 ProtocolError::InvalidPageToken,

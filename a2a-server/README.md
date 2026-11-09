@@ -24,6 +24,13 @@ message returns immediately; task responses wait for completion or interruption
 when blocking is requested. Streaming and live sends share message admission,
 with their transport setup handled separately.
 
+Blocking `SendMessage` has no deadline by default. Use
+`with_blocking_response_timeout(Duration::from_secs(60))` to bound waiting after
+input admission. Expiry returns `INTERNAL_ERROR`; admitted task execution
+continues. The deadline does not apply to `returnImmediately`, streaming, or live
+responses. Under A2A 1.1, streaming and live responses remain open across
+`INPUT_REQUIRED` and `AUTH_REQUIRED`, and close when the task becomes terminal.
+
 Custom stores keep implementing the existing persistence trait. They do not
 need to implement subscriptions or manage channels. Changes made through the
 service are persisted before publication; writes made directly to a custom
