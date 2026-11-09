@@ -628,7 +628,7 @@ pub(super) fn reject_unauthenticated(
     Err(A2AError::invalid_request("authentication required"))
 }
 
-// §13.3 (#203): a capability the card does not declare is not served.
+// A2A 1.1 §3.3.4: a capability the card does not declare is not served.
 
 pub(super) fn caps(streaming: Option<bool>, push: Option<bool>) -> AgentCapabilities {
     AgentCapabilities {

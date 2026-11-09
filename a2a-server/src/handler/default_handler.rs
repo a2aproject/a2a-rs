@@ -54,6 +54,12 @@ pub struct DefaultRequestHandler {
 
 impl DefaultRequestHandler {
     // Configuration.
+    /// Build a handler with optional capabilities initially undeclared.
+    ///
+    /// Use [`Self::with_capabilities`] to match the served Agent Card. Streaming,
+    /// user artifacts, push notifications, and extended cards require an explicit
+    /// capability declaration. Configuring push notifications or an extended card
+    /// also declares that capability unless it was explicitly disabled.
     pub fn new(executor: impl crate::AgentExecutor, task_store: impl crate::TaskStore) -> Self {
         DefaultRequestHandler {
             tasks: Arc::new(TaskService::new(executor, task_store)),
@@ -197,6 +203,13 @@ impl DefaultRequestHandler {
         self
     }
 
+    /// Replace the capabilities used to validate requests with those of the Agent Card.
+    ///
+    /// Optional features require `Some(true)`. Both `None` and `Some(false)` mean
+    /// unsupported, as required by A2A 1.1 §3.3.4. Requests using them receive
+    /// `UNSUPPORTED_OPERATION`, or `PUSH_NOTIFICATION_NOT_SUPPORTED` for push
+    /// configuration operations. Push notifications and extended cards also need
+    /// their corresponding service or card/resolver configuration.
     pub fn with_capabilities(mut self, capabilities: AgentCapabilities) -> Self {
         self.capabilities = capabilities;
         self
@@ -1107,39 +1120,97 @@ mod tests {
 
     /// An omitted optional capability is unavailable, just like explicit false.
     #[tokio::test]
-    async fn test_undeclared_capabilities_are_refused() {
-        let handler =
-            make_handler_with_push_configs().with_capabilities(AgentCapabilities::default());
-        let params = ServiceParams::new();
-        assert!(
-            matches!(handler.send_streaming_message(&params, send_request()).await,
-            Err(error) if error.code == error_code::UNSUPPORTED_OPERATION)
-        );
-        assert!(
-            matches!(handler.subscribe_to_task(&params, SubscribeToTaskRequest {
-            id: "t1".into(), tenant: None, last_seen_generation: None,
-        }).await, Err(error) if error.code == error_code::UNSUPPORTED_OPERATION)
-        );
-        assert!(
-            matches!(handler.send_live_message(&params, Box::pin(futures::stream::empty())).await,
-            Err(error) if error.code == error_code::UNSUPPORTED_OPERATION)
-        );
-        assert_eq!(
-            handler
-                .create_push_config(&params, push_config("t1"))
-                .await
-                .unwrap_err()
-                .code,
-            error_code::PUSH_NOTIFICATION_NOT_SUPPORTED
-        );
-        assert_eq!(
-            handler
-                .get_extended_agent_card(&params, extended_request())
-                .await
-                .unwrap_err()
-                .code,
-            error_code::UNSUPPORTED_OPERATION
-        );
+    async fn test_unset_and_disabled_capabilities_are_refused() {
+        for declared in [None, Some(false)] {
+            let handler = make_handler_with_push_configs().with_capabilities(AgentCapabilities {
+                streaming: declared,
+                push_notifications: declared,
+                extended_agent_card: declared,
+                user_artifacts: declared,
+                ..Default::default()
+            });
+            let params = ServiceParams::from([(SVC_PARAM_VERSION.into(), vec!["1.1".into()])]);
+            let streaming = handler
+                .send_streaming_message(&params, send_request())
+                .await;
+            assert!(
+                matches!(streaming, Err(error) if error.code == error_code::UNSUPPORTED_OPERATION)
+            );
+            let subscription = handler
+                .subscribe_to_task(
+                    &params,
+                    SubscribeToTaskRequest {
+                        id: "t1".into(),
+                        tenant: None,
+                        last_seen_generation: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(subscription, Err(error) if error.code == error_code::UNSUPPORTED_OPERATION)
+            );
+            let native_live = handler
+                .send_live_message(&params, Box::pin(futures::stream::empty()))
+                .await;
+            assert!(
+                matches!(native_live, Err(error) if error.code == error_code::UNSUPPORTED_OPERATION)
+            );
+            let http_live = handler
+                .send_live_request(
+                    &params,
+                    StreamRequest {
+                        tenant: None,
+                        payload: StreamRequestPayload::SendMessage(send_request()),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(http_live, Err(error) if error.code == error_code::UNSUPPORTED_OPERATION)
+            );
+            let mut request = send_request();
+            request.artifact_updates.push(TaskArtifactUpdateEvent {
+                task_id: String::new(),
+                context_id: String::new(),
+                generation: 0,
+                metadata: None,
+                append: None,
+                last_chunk: Some(true),
+                artifact: serde_json::from_value(
+                    serde_json::json!({"artifactId":"client","parts":[{"text":"input"}]}),
+                )
+                .unwrap(),
+            });
+            assert_eq!(
+                handler
+                    .send_message(&params, request)
+                    .await
+                    .unwrap_err()
+                    .code,
+                error_code::UNSUPPORTED_OPERATION
+            );
+            assert_eq!(
+                handler
+                    .create_push_config(&params, push_config("t1"))
+                    .await
+                    .unwrap_err()
+                    .code,
+                error_code::PUSH_NOTIFICATION_NOT_SUPPORTED
+            );
+            assert_eq!(
+                handler
+                    .get_extended_agent_card(&params, extended_request())
+                    .await
+                    .unwrap_err()
+                    .code,
+                error_code::UNSUPPORTED_OPERATION
+            );
+            assert_eq!(
+                handler.tasks.background_tasks.count(),
+                0,
+                "capability rejection precedes execution"
+            );
+            handler.shutdown().await;
+        }
     }
 
     /// Supplying a store defaults the capability to `true` but must not

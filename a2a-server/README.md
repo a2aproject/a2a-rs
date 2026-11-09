@@ -11,6 +11,27 @@ This crate is published as `a2a-server-lf` and imported in Rust as `a2a_server`.
 - A default handler and in-memory task store
 - SSE helpers for streaming task responses
 
+## Capabilities
+
+Pass the served Agent Card's capabilities to the handler:
+
+```rust
+let handler = DefaultRequestHandler::new(executor, task_store)
+    .with_capabilities(card.capabilities.clone());
+```
+
+Only `Some(true)` declares an optional capability. `None` and `Some(false)`
+both mean unsupported (A2A 1.1 §3.3.4). Streaming operations, client-written
+artifacts, and extended cards require their respective capability; otherwise
+the handler returns `UNSUPPORTED_OPERATION`. Push configuration operations
+return `PUSH_NOTIFICATION_NOT_SUPPORTED` when push support is undeclared or false.
+
+New handlers leave optional capabilities unset. Configuring push notifications
+or an extended card also declares its capability unless explicitly disabled.
+`with_capabilities` replaces the declaration, so keep it consistent with the
+Agent Card. Configure the push service and extended card/resolver separately
+from declaring support for them.
+
 ## Task Service
 
 `DefaultRequestHandler` automatically wraps your `TaskStore` in an internal
