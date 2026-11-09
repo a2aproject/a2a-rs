@@ -218,16 +218,29 @@ pub(crate) fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
 /// Turns a decoded JSON `StreamResponse` into a stream item. A payload kind
 /// this client does not recognise (e.g. one added by a later minor version) is
 /// skipped rather than reported, as the spec requires of stream readers. An
-/// event with no payload at all (`{}`) is not an unknown kind but a malformed
-/// event, and is reported.
+/// event with no payload at all (`{}`), or only a null known payload, is
+/// malformed and is reported. ProtoJSON treats null fields as unset, so a
+/// missing decoded payload alone does not prove that its kind was unknown.
 fn decode_stream_value(
     value: serde_json::Value,
     context: &str,
 ) -> Option<Result<StreamResponse, A2AError>> {
-    let empty = value.as_object().is_some_and(serde_json::Map::is_empty);
+    let unknown_payload = value.as_object().is_some_and(|fields| {
+        !fields.is_empty()
+            && ![
+                "task",
+                "message",
+                "statusUpdate",
+                "status_update",
+                "artifactUpdate",
+                "artifact_update",
+            ]
+            .iter()
+            .any(|field| fields.contains_key(*field))
+    });
     match protojson_conv::from_value::<StreamResponse>(value) {
         Ok(event) => Some(Ok(event)),
-        Err(protojson_conv::ProtoJsonPayloadError::MissingPayload(_)) if !empty => None,
+        Err(protojson_conv::ProtoJsonPayloadError::MissingPayload(_)) if unknown_payload => None,
         Err(error) => Some(Err(A2AError::internal(format!("{context}: {error}")))),
     }
 }
@@ -930,6 +943,118 @@ mod tests {
         let sse_text = format!("data: {}\n\n", serde_json::to_string(&empty).unwrap());
         let mut parsed = parse_sse_stream(byte_stream(vec![sse_text]));
         assert!(parsed.next().await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn known_null_payloads_are_reported_in_rest_and_jsonrpc_streams() {
+        for field in [
+            "task",
+            "message",
+            "statusUpdate",
+            "status_update",
+            "artifactUpdate",
+            "artifact_update",
+        ] {
+            for extra_unknown in [false, true] {
+                let mut payload = serde_json::json!({field: null});
+                if extra_unknown {
+                    payload["futureEvent"] = serde_json::json!({"taskId": "task"});
+                }
+                for jsonrpc in [false, true] {
+                    let value = if jsonrpc {
+                        serde_json::to_value(JsonRpcResponse::success(
+                            JsonRpcId::Number(1),
+                            payload.clone(),
+                        ))
+                        .unwrap()
+                    } else {
+                        payload.clone()
+                    };
+                    for terminated in [false, true] {
+                        let body = format!("data: {value}{}", if terminated { "\n\n" } else { "" });
+                        let bytes = byte_stream(vec![body]);
+                        let items: Vec<_> = if jsonrpc {
+                            parse_sse_stream(bytes)
+                        } else {
+                            parse_sse_stream_rest(bytes)
+                        }
+                        .collect()
+                        .await;
+                        assert_eq!(
+                            items.len(),
+                            1,
+                            "field={field}, jsonrpc={jsonrpc}, terminated={terminated}, unknown={extra_unknown}"
+                        );
+                        let error = items.into_iter().next().unwrap().unwrap_err();
+                        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+                        assert!(error.message.contains("SSE parse error"), "{error}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn known_null_payloads_are_reported_in_plain_jsonrpc_tails() {
+        for field in [
+            "task",
+            "message",
+            "statusUpdate",
+            "status_update",
+            "artifactUpdate",
+            "artifact_update",
+        ] {
+            let envelope =
+                JsonRpcResponse::success(JsonRpcId::Number(1), serde_json::json!({field: null}));
+            let items: Vec<_> =
+                parse_sse_stream(byte_stream(vec![serde_json::to_string(&envelope).unwrap()]))
+                    .collect()
+                    .await;
+            assert_eq!(items.len(), 1, "field={field}");
+            let error = items.into_iter().next().unwrap().unwrap_err();
+            assert_eq!(error.code, error_code::INTERNAL_ERROR);
+            assert!(error.message.contains("end of stream"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_known_null_payload_is_reported_before_the_next_valid_event() {
+        for jsonrpc in [false, true] {
+            let payloads = [
+                serde_json::json!({"futureEvent": null}),
+                serde_json::json!({"task": null}),
+                // Null fields are unset in ProtoJSON; a real payload still wins.
+                serde_json::json!({"statusUpdate": null, "task": {
+                    "id": "task", "contextId": "context", "status": {"state": "TASK_STATE_WORKING"}
+                }}),
+            ];
+            let body = payloads
+                .into_iter()
+                .map(|payload| {
+                    let value = if jsonrpc {
+                        serde_json::to_value(JsonRpcResponse::success(
+                            JsonRpcId::Number(1),
+                            payload,
+                        ))
+                        .unwrap()
+                    } else {
+                        payload
+                    };
+                    format!("data: {value}\n\n")
+                })
+                .collect::<String>();
+            let bytes = byte_stream(vec![body]);
+            let items: Vec<_> = if jsonrpc {
+                parse_sse_stream(bytes)
+            } else {
+                parse_sse_stream_rest(bytes)
+            }
+            .collect()
+            .await;
+            assert_eq!(items.len(), 2);
+            assert!(items[0].is_err());
+            assert!(matches!(&items[1], Ok(StreamResponse::Task(task)) if task.id == "task"));
+        }
     }
 
     #[tokio::test]
