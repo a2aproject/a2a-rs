@@ -20,7 +20,6 @@ tls = [
     "dep:rustls",
     "dep:rustls-native-certs",
     "dep:webpki-roots",
-    "dep:rustls-pemfile",
 ]
 
 [dependencies]
@@ -57,7 +56,6 @@ rustls = { version = "0.23", default-features = false, features = [
 ], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 webpki-roots = { version = "1", optional = true }
-rustls-pemfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
