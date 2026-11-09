@@ -9,8 +9,8 @@ use super::http_exchange::RegistrationLease;
 #[cfg(test)]
 use super::protocol::StartMode;
 use super::protocol::{
-    self, IncomingRequest, InputCursor, OpeningPolicy, Rejection, ResponsePolicy, StreamDecision,
-    generation_of,
+    self, DeliveryPlan, IncomingRequest, InputCursor, OpeningPolicy, Rejection, ResponsePolicy,
+    StreamDecision, generation_of,
 };
 use super::task_handle::TaskHandle;
 use super::task_service::TaskService;
@@ -461,8 +461,10 @@ pub(super) type TaskEvents = (TaskHandle, ResponseStream);
 /// Turn one admission result into its operation's opening and task stream.
 pub(super) fn message_response(delivery: Delivery, settings: ResponsePolicy) -> TaskEvents {
     let handle = delivery.handle();
-    let (task, events) = attach_delivery(settings, delivery);
-    let events = match settings.opening() {
+    let plan = settings.delivery_plan(matches!(&delivery, Delivery::Injected { .. }));
+    let opening = plan.opening;
+    let (task, events) = attach_delivery(settings, delivery, plan);
+    let events = match opening {
         OpeningPolicy::None => events,
         OpeningPolicy::OnFirstEvent => with_opening_task(events, task),
         OpeningPolicy::Snapshot => {
@@ -527,8 +529,8 @@ fn subscription_stream_with_policy(
 pub(super) fn attach_delivery(
     policy: ResponsePolicy,
     delivery: Delivery,
+    plan: DeliveryPlan,
 ) -> (Task, ResponseStream) {
-    let plan = policy.delivery_plan();
     let (task, receiver, sequence) = match delivery {
         Delivery::Started { task, receiver } => {
             let receiver = receiver.for_input(task.generation);
@@ -1121,7 +1123,7 @@ mod subscription_tests {
         });
         let settings =
             ResponsePolicy::message(StartMode::Blocking, &crate::ServiceParams::new(), &request);
-        let (_, mut events) = attach_delivery(settings, delivery);
+        let (_, mut events) = attach_delivery(settings, delivery, settings.delivery_plan(true));
         assert!(
             matches!(events.next().await.unwrap().unwrap(), StreamResponse::Task(snapshot) if snapshot == task)
         );

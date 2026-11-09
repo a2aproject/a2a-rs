@@ -446,6 +446,7 @@ pub(super) enum InputCursor {
 }
 
 pub(super) struct DeliveryPlan {
+    pub(super) opening: OpeningPolicy,
     pub(super) attach_receiver: bool,
     pub(super) cursor: InputCursor,
     pub(super) wait_for_first_output: bool,
@@ -552,24 +553,25 @@ impl ResponsePolicy {
         }
     }
 
-    pub(super) fn opening(self) -> OpeningPolicy {
-        match self.mode {
+    pub(super) fn delivery_plan(self, joins_execution: bool) -> DeliveryPlan {
+        let opening = match self.mode {
             StartMode::Blocking => OpeningPolicy::None,
-            StartMode::Streaming => OpeningPolicy::OnFirstEvent,
-            StartMode::Bidi => OpeningPolicy::Snapshot,
-        }
-    }
-    pub(super) fn delivery_plan(self) -> DeliveryPlan {
+            // A join already has a committed Task and can open immediately.
+            // A new invocation may still choose a taskless Message response.
+            StartMode::Streaming if !joins_execution => OpeningPolicy::OnFirstEvent,
+            StartMode::Streaming | StartMode::Bidi => OpeningPolicy::Snapshot,
+        };
         DeliveryPlan {
+            opening,
             attach_receiver: !(self.mode == StartMode::Blocking && self.return_immediately()),
             cursor: if self.mode == StartMode::Blocking {
                 InputCursor::Before
             } else {
                 InputCursor::After
             },
-            // Streaming needs an opening snapshot if a silent invocation ends.
-            // A blocking answer follows the task until its own input has output.
-            wait_for_first_output: self.mode == StartMode::Streaming,
+            // Only an undecided streaming opening depends on this invocation.
+            // Other responses follow the task across invocation boundaries.
+            wait_for_first_output: matches!(opening, OpeningPolicy::OnFirstEvent),
         }
     }
     pub(super) fn event_filter(self) -> EventFilter {
