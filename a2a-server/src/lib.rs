@@ -1,6 +1,55 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+//! Server framework for implementing A2A v1 agents.
+//!
+//! Published as `a2a-server-lf` and imported as `a2a_server`. The protocol
+//! types come from the [`a2a`] crate.
+//!
+//! # How a request flows
+//!
+//! A protocol binding turns a wire request into a call on a
+//! [`RequestHandler`]. [`DefaultRequestHandler`] is the implementation most
+//! agents use: it manages the task lifecycle, saves tasks in a [`TaskStore`],
+//! and hands the work to your [`AgentExecutor`], which returns a stream of
+//! events.
+//!
+//! # Where to start
+//!
+//! 1. Implement [`AgentExecutor`] with the agent's logic. [`ExecutorContext`]
+//!    describes the request being served.
+//! 2. Build a [`DefaultRequestHandler`] from the executor and a
+//!    [`TaskStore`]. [`InMemoryTaskStore`] is provided.
+//! 3. Mount a binding on an axum router with [`jsonrpc::jsonrpc_router`] or
+//!    [`rest::rest_router`]. The gRPC and SLIMRPC bindings are in the
+//!    `a2a-grpc` and `a2a-slimrpc` crates.
+//! 4. Serve the agent card at [`WELL_KNOWN_AGENT_CARD_PATH`] with
+//!    [`agent_card::agent_card_router`], from a [`StaticAgentCard`] or your
+//!    own [`AgentCardProducer`].
+//!
+//! # Also in this crate
+//!
+//! - [`sse`]: streaming responses as server-sent events.
+//! - [`push`]: push notification configs ([`PushConfigStore`]) and their
+//!   delivery ([`HttpPushSender`]).
+//! - [`middleware`]: [`CallInterceptor`]s around a handler, applied with
+//!   [`InterceptedHandler`].
+//! - [`RequestAuthorizer`]: decides whether a request may proceed; set it
+//!   with [`DefaultRequestHandler::with_authorizer`].
+//! - [`pagination`]: the page limits the list endpoints share.
+//!
+//! # Feature flags
+//!
+//! - `rustls-tls` (default): rustls, with its default crypto provider, for
+//!   push notification delivery and for serving over HTTPS through the `tls`
+//!   module.
+//! - `rustls-no-provider`: the same, with the crypto provider installed by
+//!   the application.
+//! - `native-tls`: the platform's native TLS stack for push notification
+//!   delivery. The `tls` module is not available with this flag alone.
+//!
+//! `fuzzing` is for the fuzz targets in this repository, not for dependents.
+
 pub mod agent_card;
 pub mod executor;
 pub mod handler;

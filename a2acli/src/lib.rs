@@ -1,6 +1,19 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+//! The library behind the `a2acli` binary, published as `a2a-cli`.
+//!
+//! `main` only calls [`run_args`], which parses the command line into a
+//! [`Cli`] and runs the command it names. The public types follow the command
+//! line: [`Cli`] holds the global options, [`Command`] the subcommands, and
+//! [`CliError`] what can go wrong, with its exit code and terminal report.
+//!
+//! [`card_schema`] validates an agent card against the vendored A2A JSON
+//! Schema, for `card get --validate`.
+//!
+//! The README of the `a2acli` package has the installation steps and the
+//! command reference.
+
 pub mod card_schema;
 mod fileparts;
 
