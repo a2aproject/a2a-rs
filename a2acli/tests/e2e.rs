@@ -734,6 +734,33 @@ impl RequestHandler for TestHandler {
                 task_event(&task_id, TaskState::Completed),
             ])));
         }
+        if text == "stream-client-file" {
+            let mut input = req.message;
+            input.task_id = Some(task_id.clone());
+            input.context_id = Some(context_id.clone());
+            let completed = make_task_with_parts(
+                &task_id,
+                &context_id,
+                TaskState::Completed,
+                vec![raw_file_part(b"agent output", Some("reply.bin"))],
+            );
+            return Ok(Box::pin(stream::iter(vec![
+                Ok(StreamResponse::Task(make_task(
+                    &task_id,
+                    &context_id,
+                    TaskState::Working,
+                    "started",
+                ))),
+                Ok(StreamResponse::MessageUpdate(TaskMessageUpdateEvent {
+                    task_id,
+                    context_id,
+                    message: input,
+                    generation: 1,
+                    metadata: None,
+                })),
+                Ok(StreamResponse::Task(completed)),
+            ])));
+        }
         if text == "stream-open-error" {
             // Unlike "stream-error" (a stream that opens, then yields an
             // error item), this fails *opening* the stream at all — the
@@ -4248,6 +4275,60 @@ async fn send_saves_the_raw_file_parts_of_the_response() {
     assert_eq!(
         BASE64.decode(parts[1]["raw"].as_str().unwrap()).unwrap(),
         b"binary payload"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_send_prints_client_files_but_only_saves_agent_files() {
+    let server = TestServer::spawn().await;
+    let input = ScratchDir::new("client-echo-in");
+    input.create();
+    let input_file = input.join("note.bin");
+    std::fs::write(&input_file, b"client input").unwrap();
+    let out = ScratchDir::new("client-echo-out");
+    out.create();
+    std::fs::write(out.join("note.bin"), b"existing local file").unwrap();
+
+    let output = run_cli_output(
+        &server,
+        &[
+            "--output",
+            "json",
+            "--compact",
+            "send",
+            "--text-part",
+            "stream-client-file",
+            "--file-part",
+            input_file.to_str().unwrap(),
+            "--stream",
+            "--save-fileparts",
+            out.arg(),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read(&input_file).unwrap(), b"client input");
+    assert_eq!(
+        std::fs::read(out.join("note.bin")).unwrap(),
+        b"existing local file"
+    );
+    assert_eq!(
+        std::fs::read(out.join("reply.bin")).unwrap(),
+        b"agent output"
+    );
+    assert_eq!(std::fs::read_dir(&out.0).unwrap().count(), 2);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("reply.bin"), "{stderr}");
+    assert!(!stderr.contains("note.bin"), "{stderr}");
+
+    // The input notification is still printed with its original file bytes.
+    let events = parse_json_lines(&String::from_utf8(output.stdout).unwrap());
+    let message = &events[1]["messageUpdate"]["message"];
+    assert_eq!(message["role"], "ROLE_USER");
+    assert_eq!(
+        BASE64
+            .decode(message["parts"][1]["raw"].as_str().unwrap())
+            .unwrap(),
+        b"client input"
     );
 }
 

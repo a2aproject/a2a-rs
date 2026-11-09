@@ -64,6 +64,10 @@ impl FilePartSaver {
     }
 
     pub(crate) fn save_message(&mut self, message: &Message) -> Result<(), SaveError> {
+        // Live streams also echo client inputs; these are not agent output.
+        if message.role != a2a::Role::Agent {
+            return Ok(());
+        }
         let owner = format!("msg:{}", message.message_id);
         self.save(&owner, "status-msg", &message.parts, false)
     }
@@ -73,6 +77,10 @@ impl FilePartSaver {
         artifact: &Artifact,
         append: bool,
     ) -> Result<(), SaveError> {
+        // An omitted artifact role means Agent, including pre-1.1 responses.
+        if artifact.role == Some(a2a::Role::User) {
+            return Ok(());
+        }
         let owner = format!("art:{}", artifact.artifact_id);
         let fallback = artifact
             .name
@@ -387,6 +395,83 @@ mod tests {
         assert_eq!(scratch.read("a.bin"), b"abc");
         assert_eq!(saver.take_created(), vec![scratch.0.join("a.bin")]);
         assert!(saver.take_created().is_empty());
+    }
+
+    #[test]
+    fn test_client_message_updates_do_not_write_or_reserve_files() {
+        let scratch = Scratch::new();
+        std::fs::write(scratch.0.join("input.bin"), b"local contents").unwrap();
+        let mut saver = scratch.saver();
+        let mut input = message("client-input", vec![raw(b"echo", Some("input.bin"), None)]);
+        input.role = a2a::Role::User;
+
+        StreamResponse::MessageUpdate(a2a::TaskMessageUpdateEvent {
+            task_id: "t1".into(),
+            context_id: "c1".into(),
+            message: input.clone(),
+            generation: 1,
+            metadata: None,
+        })
+        .save_to(&mut saver)
+        .unwrap();
+
+        assert_eq!(scratch.read("input.bin"), b"local contents");
+        assert!(saver.take_created().is_empty());
+
+        // A later agent response still gets the unreserved filename.
+        input.role = a2a::Role::Agent;
+        input.message_id = "agent-output".into();
+        input.save_to(&mut saver).unwrap();
+        assert_eq!(scratch.files(), vec!["input.bin"]);
+        assert_eq!(scratch.read("input.bin"), b"echo");
+        assert_eq!(saver.take_created(), vec![scratch.0.join("input.bin")]);
+    }
+
+    #[test]
+    fn test_client_artifacts_are_not_saved_from_snapshots_or_updates() {
+        let scratch = Scratch::new();
+        let mut saver = scratch.saver();
+        let mut input = artifact(
+            "client-artifact",
+            Some("input.bin"),
+            vec![raw(b"input", None, None)],
+        );
+        input.role = Some(a2a::Role::User);
+        let task = Task {
+            id: "t1".into(),
+            context_id: "c1".into(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: Some(vec![input.clone()]),
+            history: None,
+            timeline: None,
+            metadata: None,
+            generation: 1,
+        };
+        task.save_to(&mut saver).unwrap();
+        StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            generation: 1,
+            task_id: "t1".into(),
+            context_id: "c1".into(),
+            artifact: input.clone(),
+            append: Some(true),
+            last_chunk: None,
+            metadata: None,
+        })
+        .save_to(&mut saver)
+        .unwrap();
+        assert!(scratch.files().is_empty());
+        assert!(saver.take_created().is_empty());
+
+        for role in [None, Some(a2a::Role::Agent)] {
+            input.role = role;
+            saver.save_artifact(&input, false).unwrap();
+            assert_eq!(scratch.read("input.bin"), b"input");
+        }
+        assert_eq!(scratch.files(), vec!["input.bin"]);
     }
 
     #[test]
