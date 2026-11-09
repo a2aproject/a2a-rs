@@ -16,7 +16,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "futures",
- "jsonschema 0.58.6",
+ "jsonschema 0.61.0",
  "rcgen",
  "reqwest",
  "rustls",
@@ -920,9 +920,9 @@ dependencies = [
 
 [[package]]
 name = "axum-server"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1df331683d982a0b9492b38127151e6453639cd34926eb9c07d4cd8c6d22bfc"
+checksum = "f2c55b0e6ae7c8951bc27682e97934423357c1a8208886305290a3adb1ce3c14"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -935,6 +935,7 @@ dependencies = [
  "pin-project-lite",
  "rustls",
  "rustls-pki-types",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -1839,6 +1840,17 @@ name = "fancy-regex"
 version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d301f5bf187b3c295fce6468d3875037a0bccc5f6b151c63cac2f85babf21912"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
+name = "fancy-regex"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20ed7f62ce0ae0da1a8b93c3c7104ab7e0760a74491e097c701fff966e945390"
 dependencies = [
  "bit-set",
  "regex-automata",
@@ -2769,7 +2781,7 @@ dependencies = [
  "bytecount",
  "data-encoding",
  "email_address",
- "fancy-regex",
+ "fancy-regex 0.19.2",
  "fraction 0.15.4",
  "getrandom 0.3.4",
  "idna",
@@ -2790,24 +2802,24 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.58.6"
+version = "0.61.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f622c574a29fb3034a0a90645afee194dfedc75fc124228801b6e77041075bd1"
+checksum = "e1324c9bebe052584e96e7c80d2f9cf2d86e1a6d83d621a46932c5636996be18"
 dependencies = [
  "ahash",
  "bytecount",
  "data-encoding",
  "email_address",
- "fancy-regex",
+ "fancy-regex 0.20.0",
  "fraction 0.17.0",
  "getrandom 0.3.4",
  "itoa",
- "jsonschema-regex 0.58.6",
- "jsonschema-value 0.58.6",
+ "jsonschema-regex 0.61.0",
+ "jsonschema-value 0.61.0",
  "num-cmp",
  "num-traits",
  "percent-encoding",
- "referencing 0.58.6",
+ "referencing 0.61.0",
  "regex",
  "serde",
  "serde_json",
@@ -2827,9 +2839,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.58.6"
+version = "0.61.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a968fffd387b2ab005bf00c1851f5d26e90df05b6f7ad609ed0d620033cca5e7"
+checksum = "fe90ff57cd46c2e873aa3628f87fdf32421c5f800b64e96e93efa094215235b5"
 dependencies = [
  "regex-syntax",
 ]
@@ -2850,14 +2862,15 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-value"
-version = "0.58.6"
+version = "0.61.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39b7670345e5ce87371339d13705dbb9276b7e3e934bbe1efa2c6734a1f65a96"
+checksum = "65422cdf4b8d9b214579884c7125713e521e0cf11b738f232589360a7b61bcb5"
 dependencies = [
  "ahash",
  "bytecount",
  "fraction 0.17.0",
  "getrandom 0.3.4",
+ "memchr",
  "num-cmp",
  "num-traits",
  "serde_json",
@@ -4343,9 +4356,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.58.6"
+version = "0.61.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "558f3855529c0a7e78a48e409fa653456e55f1b167eab4109c16a255b7727e3f"
+checksum = "aafb75c629a3f4cf1d1503eb9d588153392cde1bb4424adb75ed737e16201fd6"
 dependencies = [
  "ahash",
  "fluent-uri",
@@ -5784,9 +5797,9 @@ checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
 
 [[package]]
 name = "uuid"
-version = "1.29.0"
+version = "1.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
+checksum = "bed99139f7dac9b5cfe5f17be4d66dc7079a34dee1d74bcc77217119240e267c"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
