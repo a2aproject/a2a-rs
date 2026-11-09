@@ -146,6 +146,13 @@ impl ExecutorContext {
 /// request prepared it. Live openings and unary `returnImmediately` calls
 /// create the task up front. See [`Agent`] for the same contract as a typed return
 /// value.
+///
+/// Artifact updates are explicit writes: an executor may append to or replace
+/// client-originated artifacts with [`TaskArtifactUpdateEvent`]. The server keeps
+/// the artifact's original `role`; it identifies its creator, not its latest editor.
+/// Full [`Task`] snapshots carry forward the committed client-originated artifacts
+/// instead of copying their supplied versions, so an old snapshot cannot undo newer
+/// client or executor edits. Use artifact update events to edit those artifacts.
 #[async_trait::async_trait]
 pub trait AgentExecutor: Send + Sync + 'static {
     /// Execute a message. Returns an owned stream of events.

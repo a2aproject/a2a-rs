@@ -1202,8 +1202,9 @@ pub(super) fn rebase_snapshot(task: &mut Task, previous: Task) {
         .metadata
         .as_ref()
         .is_some_and(|metadata| Some(metadata) != previous.metadata.as_ref());
-    // The artifacts the client wrote are the server's to keep: an executor
-    // lists what it produced, not what the client sent it.
+    // A full Task may contain borrowed, stale copies of client-origin artifacts.
+    // Keep their committed versions, including explicit edits by either party.
+    // Executors use ArtifactUpdate events when they intend to modify these.
     let supplied = task.artifacts.take().map(|mut new| {
         for kept in previous.artifacts.iter().flatten() {
             if kept.role == Some(Role::User) {
@@ -1307,6 +1308,9 @@ fn stamp_snapshot_artifact(artifact: &mut Artifact, previous: Option<&Artifact>,
 
 /// Apply an artifact chunk using its actual origin, then stamp both the stored
 /// artifact and the outgoing chunk. The chunk keeps its own parts and metadata.
+/// Existing roles identify the original creator: explicit agent writes may edit
+/// client-origin artifacts without changing that attribution. Whole Task snapshots
+/// preserve these artifacts instead, because their copies may be stale.
 fn merge_artifact(
     task: &mut Task,
     update: &mut TaskArtifactUpdateEvent,

@@ -1514,6 +1514,99 @@ async fn executor_updates_preserve_client_artifact_ownership_even_if_they_claim_
     }
 }
 
+struct ArtifactEditThenStaleSnapshot {
+    append: bool,
+}
+
+impl AgentExecutor for ArtifactEditThenStaleSnapshot {
+    fn execute(
+        &self,
+        ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        let mut stale = ctx.stored_task.unwrap();
+        stale.status.state = TaskState::Completed;
+        let mut artifact = stale.artifacts.as_ref().unwrap()[0].clone();
+        artifact.parts = vec![Part::text("explicit edit")];
+        // The executor's claimed role and stamps do not replace provenance.
+        artifact.role = Some(Role::Agent);
+        artifact.start_generation = Some(999999);
+        artifact.end_generation = Some(999999);
+        stream::iter([
+            Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                task_id: ctx.task_id,
+                context_id: ctx.context_id,
+                artifact,
+                append: Some(self.append),
+                last_chunk: Some(true),
+                generation: 999999,
+                metadata: None,
+            })),
+            Ok(StreamResponse::Task(stale)),
+        ])
+        .boxed()
+    }
+
+    fn cancel(&self, _: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        stream::empty().boxed()
+    }
+}
+
+#[tokio::test]
+async fn a_stale_snapshot_cannot_undo_an_explicit_edit_to_a_client_originated_artifact() {
+    for append in [false, true] {
+        let store = InMemoryTaskStore::new();
+        seed_owned_artifact(&store, Role::User).await;
+        let h = DefaultRequestHandler::new(ArtifactEditThenStaleSnapshot { append }, store)
+            .with_capabilities(AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            });
+        let mut req = request("edit");
+        req.message.task_id = Some("task".into());
+        let events: Vec<_> = tokio::time::timeout(Duration::from_secs(2), async {
+            h.send_streaming_message(&params(), req)
+                .await
+                .unwrap()
+                .collect()
+                .await
+        })
+        .await
+        .unwrap();
+        let mut edit = None;
+        let mut completed = None;
+        for event in events {
+            match event.unwrap() {
+                StreamResponse::ArtifactUpdate(update) => edit = Some(update),
+                StreamResponse::Task(task) if task.status.state == TaskState::Completed => {
+                    completed = Some(task)
+                }
+                _ => {}
+            }
+        }
+        let edit = edit.expect("the explicit write is delivered");
+        assert_eq!(edit.artifact.role, Some(Role::User));
+        assert_eq!(edit.artifact.parts, [Part::text("explicit edit")]);
+        assert_eq!(edit.artifact.start_generation, Some(1));
+        assert_eq!(edit.artifact.end_generation, Some(edit.generation));
+        let completed = completed.expect("the terminal snapshot is delivered");
+        assert!(completed.generation > edit.generation);
+        let artifact = &completed.artifacts.as_ref().unwrap()[0];
+        assert_eq!(artifact.role, Some(Role::User));
+        assert_eq!(
+            artifact.parts,
+            if append {
+                vec![Part::text("original"), Part::text("explicit edit")]
+            } else {
+                vec![Part::text("explicit edit")]
+            }
+        );
+        assert_eq!(artifact.start_generation, Some(1));
+        assert_eq!(artifact.end_generation, Some(edit.generation));
+        assert_eq!(h.tasks.load("task").await.unwrap(), completed);
+        h.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn forged_snapshot_ownership_does_not_allow_client_writes_to_agent_artifacts() {
     let store = InMemoryTaskStore::new();
