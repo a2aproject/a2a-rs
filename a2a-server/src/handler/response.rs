@@ -307,6 +307,8 @@ impl Run {
             }
         }
         if let Some(receipt) = receipt.filter(|_| !interrupted) {
+            // §3.1.12 requires a Task ACK even for an individually rejected
+            // input; its StreamError was sent on the downlink above.
             receipt.complete(self.handler.tasks.load(self.task.id()).await);
         }
         // Dropping a begun, interrupted receipt makes the HTTP adapter verify

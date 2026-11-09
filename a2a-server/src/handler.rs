@@ -161,6 +161,9 @@ pub enum LiveResponse {
     Stream(BoxStream<'static, Result<StreamResponse, A2AError>>),
     /// This call was input for an exchange that is already open; here is the
     /// task as it stands. Its events arrive on the downlink, never here.
+    /// This acknowledges the call, not acceptance of its input: a request-level
+    /// rejection is a `StreamError` with `referenceId` on the downlink (§3.1.12).
+    /// Authorization and binding errors before routing still return `Err`.
     Ack(Box<Task>),
 }
 /// Decides whether a request may proceed.
