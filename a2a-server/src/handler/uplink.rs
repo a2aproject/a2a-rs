@@ -7,7 +7,6 @@ use super::protocol::{IncomingRequest, ProtocolError};
 use crate::middleware::{ServiceParams, User};
 use a2a::*;
 use futures::{FutureExt, StreamExt, stream::BoxStream};
-use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
 // Live (bidirectional) exchanges: `SendLiveMessage` (A2A 1.1 §3.1.12).
@@ -131,14 +130,15 @@ impl Uplink {
     }
 }
 
-/// Open HTTP live responses, grouped by task. Follow-up calls are routed to
-/// the input queue of a response whose downlink is already open.
+/// Reserved HTTP live responses. An exchange ID is unique before task admission;
+/// follow-up calls can route only after the response is bound to its task.
 #[derive(Default)]
 pub(super) struct HttpLiveResponses {
-    pub(super) open: parking_lot::RwLock<HashMap<TaskId, Vec<HttpLiveResponse>>>,
+    pub(super) open: parking_lot::RwLock<Vec<HttpLiveResponse>>,
 }
 
 pub(super) struct HttpLiveResponse {
+    task_id: Option<TaskId>,
     exchange_id: Option<String>,
     user: Option<User>,
     sender: mpsc::Sender<Incoming>,
@@ -169,36 +169,52 @@ impl HttpLiveResponses {
     /// Recover the bound task before authorizing an HTTP uplink that omits it.
     pub(super) fn task_for_exchange(&self, id: &str) -> Result<Option<TaskId>, A2AError> {
         let open = self.open.read();
-        let mut tasks = open.iter().filter_map(|(task, responses)| {
-            responses
-                .iter()
-                .any(|response| {
-                    !response.sender.is_closed() && response.exchange_id.as_deref() == Some(id)
-                })
-                .then_some(task)
-        });
-        let task = tasks.next().cloned();
-        if tasks.next().is_some() {
-            return Err(ProtocolError::AmbiguousExchangeIdentifier.into());
-        }
-        Ok(task)
+        let Some(response) = open.iter().find(|response| {
+            !response.sender.is_closed() && response.exchange_id.as_deref() == Some(id)
+        }) else {
+            return Ok(None);
+        };
+        response
+            .task_id
+            .clone()
+            .map(Some)
+            .ok_or_else(|| ProtocolError::ExchangeIdentifierInUse.into())
     }
+
+    /// Claim the optional identifier before admission can create or mutate a task.
     pub(super) fn register(
         &self,
-        task_id: &str,
         sender: mpsc::Sender<Incoming>,
         exchange_id: Option<String>,
         user: Option<User>,
-    ) {
-        self.open
+    ) -> Result<(), A2AError> {
+        let mut open = self.open.write();
+        open.retain(|response| !response.sender.is_closed());
+        if exchange_id.is_some()
+            && open
+                .iter()
+                .any(|response| response.exchange_id == exchange_id)
+        {
+            return Err(ProtocolError::ExchangeIdentifierInUse.into());
+        }
+        open.push(HttpLiveResponse {
+            task_id: None,
+            sender,
+            exchange_id,
+            user,
+        });
+        Ok(())
+    }
+
+    pub(super) fn bind(&self, sender: &mpsc::Sender<Incoming>, task_id: &str) {
+        if let Some(response) = self
+            .open
             .write()
-            .entry(task_id.to_string())
-            .or_default()
-            .push(HttpLiveResponse {
-                sender,
-                exchange_id,
-                user,
-            });
+            .iter_mut()
+            .find(|response| response.sender.same_channel(sender))
+        {
+            response.task_id.get_or_insert_with(|| task_id.to_owned());
+        }
     }
 
     /// Route only to one explicitly identified exchange, or one unambiguous
@@ -210,23 +226,18 @@ impl HttpLiveResponses {
         user: &Option<User>,
     ) -> Result<Option<(TaskId, mpsc::Sender<Incoming>)>, A2AError> {
         let open = self.open.read();
-        let mut candidates = open.iter().flat_map(|(task, responses)| {
-            responses
-                .iter()
-                .filter(move |response| {
-                    !response.sender.is_closed()
-                        && match exchange_id {
-                            Some(id) => response.exchange_id.as_deref() == Some(id),
-                            None => {
-                                task == task_id
-                                    && response.exchange_id.is_none()
-                                    && &response.user == user
-                            }
-                        }
-                })
-                .map(move |response| (task, response))
+        let mut candidates = open.iter().filter(|response| {
+            !response.sender.is_closed()
+                && match exchange_id {
+                    Some(id) => response.exchange_id.as_deref() == Some(id),
+                    None => {
+                        response.task_id.as_deref() == Some(task_id)
+                            && response.exchange_id.is_none()
+                            && &response.user == user
+                    }
+                }
         });
-        let Some((bound_task, response)) = candidates.next() else {
+        let Some(response) = candidates.next() else {
             return Ok(None);
         };
         if candidates.next().is_some() {
@@ -235,19 +246,17 @@ impl HttpLiveResponses {
         if &response.user != user {
             return Err(ProtocolError::ForeignExchangeCaller.into());
         }
+        let bound_task = response
+            .task_id
+            .as_ref()
+            .ok_or(ProtocolError::ExchangeIdentifierInUse)?;
         Ok(Some((bound_task.clone(), response.sender.clone())))
     }
 
-    pub(super) fn unregister(&self, task_id: &str, sender: &mpsc::Sender<Incoming>) {
-        let mut open = self.open.write();
-        if let Some(senders) = open.get_mut(task_id) {
-            senders.retain(|current| {
-                !current.sender.same_channel(sender) && !current.sender.is_closed()
-            });
-            if senders.is_empty() {
-                open.remove(task_id);
-            }
-        }
+    pub(super) fn unregister(&self, sender: &mpsc::Sender<Incoming>) {
+        self.open
+            .write()
+            .retain(|current| !current.sender.same_channel(sender) && !current.sender.is_closed());
     }
 }
 
@@ -256,20 +265,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn concurrent_registrations_cannot_route_an_ambiguous_exchange_identifier() {
+    fn duplicate_identifiers_are_rejected_without_displacing_the_owner() {
         let responses = HttpLiveResponses::default();
         let (first, _rx1) = mpsc::channel(1);
         let (second, _rx2) = mpsc::channel(1);
-        responses.register("first", first.clone(), Some("shared".into()), None);
-        responses.register("second", second, Some("shared".into()), None);
-        let error = responses.task_for_exchange("shared").unwrap_err();
+        responses
+            .register(first.clone(), Some("shared".into()), None)
+            .unwrap();
+        responses.bind(&first, "first");
+        let error = responses
+            .register(second.clone(), Some("shared".into()), None)
+            .unwrap_err();
         assert_eq!(error.code, a2a::error_code::INVALID_REQUEST);
-        assert!(error.message.contains("ambiguous"));
-        responses.unregister("first", &first);
+        assert_eq!(
+            responses.task_for_exchange("shared").unwrap().as_deref(),
+            Some("first")
+        );
+        responses.unregister(&first);
+        responses
+            .register(second.clone(), Some("shared".into()), None)
+            .unwrap();
+        responses.bind(&second, "second");
         assert_eq!(
             responses.task_for_exchange("shared").unwrap().as_deref(),
             Some("second")
         );
+    }
+
+    #[test]
+    fn simultaneous_registrations_have_only_one_identifier_owner() {
+        let responses = std::sync::Arc::new(HttpLiveResponses::default());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let contenders: Vec<_> = (0..16)
+            .map(|_| {
+                let responses = responses.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let (sender, receiver) = mpsc::channel(1);
+                    barrier.wait();
+                    let result = responses.register(sender, Some("shared".into()), None);
+                    // Keep the winning receiver open until all contenders finish.
+                    (result, receiver)
+                })
+            })
+            .collect();
+        let results: Vec<_> = contenders
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|(result, _)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(responses.open.read().len(), 1);
+        for error in results
+            .iter()
+            .filter_map(|(result, _)| result.as_ref().err())
+        {
+            assert_eq!(error.code, a2a::error_code::INVALID_REQUEST);
+        }
+    }
+
+    #[test]
+    fn releasing_a_closed_owner_does_not_remove_its_identifier_replacement() {
+        let responses = HttpLiveResponses::default();
+        let (first, receiver) = mpsc::channel(1);
+        responses
+            .register(first.clone(), Some("shared".into()), None)
+            .unwrap();
+        responses.bind(&first, "first");
+        drop(receiver);
+        let (second, _receiver) = mpsc::channel(1);
+        responses
+            .register(second.clone(), Some("shared".into()), None)
+            .unwrap();
+        responses.bind(&second, "second");
+        responses.unregister(&first);
+        let (task, sender) = responses
+            .route("second", Some("shared"), &None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(task, "second");
+        assert!(sender.same_channel(&second));
     }
 
     #[test]

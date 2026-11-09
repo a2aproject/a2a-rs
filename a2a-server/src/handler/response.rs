@@ -59,9 +59,9 @@ impl Run {
     pub(super) fn with_uplink(
         mut self,
         uplink: Option<Uplink>,
-        mut registration: Option<RegistrationLease>,
+        registration: Option<RegistrationLease>,
     ) -> Self {
-        if let Some(registration) = &mut registration {
+        if let Some(registration) = &registration {
             registration.bind(self.task.id());
         }
         self.registration = registration;

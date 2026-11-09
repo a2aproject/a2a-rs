@@ -22,35 +22,22 @@ pub(super) enum HttpOpening {
     Acknowledged(Box<Task>),
 }
 
-/// Registers only once the opening request has established the task. The
-/// lease is not cloned: normal exit, cancellation, and unwinding all drop it.
+/// Reserves routing before admission and binds it once the task is established.
+/// Normal exit, failed opening, cancellation, and unwinding release the lease.
 pub(super) struct RegistrationLease {
     responses: Arc<HttpLiveResponses>,
     sender: mpsc::Sender<Incoming>,
-    task_id: Option<TaskId>,
-    exchange_id: Option<String>,
-    user: Option<crate::middleware::User>,
 }
 
 impl RegistrationLease {
-    pub(super) fn bind(&mut self, task_id: &str) {
-        if self.task_id.is_none() {
-            self.responses.register(
-                task_id,
-                self.sender.clone(),
-                self.exchange_id.clone(),
-                self.user.clone(),
-            );
-            self.task_id = Some(task_id.to_string());
-        }
+    pub(super) fn bind(&self, task_id: &str) {
+        self.responses.bind(&self.sender, task_id);
     }
 }
 
 impl Drop for RegistrationLease {
     fn drop(&mut self) {
-        if let Some(task_id) = &self.task_id {
-            self.responses.unregister(task_id, &self.sender);
-        }
+        self.responses.unregister(&self.sender);
     }
 }
 
@@ -101,6 +88,13 @@ pub(super) async fn open(
         return Ok(HttpOpening::Acknowledged(task));
     }
     let (sender, receiver) = mpsc::channel(LIVE_UPLINK_CAPACITY);
+    handler
+        .http_live_responses
+        .register(sender.clone(), exchange_id, user)?;
+    let registration = RegistrationLease {
+        responses: handler.http_live_responses.clone(),
+        sender: sender.clone(),
+    };
     let _ = sender
         .send(Incoming {
             request,
@@ -108,13 +102,7 @@ pub(super) async fn open(
         })
         .await;
     Ok(HttpOpening::Attached {
-        registration: RegistrationLease {
-            responses: handler.http_live_responses.clone(),
-            sender,
-            task_id: None,
-            exchange_id,
-            user,
-        },
+        registration,
         uplink: Uplink::Http(receiver),
     })
 }
@@ -188,6 +176,7 @@ mod tests {
     use crate::handler::response::{ResponseStream, Run};
     use crate::handler::test_support::*;
     use crate::handler::uplink::Receipt;
+    use std::sync::atomic::AtomicUsize;
     use tokio::sync::oneshot;
 
     async fn bound_run(handler: &DefaultRequestHandler) -> Run {
@@ -285,7 +274,7 @@ mod tests {
             }),
         };
         let HttpOpening::Attached {
-            mut registration,
+            registration,
             mut uplink,
         } = open(&handler, &params, subscribe()).await.unwrap()
         else {
@@ -307,5 +296,224 @@ mod tests {
         );
         drop(registration);
         uplink.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_pending_opening_reserves_its_exchange_identifier() {
+        let handler = make_handler();
+        let params =
+            ServiceParams::from([(a2a::SDK_LIVE_EXCHANGE_HEADER.into(), vec!["shared".into()])]);
+        let request = || StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::SendMessage(send_req(None, None)),
+        };
+        let first = open(&handler, &params, request()).await.unwrap();
+        let denied = handler
+            .clone()
+            .with_authorizer(|_: &ServiceParams, _: Option<&str>| {
+                Err(A2AError::invalid_request("credentials rejected"))
+            });
+        assert_eq!(
+            open(&denied, &params, request())
+                .await
+                .err()
+                .unwrap()
+                .message,
+            "credentials rejected",
+            "authorization must precede reporting a pending ID conflict"
+        );
+        let error = open(&handler, &params, request())
+            .await
+            .err()
+            .expect("an opening must reserve its ID before task admission");
+        assert_eq!(error.code, a2a::error_code::INVALID_REQUEST);
+        assert!(
+            handler
+                .http_live_responses
+                .task_for_exchange("shared")
+                .is_err(),
+            "pending exchanges must not infer a task or open another response"
+        );
+        drop(first);
+        let replacement = open(&handler, &params, request()).await.unwrap();
+        drop(replacement);
+        assert!(handler.http_live_responses.open.read().is_empty());
+    }
+
+    #[derive(Clone, Default)]
+    struct PausedReadStore {
+        inner: Arc<InMemoryTaskStore>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TaskStore for PausedReadStore {
+        async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.create(task).await
+        }
+        async fn update(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.update(task).await
+        }
+        async fn get(&self, id: &str) -> Result<Option<Task>, A2AError> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.get(id).await
+        }
+        async fn list(&self, request: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+            self.inner.list(request).await
+        }
+        async fn begin_cancel(&self, id: &str) -> Result<Task, A2AError> {
+            self.inner.begin_cancel(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_competing_http_opening_is_rejected_before_task_admission() {
+        let store = PausedReadStore::default();
+        let handler = DefaultRequestHandler::new(EchoExecutor, store.clone()).with_capabilities(
+            AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            },
+        );
+        let params = ServiceParams::from([
+            (SVC_PARAM_VERSION.into(), vec!["1.1".into()]),
+            (SDK_LIVE_EXCHANGE_HEADER.into(), vec!["shared".into()]),
+        ]);
+        let request = || StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::SendMessage(send_req(None, None)),
+        };
+        let first = tokio::spawn({
+            let handler = handler.clone();
+            let params = params.clone();
+            let request = request();
+            async move { handler.send_live_request(&params, request).await }
+        });
+        timeout(Duration::from_secs(2), store.entered.notified())
+            .await
+            .unwrap();
+        let error = timeout(
+            Duration::from_secs(2),
+            handler.send_live_request(&params, request()),
+        )
+        .await
+        .unwrap()
+        .err()
+        .expect("the first opening owns this identifier");
+        assert_eq!(error.code, error_code::INVALID_REQUEST);
+        assert_eq!(
+            store.reads.load(Ordering::SeqCst),
+            1,
+            "the competing request must not reach admission"
+        );
+        store.release.notify_one();
+        let super::super::LiveResponse::Stream(mut stream) = timeout(Duration::from_secs(2), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("the owning opening must succeed")
+        };
+        assert!(matches!(
+            timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap(),
+            Some(Ok(StreamResponse::Task(_)))
+        ));
+        drop(stream);
+        handler.shutdown().await;
+        assert!(handler.http_live_responses.open.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_opening_releases_its_reserved_identifier() {
+        let handler = make_handler();
+        let params = ServiceParams::from([
+            (SVC_PARAM_VERSION.into(), vec!["1.1".into()]),
+            (SDK_LIVE_EXCHANGE_HEADER.into(), vec!["shared".into()]),
+        ]);
+        let error = handler
+            .send_live_request(
+                &params,
+                StreamRequest {
+                    tenant: None,
+                    payload: StreamRequestPayload::SendMessage(send_req(Some("missing"), None)),
+                },
+            )
+            .await
+            .err()
+            .expect("the task does not exist");
+        assert_eq!(error.code, error_code::TASK_NOT_FOUND);
+        assert!(handler.http_live_responses.open.read().is_empty());
+        let response = handler
+            .send_live_request(
+                &params,
+                StreamRequest {
+                    tenant: None,
+                    payload: StreamRequestPayload::SendMessage(send_req(None, None)),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(response, super::super::LiveResponse::Stream(_)));
+        drop(response);
+        handler.shutdown().await;
+        assert!(handler.http_live_responses.open.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn canceling_an_opening_releases_its_pending_identifier() {
+        let store = PausedReadStore::default();
+        let handler = DefaultRequestHandler::new(EchoExecutor, store.clone()).with_capabilities(
+            AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            },
+        );
+        let params = ServiceParams::from([
+            (SVC_PARAM_VERSION.into(), vec!["1.1".into()]),
+            (SDK_LIVE_EXCHANGE_HEADER.into(), vec!["shared".into()]),
+        ]);
+        let first = tokio::spawn({
+            let handler = handler.clone();
+            let params = params.clone();
+            async move {
+                handler
+                    .send_live_request(
+                        &params,
+                        StreamRequest {
+                            tenant: None,
+                            payload: StreamRequestPayload::SendMessage(send_req(None, None)),
+                        },
+                    )
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(2), store.entered.notified())
+            .await
+            .unwrap();
+        first.abort();
+        assert!(first.await.is_err());
+        assert!(handler.http_live_responses.open.read().is_empty());
+        let replacement = open(
+            &handler,
+            &params,
+            StreamRequest {
+                tenant: None,
+                payload: StreamRequestPayload::SendMessage(send_req(None, None)),
+            },
+        )
+        .await
+        .expect("cancellation must release the ID even while owned admission continues");
+        drop(replacement);
+        store.release.notify_one();
+        handler.shutdown().await;
+        assert!(handler.http_live_responses.open.read().is_empty());
     }
 }

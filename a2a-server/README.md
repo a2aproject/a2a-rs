@@ -142,6 +142,11 @@ or a `StreamError` for a live exchange. Other task subscribers receive task
 updates without that caller's rejection. Immediate unary replies acknowledge
 admission and have already returned when later execution rejects unread input.
 
+HTTP exchange identifiers are reserved atomically after authorization and before
+task admission. A concurrent opening using the same identifier is rejected before
+it can create a task or record input. Pending openings cannot accept follow-ups
+until bound to a task; failed or disconnected openings release their reservation.
+
 Implement `RequestAuthorizer::authenticated_user` to provide trusted caller
 information after authorization. Its default returns `None`; the SDK never
 constructs a principal from message metadata or an unvalidated user-name header.

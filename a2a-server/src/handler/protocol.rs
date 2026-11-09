@@ -1588,7 +1588,6 @@ pub(super) enum ProtocolError<'a> {
     ExtendedCardNotConfigured,
     // Existing SDK-specific HTTP live routing.
     InvalidExchangeRoutingHeader,
-    AmbiguousExchangeIdentifier,
     AmbiguousExchange,
     ForeignExchangeCaller,
     ExchangeIdentifierInUse,
@@ -1621,9 +1620,6 @@ impl From<ProtocolError<'_>> for A2AError {
             ProtocolError::ExtendedCardNotConfigured => Self::extended_card_not_configured(),
             ProtocolError::InvalidExchangeRoutingHeader => {
                 Self::invalid_params("invalid live exchange routing header")
-            }
-            ProtocolError::AmbiguousExchangeIdentifier => {
-                Self::invalid_request("ambiguous live exchange identifier")
             }
             ProtocolError::AmbiguousExchange => Self::invalid_request(
                 "ambiguous live exchange; use a distinct exchange routing identifier",
