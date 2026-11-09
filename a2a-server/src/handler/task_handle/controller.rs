@@ -152,7 +152,7 @@ impl TaskController {
             }
             let delivery = Delivery::Started {
                 task: task.clone(),
-                receiver: active.subscribe(),
+                receiver: active.subscribe_for_response(message.response_id),
             };
 
             // The invocation owns its inbox and caller context independently of this request.

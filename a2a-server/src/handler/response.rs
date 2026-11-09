@@ -211,8 +211,10 @@ impl Run {
             return false;
         }
         if inner.is_none() {
-            let (receiver, _, sequence) =
-                super::events::ExecutionReceiver::for_task(self.task.clone());
+            let (receiver, _, sequence) = super::events::ExecutionReceiver::for_task(
+                self.task.clone(),
+                self.settings.response_id(),
+            );
             match self.handler.tasks.load(self.task.id()).await {
                 Ok(task) => {
                     if !self
@@ -345,8 +347,10 @@ impl Run {
         // The response is already subscribed to the task before admitting input.
         // Even a formerly idle task publishes into this same receiver.
         if inner.is_none() {
-            let (receiver, _, sequence) =
-                super::events::ExecutionReceiver::for_task(self.task.clone());
+            let (receiver, _, sequence) = super::events::ExecutionReceiver::for_task(
+                self.task.clone(),
+                self.settings.response_id(),
+            );
             *inner = Some(event_stream(self.settings, receiver, None, sequence));
         }
         self.handler
@@ -373,7 +377,7 @@ pub(super) fn task_response(
 ) -> ResponseStream {
     let background = handler.tasks.background_tasks.clone();
     let stream = async_stream::stream! {
-        let (receiver, _, sequence) = super::events::ExecutionReceiver::for_task(task.clone());
+        let (receiver, _, sequence) = super::events::ExecutionReceiver::for_task(task.clone(), policy.response_id());
         let mut last_generation = seen_generation;
         if let Some(task) = opening {
             last_generation = last_generation.max(task.generation);

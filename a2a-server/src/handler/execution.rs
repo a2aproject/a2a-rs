@@ -352,7 +352,7 @@ pub(super) async fn reject_inputs(
         let event = Rejection::unread_input()
             .into_stream_error(task_id, Some(input.message.message_id.clone()));
         active
-            .publish_kind(Ok(&event), None, EventKind::LiveOnly(input.response_id))
+            .publish_kind(Ok(&event), None, EventKind::ResponseOnly(input.response_id))
             .await;
     }
 }
@@ -1049,7 +1049,7 @@ mod turn_tests {
         message.message_id.clear();
         reject_inputs(&active, "task", vec![crate::ClientInput::new(message, 3)]).await;
         let event = events.recv().await.unwrap();
-        assert!(matches!(event.kind, EventKind::LiveOnly(None)));
+        assert!(matches!(event.kind, EventKind::ResponseOnly(None)));
         let StreamResponse::Error(error) = event.result.unwrap() else {
             panic!("expected a rejection")
         };

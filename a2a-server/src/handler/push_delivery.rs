@@ -518,7 +518,7 @@ mod tests {
         let mut events = vec![
             (EventKind::Repeated, Ok(StreamResponse::Task(task.clone()))),
             (
-                EventKind::LiveOnly(None),
+                EventKind::ResponseOnly(None),
                 Ok(StreamResponse::Task(task.clone())),
             ),
             (

@@ -362,7 +362,9 @@ impl TaskService {
         policy: ResponsePolicy,
     ) -> Result<TaskEvents, A2AError> {
         // Resolve a snapshot and receiver together inside the task's operation queue.
-        let (receiver, snapshot, sequence) = self.subscription_source(&handle, &req.id).await?;
+        let (receiver, snapshot, sequence) = self
+            .subscription_source(&handle, &req.id, policy.response_id())
+            .await?;
 
         let plan = super::protocol::subscription_plan(snapshot, &req)?;
         let events = event_stream(policy, receiver, plan.opening, sequence);
@@ -373,6 +375,7 @@ impl TaskService {
         &self,
         handle: &TaskHandle,
         task_id: &str,
+        response_id: Option<uuid::Uuid>,
     ) -> Result<(ExecutionReceiver, Task, u64), A2AError> {
         // A deferred Task is private until the executor actually creates it.
         if let Some(active) = handle.active()
@@ -380,7 +383,8 @@ impl TaskService {
         {
             return Err(ProtocolError::TaskNotFound(task_id).into());
         }
-        let (receiver, snapshot, sequence) = ExecutionReceiver::for_task(handle.clone());
+        let (receiver, snapshot, sequence) =
+            ExecutionReceiver::for_task(handle.clone(), response_id);
         if handle.active().is_some()
             && let Some(snapshot) = snapshot
         {

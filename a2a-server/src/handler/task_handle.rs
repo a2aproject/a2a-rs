@@ -68,14 +68,16 @@ struct State {
     snapshot: Option<Task>,
     last_error: Option<(u64, A2AError)>,
     interrupted_input_generation: i64,
-    // Only outstanding receivers retain their first direct reply. No task-wide
-    // reply history survives after those receivers are dropped.
+    // Outstanding receivers retain their direct reply or private input rejection.
+    // No task-wide reply history survives after those receivers are dropped.
     replies: Vec<Weak<ReplyRetention>>,
 }
 
 pub(super) struct ReplyRetention {
     opened_at: u64,
+    pub(super) response_id: Option<uuid::Uuid>,
     pub(super) reply: std::sync::OnceLock<ExecutionEvent>,
+    pub(super) rejection: std::sync::OnceLock<ExecutionEvent>,
 }
 
 /// Persisted Task data stays in TaskStore. This handle owns its process-local
@@ -348,6 +350,7 @@ impl TaskHandle {
 
     pub(super) fn response_subscription(
         &self,
+        response_id: Option<uuid::Uuid>,
     ) -> (
         broadcast::Receiver<ExecutionEvent>,
         Option<Task>,
@@ -358,7 +361,9 @@ impl TaskHandle {
         let receiver = self.inner.sender.subscribe();
         let reply = Arc::new(ReplyRetention {
             opened_at: state.sequence,
+            response_id,
             reply: std::sync::OnceLock::new(),
+            rejection: std::sync::OnceLock::new(),
         });
         state.replies.retain(|reply| reply.strong_count() > 0);
         state.replies.push(Arc::downgrade(&reply));
@@ -483,10 +488,14 @@ impl TaskHandle {
                 let Some(reply) = reply.upgrade() else {
                     return false;
                 };
-                if matches!(event.result, Ok(StreamResponse::Message(_)))
-                    && event.sequence > reply.opened_at
-                {
-                    let _ = reply.reply.set(event.clone());
+                let private = matches!(event.kind, EventKind::ResponseOnly(Some(id)) if reply.response_id == Some(id));
+                if event.sequence > reply.opened_at {
+                    if matches!(event.result, Ok(StreamResponse::Message(_))) {
+                        let _ = reply.reply.set(event.clone());
+                    }
+                    if private {
+                        let _ = reply.rejection.set(event.clone());
+                    }
                 }
                 true
             });
@@ -587,7 +596,7 @@ mod tests {
             reference_id: None,
             metadata: None,
         });
-        task.publish(Ok(&rejection), None, EventKind::LiveOnly(None), None, 0)
+        task.publish(Ok(&rejection), None, EventKind::ResponseOnly(None), None, 0)
             .await;
         assert!(!watch.changes.has_changed().unwrap());
         let mut failed = task_with_history("task", "context", 0);
@@ -637,7 +646,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_response_releases_its_retained_reply() {
         let source = TaskHandle::new("task".into(), None);
-        let (receiver, _, _, retained) = source.response_subscription();
+        let (receiver, _, _, retained) = source.response_subscription(None);
         let weak = Arc::downgrade(&retained);
         source
             .publish(

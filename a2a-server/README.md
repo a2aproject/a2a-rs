@@ -125,8 +125,11 @@ for finishing work on messages they already received.
 
 Authorized clients can attach independent live exchanges to the same task. Their
 messages share the active executor's bounded input queue, and task updates reach
-every attached downlink. Request rejections, including unread input when a task
-ends, go only to the live response that accepted the input.
+every attached downlink. Unread input rejected when execution ends is reported
+only to its sending response: an error for a waiting unary or streaming call,
+or a `StreamError` for a live exchange. Other task subscribers receive task
+updates without that caller's rejection. Immediate unary replies acknowledge
+admission and have already returned when later execution rejects unread input.
 
 Implement `RequestAuthorizer::authenticated_user` to provide trusted caller
 information after authorization. Its default returns `None`; the SDK never

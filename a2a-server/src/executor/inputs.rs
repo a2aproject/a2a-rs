@@ -80,8 +80,9 @@ impl ClientInput {
 ///
 /// The receiver is owned and can move into a Tokio task. The server tracks
 /// delivery receipts: a message still unread at the end of a nonterminal
-/// turn is handed to the next execution. If the task ends, its
-/// sender receives a `StreamError`. An executor reads with [`recv`](Self::recv),
+/// turn is handed to the next execution. If the task ends, a waiting unary or
+/// streaming sender receives an error; a live sender receives a private
+/// `StreamError`. An executor reads with [`recv`](Self::recv),
 /// alongside its own work.
 pub struct ClientInputs {
     receiver: Option<mpsc::Receiver<QueuedInput>>,

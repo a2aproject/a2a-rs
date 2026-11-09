@@ -39,12 +39,17 @@ pub(super) struct ExecutionReceiver {
     opened_at: u64,
     reply: Option<Arc<super::task_handle::ReplyRetention>>,
     required_input: i64,
+    rejection_delivered: bool,
+    recovering_reply: bool,
 }
 
 impl ExecutionReceiver {
     /// Subscribe to the task source independently of any executor invocation.
-    pub(super) fn for_task(task: TaskHandle) -> (Self, Option<Task>, u64) {
-        let (receiver, snapshot, sequence, reply) = task.response_subscription();
+    pub(super) fn for_task(
+        task: TaskHandle,
+        response_id: Option<uuid::Uuid>,
+    ) -> (Self, Option<Task>, u64) {
+        let (receiver, snapshot, sequence, reply) = task.response_subscription(response_id);
         (
             Self {
                 receiver,
@@ -54,6 +59,8 @@ impl ExecutionReceiver {
                 opened_at: sequence,
                 reply: Some(reply),
                 required_input: 0,
+                rejection_delivered: false,
+                recovering_reply: false,
             },
             snapshot,
             sequence,
@@ -90,6 +97,16 @@ impl ExecutionReceiver {
     }
 
     pub(super) async fn recv(&mut self) -> Result<ExecutionEvent, broadcast::error::RecvError> {
+        // A private rejection precedes the direct reply that ends the exchange.
+        // Recover both when later task events have overwritten the broadcast.
+        if std::mem::take(&mut self.recovering_reply)
+            && let Some(reply) = self
+                .reply
+                .as_ref()
+                .and_then(|retained| retained.reply.get())
+        {
+            return Ok(reply.clone());
+        }
         let received = match &self.finished {
             None => self.receiver.recv().await,
             Some(finished) => tokio::select! {
@@ -98,13 +115,42 @@ impl ExecutionReceiver {
                 _ = finished.cancelled() => Err(broadcast::error::RecvError::Closed),
             },
         };
-        if matches!(received, Err(broadcast::error::RecvError::Lagged(_)))
-            && let Some(retained) = &self.reply
-            && let Some(reply) = retained.reply.get()
-        {
-            return Ok(reply.clone());
+        if matches!(received, Err(broadcast::error::RecvError::Lagged(_))) {
+            if let Some(rejection) = self.take_rejection() {
+                return Ok(rejection);
+            }
+            if let Some(reply) = self
+                .reply
+                .as_ref()
+                .and_then(|retained| retained.reply.get())
+            {
+                return Ok(reply.clone());
+            }
+        }
+        if let Some(retained) = &self.reply {
+            if let Some(rejection) = retained.rejection.get()
+                && matches!(&received, Ok(event) if event.sequence >= rejection.sequence)
+            {
+                self.rejection_delivered = true;
+            }
         }
         received
+    }
+
+    fn take_rejection(&mut self) -> Option<ExecutionEvent> {
+        if self.rejection_delivered {
+            return None;
+        }
+        let rejection = self.reply.as_ref()?.rejection.get()?.clone();
+        self.rejection_delivered = true;
+        self.recovering_reply = true;
+        Some(rejection)
+    }
+
+    fn has_retained_reply(&self) -> bool {
+        self.reply
+            .as_ref()
+            .is_some_and(|retained| retained.reply.get().is_some())
     }
 
     #[cfg(test)]
@@ -114,8 +160,25 @@ impl ExecutionReceiver {
 
     /// Starts over after the events were lost: the task as it stands, and the
     /// sequence after which events follow it. `None` when no Task exists yet.
-    fn resync(&mut self, after: u64) -> Result<Option<(Task, u64, i64)>, A2AError> {
-        let (receiver, snapshot, sequence, input_generation) = self.task.resynchronize(after)?;
+    async fn resync(&mut self, after: u64) -> Result<Option<(Task, u64, i64)>, A2AError> {
+        let mut recovered = self.task.resynchronize(after)?;
+        if recovered
+            .1
+            .as_ref()
+            .is_some_and(|task| task.status.state.is_terminal())
+            && self
+                .reply
+                .as_ref()
+                .is_some_and(|retained| retained.response_id.is_some())
+            && let Some(active) = self.task.active()
+        {
+            // Cancellation commits its snapshot before unread-input cleanup.
+            // This token belongs to the driver, so waiting does not depend on
+            // this receiver (or the ActiveExecution Arc) being dropped.
+            active.inputs_drained.cancelled().await;
+            recovered = self.task.resynchronize(after)?;
+        }
+        let (receiver, snapshot, sequence, input_generation) = recovered;
         self.receiver = receiver;
         Ok(snapshot.map(|task| (task, sequence, input_generation)))
     }
@@ -199,8 +262,16 @@ impl ActiveExecution {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[cfg(test)]
     pub(super) fn subscribe(self: &Arc<Self>) -> ExecutionReceiver {
-        let (receiver, _, sequence, reply) = self.task.response_subscription();
+        self.subscribe_for_response(None)
+    }
+
+    pub(super) fn subscribe_for_response(
+        self: &Arc<Self>,
+        response_id: Option<uuid::Uuid>,
+    ) -> ExecutionReceiver {
+        let (receiver, _, sequence, reply) = self.task.response_subscription(response_id);
         ExecutionReceiver {
             receiver,
             task: self.task.clone(),
@@ -209,6 +280,8 @@ impl ActiveExecution {
             opened_at: sequence,
             reply: Some(reply),
             required_input: 0,
+            rejection_delivered: false,
+            recovering_reply: false,
         }
     }
 
@@ -292,7 +365,8 @@ impl Drop for ActiveExecution {
 
 struct SubscriptionState {
     receiver: ExecutionReceiver,
-    snapshot_task: Option<Task>,
+    snapshot_task: Option<(Task, u64)>,
+    pending_event: Option<ExecutionEvent>,
     min_sequence: u64,
     done: bool,
 }
@@ -307,7 +381,8 @@ pub(super) fn subscription_stream(
     Box::pin(futures::stream::unfold(
         SubscriptionState {
             receiver,
-            snapshot_task,
+            snapshot_task: snapshot_task.map(|task| (task, min_sequence)),
+            pending_event: None,
             min_sequence,
             done: false,
         },
@@ -316,7 +391,8 @@ pub(super) fn subscription_stream(
                 return None;
             }
 
-            if let Some(task) = state.snapshot_task.take() {
+            if let Some((task, sequence)) = state.snapshot_task.take() {
+                state.min_sequence = state.min_sequence.max(sequence);
                 state.receiver.opened();
                 if task.status.state.is_terminal() {
                     state.done = true;
@@ -325,7 +401,11 @@ pub(super) fn subscription_stream(
             }
 
             loop {
-                match state.receiver.recv().await {
+                let received = match state.pending_event.take() {
+                    Some(event) => Ok(event),
+                    None => state.receiver.recv().await,
+                };
+                match received {
                     Ok(event) if event.sequence <= state.min_sequence => continue,
                     Ok(event) => {
                         state.min_sequence = event.sequence;
@@ -346,43 +426,29 @@ pub(super) fn subscription_stream(
                         state.done = matches!(decision, EventDecision::DeliverAndClose);
                         let result = if filter.task_snapshots {
                             event.response_task.as_ref().map_or_else(
-                                || event.result.clone(),
+                                || filter.project(event.kind, &event.result),
                                 |task| Ok(StreamResponse::Task((**task).clone())),
                             )
                         } else {
-                            event.result.clone()
+                            filter.project(event.kind, &event.result)
                         };
                         return Some((result, state));
                     }
-                    // Events were lost: start over from the task as it stands.
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        match state.receiver.resync(state.min_sequence) {
+                    // Recover gaps and silent openings through the same task snapshot.
+                    Err(error)
+                        if matches!(error, broadcast::error::RecvError::Lagged(_))
+                            || state.receiver.opening_message =>
+                    {
+                        let closed = matches!(error, broadcast::error::RecvError::Closed);
+                        match state.receiver.resync(state.min_sequence).await {
                             Ok(Some((task, sequence, input_generation))) => {
-                                if filter.waits_for_input(
-                                    state.receiver.required_input,
-                                    input_generation,
-                                    &StreamResponse::Task(task.clone()),
-                                ) {
-                                    state.min_sequence = sequence;
+                                if let Some(rejection) = state.receiver.take_rejection() {
+                                    if !state.receiver.has_retained_reply() {
+                                        state.snapshot_task = Some((task, sequence));
+                                    }
+                                    state.pending_event = Some(rejection);
                                     continue;
                                 }
-                                state.receiver.opened();
-                                state.min_sequence = sequence;
-                                if task.status.state.is_terminal() {
-                                    state.done = true;
-                                }
-                                return Some((Ok(StreamResponse::Task(task)), state));
-                            }
-                            Ok(None) => return None,
-                            Err(error) => {
-                                state.done = true;
-                                return Some((Err(error), state));
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) if state.receiver.opening_message => {
-                        match state.receiver.resync(state.min_sequence) {
-                            Ok(Some((task, sequence, input_generation))) => {
                                 if filter.waits_for_input(
                                     state.receiver.required_input,
                                     input_generation,
@@ -390,7 +456,9 @@ pub(super) fn subscription_stream(
                                 ) {
                                     // This invocation ended without answering this input. A successor
                                     // can still consume it, so follow the task instead of the old turn.
-                                    state.receiver.finished = None;
+                                    if closed {
+                                        state.receiver.finished = None;
+                                    }
                                     state.min_sequence = sequence;
                                     continue;
                                 }
@@ -401,12 +469,16 @@ pub(super) fn subscription_stream(
                             }
                             Ok(None) => return None,
                             Err(error) => {
+                                if let Some(rejection) = state.receiver.take_rejection() {
+                                    state.pending_event = Some(rejection);
+                                    continue;
+                                }
                                 state.done = true;
                                 return Some((Err(error), state));
                             }
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => return None,
+                    Err(_) => return None,
                 }
             }
         },
@@ -417,6 +489,150 @@ pub(super) fn subscription_stream(
 mod tests {
     use super::*;
     use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn a_lagging_sender_waits_for_unread_cleanup_before_accepting_cancellation() {
+        use crate::handler::protocol::{ResponsePolicy, StartMode};
+        for mode in [StartMode::Blocking, StartMode::Streaming, StartMode::Bidi] {
+            for hook_failure in [false, true] {
+                let mut task = task_with_history("task", "context", 0);
+                task.status.state = TaskState::Working;
+                let source = TaskHandle::new(task.id.clone(), Some(task.clone()));
+                let (active, _inputs, _bookkeeping) = source.reserve().unwrap();
+                active.set_snapshot(task.clone());
+                let request = send_request();
+                let policy = ResponsePolicy::message(mode, &ServiceParams::new(), &request);
+                let receiver = active.subscribe_for_response(policy.response_id());
+                let peer = active.subscribe();
+                for _ in 0..EXECUTION_BUFFER_CAPACITY + 2 {
+                    active
+                        .publish(Ok(&StreamResponse::Task(task.clone())), None)
+                        .await;
+                }
+                // begin_cancel commits this snapshot before the driver drains its inbox.
+                task.status.state = TaskState::Canceled;
+                active.set_snapshot(task.clone());
+                let mut peer = subscription_stream(
+                    peer,
+                    None,
+                    0,
+                    ResponsePolicy::new(StartMode::Streaming, true).event_filter(),
+                );
+                assert!(
+                    matches!(peer.next().await, Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Canceled)
+                );
+                let mut events = subscription_stream(receiver, None, 0, policy.event_filter());
+                assert!(
+                    timeout(Duration::from_millis(20), events.next())
+                        .await
+                        .is_err(),
+                    "a sending response must wait until unread inputs have outcomes"
+                );
+                let input = crate::ClientInput::received(
+                    &request,
+                    1,
+                    None,
+                    &ServiceParams::new(),
+                    policy.response_id(),
+                );
+                super::super::execution::reject_inputs(&active, "task", vec![input]).await;
+                if hook_failure {
+                    active
+                        .publish(Err(&A2AError::internal("cleanup failed")), None)
+                        .await;
+                }
+                active.inputs_drained.cancel();
+                let rejected = timeout(Duration::from_secs(2), events.next())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if mode == StartMode::Bidi {
+                    assert!(
+                        matches!(rejected, Ok(StreamResponse::Error(error)) if error.code == "UNAVAILABLE")
+                    );
+                    if hook_failure {
+                        assert!(
+                            matches!(events.next().await, Some(Err(error)) if error.message == "cleanup failed")
+                        );
+                    } else {
+                        assert!(
+                            matches!(events.next().await, Some(Ok(StreamResponse::Task(task))) if task.status.state == TaskState::Canceled)
+                        );
+                    }
+                } else {
+                    assert!(
+                        matches!(rejected, Err(error) if error.code == error_code::UNSUPPORTED_OPERATION)
+                    );
+                }
+                assert!(events.next().await.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_private_rejections_do_not_displace_a_direct_reply_or_reach_peers() {
+        use crate::handler::protocol::{Rejection, ResponsePolicy, StartMode};
+        let params = ServiceParams::from([(SVC_PARAM_VERSION.into(), vec!["1.1".into()])]);
+        for mode in [StartMode::Blocking, StartMode::Streaming, StartMode::Bidi] {
+            let active = ActiveExecution::new(Some(task_with_history("task", "context", 0)));
+            let policy = ResponsePolicy::message(mode, &params, &send_request());
+            let receiver = active.subscribe_for_response(policy.response_id());
+            let peer = active.subscribe();
+            let rejection =
+                Rejection::unread_input().into_stream_error("task", Some("unread".into()));
+            active
+                .publish_kind(
+                    Ok(&rejection),
+                    None,
+                    EventKind::ResponseOnly(policy.response_id()),
+                )
+                .await;
+            let message = Message::new(Role::Agent, vec![Part::text("final reply")]);
+            active
+                .publish_kind(
+                    Ok(&StreamResponse::Message(message.clone())),
+                    None,
+                    EventKind::Reply,
+                )
+                .await;
+            // Later invocations can overwrite the broadcast before a caller polls.
+            for _ in 0..EXECUTION_BUFFER_CAPACITY + 2 {
+                active
+                    .publish(
+                        Ok(&StreamResponse::Task(task_with_history(
+                            "task", "context", 0,
+                        ))),
+                        None,
+                    )
+                    .await;
+            }
+            let mut events = subscription_stream(receiver, None, 0, policy.event_filter());
+            let first = events.next().await.unwrap();
+            if mode == StartMode::Bidi {
+                assert!(
+                    matches!(first, Ok(StreamResponse::Error(error)) if error.reference_id.as_deref() == Some("unread"))
+                );
+                assert!(
+                    matches!(events.next().await, Some(Ok(StreamResponse::Message(reply))) if reply == message)
+                );
+            } else {
+                assert!(
+                    matches!(first, Err(error) if error.code == error_code::UNSUPPORTED_OPERATION)
+                );
+            }
+            assert!(events.next().await.is_none());
+            let mut peer = subscription_stream(
+                peer,
+                None,
+                0,
+                ResponsePolicy::subscription(StartMode::Streaming, &params).event_filter(),
+            );
+            assert!(
+                matches!(peer.next().await, Some(Ok(StreamResponse::Message(reply))) if reply == message)
+            );
+            assert!(peer.next().await.is_none());
+        }
+    }
 
     #[tokio::test]
     async fn test_active_execution_keeps_snapshot_without_subscribers() {
@@ -440,7 +656,7 @@ mod tests {
         active.publish(Ok(&event), Some(task)).await;
 
         let (mut receiver, snapshot_task, sequence) =
-            ExecutionReceiver::for_task(active.task.clone());
+            ExecutionReceiver::for_task(active.task.clone(), None);
         assert_eq!(snapshot_task.unwrap().id, "t-buffering");
         assert_eq!(sequence, 1);
         assert!(receiver.try_recv().is_err());
@@ -497,7 +713,7 @@ mod tests {
 
         // Resubscribe to verify snapshot was updated but no event was buffered
         let (mut receiver, snapshot_task, sequence) =
-            ExecutionReceiver::for_task(active.task.clone());
+            ExecutionReceiver::for_task(active.task.clone(), None);
         assert_eq!(snapshot_task.unwrap().id, "t-error-no-sub");
         assert_eq!(sequence, 1);
         assert!(receiver.try_recv().is_err());
@@ -551,7 +767,7 @@ mod tests {
         }
 
         // Verify snapshot was updated
-        let (_, snapshot_task, sequence) = ExecutionReceiver::for_task(active.task.clone());
+        let (_, snapshot_task, sequence) = ExecutionReceiver::for_task(active.task.clone(), None);
         assert_eq!(snapshot_task.unwrap().id, "t-snapshot-update");
         assert_eq!(sequence, 1);
     }
@@ -721,7 +937,7 @@ mod tests {
         task.status.state = TaskState::Working;
         let (first, _inputs, _invocation) = manager.task(&task.id).reserve().unwrap();
         first.set_snapshot(task.clone());
-        let (receiver, _, sequence) = ExecutionReceiver::for_task(first.task.clone());
+        let (receiver, _, sequence) = ExecutionReceiver::for_task(first.task.clone(), None);
         let mut old_response = subscription_stream(
             receiver,
             None,

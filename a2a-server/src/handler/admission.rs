@@ -76,7 +76,14 @@ pub(super) async fn inject_input(
     let (task, recorded) = persist_input(handler, message, task_id, task).await?;
 
     // Publish the complete batch before handing the message to user code.
-    let delivery = publish_input(active, task, &recorded.events, recorded.message_generation).await;
+    let delivery = publish_input(
+        active,
+        task,
+        &recorded.events,
+        recorded.message_generation,
+        message.response_id,
+    )
+    .await;
     deliver_input(permit, recorded.message_generation, message, invocation);
     Ok(delivery)
 }
@@ -133,9 +140,12 @@ async fn publish_input(
     task: Task,
     events: &[StreamResponse],
     input_generation: Option<i64>,
+    response_id: Option<uuid::Uuid>,
 ) -> Delivery {
     let sequence_before = active.sequence();
-    let receiver = active.subscribe();
+    // Bind before publication/delivery: the caller may not poll again before
+    // execution finishes and rejects its input.
+    let receiver = active.subscribe_for_response(response_id);
     active.publish_input(task.clone(), events).await;
     Delivery::Injected {
         task,

@@ -399,9 +399,8 @@ pub(super) enum EventKind {
     /// already announced, so streams meant for clients leave it out; the
     /// blocking send, which only needs to know the executor spoke, keeps it.
     Repeated,
-    /// Something only a live exchange is told (a `StreamError` about a message
-    /// of its own), not the other subscribers of the task.
-    LiveOnly(Option<uuid::Uuid>),
+    /// An unread-input rejection for its sending response, not task subscribers.
+    ResponseOnly(Option<uuid::Uuid>),
     /// The executor's direct reply, with no task: the last thing any stream
     /// following the execution is sent.
     Reply,
@@ -476,10 +475,12 @@ impl ResponsePolicy {
         params: &ServiceParams,
         request: &SendMessageRequest,
     ) -> Self {
-        Self {
+        let mut policy = Self {
             options: ResponseOptions::from_request(request),
             ..Self::subscription(mode, params)
-        }
+        };
+        policy.response_id.get_or_insert_with(uuid::Uuid::now_v7);
+        policy
     }
 
     pub(super) fn subscription(mode: StartMode, params: &ServiceParams) -> Self {
@@ -627,16 +628,35 @@ impl EventFilter {
         result: &Result<StreamResponse, A2AError>,
     ) -> EventDecision {
         if (kind == EventKind::Repeated && !self.include_repeats)
-            || matches!(kind, EventKind::LiveOnly(recipient) if !self.live || recipient != self.response_id)
+            || matches!(kind, EventKind::ResponseOnly(recipient) if recipient.is_none() || recipient != self.response_id)
             || (!self.message_updates && matches!(result, Ok(StreamResponse::MessageUpdate(_))))
         {
             return EventDecision::Skip;
         }
-        if result.as_ref().map_or(true, is_terminal_event) || kind == EventKind::Reply {
+        if result.as_ref().map_or(true, is_terminal_event)
+            || kind == EventKind::Reply
+            || (!self.live && matches!(kind, EventKind::ResponseOnly(_)))
+        {
             EventDecision::DeliverAndClose
         } else {
             EventDecision::Deliver
         }
+    }
+
+    /// Only live exchanges carry non-fatal StreamErrors. An ordinary sending
+    /// call instead fails with the unread-input error and closes its response.
+    pub(super) fn project(
+        self,
+        kind: EventKind,
+        result: &Result<StreamResponse, A2AError>,
+    ) -> Result<StreamResponse, A2AError> {
+        if !self.live
+            && matches!(kind, EventKind::ResponseOnly(_))
+            && let Ok(StreamResponse::Error(error)) = result
+        {
+            return Err(Rejection::Declined(error.message.clone()).into_error());
+        }
+        result.clone()
     }
 }
 
@@ -2039,7 +2059,7 @@ mod policy_tests {
                 let rejection = Rejection::Declined("busy".into())
                     .into_stream_error("task", Some("input".into()));
                 let mine = filter.decide(
-                    EventKind::LiveOnly(policy.response_id()),
+                    EventKind::ResponseOnly(policy.response_id()),
                     &Ok(rejection.clone()),
                 );
                 assert_eq!(
@@ -2048,7 +2068,7 @@ mod policy_tests {
                 );
                 assert!(matches!(
                     filter.decide(
-                        EventKind::LiveOnly(Some(uuid::Uuid::now_v7())),
+                        EventKind::ResponseOnly(Some(uuid::Uuid::now_v7())),
                         &Ok(rejection)
                     ),
                     EventDecision::Skip
