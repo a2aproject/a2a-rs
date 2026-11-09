@@ -63,6 +63,19 @@ coverage-lcov:
 example:
     cargo run -p helloworld
 
+# Install the docs toolchain into .venv-docs (needs Python 3.11 or newer)
+docs-install:
+    python3 -m venv .venv-docs
+    .venv-docs/bin/python -m pip install --require-hashes -r requirements-docs.txt
+
+# Serve the docs site at http://127.0.0.1:8000, rebuilding on change
+docs: docs-install
+    .venv-docs/bin/mkdocs serve
+
+# Build the docs site into site/, failing on any warning
+docs-build: docs-install
+    .venv-docs/bin/mkdocs build --strict
+
 # Clean build artifacts
 clean:
     cargo clean

@@ -37,6 +37,7 @@ async fn main() {
     ]);
     let card_producer = Arc::new(StaticAgentCard::new(agent_card));
 
+    // --8<-- [start:routers]
     let app = axum::Router::new()
         .nest(
             "/jsonrpc",
@@ -44,6 +45,7 @@ async fn main() {
         )
         .nest("/rest", a2a_server::rest::rest_router(handler.clone()))
         .merge(a2a_server::agent_card::agent_card_router(card_producer));
+    // --8<-- [end:routers]
 
     let grpc_service = A2aServiceServer::new(GrpcHandler::new(handler));
 

@@ -1,0 +1,103 @@
+# Documentation site for the A2A Rust SDK. Build it with `just docs-build`.
+# The theme settings follow https://github.com/a2aproject/A2A/blob/main/mkdocs.yml
+# so the two sites look alike.
+
+# Project information
+site_name: A2A Rust SDK
+site_url: https://a2aproject.github.io/a2a-rs/
+site_description: >-
+  Documentation for the Rust SDK of the Agent2Agent (A2A) protocol: build A2A agents and clients with the a2a-rs crates.
+site_author: A2A Contributors
+site_dir: site
+edit_uri: edit/main/docs/
+
+# Repository
+repo_name: a2aproject/a2a-rs
+repo_url: https://github.com/a2aproject/a2a-rs
+
+# Copyright
+copyright: Copyright A2A Contributors. Licensed under the Apache License, Version 2.0.
+
+# Navigation
+nav:
+  - Home: index.md
+
+# Custom CSS
+extra_css:
+  - stylesheets/custom.css
+
+# Configuration
+theme:
+  name: material
+  font:
+    text: Google Sans
+    code: Roboto Mono
+  logo: assets/a2a_icon_white.svg
+  favicon: assets/a2a_icon_color.svg
+  icon:
+    repo: fontawesome/brands/github
+    admonition:
+      note: fontawesome/solid/note-sticky
+      abstract: fontawesome/solid/book
+      info: fontawesome/solid/circle-info
+      tip: fontawesome/solid/bullhorn
+      success: fontawesome/solid/check
+      question: fontawesome/solid/circle-question
+      warning: fontawesome/solid/triangle-exclamation
+      failure: fontawesome/solid/bomb
+      danger: fontawesome/solid/skull
+      bug: fontawesome/solid/robot
+      example: fontawesome/solid/flask
+      quote: fontawesome/solid/quote-left
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: white
+  features:
+    - content.action.edit
+    - content.code.annotate
+    - content.code.copy
+    - content.code.select
+    - content.tabs.link
+    - navigation.footer
+    - navigation.indexes
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.path
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - navigation.tracking
+    - toc.follow
+
+# Extensions
+markdown_extensions:
+  - admonition
+  - attr_list
+  - footnotes
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  # check_paths makes a missing file or snippet section a build error. Without
+  # it the page renders empty and `mkdocs build --strict` still passes.
+  - pymdownx.snippets:
+      base_path: .
+      check_paths: true
+      dedent_subsections: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+# Plugins
+plugins:
+  - search
