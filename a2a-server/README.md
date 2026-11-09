@@ -160,9 +160,11 @@ This does not provide a durable outbox across process crashes or transactions
 across independent task and configuration stores.
 
 Task broadcast subscribers enqueue webhook deliveries into one handler-wide
-dispatcher. One Tokio task polls up to 16 concurrent HTTP request futures and
-preserves order per Task/URL. Its ingress queue and pending queue each hold at
-most 1024 deliveries; overflow drops the new delivery and follows `fail_on_error`.
+dispatcher. Each task has its own bounded ingress and pending queues, each holding
+at most 1024 deliveries. A full queue backpressures that task instead of dropping
+updates or filling another task's queue. One Tokio task rotates between ready
+tasks, polls up to 16 concurrent HTTP request futures, and preserves order per
+Task/URL. HTTP concurrency remains shared; delivery waits for an available slot.
 There are no per-endpoint worker tasks, and accepted deliveries keep their Task
 event source alive until they drain. All webhook redirects must keep the original
 scheme, host, and effective port, including when `validate_urls` is disabled for

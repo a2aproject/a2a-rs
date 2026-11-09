@@ -5,6 +5,7 @@
 
 use super::events::{ActiveExecution, ExecutionEvent, FailureSignal};
 use super::protocol::EventKind;
+use super::push_worker::{PushDispatcher, TaskPushQueue};
 use a2a::*;
 use parking_lot::RwLock;
 use std::sync::{Arc, Weak};
@@ -68,6 +69,7 @@ struct State {
     snapshot: Option<Task>,
     last_error: Option<(u64, A2AError)>,
     interrupted_input_generation: i64,
+    push_queue: Weak<TaskPushQueue>,
     // Outstanding receivers retain their direct reply or private input rejection.
     // No task-wide reply history survives after those receivers are dropped.
     replies: Vec<Weak<ReplyRetention>>,
@@ -164,6 +166,31 @@ impl TaskHandle {
 
     pub(super) fn pushes(&self) -> Option<&Arc<super::push_delivery::PushService>> {
         self.inner.notifications.get()
+    }
+
+    pub(super) fn push_queue(&self, dispatcher: &PushDispatcher) -> Option<Arc<TaskPushQueue>> {
+        let mut state = self.inner.state.write();
+        if let Some(queue) = state.push_queue.upgrade()
+            && !queue.is_closed()
+        {
+            return Some(queue);
+        }
+        let queue = dispatcher.register(self)?;
+        state.push_queue = Arc::downgrade(&queue);
+        Some(queue)
+    }
+
+    /// Synchronize retirement with producer lookup. A producer either retains
+    /// this queue before the check or registers a new queue after it is detached.
+    pub(super) fn retire_push_queue(&self, queue: &Arc<TaskPushQueue>) -> bool {
+        let mut state = self.inner.state.write();
+        if Arc::strong_count(queue) != 1 || !queue.is_empty() {
+            return false;
+        }
+        if Weak::ptr_eq(&state.push_queue, &Arc::downgrade(queue)) {
+            state.push_queue = Weak::new();
+        }
+        true
     }
 
     pub(super) fn configure_pushes(

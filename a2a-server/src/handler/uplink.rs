@@ -34,10 +34,9 @@ use tokio::sync::{mpsc, oneshot};
 //   (`EXECUTION_BUFFER_CAPACITY` events) starts over from the task as it
 //   stands, a snapshot with a gap in the generations, as for any subscription.
 // - Without replay, `lastSeenGeneration` resumes from a snapshot.
-// - Webhook deliveries are queued per task, in publish order, and never waited
-//   for. A receiver that is down or slow delays only its own task's deliveries,
-//   and when more than `PUSH_QUEUE_CAPACITY` are waiting the newest are dropped
-//   (a client sees the gap in the generations and reads the task). With
+// - Webhook deliveries are queued per task, in publish order. A full task queue
+//   applies backpressure to that task; notifications are not dropped. One shared
+//   dispatcher rotates ready tasks within its HTTP concurrency bound. With
 //   `fail_on_error`, a failed delivery wakes its execution driver with an error;
 //   an event that was already published is not rolled back.
 

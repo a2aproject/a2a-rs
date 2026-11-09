@@ -13,8 +13,6 @@ use std::{
     sync::{Arc, Weak},
     time::Duration,
 };
-#[cfg(test)]
-use tokio::sync::mpsc;
 use tokio::sync::{Mutex, broadcast, watch};
 
 pub(super) const PUSH_QUEUE_CAPACITY: usize = 1024;
@@ -353,7 +351,7 @@ mod tests {
     async fn captured_source(
         capacity: usize,
         fail_on_error: bool,
-    ) -> (TaskHandle, mpsc::Receiver<Notification>) {
+    ) -> (TaskHandle, super::super::push_worker::CapturedNotifications) {
         let handler = make_push_delivery_handler();
         let source = handler.tasks.task("task");
         handler.attach_pushes(&source);
@@ -366,7 +364,7 @@ mod tests {
                 ..Default::default()
             },
         )));
-        let (dispatcher, receiver) = PushDispatcher::channel(capacity);
+        let (dispatcher, receiver) = PushDispatcher::capture(capacity);
         settings.dispatcher = Arc::new(std::sync::OnceLock::from(dispatcher));
         let source = TaskHandle::new("task".into(), None);
         assert!(source.configure_pushes(Arc::new(settings)).is_ok());
