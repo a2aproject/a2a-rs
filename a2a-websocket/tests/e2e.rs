@@ -234,25 +234,28 @@ async fn end_to_end_get_task_after_send_returns_the_persisted_task() {
     let transport = WebSocketTransport::connect(&url).await.unwrap();
 
     let mut req = send_message_request();
-    req.message.task_id = Some("e2e-task".into());
     req.message.context_id = Some("e2e-ctx".into());
-    transport
+    let task_id = match transport
         .send_message(&ServiceParams::new(), &req)
         .await
-        .unwrap();
+        .unwrap()
+    {
+        SendMessageResponse::Task(task) => task.id,
+        _ => panic!("expected Task response"),
+    };
 
     let fetched = transport
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
-                id: "e2e-task".into(),
+                id: task_id.clone(),
                 history_length: None,
                 tenant: None,
             },
         )
         .await
         .unwrap();
-    assert_eq!(fetched.id, "e2e-task");
+    assert_eq!(fetched.id, task_id);
     assert_eq!(fetched.status.state, TaskState::Completed);
 
     transport.destroy().await.unwrap();
@@ -356,7 +359,7 @@ async fn end_to_end_unknown_method_returns_method_not_found() {
 
     // The transport does not expose an unknown-method API directly; instead we
     // call `get_extended_agent_card` which `DefaultRequestHandler` rejects with
-    // `unsupported_operation`, exercising the unary-error pathway.
+    // `extended_card_not_configured`, exercising the unary-error pathway.
     let err = transport
         .get_extended_agent_card(
             &ServiceParams::new(),
@@ -364,7 +367,7 @@ async fn end_to_end_unknown_method_returns_method_not_found() {
         )
         .await
         .unwrap_err();
-    assert_eq!(err.code, error_code::UNSUPPORTED_OPERATION);
+    assert_eq!(err.code, error_code::EXTENDED_CARD_NOT_CONFIGURED);
 
     transport.destroy().await.unwrap();
     shutdown.send(()).unwrap();
@@ -380,7 +383,6 @@ async fn end_to_end_concurrent_unary_requests_are_multiplexed_on_one_socket() {
         let transport = transport.clone();
         handles.push(tokio::spawn(async move {
             let mut req = send_message_request();
-            req.message.task_id = Some(format!("concurrent-{index}"));
             req.message.context_id = Some(format!("ctx-concurrent-{index}"));
             transport
                 .send_message(&ServiceParams::new(), &req)
@@ -437,7 +439,6 @@ async fn end_to_end_large_frames_survive_traffic_in_both_directions() {
                 metadata: None,
                 tenant: None,
             };
-            req.message.task_id = Some(format!("large-{index}"));
             req.message.context_id = Some(format!("ctx-large-{index}"));
             transport.send_message(&ServiceParams::new(), &req).await
         }));

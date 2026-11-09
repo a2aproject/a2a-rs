@@ -1238,6 +1238,7 @@ mod tls {
     use std::sync::Arc;
 
     use a2a::A2AError;
+    use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, ServerName};
     use tokio::net::TcpStream;
     use tokio_rustls::{TlsConnector, client::TlsStream};
@@ -1301,8 +1302,7 @@ mod tls {
     fn parse_pem_certs(pems: &[Vec<u8>]) -> Result<Vec<CertificateDer<'static>>, A2AError> {
         let mut out = Vec::new();
         for pem in pems {
-            let mut reader = std::io::BufReader::new(pem.as_slice());
-            for item in rustls_pemfile::certs(&mut reader) {
+            for item in CertificateDer::pem_slice_iter(pem) {
                 let cert = item.map_err(|err| {
                     A2AError::internal(format!("failed to parse PEM certificate: {err}"))
                 })?;
