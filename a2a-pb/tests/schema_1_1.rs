@@ -267,6 +267,71 @@ fn new_stream_payloads_round_trip() {
 }
 
 #[test]
+fn message_updates_without_a_required_message_are_rejected_in_protojson() {
+    for field in ["messageUpdate", "message_update"] {
+        for null_message in [false, true] {
+            let mut update = json!({"taskId":"task", "contextId":"context", "generation":"7"});
+            if null_message {
+                update["message"] = json!(null);
+            }
+            let wire = json!({field:update});
+            assert!(
+                protojson_conv::from_value::<StreamResponse>(wire.clone()).is_err(),
+                "{wire}"
+            );
+            assert!(
+                protojson_conv::from_str::<StreamResponse>(&wire.to_string()).is_err(),
+                "{wire}"
+            );
+        }
+    }
+}
+
+#[test]
+fn protobuf_message_updates_distinguish_missing_messages_from_unknown_events() {
+    use a2a_pb::proto;
+    use prost::Message as _;
+
+    let update = proto::TaskMessageUpdateEvent {
+        task_id: "task".into(),
+        context_id: "context".into(),
+        generation: 7,
+        message: None,
+        metadata: None,
+    };
+    assert!(pbconv::from_proto_task_message_update_event(&update).is_none());
+    let wire = proto::StreamResponse {
+        payload: Some(proto::stream_response::Payload::MessageUpdate(update)),
+    }
+    .encode_to_vec();
+    let decoded = proto::StreamResponse::decode(wire.as_slice()).unwrap();
+    assert!(pbconv::from_proto_stream_response(&decoded).is_none());
+    let error = pbconv::try_from_proto_stream_response(&decoded).unwrap_err();
+    assert_eq!(error.code, error_code::INTERNAL_ERROR);
+    assert!(error.message.contains("missing required data"));
+    assert_eq!(
+        pbconv::try_from_proto_stream_response(&proto::StreamResponse { payload: None }).unwrap(),
+        None
+    );
+
+    let mut message = Message::new(Role::User, vec![Part::text("real input")]);
+    message.message_id = "original-message-id".into();
+    let event = StreamResponse::MessageUpdate(TaskMessageUpdateEvent {
+        task_id: "task".into(),
+        context_id: "context".into(),
+        generation: i64::MAX,
+        message,
+        metadata: Some([("origin".into(), json!("client"))].into()),
+    });
+    let encoded = pbconv::to_proto_stream_response(&event).encode_to_vec();
+    let decoded = proto::StreamResponse::decode(encoded.as_slice()).unwrap();
+    assert_eq!(
+        pbconv::try_from_proto_stream_response(&decoded).unwrap(),
+        Some(event)
+    );
+}
+
+#[test]
 fn event_generation_survives() {
     let status = StreamResponse::StatusUpdate(event::TaskStatusUpdateEvent {
         task_id: "t1".into(),

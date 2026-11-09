@@ -51,6 +51,9 @@ fn skipped_unknown_result(text: &str) -> bool {
                     | "status_update"
                     | "artifactUpdate"
                     | "artifact_update"
+                    | "messageUpdate"
+                    | "message_update"
+                    | "error"
             )
         })
 }
@@ -104,6 +107,9 @@ mod tests {
             "status_update",
             "artifactUpdate",
             "artifact_update",
+            "messageUpdate",
+            "message_update",
+            "error",
         ] {
             for value in [json!(null), json!({}), json!(false)] {
                 for extra_unknown in [false, true] {

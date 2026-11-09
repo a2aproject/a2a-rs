@@ -238,6 +238,9 @@ fn decode_stream_value(
                 "status_update",
                 "artifactUpdate",
                 "artifact_update",
+                "messageUpdate",
+                "message_update",
+                "error",
             ]
             .iter()
             .any(|field| fields.contains_key(*field))
@@ -985,6 +988,9 @@ mod tests {
             "status_update",
             "artifactUpdate",
             "artifact_update",
+            "messageUpdate",
+            "message_update",
+            "error",
         ] {
             for extra_unknown in [false, true] {
                 let mut payload = serde_json::json!({field: null});
@@ -1034,6 +1040,9 @@ mod tests {
             "status_update",
             "artifactUpdate",
             "artifact_update",
+            "messageUpdate",
+            "message_update",
+            "error",
         ] {
             let envelope =
                 JsonRpcResponse::success(JsonRpcId::Number(1), serde_json::json!({field: null}));
@@ -1085,6 +1094,44 @@ mod tests {
             assert_eq!(items.len(), 2);
             assert!(items[0].is_err());
             assert!(matches!(&items[1], Ok(StreamResponse::Task(task)) if task.id == "task"));
+        }
+    }
+
+    #[tokio::test]
+    async fn message_updates_without_a_required_message_are_reported() {
+        for field in ["messageUpdate", "message_update"] {
+            for null_message in [false, true] {
+                let mut update =
+                    serde_json::json!({"taskId":"task", "contextId":"context", "generation":"7"});
+                if null_message {
+                    update["message"] = serde_json::json!(null);
+                }
+                let payload = serde_json::json!({field:update});
+                for jsonrpc in [false, true] {
+                    let value = if jsonrpc {
+                        serde_json::to_value(JsonRpcResponse::success(
+                            JsonRpcId::Number(1),
+                            payload.clone(),
+                        ))
+                        .unwrap()
+                    } else {
+                        payload.clone()
+                    };
+                    let bytes = byte_stream(vec![format!("data: {value}\n\n")]);
+                    let items: Vec<_> = if jsonrpc {
+                        parse_sse_stream(bytes)
+                    } else {
+                        parse_sse_stream_rest(bytes)
+                    }
+                    .collect()
+                    .await;
+                    assert_eq!(items.len(), 1, "{value}");
+                    assert!(
+                        items[0].is_err(),
+                        "a missing message must not be fabricated or skipped: {items:?}"
+                    );
+                }
+            }
         }
     }
 

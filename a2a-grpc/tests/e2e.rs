@@ -685,6 +685,8 @@ async fn grpc_transport_decodes_error_details_from_a_real_server() {
         .get_task(
             &versioned_params(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "invalid".to_string(),
                 history_length: None,
                 tenant: None,

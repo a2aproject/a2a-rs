@@ -11,6 +11,7 @@
 #![allow(deprecated)]
 
 use crate::proto;
+use a2a::A2AError;
 use a2a::agent_card::*;
 use a2a::event::*;
 use a2a::types::*;
@@ -940,20 +941,17 @@ pub fn to_proto_task_message_update_event(
     }
 }
 
+/// A missing required message cannot be replaced with a synthetic message.
 pub fn from_proto_task_message_update_event(
     e: &proto::TaskMessageUpdateEvent,
-) -> TaskMessageUpdateEvent {
-    TaskMessageUpdateEvent {
+) -> Option<TaskMessageUpdateEvent> {
+    Some(TaskMessageUpdateEvent {
         task_id: e.task_id.clone(),
         context_id: e.context_id.clone(),
-        message: e
-            .message
-            .as_ref()
-            .map(from_proto_message)
-            .unwrap_or_else(|| Message::new(Role::Unspecified, vec![])),
+        message: from_proto_message(e.message.as_ref()?),
         metadata: opt_metadata_from_proto(&e.metadata),
         generation: e.generation,
-    }
+    })
 }
 
 pub fn to_proto_stream_error(e: &StreamError) -> proto::StreamError {
@@ -1034,6 +1032,9 @@ pub fn to_proto_stream_response(r: &StreamResponse) -> proto::StreamResponse {
     proto::StreamResponse { payload }
 }
 
+/// Convert a stream event. Unknown payloads and message updates missing their
+/// required message return None. Use [`try_from_proto_stream_response`] to
+/// distinguish skipped event kinds from rejected message updates.
 pub fn from_proto_stream_response(r: &proto::StreamResponse) -> Option<StreamResponse> {
     match &r.payload {
         Some(proto::stream_response::Payload::Task(t)) => {
@@ -1048,14 +1049,28 @@ pub fn from_proto_stream_response(r: &proto::StreamResponse) -> Option<StreamRes
         Some(proto::stream_response::Payload::ArtifactUpdate(a)) => Some(
             StreamResponse::ArtifactUpdate(from_proto_task_artifact_update_event(a)),
         ),
-        Some(proto::stream_response::Payload::MessageUpdate(m)) => Some(
-            StreamResponse::MessageUpdate(from_proto_task_message_update_event(m)),
-        ),
+        Some(proto::stream_response::Payload::MessageUpdate(m)) => {
+            from_proto_task_message_update_event(m).map(StreamResponse::MessageUpdate)
+        }
         Some(proto::stream_response::Payload::Error(e)) => {
             Some(StreamResponse::Error(from_proto_stream_error(e)))
         }
         None => None,
     }
+}
+
+/// Distinguish unknown wire payload kinds from rejected known events. The former
+/// remain skippable; the latter surface as decoding errors in client streams.
+pub fn try_from_proto_stream_response(
+    response: &proto::StreamResponse,
+) -> Result<Option<StreamResponse>, A2AError> {
+    let event = from_proto_stream_response(response);
+    if event.is_none() && response.payload.is_some() {
+        return Err(A2AError::internal(
+            "invalid StreamResponse payload: missing required data",
+        ));
+    }
+    Ok(event)
 }
 
 // ---------------------------------------------------------------------------
