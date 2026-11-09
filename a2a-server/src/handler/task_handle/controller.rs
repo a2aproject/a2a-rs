@@ -350,7 +350,12 @@ impl TaskController {
         task_id: &TaskId,
     ) {
         // Finish deferred creation before deciding whether another invocation is needed.
-        self.persist_deferred_task(handler, active, task_id).await;
+        if let Err(error) = self.persist_deferred_task(handler, active).await {
+            reject_unread_inputs(active, task_id, self).await;
+            execution::publish_failure(handler, active, task_id, &error).await;
+            self.release(active);
+            return;
+        }
 
         // Only a nonterminal task can hand accepted input to a successor.
         let Some(snapshot) = active
@@ -379,31 +384,22 @@ impl TaskController {
         &mut self,
         handler: &DefaultRequestHandler,
         active: &Arc<ActiveExecution>,
-        task_id: &str,
-    ) {
-        if !active
+    ) -> Result<(), A2AError> {
+        if !active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let task = active
+            .snapshot()
+            .ok_or_else(|| A2AError::internal("a deferred task has no snapshot"))?;
+        let task = handler.tasks.save(task, true).await?;
+        active
             .uncreated
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return;
-        }
-        let Some(task) = active.snapshot() else {
-            return;
-        };
-        match handler.tasks.save(task, true).await {
-            Ok(task) => {
-                active.set_snapshot(task.clone());
-                if let Err(error) = save_pending_push_config(active, handler, self).await {
-                    execution::publish_failure(handler, active, task_id, &error).await;
-                    return;
-                }
-                let event = StreamResponse::Task(task.clone());
-                active.publish(Ok(&event), Some(task)).await;
-            }
-            Err(error) => {
-                tracing::warn!(task_id = %task_id, %error, "could not create the task");
-            }
-        }
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        active.set_snapshot(task.clone());
+        save_pending_push_config(active, handler, self).await?;
+        let event = StreamResponse::Task(task.clone());
+        active.publish(Ok(&event), Some(task)).await;
+        Ok(())
     }
 
     fn take_unread_inputs(&mut self, active: &Arc<ActiveExecution>) -> Vec<crate::ClientInput> {
