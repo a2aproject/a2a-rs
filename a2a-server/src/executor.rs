@@ -258,11 +258,11 @@ pub trait Agent: Send + Sync + 'static {
 
     /// Clean up an already-canceled task. Returned canceled Task/status events
     /// acknowledge cleanup and cannot modify its committed terminal snapshot.
+    /// The default needs no additional cleanup: the handler has already committed
+    /// cancellation and stopped execution. Override this hook to release agent resources.
     fn cancel(&self, ctx: ExecutorContext) -> EventStream {
         let _ = ctx;
-        Box::pin(futures::stream::once(async {
-            Err(A2AError::unsupported_operation("this agent keeps no tasks"))
-        }))
+        Box::pin(futures::stream::empty())
     }
 }
 
@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_agents_report_unsupported_execution_and_cancellation_by_default() {
+    async fn typed_agents_require_execute_but_default_to_successful_cancellation() {
         use futures::StreamExt;
         let adapter = AgentExecutorAdapter(Arc::new(StartOnly));
         let mut context = ExecutorContext::new("task", "context", ClientInputs::closed())
@@ -397,10 +397,7 @@ mod tests {
             "context",
             ClientInputs::closed(),
         ));
-        assert_eq!(
-            events.next().await.unwrap().unwrap_err().code,
-            error_code::UNSUPPORTED_OPERATION
-        );
+        assert!(events.next().await.is_none());
     }
 
     struct InvalidStart(bool);
