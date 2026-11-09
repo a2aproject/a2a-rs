@@ -91,6 +91,7 @@ impl Cancellation {
             tenant: req.tenant,
             inputs: cancel_inputs,
             new_task: false,
+            task_snapshot: None,
         };
         // A store that advanced the generation recorded the transition ithandler.
         let recorded_by_store = task.generation > generation_before;

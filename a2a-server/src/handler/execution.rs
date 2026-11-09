@@ -288,6 +288,7 @@ pub(super) async fn start_next_turn(
         tenant: first.tenant,
         inputs,
         new_task: false,
+        task_snapshot: None,
     };
     handler
         .tasks

@@ -90,11 +90,15 @@ pub(super) struct TaskHandle {
 }
 
 /// Weak routing reference that does not retain a task's channels or snapshot.
-pub(super) struct WeakTaskHandle {
+pub(crate) struct WeakTaskHandle {
     inner: Weak<TaskInner>,
 }
 
 impl WeakTaskHandle {
+    pub(crate) fn snapshot(&self) -> Option<Task> {
+        self.upgrade()?.snapshot()
+    }
+
     pub(super) fn upgrade(&self) -> Option<TaskHandle> {
         self.inner.upgrade().map(|inner| TaskHandle { inner })
     }

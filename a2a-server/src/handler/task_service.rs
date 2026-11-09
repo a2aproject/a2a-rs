@@ -132,7 +132,13 @@ impl TaskService {
         active: Arc<ActiveExecution>,
         request: impl Into<ExecutionRequest>,
     ) {
-        let request = request.into();
+        let mut request = request.into();
+        let context = match &mut request {
+            ExecutionRequest::Message(context) | ExecutionRequest::Restart { context, .. } => {
+                context
+            }
+        };
+        context.task_snapshot = Some(active.task.downgrade());
         let lease = active.task.operations();
         self.background_tasks.spawn(async move {
             let _lease = lease;

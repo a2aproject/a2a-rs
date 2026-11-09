@@ -32,6 +32,7 @@ mod updates;
 mod uplink;
 
 pub use default_handler::DefaultRequestHandler;
+pub(crate) use task_handle::WeakTaskHandle;
 
 const EXECUTION_BUFFER_CAPACITY: usize = 128;
 

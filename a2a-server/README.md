@@ -63,6 +63,13 @@ task operations. The response `Run` owns its input stream and optional HTTP
 registration lease, unregistering before releasing the stream on exit or panic.
 `AgentExecutor` and its owned `ctx.inputs` API are unchanged.
 
+Every send mode supplies `ctx.stored_task` with the task snapshot containing the
+admitted client input. Use `ctx.new_task` to identify a first invocation. For
+deferred creation, the snapshot is provisional until the first task event is
+saved; receiving it does not create a stored task. A typed `Agent::execute`
+receives the committed snapshot after `Agent::start` creates the task, including
+the server's recorded input, artifacts, timestamps, and generation.
+
 ## Shutdown
 
 After stopping incoming transport requests, call `handler.shutdown().await`.

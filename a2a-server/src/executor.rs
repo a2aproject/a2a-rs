@@ -36,9 +36,12 @@ pub struct ExecutorContext {
     pub message: Option<Message>,
     /// The task ID being executed.
     pub task_id: TaskId,
-    /// The existing task, if this is a continuation. For a new task it is
-    /// `None`, except on a blocking `SendMessage`, where it is the task as the
-    /// request prepared it (not saved yet: the executor's first event creates it).
+    /// The task snapshot prepared for this invocation, including its admitted
+    /// client input. The handler supplies it in every response mode; use
+    /// `new_task` to distinguish the first invocation from a continuation.
+    /// For deferred creation this snapshot is provisional until the executor's
+    /// first task event commits it. A typed [`Agent::execute`] receives the
+    /// committed snapshot after [`Agent::start`] creates its task.
     pub stored_task: Option<Task>,
     /// Context ID grouping related interactions.
     pub context_id: String,
@@ -55,8 +58,12 @@ pub struct ExecutorContext {
     /// alongside its own work. Messages left unread at the end of a nonterminal
     /// turn are handed to the next execution.
     pub inputs: ClientInputs,
-    /// Whether this message creates the task, which has not existed until now.
+    /// Whether this is the task's first invocation. This remains true for a
+    /// typed agent's first `execute` call after `start` has created the task.
     pub new_task: bool,
+    // The typed adapter refreshes its context after its opening Task is committed.
+    // A weak reference keeps this lookup from extending the task's lifetime.
+    pub(crate) task_snapshot: Option<crate::handler::WeakTaskHandle>,
 }
 
 impl ExecutorContext {
@@ -81,6 +88,7 @@ impl ExecutorContext {
             tenant: None,
             inputs,
             new_task: false,
+            task_snapshot: None,
         }
     }
 
@@ -313,11 +321,24 @@ impl<A: Agent> AgentExecutor for AgentExecutorAdapter<A> {
                     }
                     Ok(Start::Task(task)) => {
                         let mut ctx = ctx;
-                        ctx.stored_task = Some(task.clone());
-                        futures::stream::once(async move { Ok(StreamResponse::Task(task)) })
+                        let opening = StreamResponse::Task(task.clone());
+                        futures::stream::once(async move { Ok(opening) })
                             // The turn starts once the task has been created.
                             .chain(
-                                futures::stream::once(async move { agent.execute(ctx) }).flatten(),
+                                futures::stream::once(async move {
+                                    // The handler polls us again only after accepting
+                                    // and saving the opening. Include its normalized
+                                    // input, artifacts and generation in the context.
+                                    ctx.stored_task = Some(
+                                        ctx.task_snapshot
+                                            .take()
+                                            .and_then(|source| source.snapshot())
+                                            // Standalone contexts have no handler source.
+                                            .unwrap_or(task),
+                                    );
+                                    agent.execute(ctx)
+                                })
+                                .flatten(),
                             )
                             .boxed()
                     }
@@ -355,6 +376,7 @@ mod tests {
             tenant: None,
             inputs,
             new_task: false,
+            task_snapshot: None,
         };
         let (tid, cid) = ctx.task_info();
         assert_eq!(tid, "t1");

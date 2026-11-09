@@ -162,13 +162,14 @@ impl TaskController {
                 message: (!is_artifact_only(&message.request)).then_some(message.request.message),
                 task_id: task.id.clone(),
                 context_id: task.context_id.clone(),
-                stored_task: (existed || mode == StartMode::Blocking).then_some(task),
+                stored_task: Some(task),
                 metadata: message.request.metadata,
                 user: message.user,
                 service_params: message.params,
                 tenant: message.request.tenant,
                 inputs,
                 new_task: !existed,
+                task_snapshot: None,
             };
             handler
                 .tasks
