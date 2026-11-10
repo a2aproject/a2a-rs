@@ -155,6 +155,13 @@ impl ExecutorContext {
 /// client or executor edits. Use artifact update events to edit those artifacts.
 #[async_trait::async_trait]
 pub trait AgentExecutor: Send + Sync + 'static {
+    /// Output/input correlation is sampled when the SDK polls the returned
+    /// stream. It cannot infer when an event was created in an executor-owned
+    /// buffer. In particular, do not buffer an interruption for input A, consume
+    /// input B, and then expose A's interruption: a concurrent blocking sender
+    /// can otherwise see that old question. Yield interruptions before reading
+    /// the next input, or end the invocation and let a later input start a new
+    /// one. The task generation orders persisted mutations, not producer work.
     /// Execute a message. Returns an owned stream of events.
     fn execute(&self, ctx: ExecutorContext)
     -> BoxStream<'static, Result<StreamResponse, A2AError>>;
