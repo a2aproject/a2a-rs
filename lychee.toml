@@ -1,0 +1,41 @@
+# Link checker for the docs site: .github/workflows/docs.yml runs it on the
+# built site/. Local links and anchors between pages are checked by
+# `mkdocs build --strict`; lychee adds the files the pages point at and every
+# external URL. Modelled on lychee.toml in a2aproject/A2A.
+
+max_concurrency = 6
+timeout = 30
+max_retries = 3
+retry_wait_time = 10
+method = "get"
+user_agent = "lychee/a2a-rs-docs"
+
+# Statuses that bot protection and rate limits produce for pages that exist.
+accept = [200, 201, 204, 301, 302, 307, 308, 403, 429, 503]
+
+# Links inside code blocks are examples, not references.
+include_verbatim = false
+
+exclude = [
+    # Addresses in the examples
+    'localhost',
+    '127\.0\.0\.1',
+    '0\.0\.0\.0',
+    'example\.com',
+
+    # The site's own URL: the canonical link and sitemap name pages that do not
+    # exist yet, or are added by the pull request being checked.
+    'a2aproject\.github\.io/a2a-rs',
+
+    # "Edit this page" links name files on main, which a new page is not on yet.
+    'github\.com/.*/edit/',
+
+    # Fonts the theme injects; the root URL returns 404 to a plain GET.
+    'fonts\.googleapis\.com',
+    'fonts\.gstatic\.com',
+]
+
+# The theme's 404 page uses root-relative links lychee cannot resolve on disk.
+exclude_path = [
+    '(^|/)404\.html$',
+]
