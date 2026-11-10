@@ -6,7 +6,7 @@
 //!
 //! Demonstrates the two client-side responsibilities the binding cannot take
 //! over: supplying handshake credentials, and reacting when the server asks for
-//! reauthentication (spec Section 9.3.2).
+//! reauthentication with `ws/ReauthenticationRequired` (spec Section 9.5).
 //!
 //! Run the server first:
 //!   cargo run --bin websocket-server --package examples
@@ -38,10 +38,11 @@ struct DemoCredentials {
 impl CredentialProvider for DemoCredentials {
     async fn fresh_credentials(&self) -> Result<AuthenticateParams, A2AError> {
         tracing::info!("minting fresh credentials for in-band refresh");
-        Ok(AuthenticateParams {
-            scheme: "Bearer".to_string(),
-            credentials: self.next_token.clone(),
-        })
+        // Keyed by the Agent Card `securitySchemes` name.
+        Ok(AuthenticateParams::single(
+            "bearer",
+            self.next_token.clone(),
+        ))
     }
 }
 
@@ -59,25 +60,25 @@ async fn connect_as_alice() -> Result<WebSocketTransport, A2AError> {
 }
 
 /// Connect as a caller whose credentials expire, and hand the transport a way
-/// to replace them. The server's `ReauthenticationRequired` frame is then
-/// answered in-band and the connection survives (Section 9.3.3).
+/// to replace them. The server's `ws/ReauthenticationRequired` notification is
+/// then answered with `ws/Authenticate` and the connection survives. The new
+/// credentials must identify the same principal (Section 9.3).
 async fn connect_with_refresh() -> Result<WebSocketTransport, A2AError> {
     let options = ConnectOptions::with_bearer_token("expiring-token").with_credential_provider(
         Arc::new(DemoCredentials {
-            next_token: "bob-token".to_string(),
+            next_token: "carol-renewed-token".to_string(),
         }),
     );
     WebSocketTransport::connect_with_options(WS_URL, options).await
 }
 
 /// The alternative to refreshing in-band: be told, and reconnect yourself.
-/// Without either policy the server closes the connection with `4001` once its
-/// grace period expires.
+/// Without either policy the server closes the connection with `4001` at
+/// `expiresAt`.
 async fn connect_with_notify() -> Result<WebSocketTransport, A2AError> {
     let options = ConnectOptions::with_bearer_token("expiring-token").on_reauth_required(|req| {
         tracing::warn!(
-            reason = ?req.reason,
-            retry_after_ms = ?req.retry_after_ms,
+            expires_at = %req.expires_at,
             "server asked for reauthentication; reconnect with fresh credentials"
         );
     });
@@ -114,7 +115,7 @@ async fn main() {
     }
 
     // Kept short: this connection is expected to be closed with 4001 once the
-    // server's grace period elapses, since nothing replaces the credentials.
+    // credentials expire, since nothing replaces them.
     match connect_with_notify().await {
         Ok(transport) => {
             exercise_client(

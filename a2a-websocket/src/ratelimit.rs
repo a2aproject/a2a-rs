@@ -1,7 +1,7 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Inbound message rate limiting (specification Section 13.3).
+//! Inbound message rate limiting (specification Section 7.4).
 //!
 //! The spec requires servers to rate limit incoming WebSocket messages, and
 //! recommends applying the limit both per-connection and per-authenticated
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 /// Rate limit applied when [`WebSocketConfig::rate_limit`] is left at its
 /// default: 100 inbound messages per second, per connection and per identity.
 ///
-/// Section 13.3 requires a limit but does not prescribe a value. 100 messages
+/// Section 7.4 requires a limit but does not prescribe a value. 100 messages
 /// per second is far above what A2A request traffic needs — each message is a
 /// complete RPC — while still capping a flood.
 ///
@@ -30,10 +30,10 @@ pub const DEFAULT_RATE_LIMIT: RateLimit = RateLimit {
     window: Duration::from_secs(1),
 };
 
-/// Whether, and how, inbound messages are rate limited (spec Section 13.3).
+/// Whether, and how, inbound messages are rate limited (spec Section 7.4).
 ///
 /// The default is [`RateLimitPolicy::Default`] rather than "off", because
-/// Section 13.3 makes rate limiting a **MUST** for servers: a server built from
+/// Section 7.4 makes rate limiting a **MUST** for servers: a server built from
 /// [`WebSocketConfig::default()`](crate::server::WebSocketConfig) has to be
 /// conformant. Turning the limit off is therefore a deliberate, greppable
 /// choice rather than an omission.
@@ -61,7 +61,7 @@ impl RateLimitPolicy {
 }
 
 /// Message rate allowed on a connection, and for a single authenticated
-/// identity across all of its connections (spec Section 13.3).
+/// identity across all of its connections (spec Section 7.4).
 ///
 /// `max_messages` doubles as the burst capacity: a freshly opened connection
 /// may send that many messages immediately, after which messages are admitted
@@ -151,7 +151,7 @@ impl TokenBucket {
 const MAX_TRACKED_IDENTITIES: usize = 10_000;
 
 /// Rate limiter shared by every connection belonging to the same authenticated
-/// identity (spec Section 13.3, "per-authenticated-identity").
+/// identity (spec Section 7.4, "per-authenticated-identity").
 #[derive(Debug)]
 pub struct IdentityRateLimiter {
     limit: RateLimit,
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn the_default_policy_enforces_a_limit() {
-        // Section 13.3 makes rate limiting a MUST, so a default-constructed
+        // Section 7.4 makes rate limiting a MUST, so a default-constructed
         // server has to come with one rather than silently opting out.
         assert_eq!(RateLimitPolicy::default().limit(), Some(DEFAULT_RATE_LIMIT));
         assert_eq!(RateLimitPolicy::Disabled.limit(), None);
