@@ -30,5 +30,5 @@ assert_eq!(message.text(), Some("hello"));
 
 This crate is part of the `a2a-rs` workspace.
 
-- Repository: https://github.com/a2aproject/a2a-rs
-- Workspace README: https://github.com/a2aproject/a2a-rs/blob/main/README.md
+- Repository: <https://github.com/a2aproject/a2a-rs>
+- Workspace README: <https://github.com/a2aproject/a2a-rs/blob/main/README.md>

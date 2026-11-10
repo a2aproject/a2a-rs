@@ -15,7 +15,7 @@ pub type ServiceParams = HashMap<String, Vec<String>>;
 /// The [`TransportFactory`] creates instances of `Transport` for a given agent interface.
 ///
 /// A blanket implementation for `Box<dyn Transport>` is automatically derived via
-/// [`auto_impl`], enabling `A2AClient<Box<dyn Transport>>` for runtime-selected transports.
+/// [`auto_impl`](https://docs.rs/auto_impl), enabling `A2AClient<Box<dyn Transport>>` for runtime-selected transports.
 #[async_trait]
 #[auto_impl(Box)]
 pub trait Transport: Send + Sync {

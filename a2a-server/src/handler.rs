@@ -1142,7 +1142,7 @@ impl RequestHandler for DefaultRequestHandler {
     /// On truncation the store's `next_page_token` is left alone: paging is
     /// the store's own scheme (the in-tree stores use offsets, another may
     /// use an opaque cursor) so no correct token can be synthesised. See
-    /// [`TaskStore::list`].
+    /// [`TaskStore::list`](crate::TaskStore::list).
     async fn list_tasks(
         &self,
         params: &ServiceParams,

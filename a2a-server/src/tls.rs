@@ -4,9 +4,10 @@
 
 //! Re-exports for serving axum routers over HTTPS with rustls.
 //!
-//! This module is available when the `rustls` feature is enabled. It
-//! re-exports compatible versions of [`rustls`] and [`axum_server`] so that
-//! consumers do not need to manually align dependency versions.
+//! This module is available when the `rustls-tls` or `rustls-no-provider`
+//! feature is enabled. It re-exports compatible versions of [`rustls`] and
+//! [`axum_server`] so that consumers do not need to manually align dependency
+//! versions.
 //!
 //! # Example
 //!

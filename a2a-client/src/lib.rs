@@ -1,6 +1,42 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+//! Async client for A2A v1 agents.
+//!
+//! Published as `a2a-client-lf` and imported as `a2a_client`. The protocol
+//! types come from the [`a2a`] crate.
+//!
+//! # Where to start
+//!
+//! - [`A2AClientFactory`] turns an [`AgentCard`](a2a::AgentCard) into a
+//!   client. It ranks the card's interfaces against the client's preferred
+//!   bindings and returns an [`A2AClient`] for the first transport that
+//!   connects. JSON-RPC and REST are registered unless
+//!   [`no_defaults`](factory::A2AClientFactoryBuilder::no_defaults) is called.
+//! - [`A2AClient`] sends messages, streams responses, and manages tasks and
+//!   push notification configs over any [`Transport`].
+//! - [`agent_card::AgentCardResolver`] fetches a card from a base URL's
+//!   `/.well-known/agent-card.json`.
+//!
+//! # Extension points
+//!
+//! - [`Transport`] and [`TransportFactory`] are what a protocol binding
+//!   implements. This crate provides [`jsonrpc`] and [`rest`]; the gRPC and
+//!   SLIMRPC bindings are in the `a2a-grpc` and `a2a-slimrpc` crates.
+//! - [`middleware::CallInterceptor`] runs around every call: `before` in
+//!   order, `after` in reverse order. [`auth::AuthInterceptor`] uses it to add
+//!   a bearer token or a custom header.
+//!
+//! # Feature flags
+//!
+//! - `rustls-tls` (default): TLS through rustls, with its default crypto
+//!   provider.
+//! - `rustls-no-provider`: TLS through rustls; the application installs the
+//!   crypto provider.
+//! - `native-tls`: TLS through the platform's native stack.
+//!
+//! `fuzzing` is for the fuzz targets in this repository, not for dependents.
+
 // Framing internals reached by the fuzz targets in fuzz/ — see #238.
 // Thin wrappers, not re-exports: the originals stay crate-private.
 #[cfg(feature = "fuzzing")]
