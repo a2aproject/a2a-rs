@@ -303,13 +303,13 @@ async fn dropping_an_unpolled_live_downlink_closes_the_rpc_input() {
         .await
         .unwrap();
     drop(connection.events);
-    tokio::time::timeout(Duration::from_secs(5), closed.notified())
-        .await
-        .expect("dropped downlink left the RPC input task alive");
     assert_eq!(
         connection.sender.send(request).await.err().unwrap().code,
         error_code::INVALID_REQUEST
     );
+    tokio::time::timeout(Duration::from_secs(5), closed.notified())
+        .await
+        .expect("dropped downlink left the RPC input task alive");
     transport.destroy().await.unwrap();
     env.shutdown().await;
 }

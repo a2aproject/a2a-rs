@@ -181,6 +181,7 @@ impl SlimRpcTransport {
 /// stream the call opened. It closes when the last sender is dropped.
 struct SlimLiveUplink {
     sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    closed: futures::future::AbortHandle,
 }
 
 /// SLIMRPC drives its request stream in an internal task. End that stream
@@ -196,12 +197,24 @@ impl Drop for CancelLiveInput {
 #[async_trait]
 impl a2a_client::LiveUplink for SlimLiveUplink {
     async fn send(&self, request: StreamRequest) -> Result<a2a_client::LiveAck, A2AError> {
-        self.sender
-            .send(encode_proto_message(&pbconv::to_proto_stream_request(
-                &request,
-            )))
+        if self.closed.is_aborted() {
+            return Err(A2AError::invalid_request(
+                "the live exchange is no longer open",
+            ));
+        }
+        let permit = self
+            .sender
+            .reserve()
             .await
             .map_err(|_| A2AError::invalid_request("the live exchange is no longer open"))?;
+        if self.closed.is_aborted() {
+            return Err(A2AError::invalid_request(
+                "the live exchange is no longer open",
+            ));
+        }
+        permit.send(encode_proto_message(&pbconv::to_proto_stream_request(
+            &request,
+        )));
         Ok(a2a_client::LiveAck::Sent)
     }
 }
@@ -302,7 +315,7 @@ impl Transport for SlimRpcTransport {
         });
         // Construct the guard before the generator: even an unpolled stream
         // must cancel the input task when dropped.
-        let cancel_on_drop = CancelLiveInput(cancel_input);
+        let cancel_on_drop = CancelLiveInput(cancel_input.clone());
         let events = async_stream::stream! {
             let _cancel_on_drop = cancel_on_drop;
             while let Some(event) = events_receiver.recv().await {
@@ -311,7 +324,10 @@ impl Transport for SlimRpcTransport {
         };
         Ok(a2a_client::LiveConnection {
             events: Box::pin(events),
-            sender: a2a_client::LiveSender::new(Arc::new(SlimLiveUplink { sender })),
+            sender: a2a_client::LiveSender::new(Arc::new(SlimLiveUplink {
+                sender,
+                closed: cancel_input,
+            })),
         })
     }
 
@@ -639,7 +655,10 @@ mod stream_decode_tests {
     async fn live_uplink_preserves_routing_and_reports_a_closed_exchange() {
         use a2a_client::LiveUplink;
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        let uplink = SlimLiveUplink { sender };
+        let uplink = SlimLiveUplink {
+            sender,
+            closed: futures::future::AbortHandle::new_pair().0,
+        };
         let request = StreamRequest {
             tenant: Some("tenant-a".into()),
             payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
