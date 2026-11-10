@@ -306,8 +306,12 @@ cargo test -p a2acli-transport-slimrpc --release --locked
 
 The [CLI plugin interop workflow](../.github/workflows/cli-plugin-interop.yml)
 checks discovery with the real Go CLI and verifies the missing-configuration
-startup error. Run the local example above to check unary and streaming
-responses manually; the workflow does not start a gateway or echo agent.
+startup error. It also starts a SLIM gateway and the Go echo agent, then checks
+unary and streaming sends for the exact response artifact and a completed task.
+Streaming must finish without falling back to polling. The workflow pins its
+CLI, gateway and agent versions independently of the local example above, and
+uploads gateway, agent and CLI logs for diagnosis. This Linux CI check uses the
+public demo credentials and does not validate production authentication.
 
 ## Workspace
 
