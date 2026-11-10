@@ -70,7 +70,7 @@ impl Cancellation {
             // Wake the driver. Its completion command returns unread inputs
             // before the hook publishes the cancellation event.
             active.set_snapshot(task.clone());
-            active.inputs.close();
+            active.inputs.revoke();
         }
         // The task changed under every long-poll waiting on it.
         handle.notify();
