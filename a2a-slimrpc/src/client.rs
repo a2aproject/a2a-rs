@@ -183,6 +183,16 @@ struct SlimLiveUplink {
     sender: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
+/// SLIMRPC drives its request stream in an internal task. End that stream
+/// when either the downlink is dropped or its RPC finishes.
+struct CancelLiveInput(futures::future::AbortHandle);
+
+impl Drop for CancelLiveInput {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[async_trait]
 impl a2a_client::LiveUplink for SlimLiveUplink {
     async fn send(&self, request: StreamRequest) -> Result<a2a_client::LiveAck, A2AError> {
@@ -250,35 +260,53 @@ impl Transport for SlimRpcTransport {
             .await
             .map_err(|_| A2AError::internal("could not queue the first live request"))?;
 
-        // As for the other streaming calls, the channel is owned by the
-        // generator so the returned stream is `'static`.
+        // Drive the lazy SLIMRPC call immediately, independently of response
+        // polling, so senders can keep feeding the bounded input queue.
         let channel = self.channel.clone();
         let metadata = service_params_to_metadata_opt(params);
-        let events = async_stream::stream! {
+        let (cancel_input, cancelled) = futures::future::AbortHandle::new_pair();
+        let input = futures::stream::Abortable::new(
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+            cancelled,
+        );
+        let cancel_on_finish = CancelLiveInput(cancel_input.clone());
+        let (events_sender, mut events_receiver) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            let _cancel_on_finish = cancel_on_finish;
             let inner = channel.stream_stream::<Vec<u8>, Vec<u8>>(
                 A2A_SLIMRPC_SERVICE,
                 METHOD_SEND_LIVE_MESSAGE,
-                tokio_stream::wrappers::ReceiverStream::new(receiver),
+                input,
                 None,
                 metadata,
             );
             futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
-                match item {
-                    Ok(data) => match decode_proto_response::<a2a_pb::proto::StreamResponse>(
-                        data,
-                        "StreamResponse",
-                    ) {
-                        // Payload kinds this client does not know are skipped.
-                        Ok(response) => {
-                            if let Some(event) = pbconv::from_proto_stream_response(&response) {
-                                yield Ok(event);
-                            }
-                        }
-                        Err(error) => yield Err(error),
+            loop {
+                let item = tokio::select! {
+                    biased;
+                    _ = events_sender.closed() => break,
+                    item = inner.next() => match item {
+                        Some(item) => item,
+                        None => break,
                     },
-                    Err(error) => yield Err(rpc_error_to_a2a_error(&error)),
+                };
+                let item = item
+                    .map_err(|error| rpc_error_to_a2a_error(&error))
+                    .and_then(|data| decode_proto_response(data, "StreamResponse"));
+                if let Some(event) = decode_stream_item(item)
+                    && events_sender.send(event).await.is_err()
+                {
+                    break;
                 }
+            }
+        });
+        // Construct the guard before the generator: even an unpolled stream
+        // must cancel the input task when dropped.
+        let cancel_on_drop = CancelLiveInput(cancel_input);
+        let events = async_stream::stream! {
+            let _cancel_on_drop = cancel_on_drop;
+            while let Some(event) = events_receiver.recv().await {
+                yield event;
             }
         };
         Ok(a2a_client::LiveConnection {
