@@ -130,7 +130,9 @@ async fn drive_execution(
     request: ExecutionRequest,
 ) {
     let end = poll_executor(&handler, &active, request).await;
-    active
+    // Shutdown can close the mailbox after output polling has completed.
+    // The driver's cleanup guard still runs; this is not an executor panic.
+    let _ = active
         .task
         .clone()
         .request(TaskOperation::Finished, |reply| TaskCommand::Finished {
@@ -139,8 +141,7 @@ async fn drive_execution(
             end,
             reply,
         })
-        .await
-        .expect("execution completion must reach the task service");
+        .await;
 }
 
 /// Cancellation drops the owned output stream; input receipts can be reclaimed
@@ -264,6 +265,7 @@ pub(super) async fn start_next_turn(
     next.set_snapshot(snapshot.clone());
     let first = unread.remove(0);
     next.inputs.received(first.generation);
+    let mut rejected = Vec::new();
     for input in unread {
         if let Ok(permit) = next.inputs.sender.clone().try_reserve_owned() {
             permit.send(
@@ -273,8 +275,11 @@ pub(super) async fn start_next_turn(
                     .unwrap()
                     .track_input(input),
             );
+        } else {
+            rejected.push(input);
         }
     }
+    reject_inputs(&next, task_id, rejected).await;
 
     let exec_ctx = crate::ExecutorContext {
         execution_id: next.execution_id.clone(),
@@ -962,6 +967,54 @@ mod driver_tests {
 mod turn_tests {
     use super::*;
     use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn handoff_capacity_failure_rejects_every_input_it_cannot_queue() {
+        struct Pending;
+        impl crate::AgentExecutor for Pending {
+            fn execute(
+                &self,
+                _: crate::ExecutorContext,
+            ) -> futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>> {
+                Box::pin(futures::stream::pending())
+            }
+            fn cancel(
+                &self,
+                _: crate::ExecutorContext,
+            ) -> futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>> {
+                Box::pin(futures::stream::empty())
+            }
+        }
+        let runtime = DefaultRequestHandler::new(Pending, InMemoryTaskStore::new());
+        let task = task_with_history("handoff-capacity", "context", 0);
+        let handle = runtime.tasks.task(&task.id);
+        let mut events = handle.sender().subscribe();
+        let capacity = crate::handler::TASK_INPUT_CAPACITY;
+        let inputs = (0..capacity + 3)
+            .map(|index| {
+                let mut message = make_message();
+                message.message_id = format!("input-{index}");
+                crate::ClientInput::new(message, index as i64 + 1)
+            })
+            .collect();
+        start_next_turn(
+            &runtime,
+            &task.id,
+            task.clone(),
+            inputs,
+            &mut TaskController::default(),
+        )
+        .await
+        .unwrap();
+        for index in capacity + 1..capacity + 3 {
+            let event = events.recv().await.unwrap();
+            assert!(
+                matches!(event.result, Ok(StreamResponse::Error(error)) if error.reference_id == Some(format!("input-{index}")))
+            );
+        }
+        assert!(events.try_recv().is_err());
+        runtime.shutdown().await;
+    }
 
     #[tokio::test]
     async fn a_busy_handoff_returns_input_with_its_caller_identity_intact() {
