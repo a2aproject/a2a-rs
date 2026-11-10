@@ -1927,8 +1927,10 @@ mod tests {
     #[tokio::test]
     async fn test_unsupported_a2a_version_is_rejected() {
         // §3.6.2, §6.4: same rejection as JSON-RPC, in REST's error shape.
-        let resp = send_message_with_version(REST_SEND_MESSAGE_PATH, Some("99.0")).await;
-        assert_version_not_supported(resp).await;
+        for version in ["99.0", "1"] {
+            let resp = send_message_with_version(REST_SEND_MESSAGE_PATH, Some(version)).await;
+            assert_version_not_supported(resp).await;
+        }
     }
 
     #[tokio::test]

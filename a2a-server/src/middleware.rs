@@ -16,6 +16,8 @@ pub type ServiceParams = HashMap<String, Vec<String>>;
 /// This SDK implements the 1.x protocol family, including its 1.0
 /// compatibility surface. An absent or empty value is the legacy 0.3
 /// version, which this SDK does not implement.
+/// Section 3.6 requires `Major.Minor`: a bare `1` is invalid. A numeric
+/// patch component is tolerated and ignored when negotiating compatibility.
 pub fn check_a2a_version(params: &ServiceParams) -> Result<(), A2AError> {
     let mut values = params
         .iter()
@@ -180,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_protocol_version_accepts_supported_versions() {
-        for version in ["1.0", "1.1", "1.4"] {
+        for version in ["1.0", "1.1", "1.4", "1.1.99"] {
             let params = ServiceParams::from([("a2a-version".to_string(), vec![version.into()])]);
             assert!(check_a2a_version(&params).is_ok(), "{version}");
         }
@@ -194,7 +196,9 @@ mod tests {
             a2a::error_code::VERSION_NOT_SUPPORTED
         );
 
-        for version in ["", "0.3", "2.0", "invalid"] {
+        for version in [
+            "", "1", "1.", ".1", "1..1", "1.1.x", "0.3", "2.0", "invalid",
+        ] {
             let params = ServiceParams::from([("a2a-version".to_string(), vec![version.into()])]);
             assert_eq!(
                 check_a2a_version(&params).unwrap_err().code,
