@@ -3328,9 +3328,12 @@ fn is_unchanged_reconciliation(
     value: &StreamResponse,
     state: Option<&TaskState>,
     state_before_this_attempt: Option<&TaskState>,
+    generation_before_this_attempt: i64,
 ) -> bool {
     first_event
-        && (matches!(value, StreamResponse::Task(_)) || stream_response_generation(value) == 0)
+        && (stream_response_generation(value) == 0
+            || (matches!(value, StreamResponse::Task(_))
+                && stream_response_generation(value) <= generation_before_this_attempt))
         && state.is_some()
         && state == state_before_this_attempt
 }
@@ -3386,6 +3389,7 @@ async fn subscribe_with_resumption<T: a2a_client::Transport>(
 
     loop {
         let state_before_this_attempt = last_state.clone();
+        let generation_before_this_attempt = last_generation;
         let mut first_event = attempt > 0;
         let mut interruption: Option<A2AError> = None;
 
@@ -3403,6 +3407,7 @@ async fn subscribe_with_resumption<T: a2a_client::Transport>(
                         &value,
                         state.as_ref(),
                         state_before_this_attempt.as_ref(),
+                        generation_before_this_attempt,
                     );
                     first_event = false;
                     if is_unchanged_reconciliation {
@@ -4125,14 +4130,16 @@ mod tests {
             true,
             &task,
             Some(&working),
-            Some(&working)
+            Some(&working),
+            0
         ));
         // After resuming without a snapshot the first event is a real update.
         assert!(!is_unchanged_reconciliation(
             true,
             &update,
             Some(&working),
-            Some(&working)
+            Some(&working),
+            0
         ));
         let StreamResponse::StatusUpdate(mut legacy) = update else {
             unreachable!()
@@ -4144,27 +4151,31 @@ mod tests {
             true,
             &legacy,
             Some(&working),
-            Some(&working)
+            Some(&working),
+            0
         ));
         assert!(!is_unchanged_reconciliation(
             false,
             &legacy,
             Some(&working),
-            Some(&working)
+            Some(&working),
+            0
         ));
         // Past the first event nothing is suppressed.
         assert!(!is_unchanged_reconciliation(
             false,
             &task,
             Some(&working),
-            Some(&working)
+            Some(&working),
+            0
         ));
         // A snapshot that moved on is printed.
         assert!(!is_unchanged_reconciliation(
             true,
             &task,
             Some(&working),
-            Some(&TaskState::Submitted)
+            Some(&TaskState::Submitted),
+            0
         ));
     }
 
