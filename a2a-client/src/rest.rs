@@ -371,6 +371,8 @@ impl crate::LiveUplink for RestLiveUplink {
 }
 
 fn parse_rest_error(status: reqwest::StatusCode, body: &str) -> A2AError {
+    // A malformed google.rpc.Status is a response/transport failure. Keep
+    // its HTTP status and body for diagnosis instead of trusting its reason.
     rest_error(body).unwrap_or_else(|| A2AError::internal(format!("HTTP {status}: {body}")))
 }
 
@@ -1451,6 +1453,40 @@ mod tests {
         ] {
             let body = serde_json::json!({"error":{"code":code,"message":"bad input"}});
             assert!(rest_error(&body.to_string()).is_none());
+        }
+    }
+
+    #[test]
+    fn unary_rest_errors_validate_codes_before_using_protocol_details() {
+        for (code, valid) in [
+            (json!(404), true),
+            (json!("404"), true),
+            (json!("4.04e2"), true),
+            (json!("NOT_FOUND"), false),
+            (json!("not-a-number"), false),
+            (json!(404.5), false),
+            (json!(true), false),
+            (json!({}), false),
+        ] {
+            let body = json!({"error": {
+                "code": code,
+                "message": "missing task",
+                "details": [{
+                    "@type": a2a::errordetails::ERROR_INFO_TYPE,
+                    "reason": "TASK_NOT_FOUND",
+                    "domain": a2a::errordetails::PROTOCOL_DOMAIN
+                }]
+            }})
+            .to_string();
+            let error = parse_rest_error(reqwest::StatusCode::NOT_FOUND, &body);
+            if valid {
+                assert_eq!(error.code, error_code::TASK_NOT_FOUND, "{body}");
+                assert_eq!(error.message, "missing task");
+            } else {
+                assert_eq!(error.code, error_code::INTERNAL_ERROR, "{body}");
+                assert!(error.message.contains("HTTP 404"), "{error}");
+                assert!(error.message.contains(&body), "{error}");
+            }
         }
     }
 }
