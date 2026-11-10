@@ -40,7 +40,11 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
             "SendMessageRequest",
             pbconv::from_proto_send_message_request,
             |handler, params, request| {
-                Box::pin(async move { handler.send_message(&params, request).await })
+                Box::pin(async move {
+                    // A request that fails conversion is the caller's.
+                    let request = request.map_err(pbconv::invalid_request)?;
+                    handler.send_message(&params, request).await
+                })
             },
             |response| encode_proto_message(&pbconv::to_proto_send_message_response(response)),
         );
@@ -184,11 +188,16 @@ where
                 // visible immediately rather than only after the session ends.
                 tokio::spawn(async move {
                     while let Some(item) = stream.next().await {
-                        if let Ok(bytes) = item
-                            && let Ok(proto_message) =
-                                decode_proto_request::<a2a_pb::proto::Message>(bytes, "Message")
-                        {
-                            on_message(pbconv::from_proto_message(&proto_message));
+                        match collaborate_message(item) {
+                            Ok(message) => on_message(message),
+                            Err(error) => {
+                                // The reason carries text the peer chose: `?`
+                                // escapes control characters, the cap bounds
+                                // the line.
+                                let reason = error.to_string();
+                                let reason = capped(&reason);
+                                tracing::warn!(?reason, "dropping a Collaborate message");
+                            }
                         }
                     }
                 });
@@ -196,6 +205,30 @@ where
             }
         },
     );
+}
+
+/// The most characters of a dropped message's reason that reach the log.
+const MAX_LOGGED_REASON_CHARS: usize = 256;
+
+/// One broadcast item as a `Message`, or why it cannot be delivered: the
+/// stream failed, the bytes do not decode, or the message fails conversion.
+fn collaborate_message(
+    item: Result<Vec<u8>, slim_rpc::RpcError>,
+) -> Result<Message, slim_rpc::RpcError> {
+    let proto_message = decode_proto_request::<proto::Message>(item?, "Message")?;
+    pbconv::from_proto_message(&proto_message).map_err(|violation| {
+        slim_rpc::RpcError::invalid_argument(format!(
+            "{} (message {})",
+            pbconv::invalid_request(violation).message,
+            proto_message.message_id
+        ))
+    })
+}
+
+fn capped(text: &str) -> &str {
+    text.char_indices()
+        .nth(MAX_LOGGED_REASON_CHARS)
+        .map_or(text, |(end, _)| &text[..end])
 }
 
 fn register_unary_unary<H, ReqProto, ReqNative, ResNative, DecodeReq, EncodeRes>(
@@ -259,7 +292,9 @@ where
                     "SendMessageRequest",
                 )?;
                 let params = context_to_service_params(&context);
-                let request = pbconv::from_proto_send_message_request(&proto_request);
+                let request = pbconv::from_proto_send_message_request(&proto_request).map_err(
+                    |violation| a2a_error_to_rpc_error(&pbconv::invalid_request(violation)),
+                )?;
                 let stream = handler
                     .send_streaming_message(&params, request)
                     .await
@@ -310,6 +345,37 @@ fn map_stream_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collaborate_message_says_why_an_item_is_dropped() {
+        let reason = |item| collaborate_message(item).unwrap_err().to_string();
+
+        let stream_error = slim_rpc::RpcError::internal("stream broke");
+        assert_eq!(reason(Err(stream_error)), "stream broke");
+
+        let undecodable = reason(Ok(vec![0xff]));
+        assert!(
+            undecodable.contains("invalid Message payload"),
+            "{undecodable}"
+        );
+
+        let empty_part = proto::Message {
+            message_id: "m1".to_string(),
+            parts: vec![proto::Part::default()],
+            ..Default::default()
+        };
+        assert_eq!(
+            reason(Ok(encode_proto_message(&empty_part))),
+            "parts[0]: must have one of: text, raw, url, data (message m1)"
+        );
+    }
+
+    #[test]
+    fn capped_cuts_on_a_character_boundary() {
+        let long = "\u{e9}".repeat(MAX_LOGGED_REASON_CHARS + 1);
+        assert_eq!(capped(&long).chars().count(), MAX_LOGGED_REASON_CHARS);
+        assert_eq!(capped("short"), "short");
+    }
 
     #[test]
     fn test_slimrpc_handler_new() {

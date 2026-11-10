@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use a2a::*;
-use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
+use a2a_pb::protojson_conv::{self, ProtoJsonPayload, ProtoJsonPayloadError};
 use axum::{
     Json,
     body::Bytes,
@@ -239,7 +239,7 @@ async fn handle_send_message<H: RequestHandler>(
     };
     let mut req = match protojson_conv::from_value::<SendMessageRequest>(raw_req) {
         Ok(req) => req,
-        Err(e) => return rest_payload_error_response(e),
+        Err(e) => return protojson_error_response(e),
     };
     req.tenant = match reconcile_tenant(tenant, req.tenant.take()) {
         Ok(tenant) => tenant,
@@ -265,7 +265,7 @@ async fn handle_stream_message<H: RequestHandler>(
     };
     let mut req = match protojson_conv::from_value::<SendMessageRequest>(raw_req) {
         Ok(req) => req,
-        Err(e) => return rest_payload_error_response(e),
+        Err(e) => return protojson_error_response(e),
     };
     req.tenant = match reconcile_tenant(tenant, req.tenant.take()) {
         Ok(tenant) => tenant,
@@ -656,10 +656,22 @@ fn json_rejection_response(rejection: JsonRejection) -> axum::response::Response
 }
 
 fn rest_payload_error_response(error: impl std::fmt::Display) -> axum::response::Response {
-    let violation = FieldViolation {
+    rest_violation_response(FieldViolation {
         field: String::new(),
         description: error.to_string(),
-    };
+    })
+}
+
+/// A body that fails ProtoJSON conversion; a field the conversion rejects is
+/// named in the violation.
+fn protojson_error_response(error: ProtoJsonPayloadError) -> axum::response::Response {
+    match error {
+        ProtoJsonPayloadError::Invalid(violation) => rest_violation_response(violation),
+        error => rest_payload_error_response(error),
+    }
+}
+
+fn rest_violation_response(violation: FieldViolation) -> axum::response::Response {
     rest_error_response(
         A2AError::invalid_params("invalid request body")
             .with_details(vec![TypedDetail::bad_request(vec![violation])]),
@@ -832,6 +844,51 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `Part.content` is a required oneof and `message` a REQUIRED field in
+    /// a2a.proto: a request without either is a 400 whose `BadRequest` names
+    /// the field, on `message:send` and `message:stream` alike. A body that
+    /// does not decode at all keeps its violation without a field.
+    #[tokio::test]
+    async fn test_send_message_rejects_a_missing_message_and_a_part_without_content() {
+        let cases = [
+            (
+                serde_json::json!({"message": {
+                    "messageId": "m1",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "ok"}, {}]
+                }}),
+                "message.parts[1]",
+                "must have one of: text, raw, url, data",
+            ),
+            (serde_json::json!({}), "message", "is required"),
+            // Not a conversion failure: the body is not a SendMessageRequest.
+            (
+                serde_json::json!({"message": 5}),
+                "",
+                "ProtoJSON error: invalid type: integer `5`, expected struct lf.a2a.v1.Message",
+            ),
+        ];
+        for path in [REST_SEND_MESSAGE_PATH, REST_STREAM_MESSAGE_PATH] {
+            for (body, field, description) in &cases {
+                let req = Request::builder()
+                    .header("a2a-version", "1.0")
+                    .uri(path)
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(body).unwrap()))
+                    .unwrap();
+                let resp = make_app().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+
+                let body = resp.into_body().collect().await.unwrap().to_bytes();
+                let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let violation = &payload["error"]["details"][0]["fieldViolations"][0];
+                assert_eq!(violation["field"], *field, "{path}");
+                assert_eq!(violation["description"], *description, "{path}");
+            }
+        }
     }
 
     #[tokio::test]

@@ -71,6 +71,14 @@ fn map_proto_stream_item(
     }
 }
 
+/// A request that fails conversion is the caller's: `INVALID_ARGUMENT`.
+fn send_message_request(
+    request: &proto::SendMessageRequest,
+) -> Result<a2a::SendMessageRequest, tonic::Status> {
+    pbconv::from_proto_send_message_request(request)
+        .map_err(|violation| a2a_error_to_status(&pbconv::invalid_request(violation)))
+}
+
 #[tonic::async_trait]
 impl<H: RequestHandler> A2aService for GrpcHandler<H> {
     async fn send_message(
@@ -79,7 +87,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
     ) -> Result<tonic::Response<proto::SendMessageResponse>, tonic::Status> {
         let params = extract_service_params(request.metadata());
         validate_protocol_version(&params)?;
-        let native_req = pbconv::from_proto_send_message_request(request.get_ref());
+        let native_req = send_message_request(request.get_ref())?;
         let result = self
             .handler
             .send_message(&params, native_req)
@@ -98,7 +106,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
     ) -> Result<tonic::Response<Self::SendStreamingMessageStream>, tonic::Status> {
         let params = extract_service_params(request.metadata());
         validate_protocol_version(&params)?;
-        let native_req = pbconv::from_proto_send_message_request(request.get_ref());
+        let native_req = send_message_request(request.get_ref())?;
         let stream = self
             .handler
             .send_streaming_message(&params, native_req)
