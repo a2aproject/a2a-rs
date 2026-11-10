@@ -3283,8 +3283,7 @@ fn stream_response_state(value: &StreamResponse) -> Option<TaskState> {
 /// reconnecting over, rather than a failure the agent reported on the stream.
 ///
 /// The clients raise a dropped connection or an undecodable body locally,
-/// with no details, and keep the details an agent's error arrived with. gRPC
-/// and SLIMRPC drop details either way, so there both kinds are retried.
+/// with no details, and keep the details an agent's error arrived with.
 fn is_connection_failure(error: &A2AError) -> bool {
     error.code == a2a::error_code::INTERNAL_ERROR && error.details.is_none()
 }
