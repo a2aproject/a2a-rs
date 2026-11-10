@@ -3504,7 +3504,7 @@ async fn explicit_a2a_version_replaces_the_default_rather_than_appending() {
             "--output",
             "json",
             "--a2a-version",
-            "1.4",
+            "1.0",
             "task",
             "get",
             "task-1",
@@ -3516,12 +3516,12 @@ async fn explicit_a2a_version_replaces_the_default_rather_than_appending() {
 
     let headers = server.state.agent_headers.lock().unwrap().clone();
     let version = headers.last().unwrap().3.clone();
-    // Exactly "1.4" — not "1.0,1.4", which is what appending would produce.
-    assert_eq!(version.as_deref(), Some("1.4"), "{headers:?}");
+    // Exactly "1.0" — not "1.1,1.0", which is what appending would produce.
+    assert_eq!(version.as_deref(), Some("1.0"), "{headers:?}");
 
     // §13.2: no silent change of the signaled version.
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("signaling A2A-Version 1.4"), "{stderr}");
+    assert!(stderr.contains("signaling A2A-Version 1.0"), "{stderr}");
 }
 
 /// §11.6: a bad `--a2a-version` is a usage error, reported before any
