@@ -1261,6 +1261,18 @@ mod tests {
                     } else {
                         "POST /tenant-a/message:live HTTP/1.1"
                     }));
+                    if rpc {
+                        let accept = raw[..boundary]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("accept").then_some(value.trim())
+                            })
+                            .unwrap();
+                        let accepted: Vec<_> = accept.split(',').map(str::trim).collect();
+                        assert!(accepted.contains(&"text/event-stream"), "{accept}");
+                        assert!(accepted.contains(&"application/json"), "{accept}");
+                    }
                     let routing = raw[..boundary]
                         .lines()
                         .find_map(|line| {

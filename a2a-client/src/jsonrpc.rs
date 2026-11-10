@@ -181,7 +181,8 @@ impl JsonRpcTransport {
         let mut builder = self
             .client
             .post(&self.endpoint)
-            .header("Accept", "text/event-stream");
+            // Live openings/reopenings stream; follow-ups acknowledge in JSON.
+            .header("Accept", "text/event-stream, application/json");
         for (key, values) in params {
             for v in values {
                 builder = builder.header(key, v);
