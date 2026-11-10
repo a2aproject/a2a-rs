@@ -422,10 +422,42 @@ mod tests {
             error_code::TASK_GENERATION_MISMATCH
         );
         let bare = tonic::Status::new(tonic::Code::Aborted, "conflict");
-        assert_eq!(
-            status_to_a2a_error(&bare).code,
-            error_code::INTERNAL_ERROR
-        );
+        assert_eq!(status_to_a2a_error(&bare).code, error_code::INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn aborted_status_uses_only_recognized_protocol_error_details() {
+        for (reason, domain, expected) in [
+            (
+                "TASK_NOT_CANCELABLE",
+                errordetails::PROTOCOL_DOMAIN,
+                error_code::TASK_NOT_CANCELABLE,
+            ),
+            (
+                "TASK_NOT_FOUND",
+                "other.example",
+                error_code::INTERNAL_ERROR,
+            ),
+            (
+                "UNKNOWN_REASON",
+                errordetails::PROTOCOL_DOMAIN,
+                error_code::INTERNAL_ERROR,
+            ),
+        ] {
+            let details = ErrorDetails::with_error_info(reason, domain, HashMap::new());
+            let status =
+                tonic::Status::with_error_details(tonic::Code::Aborted, "conflict", details);
+            let error = status_to_a2a_error(&status);
+            assert_eq!(error.code, expected, "{reason} in {domain}");
+            assert_eq!(
+                error.message,
+                if expected == error_code::INTERNAL_ERROR {
+                    "gRPC Aborted: conflict"
+                } else {
+                    "conflict"
+                }
+            );
+        }
     }
 
     #[test]

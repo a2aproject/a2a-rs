@@ -30,6 +30,8 @@ pub fn a2a_error_to_rpc_error(err: &A2AError) -> slim_rpc::RpcError {
 }
 
 /// Convert a SLIMRPC status to an A2A error.
+/// Uses the canonical binding map, as SLIMRPC has no A2A `ErrorInfo`
+/// reason: `Aborted` is the binding code for a task generation mismatch.
 pub fn rpc_error_to_a2a_error(error: &slim_rpc::RpcError) -> A2AError {
     use a2a::error_code;
     use slim_rpc::RpcCode;
@@ -88,6 +90,7 @@ mod tests {
     fn test_rpc_error_to_a2a_error_mapping() {
         let cases = [
             (RpcCode::NotFound, error_code::TASK_NOT_FOUND),
+            (RpcCode::Aborted, error_code::TASK_GENERATION_MISMATCH),
             (RpcCode::FailedPrecondition, error_code::TASK_NOT_CANCELABLE),
             (RpcCode::Unimplemented, error_code::UNSUPPORTED_OPERATION),
             (RpcCode::InvalidArgument, error_code::INVALID_PARAMS),
