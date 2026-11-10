@@ -227,6 +227,10 @@ fn decode_stream_value(
 ) -> Option<Result<StreamResponse, A2AError>> {
     let unknown_payload = value.as_object().is_some_and(|fields| {
         !fields.is_empty()
+            // Legacy 0.3 events and misplaced/malformed RPC envelopes are
+            // not future StreamResponse payload kinds.
+            && !["kind", "jsonrpc", "id", "result", "taskId", "contextId", "messageId", "status", "parts"]
+                .iter().any(|field| fields.contains_key(*field))
             && ![
                 "task",
                 "message",
@@ -642,6 +646,28 @@ impl TransportFactory for JsonRpcTransportFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_events_and_incomplete_envelopes_are_errors_on_both_http_streams() {
+        for value in [
+            serde_json::json!({"kind":"status-update", "taskId":"t", "status":{}}),
+            serde_json::json!({"id":"t", "contextId":"c", "status":{}}),
+            serde_json::json!({"id":1, "result":{"task":null}}),
+            serde_json::json!({"jsonrpc":"1.0", "id":1, "result":{}}),
+        ] {
+            for terminated in [true, false] {
+                let frame = format!("data: {value}{}", if terminated { "\n\n" } else { "" });
+                let rpc: Vec<_> = parse_sse_stream(byte_stream(vec![frame.clone()]))
+                    .collect()
+                    .await;
+                let rest: Vec<_> = parse_sse_stream_rest(byte_stream(vec![frame]))
+                    .collect()
+                    .await;
+                assert!(matches!(rpc.as_slice(), [Err(_)]), "{value}: {rpc:?}");
+                assert!(matches!(rest.as_slice(), [Err(_)]), "{value}: {rest:?}");
+            }
+        }
+    }
     use a2a_pb::protojson_conv;
     use futures::StreamExt;
     use serde_json::{Value, json};

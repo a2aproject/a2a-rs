@@ -87,8 +87,7 @@ jobs:
 
       - name: Test SSE framing oracle
         if: matrix.target == 'sse_framing'
-        working-directory: fuzz
-        run: cargo test --bin sse_framing
+        run: cargo test -p a2a-client-lf --features fuzzing --lib fuzz_support
 
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
