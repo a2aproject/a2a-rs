@@ -69,6 +69,7 @@ struct State {
     snapshot: Option<Task>,
     last_error: Option<(u64, A2AError)>,
     interrupted_input_generation: i64,
+    completed_input: Option<(u64, i64)>,
     push_queue: Weak<TaskPushQueue>,
     // Outstanding receivers retain their direct reply or private input rejection.
     // No task-wide reply history survives after those receivers are dropped.
@@ -119,6 +120,26 @@ struct TaskInner {
 }
 
 impl TaskHandle {
+    /// A bounded checkpoint lets blocking senders recover a missed local
+    /// invocation-completion event without retaining another task snapshot.
+    pub(super) fn completed_input(&self, required: i64, after: u64) -> Option<ExecutionEvent> {
+        if required <= 0 {
+            return None;
+        }
+        let state = self.inner.state.read();
+        let (sequence, input_generation) = state.completed_input?;
+        if sequence <= after || input_generation < required {
+            return None;
+        }
+        Some(ExecutionEvent {
+            sequence,
+            input_generation,
+            kind: EventKind::InvocationEnded,
+            result: Ok(StreamResponse::Task(state.snapshot.clone()?)),
+            failure: None,
+            response_task: None,
+        })
+    }
     #[cfg(test)]
     pub(super) fn new(id: TaskId, snapshot: Option<Task>) -> Self {
         Self::with_background_tasks(id, snapshot, Arc::default())
@@ -515,6 +536,9 @@ impl TaskHandle {
                     None
                 },
             };
+            if kind == EventKind::InvocationEnded {
+                state.completed_input = Some((event.sequence, event.input_generation));
+            }
             state.replies.retain(|reply| {
                 let Some(reply) = reply.upgrade() else {
                     return false;

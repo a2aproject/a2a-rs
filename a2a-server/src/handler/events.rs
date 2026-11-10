@@ -42,6 +42,7 @@ pub(super) struct ExecutionReceiver {
     required_input: i64,
     rejection_delivered: bool,
     recovering_reply: bool,
+    recovered_completion: u64,
 }
 
 impl ExecutionReceiver {
@@ -62,6 +63,7 @@ impl ExecutionReceiver {
                 required_input: 0,
                 rejection_delivered: false,
                 recovering_reply: false,
+                recovered_completion: 0,
             },
             snapshot,
             sequence,
@@ -126,6 +128,13 @@ impl ExecutionReceiver {
                 .and_then(|retained| retained.reply.get())
             {
                 return Ok(reply.clone());
+            }
+            if let Some(completion) = self.task.completed_input(
+                self.required_input,
+                self.opened_at.max(self.recovered_completion),
+            ) {
+                self.recovered_completion = completion.sequence;
+                return Ok(completion);
             }
         }
         if let Some(retained) = &self.reply {
@@ -283,6 +292,7 @@ impl ActiveExecution {
             required_input: 0,
             rejection_delivered: false,
             recovering_reply: false,
+            recovered_completion: 0,
         }
     }
 
@@ -495,6 +505,40 @@ pub(super) fn subscription_stream(
 mod tests {
     use super::*;
     use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn blocking_completion_survives_broadcast_lag() {
+        let task = task_with_history("task", "context", 0);
+        let active = ActiveExecution::new(Some(task.clone()));
+        let receiver = active.subscribe().for_input(7).follow_task();
+        active.inputs.received(7);
+        active.emitted_output();
+        active
+            .publish_kind(
+                Ok(&StreamResponse::Task(task.clone())),
+                None,
+                EventKind::InvocationEnded,
+            )
+            .await;
+        for _ in 0..EXECUTION_BUFFER_CAPACITY + 1 {
+            active
+                .publish_kind(
+                    Ok(&StreamResponse::Task(task.clone())),
+                    None,
+                    EventKind::Repeated,
+                )
+                .await;
+        }
+        let policy = super::super::protocol::ResponsePolicy::new(
+            super::super::protocol::StartMode::Blocking,
+            false,
+        );
+        let events = subscription_stream(receiver, None, 0, policy.event_filter());
+        let results: Vec<_> = timeout(Duration::from_secs(1), events.collect())
+            .await
+            .unwrap();
+        assert!(matches!(results.as_slice(), [Ok(StreamResponse::Task(_))]));
+    }
 
     #[tokio::test]
     async fn a_lagging_sender_waits_for_unread_cleanup_before_accepting_cancellation() {
