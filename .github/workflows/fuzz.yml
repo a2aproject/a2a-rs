@@ -4,11 +4,25 @@ on:
   pull_request:
     paths-ignore:
       - 'itk/**'
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.in'
+      - 'requirements-docs.txt'
+      - 'lychee.toml'
+      - '.typos.toml'
+      - '.github/workflows/docs.yml'
   push:
     branches:
       - main
     paths-ignore:
       - 'itk/**'
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.in'
+      - 'requirements-docs.txt'
+      - 'lychee.toml'
+      - '.typos.toml'
+      - '.github/workflows/docs.yml'
   # A weekly, much longer run per #238 Phase 4. This is deliberately not
   # OSS-Fuzz or ClusterFuzzLite: both give persistent, continuously-growing
   # corpora, but OSS-Fuzz needs an upstream onboarding PR and a security

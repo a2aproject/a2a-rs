@@ -94,7 +94,6 @@ pub struct Cli {
     )]
     pub transport: Vec<Binding>,
 
-    /// Bearer token attached to the agent-card fetch and client calls.
     /// Protocol version to signal to the server on every request (§13.2).
     /// Absent this flag the version is negotiated down to the highest one
     /// both a2acli and the agent's selected interface declare. Must be
@@ -102,6 +101,7 @@ pub struct Cli {
     #[arg(long = "a2a-version", global = true, env = "A2ACLI_A2A_VERSION")]
     pub a2a_version: Option<String>,
 
+    /// Bearer token attached to the agent-card fetch and client calls.
     #[arg(long, global = true, env = "A2ACLI_BEARER")]
     pub bearer: Option<String>,
 
@@ -112,9 +112,8 @@ pub struct Cli {
     pub api_key: Option<String>,
 
     /// Add an A2A service parameter (a transport-level key-value pair, e.g.
-    /// a header or gRPC metadata) — general-purpose, not authentication-
-    /// specific. Distinct from `--metadata`, which travels in the request
-    /// payload.
+    /// a header or gRPC metadata) — general-purpose, not
+    /// authentication-specific.
     #[arg(long = "svc-param", global = true, value_parser = parse_header)]
     pub svc_params: Vec<HeaderArg>,
 
@@ -3397,7 +3396,7 @@ mod tests {
     use futures::stream;
     use reqwest::header;
     use serde::ser;
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::sync::Mutex;
     use tokio::net::TcpListener;
 
@@ -4065,6 +4064,95 @@ mod tests {
         assert_eq!(cli.transport, vec![Binding::Jsonrpc]);
         assert_eq!(cli.svc_params.len(), 1);
         assert!(matches!(cli.command, Command::Send(_)));
+    }
+
+    /// Every `--name` a piece of help text mentions.
+    fn mentioned_long_flags(text: &str) -> Vec<&str> {
+        text.match_indices("--")
+            .filter(|(at, _)| !text[..*at].ends_with(|c: char| c.is_alphanumeric() || c == '-'))
+            .map(|(at, _)| {
+                let rest = &text[at + 2..];
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                    .unwrap_or(rest.len());
+                rest[..end].trim_end_matches('-')
+            })
+            .filter(|name| name.starts_with(|c: char| c.is_ascii_lowercase()))
+            .collect()
+    }
+
+    fn help_text(arg: &clap::Arg) -> String {
+        let short = arg.get_help().map(ToString::to_string).unwrap_or_default();
+        let long = arg
+            .get_long_help()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        format!("{short}\n{long}")
+    }
+
+    fn global_arg<'a>(command: &'a clap::Command, long: &str) -> &'a clap::Arg {
+        command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some(long))
+            .unwrap_or_else(|| panic!("no --{long} option"))
+    }
+
+    #[test]
+    fn bearer_flag_has_help_text() {
+        let bearer = help_text(global_arg(&Cli::command(), "bearer"));
+        assert!(!bearer.trim().is_empty(), "--bearer has no help text");
+    }
+
+    #[test]
+    fn a2a_version_help_is_not_the_bearer_description() {
+        let version = help_text(global_arg(&Cli::command(), "a2a-version"));
+        assert!(!version.contains("Bearer"), "--a2a-version help: {version}");
+    }
+
+    /// A description that points at `--foo` must point at a flag that exists.
+    #[test]
+    fn help_text_only_mentions_real_options() {
+        fn walk(
+            command: &clap::Command,
+            longs: &mut BTreeSet<String>,
+            mentions: &mut BTreeSet<(String, String)>,
+        ) {
+            for arg in command.get_arguments() {
+                let owner = arg.get_long().map_or_else(
+                    || arg.get_id().to_string(),
+                    |long| {
+                        longs.insert(long.to_string());
+                        format!("--{long}")
+                    },
+                );
+                longs.extend(
+                    arg.get_all_aliases()
+                        .into_iter()
+                        .flatten()
+                        .map(String::from),
+                );
+                for name in mentioned_long_flags(&help_text(arg)) {
+                    mentions.insert((owner.clone(), name.to_string()));
+                }
+            }
+            for sub in command.get_subcommands() {
+                walk(sub, longs, mentions);
+            }
+        }
+
+        let mut command = Cli::command();
+        // `build` adds the generated `--help` and `--version`.
+        command.build();
+        let (mut longs, mut mentions) = (BTreeSet::new(), BTreeSet::new());
+        walk(&command, &mut longs, &mut mentions);
+        assert!(!mentions.is_empty(), "found no --flag mentions to check");
+
+        let unknown: Vec<_> = mentions
+            .iter()
+            .filter(|(_, name)| !longs.contains(name))
+            .map(|(owner, name)| format!("{owner} mentions --{name}"))
+            .collect();
+        assert!(unknown.is_empty(), "{unknown:?}");
     }
 
     fn http_client_cli(extra: &[&str]) -> Cli {
