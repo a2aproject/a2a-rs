@@ -19,10 +19,12 @@ pub use client::{
     WebSocketTransport, WebSocketTransportFactory,
 };
 pub use common::{
-    CONTROL_REAUTH_REQUIRED, DEFAULT_MAX_FRAME_BYTES, JSONRPC_VERSION, JsonRpcError, JsonRpcId,
-    SERVER_ERROR_CODE, SUBPROTOCOL, TRANSPORT_PROTOCOL_WEBSOCKET, WsRequestEnvelope,
-    WsResponseEnvelope, close_codes, error_types, methods,
+    DEFAULT_MAX_FRAME_BYTES, JSONRPC_VERSION, JsonRpcError, JsonRpcId,
+    ReauthenticationRequiredParams, SERVER_ERROR_CODE, SUBPROTOCOL, StreamControlParams,
+    TRANSPORT_PROTOCOL_WEBSOCKET, WsRequestEnvelope, WsResponseEnvelope, binding_errors,
+    close_codes, methods,
 };
+pub use errors::{binding_error, binding_error_reason};
 pub use limits::{
     ConnectionLimitPolicy, ConnectionLimits, DEFAULT_CONNECTION_LIMITS, IdentityConnectionCounter,
 };

@@ -6,6 +6,7 @@
 //! `WebSocketTransport`, and exercise the full request/response, streaming,
 //! and cancellation paths over an actual TCP loopback connection.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use a2a_websocket::auth::{
 use a2a_websocket::{
     Backoff, ConnectOptions, ConnectionLimitPolicy, ConnectionLimits, CredentialProvider, Liveness,
     LivenessPolicy, RateLimit, RateLimitPolicy, WebSocketConfig, WebSocketTransport,
-    server::websocket_router, server::websocket_router_with_auth,
+    binding_error_reason, server::websocket_router, server::websocket_router_with_auth,
     server::websocket_router_with_config,
 };
 use async_trait::async_trait;
@@ -158,13 +159,12 @@ impl WsAuthenticator for TokenAuth {
     async fn refresh(
         &self,
         ctx: &AuthContext,
-        _scheme: &str,
-        credentials: &str,
+        credentials: &HashMap<String, String>,
     ) -> Result<AuthContext, AuthError> {
-        if credentials == "new-good" {
-            Ok(ctx.clone())
-        } else {
-            Err(AuthError::unauthorized("bad refresh credentials"))
+        match credentials.get("bearer").map(String::as_str) {
+            Some("new-good") => Ok(ctx.clone()),
+            Some(_) => Err(AuthError::unauthorized("bad refresh credentials")),
+            None => Err(AuthError::invalid_params("unknown security scheme")),
         }
     }
 }
@@ -330,7 +330,7 @@ async fn end_to_end_dropping_stream_emits_cancel_stream_to_server() {
             .await
             .unwrap();
         // Consume just one event then drop the stream — this should trigger the
-        // Drop guard which emits a `cancelStream: true` envelope to the server.
+        // Drop guard which sends a `ws/CancelStream` notification.
         let first = stream.next().await.unwrap().unwrap();
         match first {
             StreamResponse::StatusUpdate(_) | StreamResponse::Task(_) => {}
@@ -543,16 +543,24 @@ async fn end_to_end_in_band_authenticate_refresh_round_trips() {
 
     // A good refresh succeeds...
     transport
-        .authenticate("Bearer", "new-good")
+        .authenticate(AuthenticateParams::single("bearer", "new-good"))
         .await
         .expect("refresh with valid credentials should succeed");
 
-    // ...and a bad refresh surfaces the server error.
+    // ...a bad refresh surfaces WS_UNAUTHENTICATED...
     let err = transport
-        .authenticate("Bearer", "still-bad")
+        .authenticate(AuthenticateParams::single("bearer", "still-bad"))
         .await
         .unwrap_err();
     assert_eq!(err.code, a2a_websocket::SERVER_ERROR_CODE);
+    assert_eq!(binding_error_reason(&err), Some("WS_UNAUTHENTICATED"));
+
+    // ...and an unknown scheme is invalid params.
+    let err = transport
+        .authenticate(AuthenticateParams::single("unknown", "x"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, error_code::INVALID_PARAMS);
 
     // The connection remains usable afterwards.
     transport
@@ -587,12 +595,27 @@ async fn raw_connect_as(
     url: &str,
     bearer: Option<&str>,
 ) -> fastwebsockets::WebSocket<TokioIo<hyper::upgrade::Upgraded>> {
+    let mut headers = vec![("A2A-Version", a2a::VERSION.to_string())];
+    if let Some(token) = bearer {
+        headers.push(("Authorization", format!("Bearer {token}")));
+    }
+    raw_upgrade(url, "", &headers)
+        .await
+        .expect("raw handshake should succeed")
+}
+
+/// Attempt a raw upgrade with exactly the given extra headers and query string.
+async fn raw_upgrade(
+    url: &str,
+    query: &str,
+    headers: &[(&str, String)],
+) -> Result<fastwebsockets::WebSocket<TokioIo<hyper::upgrade::Upgraded>>, String> {
     let rest = url.strip_prefix("ws://").expect("ws:// url");
     let (authority, path) = rest.split_once('/').expect("url with a path");
     let stream = TcpStream::connect(authority).await.unwrap();
     let mut builder = http::Request::builder()
         .method("GET")
-        .uri(format!("/{path}"))
+        .uri(format!("/{path}{query}"))
         .header("Host", authority)
         .header("Upgrade", "websocket")
         .header("Connection", "upgrade")
@@ -602,16 +625,145 @@ async fn raw_connect_as(
         )
         .header("Sec-WebSocket-Version", "13")
         .header("Sec-WebSocket-Protocol", a2a_websocket::SUBPROTOCOL);
-    if let Some(token) = bearer {
-        builder = builder.header("Authorization", format!("Bearer {token}"));
+    for (name, value) in headers {
+        builder = builder.header(*name, value);
     }
     let request = builder
         .body(http_body_util::Empty::<hyper::body::Bytes>::new())
         .unwrap();
-    let (ws, _response) = fastwebsockets::handshake::client(&SpawnExecutor, request, stream)
+    fastwebsockets::handshake::client(&SpawnExecutor, request, stream)
         .await
-        .expect("raw handshake should succeed");
-    ws
+        .map(|(ws, _response)| ws)
+        .map_err(|e| e.to_string())
+}
+
+async fn read_json(
+    ws: &mut fastwebsockets::WebSocket<TokioIo<hyper::upgrade::Upgraded>>,
+) -> serde_json::Value {
+    let frame = tokio::time::timeout(Duration::from_secs(5), ws.read_frame())
+        .await
+        .expect("timed out waiting for a frame")
+        .unwrap();
+    assert_eq!(frame.opcode, OpCode::Text, "expected a text frame");
+    serde_json::from_slice(&frame.payload).unwrap()
+}
+
+async fn write_json(
+    ws: &mut fastwebsockets::WebSocket<TokioIo<hyper::upgrade::Upgraded>>,
+    value: serde_json::Value,
+) {
+    ws.write_frame(Frame::text(Payload::Owned(value.to_string().into_bytes())))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn end_to_end_upgrade_without_a2a_version_is_rejected() {
+    let (url, shutdown) = start_server(EchoExecutor).await;
+    // An absent version means 0.3, which this binding does not support.
+    assert!(raw_upgrade(&url, "", &[]).await.is_err());
+    shutdown.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn end_to_end_upgrade_with_an_unsupported_a2a_version_is_rejected() {
+    let (url, shutdown) = start_server(EchoExecutor).await;
+    let headers = [("A2A-Version", "2.0".to_string())];
+    assert!(raw_upgrade(&url, "", &headers).await.is_err());
+    shutdown.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn end_to_end_a2a_version_query_parameter_is_accepted() {
+    let (url, shutdown) = start_server(EchoExecutor).await;
+    let mut ws = raw_upgrade(&url, "?A2A-Version=1.0", &[])
+        .await
+        .expect("a query-string version is enough for browser clients");
+    write_json(
+        &mut ws,
+        serde_json::json!({"jsonrpc": "2.0", "id": "q", "method": "Bogus", "params": {}}),
+    )
+    .await;
+    assert_eq!(read_json(&mut ws).await["id"], "q");
+    shutdown.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn end_to_end_a_request_cannot_change_the_connection_version() {
+    let (url, shutdown) = start_server(EchoExecutor).await;
+    let mut ws = raw_connect(&url).await;
+    let params = a2a_pb::protojson_conv::to_value(&send_message_request()).unwrap();
+    write_json(
+        &mut ws,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "v",
+            "method": a2a_websocket::methods::SEND_MESSAGE,
+            "params": params,
+            "serviceParams": {"A2A-Version": "1.1"},
+        }),
+    )
+    .await;
+    let response = read_json(&mut ws).await;
+    assert_eq!(response["id"], "v");
+    assert_eq!(response["error"]["code"], -32009);
+    shutdown.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn end_to_end_cancel_stream_notification_ends_with_stream_end() {
+    let (url, shutdown) = start_server(SlowStreamingExecutor {
+        events: 100,
+        gap: Duration::from_millis(20),
+    })
+    .await;
+    let mut ws = raw_connect(&url).await;
+    let params = a2a_pb::protojson_conv::to_value(&send_message_request()).unwrap();
+    write_json(
+        &mut ws,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "s",
+            "method": a2a_websocket::methods::SEND_STREAMING_MESSAGE,
+            "params": params,
+        }),
+    )
+    .await;
+    assert_eq!(read_json(&mut ws).await["id"], "s");
+
+    write_json(
+        &mut ws,
+        serde_json::json!({"jsonrpc": "2.0", "method": "ws/CancelStream", "params": {"id": "s"}}),
+    )
+    .await;
+
+    let end = loop {
+        let value = read_json(&mut ws).await;
+        if value.get("method").is_some() {
+            break value;
+        }
+    };
+    assert_eq!(
+        end,
+        serde_json::json!({"jsonrpc": "2.0", "method": "ws/StreamEnd", "params": {"id": "s"}})
+    );
+    shutdown.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn end_to_end_invalid_utf8_is_closed_with_1007() {
+    let (url, shutdown) = start_server(EchoExecutor).await;
+    let mut ws = raw_connect(&url).await;
+    ws.set_auto_close(false);
+    ws.write_frame(Frame::text(Payload::Owned(vec![0xff, 0xfe, 0xfd])))
+        .await
+        .unwrap();
+    let frame = ws.read_frame().await.expect("server should close cleanly");
+    assert_eq!(
+        close_code_of(&frame),
+        a2a_websocket::close_codes::INVALID_PAYLOAD
+    );
+    shutdown.send(()).unwrap();
 }
 
 fn close_code_of(frame: &Frame<'_>) -> u16 {
@@ -684,7 +836,7 @@ async fn end_to_end_oversize_message_is_closed_with_1009() {
     assert_eq!(
         close_code_of(&frame),
         a2a_websocket::close_codes::MESSAGE_TOO_BIG,
-        "an oversize message must be closed with 1009 (spec Section 3.6)"
+        "an oversize message must be closed with 1009"
     );
 
     shutdown.send(()).unwrap();
@@ -716,7 +868,7 @@ async fn end_to_end_message_under_the_size_limit_is_still_accepted() {
     shutdown.send(()).unwrap();
 }
 
-/// Keep-alive ping/pong support is required by Section 2.4.
+/// Keep-alive ping/pong support is required by the binding.
 ///
 /// Worth covering explicitly because the pong is not written by the read half:
 /// once the socket is split, `fastwebsockets` hands back the frames it owes the
@@ -783,7 +935,7 @@ async fn end_to_end_client_initiated_close_is_echoed() {
 }
 
 #[tokio::test]
-async fn end_to_end_malformed_json_gets_a_parse_error_before_the_1002_close() {
+async fn end_to_end_malformed_json_gets_a_parse_error_and_the_connection_stays_open() {
     let (url, shutdown) = start_server(EchoExecutor).await;
     let mut ws = raw_connect(&url).await;
     ws.set_auto_close(false);
@@ -792,28 +944,47 @@ async fn end_to_end_malformed_json_gets_a_parse_error_before_the_1002_close() {
         .await
         .unwrap();
 
-    // The error response has to be written before the connection goes away,
-    // otherwise the peer cannot tell a rejected message from a dropped socket
-    // (spec Sections 3.3 and 7.2).
-    let frame = ws.read_frame().await.expect("server should answer");
-    assert_eq!(
-        frame.opcode,
-        OpCode::Text,
-        "expected a parse error response"
-    );
-    let response: serde_json::Value = serde_json::from_slice(&frame.payload).unwrap();
+    let response = read_json(&mut ws).await;
     assert_eq!(response["error"]["code"], error_code::PARSE_ERROR);
+    assert!(response["id"].is_null());
 
-    let close = ws.read_frame().await.expect("server should close cleanly");
-    assert_eq!(
-        close_code_of(&close),
-        a2a_websocket::close_codes::PROTOCOL_ERROR
-    );
+    write_json(
+        &mut ws,
+        serde_json::json!({"jsonrpc": "2.0", "id": "next", "method": "Bogus", "params": {}}),
+    )
+    .await;
+    assert_eq!(read_json(&mut ws).await["id"], "next");
 
     shutdown.send(()).unwrap();
 }
 
-// --- Rate limiting (spec Section 13.3) ------------------------------------
+#[tokio::test]
+async fn end_to_end_notifications_are_never_answered() {
+    let (url, shutdown) = start_server(EchoExecutor).await;
+    let mut ws = raw_connect(&url).await;
+
+    write_json(
+        &mut ws,
+        serde_json::json!({"jsonrpc": "2.0", "method": "SendMessage", "params": {}}),
+    )
+    .await;
+    write_json(
+        &mut ws,
+        serde_json::json!({"jsonrpc": "2.0", "method": "ws/Unknown"}),
+    )
+    .await;
+    write_json(
+        &mut ws,
+        serde_json::json!({"jsonrpc": "2.0", "id": "after", "method": "Bogus", "params": {}}),
+    )
+    .await;
+
+    // The first frame back answers the request, not either notification.
+    assert_eq!(read_json(&mut ws).await["id"], "after");
+    shutdown.send(()).unwrap();
+}
+
+// --- Rate limiting ---------------------------------------------------------
 
 /// A window long enough that no token is refilled while a test runs, so the
 /// budget under test is exactly `max_messages`.
@@ -870,7 +1041,7 @@ async fn end_to_end_exceeding_the_rate_limit_sends_minus_32000_then_closes_with_
     assert_eq!(
         close_code,
         a2a_websocket::close_codes::POLICY_VIOLATION,
-        "exceeding the limit must close with 1008 (spec Section 13.3)"
+        "exceeding the limit must close with 1008"
     );
 
     let rejection = frames
@@ -878,6 +1049,8 @@ async fn end_to_end_exceeding_the_rate_limit_sends_minus_32000_then_closes_with_
         .expect("the rate-limit error must be delivered before the close");
     assert_eq!(rejection["error"]["code"], a2a_websocket::SERVER_ERROR_CODE);
     assert_eq!(rejection["error"]["message"], "Rate limit exceeded");
+    assert_eq!(rejection["error"]["data"][0]["reason"], "WS_RATE_LIMITED");
+    assert_eq!(rejection["error"]["data"][0]["domain"], "a2a-protocol.org");
     assert!(
         rejection["id"].is_null(),
         "the limit is enforced before parsing, so no request id is echoed"
@@ -939,7 +1112,7 @@ async fn end_to_end_rate_limit_budget_is_shared_across_one_identity() {
     assert_eq!(
         close_code,
         a2a_websocket::close_codes::POLICY_VIOLATION,
-        "the identity budget is shared across connections (spec Section 13.3)"
+        "the identity budget is shared across connections"
     );
     assert_eq!(frames.len(), 1, "only the rate-limit error is sent");
     assert_eq!(frames[0]["error"]["message"], "Rate limit exceeded");
@@ -971,12 +1144,12 @@ async fn end_to_end_requests_within_the_rate_limit_are_unaffected() {
     shutdown.send(()).unwrap();
 }
 
-// --- Reauthentication (spec Sections 9.3.2 and 9.3.3) ---------------------
+// --- Reauthentication ------------------------------------------------------
 
-/// Authenticator whose credentials are always "about to expire" until they are
-/// refreshed in-band once, after which the connection is valid again.
+/// Authenticator whose handshake credentials expire `lifetime` after the
+/// upgrade. An in-band refresh installs credentials without an expiry.
 struct ExpiringAuth {
-    grace: Duration,
+    lifetime: Duration,
     refreshed: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -984,19 +1157,19 @@ struct ExpiringAuth {
 impl WsAuthenticator for ExpiringAuth {
     async fn authenticate(&self, headers: &HeaderMap) -> Result<AuthContext, AuthError> {
         match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-            Some("Bearer good-token") => Ok(AuthContext::for_user(User::authenticated("alice"))),
+            Some("Bearer good-token") => {
+                let lifetime = chrono::Duration::from_std(self.lifetime).unwrap();
+                Ok(AuthContext::for_user(User::authenticated("alice"))
+                    .expiring_at(chrono::Utc::now() + lifetime))
+            }
             _ => Err(AuthError::unauthorized("missing or invalid token")),
         }
     }
 
-    async fn revalidate(&self, _ctx: &AuthContext) -> AuthStatus {
-        if self.refreshed.load(std::sync::atomic::Ordering::SeqCst) {
-            AuthStatus::Valid
-        } else {
-            AuthStatus::ReauthRequired {
-                reason: "token expiring".to_string(),
-                retry_after_ms: 1_000,
-            }
+    async fn revalidate(&self, ctx: &AuthContext) -> AuthStatus {
+        match ctx.expires_at {
+            Some(expires_at) => AuthStatus::ExpiresAt { expires_at },
+            None => AuthStatus::Valid,
         }
     }
 
@@ -1007,25 +1180,22 @@ impl WsAuthenticator for ExpiringAuth {
     async fn refresh(
         &self,
         ctx: &AuthContext,
-        _scheme: &str,
-        credentials: &str,
+        credentials: &HashMap<String, String>,
     ) -> Result<AuthContext, AuthError> {
-        if credentials == "new-good" {
+        if credentials.get("bearer").map(String::as_str) == Some("new-good") {
             self.refreshed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(ctx.clone())
+            let mut refreshed = ctx.clone();
+            refreshed.expires_at = None;
+            Ok(refreshed)
         } else {
             Err(AuthError::unauthorized("bad refresh credentials"))
         }
     }
-
-    fn reauth_grace(&self) -> Duration {
-        self.grace
-    }
 }
 
 async fn start_expiring_auth_server(
-    grace: Duration,
+    lifetime: Duration,
 ) -> (
     String,
     Arc<std::sync::atomic::AtomicBool>,
@@ -1041,7 +1211,7 @@ async fn start_expiring_auth_server(
         websocket_router_with_auth(
             handler,
             Arc::new(ExpiringAuth {
-                grace,
+                lifetime,
                 refreshed: refreshed.clone(),
             }),
         ),
@@ -1065,17 +1235,14 @@ struct StaticCredentials(&'static str);
 #[async_trait]
 impl CredentialProvider for StaticCredentials {
     async fn fresh_credentials(&self) -> Result<AuthenticateParams, A2AError> {
-        Ok(AuthenticateParams {
-            scheme: "Bearer".to_string(),
-            credentials: self.0.to_string(),
-        })
+        Ok(AuthenticateParams::single("bearer", self.0))
     }
 }
 
 #[tokio::test]
 async fn end_to_end_in_band_refresh_keeps_the_connection_open() {
-    const GRACE: Duration = Duration::from_millis(1_000);
-    let (url, refreshed, shutdown) = start_expiring_auth_server(GRACE).await;
+    const LIFETIME: Duration = Duration::from_millis(1_000);
+    let (url, refreshed, shutdown) = start_expiring_auth_server(LIFETIME).await;
 
     let transport = WebSocketTransport::connect_with_options(
         &url,
@@ -1085,14 +1252,14 @@ async fn end_to_end_in_band_refresh_keeps_the_connection_open() {
     .await
     .unwrap();
 
-    // This request triggers revalidation, which signals ReauthenticationRequired
-    // and schedules a 4001 close after the grace period.
+    // This request triggers revalidation, which sends ws/ReauthenticationRequired
+    // and schedules a 4001 close at expiresAt.
     transport
         .send_message(&ServiceParams::new(), &send_message_request())
         .await
         .unwrap();
 
-    // The client refreshes in-band rather than reconnecting (Section 9.3.3).
+    // The client refreshes in-band rather than reconnecting.
     for _ in 0..100 {
         if refreshed.load(std::sync::atomic::Ordering::SeqCst) {
             break;
@@ -1104,9 +1271,9 @@ async fn end_to_end_in_band_refresh_keeps_the_connection_open() {
         "the credential provider should have refreshed the connection in-band"
     );
 
-    // Once the grace period has elapsed the connection must still be usable:
-    // a successful refresh cancels the pending 4001 close.
-    tokio::time::sleep(GRACE + Duration::from_millis(300)).await;
+    // Once the old credentials have expired the connection must still be
+    // usable: a successful refresh cancels the pending 4001 close.
+    tokio::time::sleep(LIFETIME + Duration::from_millis(300)).await;
     let response = transport
         .send_message(&ServiceParams::new(), &send_message_request())
         .await
@@ -1119,8 +1286,8 @@ async fn end_to_end_in_band_refresh_keeps_the_connection_open() {
 
 #[tokio::test]
 async fn end_to_end_notify_policy_reports_reauth_and_the_4001_close_is_surfaced() {
-    const GRACE: Duration = Duration::from_millis(200);
-    let (url, _refreshed, shutdown) = start_expiring_auth_server(GRACE).await;
+    const LIFETIME: Duration = Duration::from_millis(500);
+    let (url, _refreshed, shutdown) = start_expiring_auth_server(LIFETIME).await;
 
     let (reauth_tx, mut reauth_rx) = tokio::sync::mpsc::unbounded_channel();
     let transport = WebSocketTransport::connect_with_options(
@@ -1139,14 +1306,16 @@ async fn end_to_end_notify_policy_reports_reauth_and_the_4001_close_is_surfaced(
 
     let signal = tokio::time::timeout(Duration::from_secs(5), reauth_rx.recv())
         .await
-        .expect("the reauth callback should fire (spec Section 9.3.2)")
+        .expect("the reauth callback should fire")
         .unwrap();
-    assert_eq!(signal.reason.as_deref(), Some("token expiring"));
-    assert_eq!(signal.retry_after_ms, Some(1_000));
+    assert!(
+        signal.expires_at > chrono::Utc::now(),
+        "expiresAt should still be in the future when the notification arrives"
+    );
 
-    // Without a refresh the server closes with 4001 after the grace period, and
-    // the reason must be visible to the caller rather than a bare disconnect.
-    tokio::time::sleep(GRACE + Duration::from_millis(300)).await;
+    // Without a refresh the server closes with 4001 at expiresAt, and the
+    // reason must be visible to the caller rather than a bare disconnect.
+    tokio::time::sleep(LIFETIME + Duration::from_millis(300)).await;
     let err = transport
         .send_message(&ServiceParams::new(), &send_message_request())
         .await
@@ -1162,7 +1331,7 @@ async fn end_to_end_notify_policy_reports_reauth_and_the_4001_close_is_surfaced(
 
 // ---------------------------------------------------------------------------
 // The identity the authenticator establishes is what the handler sees, and only
-// the authenticator can change it (spec Sections 9.1–9.3.3).
+// the authenticator can change it (spec Sections 9.3 and 9.4).
 // ---------------------------------------------------------------------------
 
 const CALLER_PARAM: &str = "x-caller";
@@ -1206,8 +1375,8 @@ impl AgentExecutor for CallerEchoExecutor {
     }
 }
 
-/// Maps each credential to a different principal, so a refresh visibly changes
-/// who the connection is.
+/// Maps each credential to a principal, so a test can try to switch who the
+/// connection is with an in-band refresh.
 struct RotatingIdentityAuth;
 
 #[async_trait]
@@ -1227,11 +1396,12 @@ impl WsAuthenticator for RotatingIdentityAuth {
     async fn refresh(
         &self,
         _ctx: &AuthContext,
-        _scheme: &str,
-        credentials: &str,
+        credentials: &HashMap<String, String>,
     ) -> Result<AuthContext, AuthError> {
-        match credentials {
-            "bob-token" => {
+        match credentials.get("bearer").map(String::as_str) {
+            Some("alice-token-2") => Ok(AuthContext::for_user(User::authenticated("alice"))
+                .with_param(CALLER_PARAM, "alice")),
+            Some("bob-token") => {
                 Ok(AuthContext::for_user(User::authenticated("bob"))
                     .with_param(CALLER_PARAM, "bob"))
             }
@@ -1304,7 +1474,7 @@ async fn end_to_end_a_request_cannot_override_the_authenticated_identity() {
 }
 
 #[tokio::test]
-async fn end_to_end_in_band_refresh_updates_the_identity_seen_by_the_handler() {
+async fn end_to_end_in_band_refresh_cannot_change_the_principal() {
     let (url, shutdown) = start_rotating_identity_server().await;
     let transport = WebSocketTransport::connect_with_options(
         &url,
@@ -1316,18 +1486,25 @@ async fn end_to_end_in_band_refresh_updates_the_identity_seen_by_the_handler() {
     let params = ServiceParams::new();
     assert_eq!(observed_caller(&transport, &params).await, "alice");
 
-    transport.authenticate("Bearer", "bob-token").await.unwrap();
+    let err = transport
+        .authenticate(AuthenticateParams::single("bearer", "bob-token"))
+        .await
+        .unwrap_err();
+    assert_eq!(binding_error_reason(&err), Some("WS_PERMISSION_DENIED"));
+    // The rejected refresh leaves the current credentials in place.
+    assert_eq!(observed_caller(&transport, &params).await, "alice");
 
-    // Refreshing the credentials replaces the principal; continuing to serve
-    // requests as `alice` would leave the connection acting on stale
-    // authorization.
-    assert_eq!(observed_caller(&transport, &params).await, "bob");
+    transport
+        .authenticate(AuthenticateParams::single("bearer", "alice-token-2"))
+        .await
+        .expect("a refresh for the same principal succeeds");
+    assert_eq!(observed_caller(&transport, &params).await, "alice");
 
     shutdown.send(()).unwrap();
 }
 
 // ---------------------------------------------------------------------------
-// Keep-alive and idle timeouts (spec Section 2.4)
+// Keep-alive and idle timeouts (spec Section 2.2)
 // ---------------------------------------------------------------------------
 
 /// Emits events on a timer, so a stream can be made to outlive a short idle
@@ -1421,7 +1598,7 @@ async fn end_to_end_server_sends_keep_alive_pings() {
     assert_eq!(
         frame.opcode,
         OpCode::Ping,
-        "the server must send keep-alive pings (spec Section 2.4)"
+        "the server must send keep-alive pings (spec Section 2.2)"
     );
 
     shutdown.send(()).unwrap();
@@ -1530,7 +1707,7 @@ async fn end_to_end_an_active_stream_is_not_closed_as_idle() {
 }
 
 // ---------------------------------------------------------------------------
-// Connection and stream limits (spec Section 13.5)
+// Connection and stream limits (spec Section 8.6)
 // ---------------------------------------------------------------------------
 
 /// Maps each bearer token to an identity of the same name, so a test can hold
@@ -1600,7 +1777,7 @@ async fn end_to_end_connections_beyond_the_per_identity_cap_are_refused() {
             .await;
     assert!(
         second.is_err(),
-        "a second connection for the same identity must be refused (spec Section 13.5)"
+        "a second connection for the same identity must be refused (spec Section 8.6)"
     );
 
     // The cap is per identity, so another principal is unaffected.
@@ -1722,13 +1899,16 @@ async fn end_to_end_streams_beyond_the_per_connection_cap_are_refused() {
         a2a_websocket::SERVER_ERROR_CODE,
         "an over-cap stream must be refused with a server error, got {rejection}"
     );
-    assert_eq!(rejection["error"]["message"], "Too many concurrent streams");
+    assert_eq!(
+        rejection["error"]["data"][0]["reason"],
+        "WS_TOO_MANY_IN_FLIGHT"
+    );
 
     shutdown.send(()).unwrap();
 }
 
 // ---------------------------------------------------------------------------
-// Reconnection (spec Section 8.4)
+// Reconnection (spec Section 8.5)
 // ---------------------------------------------------------------------------
 
 /// Short delays with jitter off, so retry behaviour can be asserted without

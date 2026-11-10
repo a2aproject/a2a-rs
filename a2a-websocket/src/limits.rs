@@ -1,9 +1,9 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Connection and stream limits (spec Section 13.5).
+//! Connection and stream limits (spec Section 8.6).
 //!
-//! Two caps, both asked for by Section 13.5: how many connections one
+//! Two caps, both asked for by Section 8.6: how many connections one
 //! authenticated identity may hold open against a server, and how many streams
 //! may be active on a single connection.
 
@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 
 /// Caps applied when no explicit ones are given.
 ///
-/// Section 13.5 asks for limits without recommending values, unlike the
-/// intervals in Section 2.4. These are deliberately generous: they exist to stop
+/// Section 8.6 asks for limits without recommending values, unlike the
+/// intervals in Section 2.2. These are deliberately generous: they exist to stop
 /// one identity from exhausting a server, not to shape normal traffic. Deployments
 /// with a known client population should set their own.
 pub const DEFAULT_CONNECTION_LIMITS: ConnectionLimits = ConnectionLimits {
@@ -21,7 +21,7 @@ pub const DEFAULT_CONNECTION_LIMITS: ConnectionLimits = ConnectionLimits {
     max_streams_per_connection: 128,
 };
 
-/// Resource caps for a WebSocket server (spec Section 13.5).
+/// Resource caps for a WebSocket server (spec Section 8.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionLimits {
     /// Maximum concurrent connections held by one authenticated identity.
@@ -32,7 +32,7 @@ pub struct ConnectionLimits {
     pub max_streams_per_connection: usize,
 }
 
-/// Whether a server enforces the Section 13.5 caps, and with what values.
+/// Whether a server enforces the Section 8.6 caps, and with what values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionLimitPolicy {
     /// Apply [`DEFAULT_CONNECTION_LIMITS`].

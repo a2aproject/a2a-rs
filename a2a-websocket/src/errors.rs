@@ -6,48 +6,93 @@
 //! The WebSocket binding reuses the A2A JSON-RPC binding's error model: the
 //! numeric `code` is the canonical A2A error code and the human-readable
 //! `message` is carried verbatim, with any structured detail in `data`.
+//! Binding-specific errors share code `-32000` and are told apart by the
+//! `reason` of their `google.rpc.ErrorInfo` (spec Section 7.3).
 
-use a2a::{A2AError, error_code};
+use std::collections::HashMap;
+
+use a2a::errordetails::{ERROR_INFO_TYPE, PROTOCOL_DOMAIN, TypedDetail};
+use a2a::{A2AError, a2a_error_from_details};
 use fastwebsockets::WebSocketError;
+use serde_json::Value;
 
-use crate::common::{JsonRpcError, close_codes};
+use crate::common::{JsonRpcError, SERVER_ERROR_CODE, binding_errors, close_codes};
+
+/// Build a binding-specific error: code `-32000` with an `ErrorInfo` carrying
+/// `reason` (one of [`binding_errors`]) and optional metadata (spec Section 7.3).
+pub fn binding_error(
+    reason: &str,
+    message: impl Into<String>,
+    metadata: Option<HashMap<String, String>>,
+) -> A2AError {
+    A2AError::new(SERVER_ERROR_CODE, message).with_details(vec![TypedDetail::error_info(
+        reason,
+        PROTOCOL_DOMAIN,
+        metadata,
+    )])
+}
+
+/// The binding-specific `reason` of an error, if it is one (spec Section 7.3).
+pub fn binding_error_reason(err: &A2AError) -> Option<&str> {
+    if err.code != SERVER_ERROR_CODE {
+        return None;
+    }
+    err.details.as_ref()?.iter().rev().find_map(|detail| {
+        if detail.type_url != ERROR_INFO_TYPE
+            || detail.value.get("domain").and_then(Value::as_str) != Some(PROTOCOL_DOMAIN)
+        {
+            return None;
+        }
+        let reason = detail.value.get("reason")?.as_str()?;
+        binding_errors::is_binding_reason(reason).then_some(reason)
+    })
+}
 
 /// Translate an [`A2AError`] into a JSON-RPC 2.0 error object, preserving the
 /// numeric code and structured `data` (spec Section 7).
 pub fn a2a_error_to_jsonrpc(err: &A2AError) -> JsonRpcError {
-    err.to_jsonrpc_error()
-}
-
-/// Translate a JSON-RPC 2.0 error object back into an [`A2AError`], preserving
-/// the numeric code and message.
-pub fn jsonrpc_error_to_a2a(err: &JsonRpcError) -> A2AError {
-    A2AError::new(err.code, err.message.clone())
-}
-
-/// Return the WebSocket close code that should be used when an A2A error is
-/// fatal to the connection. Most errors are non-fatal, so the function returns
-/// `None`. See Section 7 of the spec.
-pub fn close_code_for_fatal(err: &A2AError) -> Option<u16> {
-    match err.code {
-        error_code::PARSE_ERROR => Some(close_codes::PROTOCOL_ERROR),
-        error_code::VERSION_NOT_SUPPORTED => Some(close_codes::VERSION_NOT_SUPPORTED),
-        _ => None,
+    let mut out = err.to_jsonrpc_error();
+    // `to_jsonrpc_error` derives the `ErrorInfo` reason from the code, which for
+    // `-32000` is `INTERNAL_ERROR`; a binding error must carry its own reason.
+    if let Some(reason) = binding_error_reason(err) {
+        if let Some(Value::Array(items)) = out.data.as_mut() {
+            if let Some(info) = items
+                .iter_mut()
+                .rev()
+                .find(|item| item.get("@type").and_then(Value::as_str) == Some(ERROR_INFO_TYPE))
+            {
+                info["reason"] = Value::String(reason.to_string());
+            }
+        }
     }
+    out
+}
+
+/// Translate a JSON-RPC 2.0 error object back into an [`A2AError`], keeping the
+/// typed details in `data` so callers can inspect a binding error's reason.
+pub fn jsonrpc_error_to_a2a(err: &JsonRpcError) -> A2AError {
+    let details: Vec<TypedDetail> = match &err.data {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| serde_json::from_value(item.clone()).ok())
+            .collect(),
+        _ => Vec::new(),
+    };
+    a2a_error_from_details(err.code, err.message.clone(), details)
 }
 
 /// Return the close code to send when reading an inbound frame fails, or
 /// `None` when the transport is already broken and a Close frame would have
 /// nowhere to go.
 ///
-/// A message exceeding the negotiated maximum size is reported as `1009`
-/// (Message Too Big) per Section 3.6; the remaining RFC 6455 framing
-/// violations are reported as `1002` (Protocol Error) per the close-code table
-/// in Section 2.3.
+/// A message exceeding the maximum size is reported as `1009` (Section 3.6),
+/// a text message that is not valid UTF-8 as `1007`, and the remaining RFC
+/// 6455 framing violations as `1002` (Sections 2.3 and 7.4).
 pub fn close_code_for_read_error(err: &WebSocketError) -> Option<u16> {
     match err {
         WebSocketError::FrameTooLarge => Some(close_codes::MESSAGE_TOO_BIG),
+        WebSocketError::InvalidUTF8 => Some(close_codes::INVALID_PAYLOAD),
         WebSocketError::InvalidFragment
-        | WebSocketError::InvalidUTF8
         | WebSocketError::InvalidContinuationFrame
         | WebSocketError::InvalidCloseFrame
         | WebSocketError::InvalidCloseCode
@@ -63,6 +108,7 @@ pub fn close_code_for_read_error(err: &WebSocketError) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use a2a::error_code;
 
     #[test]
     fn a2a_error_round_trips_through_jsonrpc() {
@@ -89,23 +135,41 @@ mod tests {
     }
 
     #[test]
-    fn close_code_for_fatal_only_set_for_known_fatal_errors() {
-        assert_eq!(
-            close_code_for_fatal(&A2AError::new(error_code::PARSE_ERROR, "x")),
-            Some(close_codes::PROTOCOL_ERROR)
+    fn binding_error_carries_its_reason_and_metadata_on_the_wire() {
+        let err = binding_error(
+            binding_errors::UNAUTHENTICATED,
+            "Invalid credentials",
+            Some(HashMap::from([(
+                "schemes".to_string(),
+                "oauth".to_string(),
+            )])),
         );
-        assert_eq!(
-            close_code_for_fatal(&A2AError::new(error_code::VERSION_NOT_SUPPORTED, "x")),
-            Some(close_codes::VERSION_NOT_SUPPORTED)
-        );
-        assert_eq!(
-            close_code_for_fatal(&A2AError::new(error_code::TASK_NOT_FOUND, "x")),
-            None
-        );
-        assert_eq!(
-            close_code_for_fatal(&A2AError::new(error_code::INTERNAL_ERROR, "x")),
-            None
-        );
+        let jsonrpc = a2a_error_to_jsonrpc(&err);
+        assert_eq!(jsonrpc.code, SERVER_ERROR_CODE);
+        let data = jsonrpc.data.as_ref().unwrap().as_array().unwrap();
+        let info = data
+            .iter()
+            .find(|item| item["@type"] == ERROR_INFO_TYPE)
+            .unwrap();
+        assert_eq!(info["reason"], "WS_UNAUTHENTICATED");
+        assert_eq!(info["domain"], PROTOCOL_DOMAIN);
+        assert_eq!(info["metadata"]["schemes"], "oauth");
+    }
+
+    #[test]
+    fn binding_error_reason_survives_a_round_trip() {
+        let err = binding_error(binding_errors::RATE_LIMITED, "Rate limit exceeded", None);
+        let back = jsonrpc_error_to_a2a(&a2a_error_to_jsonrpc(&err));
+        assert_eq!(back.code, SERVER_ERROR_CODE);
+        assert_eq!(binding_error_reason(&back), Some("WS_RATE_LIMITED"));
+    }
+
+    #[test]
+    fn a2a_errors_have_no_binding_reason() {
+        let err = A2AError::new(error_code::TASK_NOT_FOUND, "x");
+        assert_eq!(binding_error_reason(&err), None);
+        let back = jsonrpc_error_to_a2a(&a2a_error_to_jsonrpc(&err));
+        assert_eq!(binding_error_reason(&back), None);
     }
 
     #[test]
@@ -117,10 +181,17 @@ mod tests {
     }
 
     #[test]
+    fn invalid_utf8_maps_to_invalid_payload() {
+        assert_eq!(
+            close_code_for_read_error(&WebSocketError::InvalidUTF8),
+            Some(close_codes::INVALID_PAYLOAD)
+        );
+    }
+
+    #[test]
     fn framing_violations_map_to_protocol_error() {
         for err in [
             WebSocketError::InvalidFragment,
-            WebSocketError::InvalidUTF8,
             WebSocketError::InvalidContinuationFrame,
             WebSocketError::InvalidCloseFrame,
             WebSocketError::InvalidCloseCode,

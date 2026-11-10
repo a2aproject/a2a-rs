@@ -1,7 +1,7 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Connection liveness: keep-alive pings and idle timeouts (spec Section 2.4).
+//! Connection liveness: keep-alive pings and idle timeouts (spec Section 2.2).
 //!
 //! Answering a ping is handled by the WebSocket layer itself. This module covers
 //! the parts the binding has to drive: sending pings on an interval, closing a
@@ -13,14 +13,14 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-/// Intervals recommended by spec Section 2.4.
+/// Intervals recommended by spec Section 2.2.
 pub const DEFAULT_LIVENESS: Liveness = Liveness {
     ping_interval: Duration::from_secs(30),
     pong_timeout: Duration::from_secs(10),
     idle_timeout: Duration::from_secs(300),
 };
 
-/// Keep-alive and idle timings for a connection (spec Section 2.4).
+/// Keep-alive and idle timings for a connection (spec Section 2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Liveness {
     /// How often to send a keep-alive ping. Recommended: 30 seconds.
@@ -37,7 +37,7 @@ pub struct Liveness {
 /// timings.
 ///
 /// Defaults to [`DEFAULT_LIVENESS`]. Opting out is deliberate rather than the
-/// result of leaving a field unset, since Section 2.4 asks servers to ping and
+/// result of leaving a field unset, since Section 2.2 asks servers to ping and
 /// to bound idle connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LivenessPolicy {

@@ -1,53 +1,56 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use a2a::jsonrpc::{JsonRpcError, JsonRpcId};
 
-/// Transport protocol identifier used in `AgentInterface::protocol_binding`.
-///
-/// Matches the `protocolBinding` value (`WEBSOCKET`) defined in the A2A
-/// WebSocket binding specification (Section 1). The binding transports
-/// JSON-RPC 2.0 messages, but the identifier itself is simply `WEBSOCKET`.
-pub use a2a::TRANSPORT_PROTOCOL_WEBSOCKET;
+/// Transport Identifier of this binding, used as the Agent Card
+/// `protocolBinding` value (spec Sections 1 and 10).
+pub const TRANSPORT_PROTOCOL_WEBSOCKET: &str =
+    "https://a2a-protocol.org/bindings/experimental-websocket/v1";
 
-/// WebSocket sub-protocol negotiated via `Sec-WebSocket-Protocol` (spec Section
-/// 1 / 2.1).
+/// WebSocket sub-protocol negotiated via `Sec-WebSocket-Protocol` (spec Sections
+/// 1 and 2.1).
 pub const SUBPROTOCOL: &str = "a2a.v1";
 
-/// The JSON-RPC protocol version string. Every frame carries this value in its
-/// `jsonrpc` member (spec Section 3).
+/// The JSON-RPC protocol version string. Every message carries this value in
+/// its `jsonrpc` member (spec Section 3).
 pub const JSONRPC_VERSION: &str = "2.0";
 
-/// Recommended maximum frame size (1 MiB) per the binding spec (Section 3.6).
+/// Recommended maximum message size (1 MiB) per the binding spec (Section 3.6).
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1 << 20;
 
-/// Implementation-defined JSON-RPC server-error code used for binding-specific
-/// server errors that occur *after* the handshake — for example an expired or
-/// revoked authentication token (spec Section 7 and Section 9.3).
+/// JSON-RPC code shared by every binding-specific error (spec Section 7.3). The
+/// `reason` of the accompanying `ErrorInfo` tells the errors apart; see
+/// [`binding_errors`].
 pub const SERVER_ERROR_CODE: i32 = -32000;
-
-/// Name of the server-originated control frame requesting reauthentication
-/// (spec Section 9.3.2).
-pub const CONTROL_REAUTH_REQUIRED: &str = "ReauthenticationRequired";
 
 fn default_jsonrpc() -> String {
     JSONRPC_VERSION.to_string()
 }
 
-/// A2A method names supported by this binding (PascalCase, matching JSON-RPC
-/// and gRPC).
+/// Method names used by this binding: the A2A operations (PascalCase, matching
+/// JSON-RPC and gRPC) and the binding control methods under the reserved `ws/`
+/// prefix (spec Section 5).
 pub mod methods {
-    /// Binding-specific in-band token refresh method (spec Section 9.3.3).
-    ///
-    /// This is **not** part of the core A2A method inventory and is therefore
-    /// intentionally excluded from [`is_known`]; it is handled separately by
-    /// the connection loop only when the server advertises support for it.
-    pub const AUTHENTICATE: &str = "Authenticate";
+    /// Prefix reserved for the binding control methods.
+    pub const CONTROL_PREFIX: &str = "ws/";
+
+    /// Server → client notification that terminates a stream (Section 3.4).
+    pub const STREAM_END: &str = "ws/StreamEnd";
+    /// Client → server notification that stops a stream without cancelling its
+    /// task (Section 3.4).
+    pub const CANCEL_STREAM: &str = "ws/CancelStream";
+    /// Optional server → client notification warning that the connection's
+    /// credentials are about to expire (Section 9.5).
+    pub const REAUTHENTICATION_REQUIRED: &str = "ws/ReauthenticationRequired";
+    /// Optional client → server request presenting credentials in-band
+    /// (Section 9.3).
+    pub const AUTHENTICATE: &str = "ws/Authenticate";
 
     pub const SEND_MESSAGE: &str = "SendMessage";
     pub const SEND_STREAMING_MESSAGE: &str = "SendStreamingMessage";
@@ -65,6 +68,8 @@ pub mod methods {
         matches!(method, SEND_STREAMING_MESSAGE | SUBSCRIBE_TO_TASK)
     }
 
+    /// Whether `method` is one of the A2A operations. Binding control methods
+    /// are not A2A operations and are not included.
     pub fn is_known(method: &str) -> bool {
         matches!(
             method,
@@ -81,6 +86,10 @@ pub mod methods {
                 | GET_EXTENDED_AGENT_CARD
         )
     }
+
+    pub fn is_control(method: &str) -> bool {
+        method.starts_with(CONTROL_PREFIX)
+    }
 }
 
 /// WebSocket close codes used by this binding (spec Section 2.3).
@@ -89,6 +98,7 @@ pub mod close_codes {
     pub const GOING_AWAY: u16 = 1001;
     pub const PROTOCOL_ERROR: u16 = 1002;
     pub const UNSUPPORTED_DATA: u16 = 1003;
+    pub const INVALID_PAYLOAD: u16 = 1007;
     pub const POLICY_VIOLATION: u16 = 1008;
     pub const MESSAGE_TOO_BIG: u16 = 1009;
     pub const INTERNAL_ERROR: u16 = 1011;
@@ -98,26 +108,25 @@ pub mod close_codes {
     pub const VERSION_NOT_SUPPORTED: u16 = 4002;
 }
 
-/// Canonical `data[].reason` strings emitted in JSON-RPC error objects,
-/// mirroring the A2A error type names in the specification (Section 7.2).
-///
-/// These are informational reason strings carried in `error.data`; the
-/// authoritative machine-readable value is the numeric `error.code`.
-pub mod error_types {
-    pub const JSON_PARSE: &str = "JSONParseError";
-    pub const INVALID_REQUEST: &str = "InvalidRequestError";
-    pub const METHOD_NOT_FOUND: &str = "MethodNotFoundError";
-    pub const INVALID_PARAMS: &str = "InvalidParamsError";
-    pub const INTERNAL: &str = "InternalError";
-    pub const TASK_NOT_FOUND: &str = "TaskNotFoundError";
-    pub const TASK_NOT_CANCELABLE: &str = "TaskNotCancelableError";
-    pub const PUSH_NOTIFICATION_NOT_SUPPORTED: &str = "PushNotificationNotSupportedError";
-    pub const UNSUPPORTED_OPERATION: &str = "UnsupportedOperationError";
-    pub const CONTENT_TYPE_NOT_SUPPORTED: &str = "ContentTypeNotSupportedError";
-    pub const INVALID_AGENT_RESPONSE: &str = "InvalidAgentResponseError";
-    pub const EXTENDED_CARD_NOT_CONFIGURED: &str = "ExtendedAgentCardNotConfiguredError";
-    pub const EXTENSION_SUPPORT_REQUIRED: &str = "ExtensionSupportRequiredError";
-    pub const VERSION_NOT_SUPPORTED: &str = "VersionNotSupportedError";
+/// `ErrorInfo` reasons of the binding-specific errors, all sent with code
+/// [`SERVER_ERROR_CODE`] and domain `a2a-protocol.org` (spec Section 7.3).
+pub mod binding_errors {
+    pub const UNAUTHENTICATED: &str = "WS_UNAUTHENTICATED";
+    pub const CREDENTIALS_EXPIRED: &str = "WS_CREDENTIALS_EXPIRED";
+    pub const PERMISSION_DENIED: &str = "WS_PERMISSION_DENIED";
+    pub const RATE_LIMITED: &str = "WS_RATE_LIMITED";
+    pub const TOO_MANY_IN_FLIGHT: &str = "WS_TOO_MANY_IN_FLIGHT";
+
+    pub fn is_binding_reason(reason: &str) -> bool {
+        matches!(
+            reason,
+            UNAUTHENTICATED
+                | CREDENTIALS_EXPIRED
+                | PERMISSION_DENIED
+                | RATE_LIMITED
+                | TOO_MANY_IN_FLIGHT
+        )
+    }
 }
 
 /// Build a stable string key for a [`JsonRpcId`], used to correlate responses
@@ -132,22 +141,19 @@ pub fn id_key(id: &JsonRpcId) -> String {
     }
 }
 
-/// A2A WebSocket request envelope — a JSON-RPC 2.0 request object plus the A2A
-/// extension members (`serviceParams`, `cancelStream`). Each client text frame
-/// carries exactly one of these (spec Sections 3.1, 4.2, 8.5).
+/// A client → server JSON-RPC 2.0 object: an A2A request, a `ws/Authenticate`
+/// request, or a `ws/CancelStream` notification (spec Sections 3.1 and 3.4).
+/// Each client text message carries exactly one of these.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsRequestEnvelope {
     /// **MUST** be exactly `"2.0"` (spec Section 3).
     #[serde(default = "default_jsonrpc")]
     pub jsonrpc: String,
 
-    /// A unique request identifier (string or number). Absent only for
-    /// malformed frames; the binding does not use JSON-RPC notifications.
+    /// Request identifier. Absent for notifications.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<JsonRpcId>,
 
-    /// The A2A method name. Optional only for control messages such as a
-    /// `cancelStream` frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
 
@@ -155,21 +161,13 @@ pub struct WsRequestEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
 
-    /// **A2A extension.** Per-request service parameters (flat string map).
+    /// **Binding extension.** Per-request service parameters (spec Section 4.2).
     #[serde(
         default,
         rename = "serviceParams",
         skip_serializing_if = "Option::is_none"
     )]
     pub service_params: Option<HashMap<String, String>>,
-
-    /// **A2A extension.** Stream cancellation control flag (spec Section 8.5).
-    #[serde(
-        default,
-        rename = "cancelStream",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub cancel_stream: Option<bool>,
 }
 
 impl Default for WsRequestEnvelope {
@@ -180,19 +178,32 @@ impl Default for WsRequestEnvelope {
             method: None,
             params: None,
             service_params: None,
-            cancel_stream: None,
         }
     }
 }
 
-/// A2A WebSocket response envelope — a JSON-RPC 2.0 response object plus the
-/// A2A extension members. Each server text frame is one of: a unary/stream
-/// `result`, an `error`, the `streamEnd` sentinel, or a server-originated
-/// control frame (spec Sections 3.2–3.4, 8, 9.3.2).
+impl WsRequestEnvelope {
+    /// Build a `ws/CancelStream` notification for the stream opened by request
+    /// `id` (spec Section 3.4).
+    pub fn cancel_stream(id: JsonRpcId) -> Self {
+        WsRequestEnvelope {
+            method: Some(methods::CANCEL_STREAM.to_string()),
+            params: Some(serde_json::to_value(StreamControlParams { id }).unwrap_or_default()),
+            ..Default::default()
+        }
+    }
+
+    pub fn is_notification(&self) -> bool {
+        self.id.is_none()
+    }
+}
+
+/// A server → client JSON-RPC 2.0 object: a response or stream event
+/// (`result`), an error, or a binding notification (`method` and `params`)
+/// such as `ws/StreamEnd` (spec Sections 3.2–3.4).
 ///
 /// `id` is `Some(JsonRpcId::Null)` when the request id could not be parsed
-/// (Section 3.3) and `None` only for server-originated control frames that
-/// carry no request id (Section 9.3.2).
+/// (Section 3.3) and `None` for notifications.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsResponseEnvelope {
     /// **MUST** be exactly `"2.0"` (spec Section 3).
@@ -202,7 +213,7 @@ pub struct WsResponseEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<JsonRpcId>,
 
-    /// Unary result **or** a single streaming chunk (`StreamResponse`); both
+    /// Unary result **or** a single streaming event (`StreamResponse`); both
     /// use `result` per Section 3.4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -210,26 +221,13 @@ pub struct WsResponseEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
 
-    /// **A2A extension.** Stream terminator (spec Section 3.4).
-    #[serde(default, rename = "streamEnd", skip_serializing_if = "Option::is_none")]
-    pub stream_end: Option<bool>,
-
-    /// **A2A extension.** Server-originated control frame name, e.g.
-    /// `ReauthenticationRequired` (spec Section 9.3.2).
+    /// Notification method, e.g. `ws/StreamEnd`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control: Option<String>,
+    pub method: Option<String>,
 
-    /// Human-readable reason accompanying a control frame.
+    /// Notification parameters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-
-    /// Suggested client back-off before reconnecting, in milliseconds.
-    #[serde(
-        default,
-        rename = "retryAfterMs",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub retry_after_ms: Option<u64>,
+    pub params: Option<Value>,
 }
 
 impl Default for WsResponseEnvelope {
@@ -239,10 +237,8 @@ impl Default for WsResponseEnvelope {
             id: None,
             result: None,
             error: None,
-            stream_end: None,
-            control: None,
-            reason: None,
-            retry_after_ms: None,
+            method: None,
+            params: None,
         }
     }
 }
@@ -257,20 +253,17 @@ impl WsResponseEnvelope {
         }
     }
 
-    /// Build a single streaming `result` chunk (spec Section 3.4). This is the
+    /// Build a single streaming `result` event (spec Section 3.4). This is the
     /// same shape as a unary result; the client distinguishes them by which
     /// registry the request `id` is tracked in.
     pub fn stream_chunk(id: JsonRpcId, value: Value) -> Self {
         WsResponseEnvelope::result(id, value)
     }
 
-    /// Build a `streamEnd: true` sentinel response (spec Section 3.4).
+    /// Build a `ws/StreamEnd` notification for the stream opened by request
+    /// `id` (spec Section 3.4).
     pub fn stream_end(id: JsonRpcId) -> Self {
-        WsResponseEnvelope {
-            id: Some(id),
-            stream_end: Some(true),
-            ..Default::default()
-        }
+        WsResponseEnvelope::notification(methods::STREAM_END, StreamControlParams { id })
     }
 
     /// Build a JSON-RPC error response for the given request id, or
@@ -283,35 +276,70 @@ impl WsResponseEnvelope {
         }
     }
 
-    /// Build a `ReauthenticationRequired` control frame (spec Section 9.3.2).
-    /// Control frames carry no request `id`.
-    pub fn reauth_required(reason: impl Into<String>, retry_after_ms: u64) -> Self {
+    /// Build a `ws/ReauthenticationRequired` notification. `expires_at` is a
+    /// ProtoJSON `Timestamp` (spec Section 9.5).
+    pub fn reauthentication_required(expires_at: impl Into<String>) -> Self {
+        WsResponseEnvelope::notification(
+            methods::REAUTHENTICATION_REQUIRED,
+            ReauthenticationRequiredParams {
+                expires_at: expires_at.into(),
+            },
+        )
+    }
+
+    fn notification(method: &str, params: impl Serialize) -> Self {
         WsResponseEnvelope {
-            control: Some(CONTROL_REAUTH_REQUIRED.to_string()),
-            reason: Some(reason.into()),
-            retry_after_ms: Some(retry_after_ms),
+            method: Some(method.to_string()),
+            params: Some(serde_json::to_value(params).unwrap_or_default()),
             ..Default::default()
         }
     }
+
+    pub fn is_notification(&self) -> bool {
+        self.method.is_some() && self.id.is_none()
+    }
+}
+
+/// `params` of `ws/StreamEnd` and `ws/CancelStream`: the `id` of the request
+/// that opened the stream (spec Section 3.4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamControlParams {
+    pub id: JsonRpcId,
+}
+
+/// `params` of `ws/ReauthenticationRequired` (spec Section 9.5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReauthenticationRequiredParams {
+    #[serde(rename = "expiresAt")]
+    pub expires_at: String,
 }
 
 /// Convert a flat per-request `serviceParams` map (as carried on the wire)
-/// into the multi-valued `a2a_client::transport::ServiceParams` representation
-/// used internally.
-pub fn service_params_from_envelope(map: &HashMap<String, String>) -> HashMap<String, Vec<String>> {
-    // Keys are lowercased to match the handshake headers, which arrive already
-    // normalized by `HeaderMap`. Without this, `X-Tenant` in an envelope and
-    // `x-tenant` from the handshake would land in the map as two unrelated
-    // entries and a handler could read either one.
-    map.iter()
-        .map(|(k, v)| (k.to_ascii_lowercase(), vec![v.clone()]))
-        .collect()
+/// into the multi-valued `ServiceParams` representation used internally.
+///
+/// Keys are lowercased to match the handshake headers, which arrive already
+/// normalized by `HeaderMap`. Fails when two keys differ only in case, which
+/// the spec requires the server to reject (Section 4.2).
+pub fn service_params_from_envelope(
+    map: &HashMap<String, String>,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let mut seen = HashSet::new();
+    let mut out = HashMap::with_capacity(map.len());
+    for (key, value) in map {
+        let key = key.to_ascii_lowercase();
+        if !seen.insert(key.clone()) {
+            return Err(format!(
+                "serviceParams contains keys that differ only in case: '{key}'"
+            ));
+        }
+        out.insert(key, vec![value.clone()]);
+    }
+    Ok(out)
 }
 
 /// Convert the multi-valued `ServiceParams` representation into the flat
 /// string-string map used in the WebSocket envelope. Multiple values for a
-/// single key are joined with `", "` per RFC 7230 / the WebSocket binding
-/// spec recommendation.
+/// single key are comma-separated (spec Section 4).
 pub fn service_params_to_envelope(
     map: &HashMap<String, Vec<String>>,
 ) -> Option<HashMap<String, String>> {
@@ -328,6 +356,14 @@ pub fn service_params_to_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_identifier_is_the_binding_uri() {
+        assert_eq!(
+            TRANSPORT_PROTOCOL_WEBSOCKET,
+            "https://a2a-protocol.org/bindings/experimental-websocket/v1"
+        );
+    }
 
     #[test]
     fn methods_is_streaming_distinguishes_streaming_calls() {
@@ -354,29 +390,45 @@ mod tests {
             methods::GET_EXTENDED_AGENT_CARD,
         ] {
             assert!(methods::is_known(m), "{m} should be known");
+            assert!(!methods::is_control(m), "{m} is not a control method");
         }
-        // `Authenticate` is a binding-specific method, not part of the core
-        // inventory, so it must not be reported as a known A2A method.
-        assert!(!methods::is_known(methods::AUTHENTICATE));
         assert!(!methods::is_known("MessageSend"));
         assert!(!methods::is_known(""));
     }
 
     #[test]
-    fn request_envelope_serializes_as_jsonrpc_with_extensions() {
+    fn control_methods_use_the_reserved_prefix_and_are_not_a2a_operations() {
+        for m in [
+            methods::STREAM_END,
+            methods::CANCEL_STREAM,
+            methods::REAUTHENTICATION_REQUIRED,
+            methods::AUTHENTICATE,
+        ] {
+            assert!(methods::is_control(m), "{m} should use the ws/ prefix");
+            assert!(!methods::is_known(m), "{m} is not an A2A operation");
+        }
+    }
+
+    #[test]
+    fn request_envelope_serializes_as_jsonrpc_with_service_params() {
         let req = WsRequestEnvelope {
             id: Some("req-1".into()),
             method: Some(methods::SEND_MESSAGE.into()),
             params: Some(serde_json::json!({"message": {"messageId": "m1"}})),
-            service_params: Some(HashMap::from([("a2a-version".into(), "1.0".into())])),
+            service_params: Some(HashMap::from([(
+                "a2a-extensions".into(),
+                "https://example.com/ext".into(),
+            )])),
             ..Default::default()
         };
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(value["jsonrpc"], "2.0");
         assert_eq!(value["id"], "req-1");
         assert_eq!(value["method"], "SendMessage");
-        assert_eq!(value["serviceParams"]["a2a-version"], "1.0");
-        assert!(value.get("cancelStream").is_none());
+        assert_eq!(
+            value["serviceParams"]["a2a-extensions"],
+            "https://example.com/ext"
+        );
     }
 
     #[test]
@@ -397,16 +449,16 @@ mod tests {
     }
 
     #[test]
-    fn request_envelope_with_cancel_stream_only_omits_method() {
-        let req = WsRequestEnvelope {
-            id: Some("req-2".into()),
-            cancel_stream: Some(true),
-            ..Default::default()
-        };
-        let value = serde_json::to_value(&req).unwrap();
-        assert_eq!(value["cancelStream"], true);
-        assert!(value.get("method").is_none());
-        assert!(value.get("params").is_none());
+    fn cancel_stream_is_a_notification_referencing_the_stream_id() {
+        let value = serde_json::to_value(WsRequestEnvelope::cancel_stream("req-2".into())).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "ws/CancelStream",
+                "params": { "id": "req-2" }
+            })
+        );
     }
 
     #[test]
@@ -417,20 +469,27 @@ mod tests {
         assert_eq!(value["id"], "req-1");
         assert_eq!(value["result"]["ok"], true);
         assert!(value.get("error").is_none());
-        assert!(value.get("streamEnd").is_none());
+        assert!(value.get("method").is_none());
     }
 
     #[test]
-    fn response_envelope_stream_chunk_and_end_serialize_correctly() {
+    fn stream_end_is_a_notification_referencing_the_stream_id() {
         let chunk =
             WsResponseEnvelope::stream_chunk("req-2".into(), serde_json::json!({"task": {}}));
         let value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(value["id"], "req-2");
         assert!(value["result"].is_object());
 
-        let end = WsResponseEnvelope::stream_end("req-2".into());
-        let value = serde_json::to_value(&end).unwrap();
-        assert_eq!(value["streamEnd"], true);
+        let end = WsResponseEnvelope::stream_end(JsonRpcId::Number(7));
+        assert!(end.is_notification());
+        assert_eq!(
+            serde_json::to_value(&end).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "ws/StreamEnd",
+                "params": { "id": 7 }
+            })
+        );
     }
 
     #[test]
@@ -449,14 +508,16 @@ mod tests {
     }
 
     #[test]
-    fn reauth_required_control_frame_has_no_id() {
-        let frame = WsResponseEnvelope::reauth_required("Token expiring soon", 0);
-        let value = serde_json::to_value(&frame).unwrap();
-        assert_eq!(value["jsonrpc"], "2.0");
-        assert_eq!(value["control"], CONTROL_REAUTH_REQUIRED);
-        assert_eq!(value["reason"], "Token expiring soon");
-        assert_eq!(value["retryAfterMs"], 0);
-        assert!(value.get("id").is_none());
+    fn reauthentication_required_carries_expires_at_and_no_id() {
+        let frame = WsResponseEnvelope::reauthentication_required("2026-11-10T10:00:00.000Z");
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "ws/ReauthenticationRequired",
+                "params": { "expiresAt": "2026-11-10T10:00:00.000Z" }
+            })
+        );
     }
 
     #[test]
@@ -472,9 +533,25 @@ mod tests {
         assert_eq!(envelope.get("a2a-version"), Some(&"1.0".to_string()));
         assert_eq!(envelope.get("x-multi"), Some(&"a, b".to_string()));
 
-        let restored = service_params_from_envelope(&envelope);
+        let restored = service_params_from_envelope(&envelope).unwrap();
         assert_eq!(restored.get("a2a-version"), Some(&vec!["1.0".to_string()]));
         assert_eq!(restored.get("x-multi"), Some(&vec!["a, b".to_string()]));
+    }
+
+    #[test]
+    fn service_params_from_envelope_lowercases_keys() {
+        let map = HashMap::from([("X-Trace".to_string(), "t".to_string())]);
+        let params = service_params_from_envelope(&map).unwrap();
+        assert_eq!(params.get("x-trace"), Some(&vec!["t".to_string()]));
+    }
+
+    #[test]
+    fn service_params_from_envelope_rejects_keys_differing_only_in_case() {
+        let map = HashMap::from([
+            ("X-Trace".to_string(), "a".to_string()),
+            ("x-trace".to_string(), "b".to_string()),
+        ]);
+        assert!(service_params_from_envelope(&map).is_err());
     }
 
     #[test]

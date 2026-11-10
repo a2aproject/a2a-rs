@@ -1,9 +1,9 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Reconnection backoff (spec Section 8.4).
+//! Reconnection backoff (spec Section 8.5).
 //!
-//! Section 8.4 asks clients to re-establish an interrupted connection, to
+//! Section 8.5 asks clients to re-establish an interrupted connection, to
 //! resubscribe to in-progress tasks, and to tolerate the duplicate events that
 //! overlap can produce. This module covers the first part — when to try again —
 //! because it is purely mechanical.
@@ -15,7 +15,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// The schedule recommended by spec Section 8.4: one second, doubling, capped at
+/// The schedule recommended by spec Section 8.5: one second, doubling, capped at
 /// thirty.
 pub const DEFAULT_BACKOFF: Backoff = Backoff {
     initial: Duration::from_secs(1),
@@ -25,7 +25,7 @@ pub const DEFAULT_BACKOFF: Backoff = Backoff {
     max_attempts: Some(10),
 };
 
-/// An exponential backoff schedule with jitter (spec Section 8.4).
+/// An exponential backoff schedule with jitter (spec Section 8.5).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Backoff {
     /// Delay before the first retry.

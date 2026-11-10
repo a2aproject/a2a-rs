@@ -7,36 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Aligned with the current binding specification (breaking).**
+  - The transport identifier is now
+    `https://a2a-protocol.org/bindings/experimental-websocket/v1` and is
+    defined by this crate as `TRANSPORT_PROTOCOL_WEBSOCKET`; the core crate no
+    longer carries a `WEBSOCKET` constant.
+  - Control messages use the reserved `ws/` method prefix. `ws/StreamEnd`,
+    `ws/CancelStream`, and `ws/ReauthenticationRequired` are JSON-RPC
+    notifications carrying their data in `params`; the `streamEnd`,
+    `cancelStream`, `control`, `reason`, and `retryAfterMs` envelope members
+    are removed.
+  - `Authenticate` is now `ws/Authenticate`, and its params are a
+    `credentials` map keyed by Agent Card `securitySchemes` names
+    (`AuthenticateParams::single`). The result carries an optional
+    `expiresAt`. A refresh must keep the same principal (`WS_PERMISSION_DENIED`
+    otherwise), an unknown scheme is `-32602`, three failed attempts close
+    with `1008`, and a server without in-band refresh answers `-32601`.
+    `WsAuthenticator::refresh` takes the credentials map, and
+    `accepted_schemes` feeds the `schemes` error metadata.
+  - `AuthStatus::ReauthRequired` and `WsAuthenticator::reauth_grace` are
+    replaced by `AuthStatus::ExpiresAt { expires_at }`. The server sends
+    `ws/ReauthenticationRequired` once and closes with `4001` at `expiresAt`
+    unless the credentials are refreshed. On expiry, the current request and
+    every active stream fail with `WS_CREDENTIALS_EXPIRED` before the close.
+  - Binding-specific errors use `-32000` with an `ErrorInfo` reason from
+    `binding_errors` (`WS_UNAUTHENTICATED`, `WS_CREDENTIALS_EXPIRED`,
+    `WS_PERMISSION_DENIED`, `WS_RATE_LIMITED`, `WS_TOO_MANY_IN_FLIGHT`);
+    `binding_error` and `binding_error_reason` build and read them.
+  - `A2A-Version` is connection-scoped. The server reads it from the handshake
+    headers or `A2A-` query parameters, rejects an absent or unsupported
+    version with `400`, and answers a request naming a different version with
+    `-32009`. The client sends it (`ConnectOptions::with_protocol_version`,
+    defaulting to the interface's `protocolVersion` when built by the factory).
+  - Invalid JSON is answered with `-32700` and the connection stays open;
+    repeated malformed messages close with `4000`. Invalid UTF-8 closes with
+    `1007`. Notifications are never answered, and unknown or malformed ones
+    are ignored.
+  - `serviceParams` keys that differ only in case are rejected with `-32600`.
+
 ### Added
 
-- **Keep-alive pings and idle timeouts (spec Section 2.4), previously absent.**
+- **Keep-alive pings and idle timeouts (spec Section 2.2), previously absent.**
   `WebSocketConfig::liveness` takes a `Liveness { ping_interval, pong_timeout,
   idle_timeout }`. A monitor task pings on the interval, closes with `1001`
   (Going Away) when the pong does not arrive in time, and closes with `1001`
   when the connection has carried no application-level message for
   `idle_timeout`. Outbound frames count as activity as well as inbound ones, so
   a long-running stream that pushes events while the client stays quiet is
-  treated as busy rather than idle. On by default with the intervals Section 2.4
+  treated as busy rather than idle. On by default with the intervals Section 2.2
   recommends (30s / 10s / 5min); `LivenessPolicy::Disabled` opts out, which
   suits deployments where a proxy already does this.
-- **Connection and stream limits (spec Section 13.5), previously absent.**
+- **Connection and stream limits (spec Section 8.6), previously absent.**
   `WebSocketConfig::connection_limits` caps concurrent connections per
   authenticated identity and concurrent streams per connection. An identity at
   its connection limit is refused during the upgrade with `503`, so it can back
   off rather than be handed a connection that closes immediately; the slot is
   released however the connection ends. A request that would exceed the stream
-  cap is answered with a `-32000` error and the message `"Too many concurrent
-  streams"`, leaving the connection and its existing streams intact. Stream
+  cap is answered with a `-32000` error and reason `WS_TOO_MANY_IN_FLIGHT`,
+  leaving the connection and its existing streams intact. Stream
   slots are claimed before the handler is invoked, so the cap is decided under a
   single lock rather than after the work has started. On by default with
   deliberately generous values (256 connections per identity, 128 streams per
-  connection), since Section 13.5 recommends no figures;
+  connection), since Section 8.6 recommends no figures;
   `ConnectionLimitPolicy::Disabled` opts out. Registering the stream earlier
-  also means a `cancelStream` arriving while the handler is still starting up is
+  also means a `ws/CancelStream` arriving while the handler is still starting up is
   now honoured instead of missed.
-- **Reconnection backoff (spec Section 8.4), previously absent.**
+- **Reconnection backoff (spec Section 8.5), previously absent.**
   `WebSocketTransport::connect_with_retry` retries a failed connection on an
-  exponential backoff with jitter, defaulting to the schedule Section 8.4
+  exponential backoff with jitter, defaulting to the schedule Section 8.5
   recommends (1s, doubling, capped at 30s). Failures that would recur are not
   retried: a rejected token, an endpoint that is not a WebSocket server, or a
   sub-protocol the server will not speak fail immediately, so a client cannot
@@ -44,29 +84,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `503` this binding's own server returns for a per-identity connection cap.
   Resubscribing to in-progress tasks after reconnecting stays with the
   application, since only it knows which tasks still matter and whether
-  duplicate events are safe to apply twice (Section 8.4 steps 2 and 3).
-- **Inbound message rate limiting (spec Section 13.3), previously absent.**
+  duplicate events are safe to apply twice (Section 8.5 steps 2 and 3).
+- **Inbound message rate limiting (spec Section 7.4), previously absent.**
   `WebSocketConfig::rate_limit` takes a `RateLimit { max_messages, window }` and
   enforces it with a token bucket in both scopes the spec recommends: once per
   connection, and once across every connection belonging to the same
   authenticated identity. A connection that exceeds its budget receives a
-  JSON-RPC error with code `-32000` and message `"Rate limit exceeded"` and is
+  JSON-RPC error with code `-32000` and reason `WS_RATE_LIMITED` and is
   then closed with `1008` (Policy Violation). The limit is checked before the
   frame is parsed, so the error carries `"id": null`. Identity buckets that have
   fully refilled are pruned, since a refilled bucket is indistinguishable from a
   new one, which bounds memory without affecting behaviour. The limit is on by
-  default (`DEFAULT_RATE_LIMIT`, 100 messages/second) because Section 13.3 makes
+  default (`DEFAULT_RATE_LIMIT`, 100 messages/second) because Section 7.4 makes
   it a MUST; `RateLimitPolicy::Disabled` opts out explicitly, which is only
   appropriate behind a trusted layer that enforces its own limits.
-- **Client-side handling of `ReauthenticationRequired` (spec Section 9.3.2),
+- **Client-side handling of `ws/ReauthenticationRequired` (spec Section 9.5),
   which was previously only logged.** `ConnectOptions::reauth` selects a
   `ReauthPolicy`:
-  - `on_reauth_required(callback)` reports the signal (with the server's reason
-    and `retryAfterMs`) so the application can reconnect with fresh
-    credentials.
-  - `with_credential_provider(provider)` implements the in-band path of Section
-    9.3.3: the transport asks the `CredentialProvider` for fresh credentials and
-    installs them with the `Authenticate` method, keeping the connection open.
+  - `on_reauth_required(callback)` reports the notification (with the server's
+    `expiresAt`) so the application can reconnect with fresh credentials.
+  - `with_credential_provider(provider)` implements the in-band path: the
+    transport asks the `CredentialProvider` for fresh credentials and installs
+    them with `ws/Authenticate`, keeping the connection open.
   Leaving `reauth` unset now logs a warning naming both options.
 
 ### Fixed
@@ -106,7 +145,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   This also removes the head-of-line blocking that came with the old structure.
   Reads and writes now progress concurrently instead of taking turns, and
   because outbound frames no longer take priority over inbound ones, a
-  `cancelStream` sent while the server is busy streaming is read promptly
+  `ws/CancelStream` sent while the server is busy streaming is read promptly
   instead of waiting for the outbound queue to drain.
 - **A request can no longer overwrite the identity its connection authenticated
   with.** Per-request `serviceParams` were merged over the connection-scoped
@@ -120,34 +159,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   headers, which arrive normalized. Previously `X-Tenant` from an envelope and
   `x-tenant` from a header landed in the map as two unrelated entries — a
   correctness problem in its own right, and a way around the protection above.
-- **An in-band credential refresh now updates the identity the handler sees.**
-  `Authenticate` replaced the connection's `AuthContext` but not the service
-  parameters derived from it, so a connection that refreshed into a different
-  principal, tenant, or scope set kept being authorized as the previous one for
-  the rest of its life (spec Section 9.3.3).
+- **An in-band credential refresh now updates the authorization the handler
+  sees.** `ws/Authenticate` replaced the connection's `AuthContext` but not the
+  service parameters derived from it, so a connection that refreshed into a
+  different tenant or scope set kept being authorized as before for the rest
+  of its life (spec Section 9.3).
 - **A fatal error response is now actually delivered before the connection
   closes.** The read loop dropped anything still queued on the outbound channel
-  when it exited, so a parse error (`-32700` + `1002`), an expired-credentials
-  error (`4001`), and every other fatal response were silently discarded and the
-  peer saw only a dropped socket. Queued frames are now flushed up to and
-  including the Close frame.
+  when it exited, so an expired-credentials error (`4001`) and every other
+  response sent before a close were silently discarded and the peer saw only
+  a dropped socket. Queued frames are now flushed up to and including the
+  Close frame.
 - **A successful in-band credential refresh now cancels the pending `4001`
-  close.** After signalling `ReauthenticationRequired` the server scheduled an
-  unconditional close once the grace period elapsed, so a client that refreshed
-  via `Authenticate` was disconnected anyway — defeating the purpose of Section
-  9.3.3. The scheduled close is now skipped if the credentials were refreshed in
-  the meantime.
+  close.** After signalling `ws/ReauthenticationRequired` the server scheduled
+  an unconditional close, so a client that refreshed via `ws/Authenticate` was
+  disconnected anyway. The scheduled close is now skipped if the credentials
+  were refreshed in the meantime.
 - **A Close frame's status code now reaches the caller.** In-flight and
   subsequent requests failed with a generic "websocket connection closed"
-  regardless of why the server hung up. Closes carrying `4001`, `1008`, `1009`,
-  and `4002` now produce distinct errors, so an application can tell
-  reauthentication from a rate limit or an oversize message.
+  regardless of why the server hung up. Closes carrying `4001`, `1007`, `1008`,
+  `1009`, `4000`, and `4002` now produce distinct errors, so an application can
+  tell reauthentication from a rate limit or an oversize message.
 - **An oversize inbound message now closes the connection with code `1009`
   (Message Too Big) as required by spec Section 3.6.** Previously the read
   error was logged and the socket was dropped without a Close frame, leaving
-  the peer to infer the reason. Other RFC 6455 framing violations (invalid
-  UTF-8, bad fragmentation, oversize ping, malformed close) now close with
-  `1002` (Protocol Error) per the close-code table in Section 2.3. Errors that
+  the peer to infer the reason. Invalid UTF-8 now closes with `1007`, and other
+  RFC 6455 framing violations (bad fragmentation, oversize ping, malformed
+  close) close with `1002` (Protocol Error) per the close-code table in Section
+  2.3. Errors that
   mean the transport is already gone (EOF, I/O failure) still close silently,
   since there is nowhere to write. The mapping lives in
   `errors::close_code_for_read_error`.
@@ -157,7 +196,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `WebSocketConfig` gained `liveness` and `connection_limits`. Code that builds
   the struct with `..Default::default()` is unaffected; code that lists every
   field must add the two new ones. Both default to enforcing their limits, so
-  existing servers pick up keep-alive pings, idle timeouts, and the Section 13.5
+  existing servers pick up keep-alive pings, idle timeouts, and the Section 8.6
   caps on upgrade.
 - The `fastwebsockets` dependency now enables its `unstable-split` feature, which
   provides the independent read and write halves each connection needs. The
@@ -168,7 +207,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`DEFAULT_MAX_FRAME_BYTES`), which is now re-exported at the crate root.
 - `WebSocketConfig::rate_limit` changed type from `Option<RateLimit>` to
   `RateLimitPolicy` (breaking). A default-constructed config is now conformant
-  with Section 13.3 instead of silently unlimited, and switching the limit off
+  with Section 7.4 instead of silently unlimited, and switching the limit off
   is a deliberate `RateLimitPolicy::Disabled` rather than an omission.
 - `AuthContext::with_param` builds the connection-scoped service parameters that
   carry an authenticated identity to the request handler. `AuthContext::user`
@@ -188,15 +227,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `code` and structured `data` (the previous `{ type, details }` object and
     `WsErrorObject` type are removed).
   - Streaming chunks are delivered in the `result` member (the separate
-    `event` member is removed); `streamEnd`/`cancelStream` are unchanged.
-  - The negotiated sub-protocol remains `a2a.v1`. The binding name and
-    transport identifier (`TRANSPORT_PROTOCOL_WEBSOCKET`) remain `WEBSOCKET`;
-    `jsonrpc` is not used in the binding name even though the wire format is
-    JSON-RPC 2.0.
+    `event` member is removed).
+  - The negotiated sub-protocol remains `a2a.v1`.
 
 ### Added
 
-- Native `wss://` (TLS) client support (spec Section 13.1), behind the new
+- Native `wss://` (TLS) client support (spec Section 1), behind the new
   default `tls` feature:
   - Built on `rustls` with the `ring` crypto provider (no `aws-lc-rs` native
     build). TLS 1.3 and 1.2 are enabled.
@@ -210,14 +246,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Authentication and authorization support (spec Section 9):
   - `WsAuthenticator` trait for handshake authentication (`401`/`403`),
     per-message revalidation, server-initiated reauthentication
-    (`ReauthenticationRequired` control frame + `4001` close), and optional
-    in-band token refresh via the `Authenticate` method.
+    (`ws/ReauthenticationRequired` + `4001` close), and optional in-band
+    refresh via `ws/Authenticate`.
   - `websocket_router_with_auth` / `websocket_router_with_config` and
     `WebSocketConfig` (authenticator + Origin allowlist).
   - Client `ConnectOptions` for supplying handshake headers (e.g. bearer
     tokens) and `WebSocketTransport::authenticate` for in-band refresh.
   - Origin validation for Cross-Site WebSocket Hijacking mitigation
-    (Section 13.2).
+    (Section 9.7).
 
 ## [0.1.0] - 2026-05-06
 

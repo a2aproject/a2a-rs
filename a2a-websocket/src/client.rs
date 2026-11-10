@@ -12,6 +12,7 @@ use a2a::*;
 use a2a_client::transport::{ServiceParams, Transport, TransportFactory};
 use a2a_pb::protojson_conv::{self, ProtoJsonPayload};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use fastwebsockets::{
     FragmentCollectorRead, Frame, OpCode, Payload, WebSocketError, WebSocketWrite, handshake,
 };
@@ -32,9 +33,9 @@ use tokio::time::timeout;
 
 use crate::auth::AuthenticateParams;
 use crate::common::{
-    CONTROL_REAUTH_REQUIRED, DEFAULT_MAX_FRAME_BYTES, JsonRpcId, SERVER_ERROR_CODE, SUBPROTOCOL,
-    TRANSPORT_PROTOCOL_WEBSOCKET, WsRequestEnvelope, WsResponseEnvelope, close_codes, id_key,
-    methods, service_params_to_envelope,
+    DEFAULT_MAX_FRAME_BYTES, JsonRpcId, ReauthenticationRequiredParams, SERVER_ERROR_CODE,
+    SUBPROTOCOL, StreamControlParams, TRANSPORT_PROTOCOL_WEBSOCKET, WsRequestEnvelope,
+    WsResponseEnvelope, close_codes, id_key, methods, service_params_to_envelope,
 };
 use crate::errors::jsonrpc_error_to_a2a;
 use crate::reconnect::Backoff;
@@ -42,21 +43,19 @@ use crate::reconnect::Backoff;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_BUFFER_CAPACITY: usize = 64;
 
-/// Details carried by a server-sent `ReauthenticationRequired` control frame
-/// (spec Section 9.3.2).
-#[derive(Debug, Clone, Default)]
+/// A server's `ws/ReauthenticationRequired` notification (spec Section 9.5).
+#[derive(Debug, Clone)]
 pub struct ReauthRequired {
-    /// Human-readable explanation supplied by the server, if any.
-    pub reason: Option<String>,
-    /// Suggested delay before reconnecting, in milliseconds.
-    pub retry_after_ms: Option<u64>,
+    /// When the server stops accepting the connection's credentials and
+    /// closes it with `4001`.
+    pub expires_at: DateTime<Utc>,
 }
 
 /// Source of fresh credentials for a live connection.
 ///
-/// Implement this to let the transport satisfy a `ReauthenticationRequired`
-/// signal by refreshing in-band (spec Section 9.3.3) rather than forcing the
-/// application to rebuild the connection.
+/// Implement this to let the transport answer `ws/ReauthenticationRequired`
+/// by refreshing in-band with `ws/Authenticate` (spec Section 9.3) rather than
+/// forcing the application to rebuild the connection.
 #[async_trait]
 pub trait CredentialProvider: Send + Sync + 'static {
     /// Produce credentials to install on the connection. Called when the server
@@ -64,18 +63,18 @@ pub trait CredentialProvider: Send + Sync + 'static {
     async fn fresh_credentials(&self) -> Result<AuthenticateParams, A2AError>;
 }
 
-/// How the client reacts to a `ReauthenticationRequired` control frame. Section
-/// 9.3.2 requires clients to *handle* the signal, so a policy should be set on
-/// any connection whose credentials can expire.
+/// How the client reacts to a `ws/ReauthenticationRequired` notification
+/// (spec Section 9.5). Without a policy the notification is logged, and the
+/// server closes the connection with `4001` at `expiresAt`.
 #[derive(Clone)]
 pub enum ReauthPolicy {
     /// Invoke the callback so the application can obtain fresh credentials and
     /// establish a new connection itself.
     Notify(Arc<dyn Fn(ReauthRequired) + Send + Sync>),
     /// Fetch fresh credentials from the provider and install them on the live
-    /// connection using the in-band `Authenticate` method (spec Section 9.3.3),
-    /// avoiding a reconnect. A server that does not support in-band refresh
-    /// answers `UnsupportedOperationError` and then closes with `4001`, so the
+    /// connection with `ws/Authenticate` (spec Section 9.3), avoiding a
+    /// reconnect. A server that does not implement `ws/Authenticate` answers
+    /// `MethodNotFoundError` and closes with `4001` at `expiresAt`, so the
     /// application should still be prepared to reconnect.
     RefreshInBand(Arc<dyn CredentialProvider>),
 }
@@ -97,13 +96,18 @@ pub struct ConnectOptions {
     /// (spec Section 9.1). Header names are sent as-is.
     pub headers: Vec<(String, String)>,
 
+    /// The A2A protocol version sent as the connection's `A2A-Version` (spec
+    /// Section 4.1). `None` sends [`a2a::VERSION`]. An `A2A-Version` entry in
+    /// [`headers`](Self::headers) takes precedence.
+    pub protocol_version: Option<String>,
+
     /// TLS options applied when connecting to a `wss://` endpoint (requires the
     /// `tls` crate feature). Ignored for plaintext `ws://` connections.
     pub tls: TlsOptions,
 
-    /// Response to a `ReauthenticationRequired` control frame (spec Section
-    /// 9.3.2). When `None` the frame is only logged, and the server will
-    /// subsequently close the connection with `4001`.
+    /// Response to a `ws/ReauthenticationRequired` notification (spec Section
+    /// 9.5). When `None` the notification is only logged, and the server
+    /// closes the connection with `4001` once the credentials expire.
     pub reauth: Option<ReauthPolicy>,
 }
 
@@ -125,6 +129,12 @@ impl ConnectOptions {
         self
     }
 
+    /// Set the A2A protocol version sent as the connection's `A2A-Version`.
+    pub fn with_protocol_version(mut self, version: impl Into<String>) -> Self {
+        self.protocol_version = Some(version.into());
+        self
+    }
+
     /// Replace the TLS options used for `wss://` connections.
     pub fn with_tls(mut self, tls: TlsOptions) -> Self {
         self.tls = tls;
@@ -132,7 +142,7 @@ impl ConnectOptions {
     }
 
     /// Be notified when the server requests reauthentication, so the
-    /// application can reconnect with fresh credentials (spec Section 9.3.2).
+    /// application can reconnect with fresh credentials (spec Section 9.5).
     pub fn on_reauth_required<F>(mut self, callback: F) -> Self
     where
         F: Fn(ReauthRequired) + Send + Sync + 'static,
@@ -141,16 +151,16 @@ impl ConnectOptions {
         self
     }
 
-    /// Refresh credentials in-band via the `Authenticate` method when the server
+    /// Refresh credentials in-band with `ws/Authenticate` when the server
     /// requests reauthentication, keeping the connection open
-    /// (spec Section 9.3.3).
+    /// (spec Section 9.3).
     pub fn with_credential_provider(mut self, provider: Arc<dyn CredentialProvider>) -> Self {
         self.reauth = Some(ReauthPolicy::RefreshInBand(provider));
         self
     }
 }
 
-/// TLS configuration for `wss://` connections (spec Section 13.1).
+/// TLS configuration for `wss://` connections (spec Section 1).
 ///
 /// By default the platform trust store is used (falling back to the bundled
 /// Mozilla root set). Additional trusted roots may be supplied for private
@@ -325,6 +335,23 @@ impl ConnectionInner {
             Err(_) => Err(connection_closed_error(&self.pending)),
         }
     }
+
+    async fn authenticate(
+        &self,
+        credentials: AuthenticateParams,
+    ) -> Result<Option<DateTime<Utc>>, A2AError> {
+        let params = serde_json::to_value(&credentials).map_err(|err| {
+            A2AError::internal(format!("failed to serialize ws/Authenticate params: {err}"))
+        })?;
+        let result = self
+            .call_unary_raw(methods::AUTHENTICATE, &ServiceParams::new(), params)
+            .await?;
+        Ok(result
+            .get("expiresAt")
+            .and_then(Value::as_str)
+            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+            .map(|ts| ts.with_timezone(&Utc)))
+    }
 }
 
 fn connection_closed_error(pending: &Arc<Mutex<Pending>>) -> A2AError {
@@ -342,7 +369,7 @@ pub struct WebSocketTransport {
 }
 
 /// A failed connection attempt, and whether trying again could change the
-/// outcome (spec Section 8.4).
+/// outcome (spec Section 8.5).
 enum ConnectFailure {
     /// The transport failed, or the server said it was busy.
     Retryable(A2AError),
@@ -364,7 +391,7 @@ impl ConnectFailure {
 /// exceptions worth retrying: `429` and the `5xx` range, which say the server is
 /// loaded rather than that the request is wrong. `503` is what this binding's
 /// own server returns once an identity holds its maximum number of connections
-/// (Section 13.5), so a client that backs off and returns is doing the right
+/// (Section 8.6), so a client that backs off and returns is doing the right
 /// thing. Everything else here is an I/O or framing failure, which a retry may
 /// well survive.
 fn handshake_failure(err: WebSocketError) -> ConnectFailure {
@@ -408,7 +435,7 @@ impl WebSocketTransport {
     }
 
     /// Connect, retrying transient failures on an exponential backoff with
-    /// jitter (spec Section 8.4).
+    /// jitter (spec Section 8.5).
     ///
     /// Use this to re-establish a connection that was interrupted. Failures that
     /// would recur — rejected credentials, an endpoint that is not a WebSocket
@@ -417,7 +444,7 @@ impl WebSocketTransport {
     ///
     /// Resubscribing to in-progress tasks afterwards is the caller's
     /// responsibility: issue `SubscribeToTask` for the task ids you still care
-    /// about, and be ready for events you have already seen (Section 8.4 steps
+    /// about, and be ready for events you have already seen (Section 8.5 steps
     /// 2 and 3).
     pub async fn connect_with_retry(
         endpoint: impl Into<String>,
@@ -477,6 +504,16 @@ impl WebSocketTransport {
             .header("Sec-WebSocket-Key", handshake::generate_key())
             .header("Sec-WebSocket-Version", "13")
             .header("Sec-WebSocket-Protocol", SUBPROTOCOL);
+        // `A2A-Version` is connection-scoped and must be sent on the upgrade
+        // (spec Section 4.1).
+        let sets_version = options
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(a2a::SVC_PARAM_VERSION));
+        if !sets_version {
+            let version = options.protocol_version.as_deref().unwrap_or(a2a::VERSION);
+            builder = builder.header(a2a::SVC_PARAM_VERSION, version);
+        }
         for (name, value) in &options.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -537,21 +574,20 @@ impl WebSocketTransport {
         Ok(WebSocketTransport { inner })
     }
 
-    /// Refresh connection credentials in-band via the optional `Authenticate`
-    /// method (spec Section 9.3.3). Returns `UnsupportedOperationError` if the
-    /// server does not support in-band refresh.
+    /// Present credentials in-band with the optional `ws/Authenticate` method
+    /// (spec Section 9.3), keyed by the names of the Agent Card
+    /// `securitySchemes`. Returns the server's `expiresAt`, if it sent one.
+    ///
+    /// A server that does not implement the method answers
+    /// `MethodNotFoundError`; rejected credentials fail with
+    /// `WS_UNAUTHENTICATED` (see [`binding_error_reason`]).
+    ///
+    /// [`binding_error_reason`]: crate::errors::binding_error_reason
     pub async fn authenticate(
         &self,
-        scheme: impl Into<String>,
-        credentials: impl Into<String>,
-    ) -> Result<(), A2AError> {
-        let params = serde_json::json!({
-            "scheme": scheme.into(),
-            "credentials": credentials.into(),
-        });
-        self.call_unary_raw(methods::AUTHENTICATE, &ServiceParams::new(), params)
-            .await
-            .map(|_| ())
+        credentials: AuthenticateParams,
+    ) -> Result<Option<DateTime<Utc>>, A2AError> {
+        self.inner.authenticate(credentials).await
     }
 
     async fn call_unary<Req, Resp>(
@@ -700,11 +736,7 @@ impl Drop for StreamingResponse {
         if !self.cancel_sent && !self.terminated {
             self.cancel_sent = true;
             self.inner.deregister_streaming(&key);
-            let envelope = WsRequestEnvelope {
-                id: Some(JsonRpcId::String(self.id.clone())),
-                cancel_stream: Some(true),
-                ..Default::default()
-            };
+            let envelope = WsRequestEnvelope::cancel_stream(JsonRpcId::String(self.id.clone()));
             if let Ok(text) = serde_json::to_string(&envelope) {
                 let _ = self.inner.try_send_outbound(OutboundClient::Frame(text));
             }
@@ -958,9 +990,17 @@ fn close_error_for(payload: &[u8]) -> A2AError {
             SERVER_ERROR_CODE,
             "connection closed with 1008: policy violation (for example a rate limit)",
         ),
+        close_codes::INVALID_PAYLOAD => A2AError::new(
+            SERVER_ERROR_CODE,
+            "connection closed with 1007: a message was not valid UTF-8",
+        ),
         close_codes::MESSAGE_TOO_BIG => A2AError::new(
             SERVER_ERROR_CODE,
             "connection closed with 1009: message exceeded the server's maximum size",
+        ),
+        close_codes::A2A_PROTOCOL_ERROR => A2AError::new(
+            SERVER_ERROR_CODE,
+            "connection closed with 4000: too many malformed messages",
         ),
         close_codes::VERSION_NOT_SUPPORTED => A2AError::new(
             SERVER_ERROR_CODE,
@@ -971,17 +1011,23 @@ fn close_error_for(payload: &[u8]) -> A2AError {
     }
 }
 
-/// Act on a `ReauthenticationRequired` control frame per the configured policy
-/// (spec Section 9.3.2). The work is spawned because the read loop must keep
-/// running to receive the `Authenticate` response.
+/// Act on a `ws/ReauthenticationRequired` notification per the configured
+/// policy (spec Section 9.5). The work is spawned because the read loop must
+/// keep running to receive the `ws/Authenticate` response.
 fn handle_reauth_required(
-    envelope: &WsResponseEnvelope,
+    params: Option<Value>,
     inner: &Weak<ConnectionInner>,
     reauth: &Option<ReauthPolicy>,
 ) {
+    let Some(expires_at) = params
+        .and_then(|p| serde_json::from_value::<ReauthenticationRequiredParams>(p).ok())
+        .and_then(|p| DateTime::parse_from_rfc3339(&p.expires_at).ok())
+    else {
+        tracing::debug!("ignoring ws/ReauthenticationRequired without a valid params.expiresAt");
+        return;
+    };
     let request = ReauthRequired {
-        reason: envelope.reason.clone(),
-        retry_after_ms: envelope.retry_after_ms,
+        expires_at: expires_at.with_timezone(&Utc),
     };
 
     match reauth {
@@ -1004,14 +1050,7 @@ fn handle_reauth_required(
                     }
                 };
                 let Some(inner) = inner.upgrade() else { return };
-                let params = serde_json::json!({
-                    "scheme": credentials.scheme,
-                    "credentials": credentials.credentials,
-                });
-                match inner
-                    .call_unary_raw(methods::AUTHENTICATE, &ServiceParams::new(), params)
-                    .await
-                {
+                match inner.authenticate(credentials).await {
                     Ok(_) => tracing::debug!("refreshed connection credentials in-band"),
                     Err(err) => tracing::warn!(
                         error = %err.message,
@@ -1021,7 +1060,7 @@ fn handle_reauth_required(
             });
         }
         None => tracing::warn!(
-            reason = request.reason.as_deref().unwrap_or_default(),
+            expires_at = %request.expires_at,
             "server requested reauthentication but no ReauthPolicy is configured; \
              set ConnectOptions::on_reauth_required or ::with_credential_provider"
         ),
@@ -1042,12 +1081,26 @@ fn handle_incoming_text(
         }
     };
 
-    // Server-originated control frames (spec Section 9.3.2) carry no id.
-    if let Some(control) = envelope.control.as_deref() {
-        if control == CONTROL_REAUTH_REQUIRED {
-            handle_reauth_required(&envelope, inner, reauth);
-        } else {
-            tracing::debug!(control, "received unknown server control frame");
+    // Binding notifications carry no id; unknown ones are ignored (spec
+    // Section 7.6).
+    if envelope.is_notification() {
+        match envelope.method.as_deref() {
+            Some(methods::STREAM_END) => {
+                let Some(params) = envelope
+                    .params
+                    .and_then(|p| serde_json::from_value::<StreamControlParams>(p).ok())
+                else {
+                    tracing::debug!("ignoring ws/StreamEnd without a valid params.id");
+                    return;
+                };
+                // Dropping the sink ends the caller's stream. A `ws/StreamEnd`
+                // for an id with no active stream is ignored.
+                pending.lock().streaming.remove(&id_key(&params.id));
+            }
+            Some(methods::REAUTHENTICATION_REQUIRED) => {
+                handle_reauth_required(envelope.params, inner, reauth);
+            }
+            other => tracing::debug!(method = ?other, "ignoring server notification"),
         }
         return;
     }
@@ -1068,12 +1121,6 @@ fn handle_incoming_text(
         } else if let Some(tx) = pending.streaming.remove(&key) {
             let _ = tx.send(Err(a2a_error));
         }
-        return;
-    }
-
-    if envelope.stream_end.unwrap_or(false) {
-        let mut pending = pending.lock();
-        pending.streaming.remove(&key);
         return;
     }
 
@@ -1215,7 +1262,13 @@ impl TransportFactory for WebSocketTransportFactory {
         _card: &AgentCard,
         iface: &AgentInterface,
     ) -> Result<Box<dyn Transport>, A2AError> {
-        let transport = WebSocketTransport::connect(&iface.url).await?;
+        // The interface's `protocolVersion` is the connection's `A2A-Version`
+        // (spec Section 10).
+        let mut options = ConnectOptions::default();
+        if !iface.protocol_version.is_empty() {
+            options = options.with_protocol_version(iface.protocol_version.clone());
+        }
+        let transport = WebSocketTransport::connect_with_options(&iface.url, options).await?;
         Ok(Box::new(transport))
     }
 }
@@ -1480,10 +1533,13 @@ mod tests {
     }
 
     #[test]
-    fn websocket_transport_factory_protocol_string_is_websocket() {
+    fn websocket_transport_factory_protocol_is_the_binding_uri() {
         let f = WebSocketTransportFactory;
         assert_eq!(f.protocol(), TRANSPORT_PROTOCOL_WEBSOCKET);
-        assert_eq!(f.protocol(), "WEBSOCKET");
+        assert_eq!(
+            f.protocol(),
+            "https://a2a-protocol.org/bindings/experimental-websocket/v1"
+        );
     }
 
     #[tokio::test]
@@ -1613,26 +1669,52 @@ mod tests {
             rx.try_recv().unwrap().unwrap(),
             StreamResponse::StatusUpdate(_)
         ));
-        // Sink stays registered until streamEnd or error.
+        // Sink stays registered until ws/StreamEnd or an error.
         assert!(pending.lock().streaming.contains_key(&key));
 
-        // streamEnd removes the sink.
+        // A ws/StreamEnd for another id is ignored.
+        dispatch(&WsResponseEnvelope::stream_end("other".into()), &pending);
+        assert!(pending.lock().streaming.contains_key(&key));
+
+        // ws/StreamEnd removes the sink.
         let end = WsResponseEnvelope::stream_end("req-2".into());
         dispatch(&end, &pending);
         assert!(!pending.lock().streaming.contains_key(&key));
     }
 
     #[test]
-    fn reauth_control_frame_without_a_policy_is_ignored() {
+    fn unknown_and_malformed_notifications_are_ignored() {
         let pending = Arc::new(Mutex::new(Pending::default()));
-        let frame = WsResponseEnvelope::reauth_required("expiring", 0);
+        let key = id_key_of("req-3");
+        let (tx, _rx) = mpsc::unbounded_channel::<Result<StreamResponse, A2AError>>();
+        pending.lock().streaming.insert(key.clone(), tx);
+
+        for raw in [
+            serde_json::json!({"jsonrpc": "2.0", "method": "ws/Unknown", "params": {"id": "req-3"}}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "ws/StreamEnd"}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "ws/ReauthenticationRequired", "params": {}}),
+        ] {
+            handle_incoming_text(
+                &serde_json::to_vec(&raw).unwrap(),
+                &pending,
+                &Weak::new(),
+                &None,
+            );
+        }
+        assert!(pending.lock().streaming.contains_key(&key));
+    }
+
+    #[test]
+    fn reauth_notification_without_a_policy_is_ignored() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let frame = WsResponseEnvelope::reauthentication_required("2026-11-10T10:00:00.000Z");
         dispatch(&frame, &pending);
         assert!(pending.lock().unary.is_empty());
         assert!(pending.lock().streaming.is_empty());
     }
 
     #[tokio::test]
-    async fn reauth_control_frame_invokes_the_notify_callback() {
+    async fn reauth_notification_invokes_the_notify_callback() {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let seen = Arc::new(Mutex::new(None::<ReauthRequired>));
         let sink = seen.clone();
@@ -1640,7 +1722,7 @@ mod tests {
             *sink.lock() = Some(request);
         })));
 
-        let frame = WsResponseEnvelope::reauth_required("token expiring", 5_000);
+        let frame = WsResponseEnvelope::reauthentication_required("2026-11-10T10:00:00.000Z");
         handle_incoming_text(
             &serde_json::to_vec(&frame).unwrap(),
             &pending,
@@ -1656,8 +1738,10 @@ mod tests {
             tokio::task::yield_now().await;
         }
         let request = seen.lock().clone().expect("callback should have been run");
-        assert_eq!(request.reason.as_deref(), Some("token expiring"));
-        assert_eq!(request.retry_after_ms, Some(5_000));
+        assert_eq!(
+            request.expires_at,
+            DateTime::parse_from_rfc3339("2026-11-10T10:00:00Z").unwrap()
+        );
     }
 
     #[test]
@@ -1703,9 +1787,15 @@ mod tests {
         assert!(!pending.lock().streaming.contains_key(&id_key_of("s1")));
         match outbound_rx.try_recv().unwrap() {
             OutboundClient::Frame(text) => {
-                let envelope: WsRequestEnvelope = serde_json::from_str(&text).unwrap();
-                assert_eq!(envelope.id, Some(JsonRpcId::String("s1".into())));
-                assert_eq!(envelope.cancel_stream, Some(true));
+                let value: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(
+                    value,
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "ws/CancelStream",
+                        "params": { "id": "s1" }
+                    })
+                );
             }
             other => panic!("expected a cancel frame, got {other:?}"),
         }
