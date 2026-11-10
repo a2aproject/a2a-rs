@@ -178,11 +178,14 @@ impl JsonRpcTransport {
         })?;
         let rpc_request = JsonRpcRequest::new(id, method, Some(payload));
 
-        let mut builder = self
-            .client
-            .post(&self.endpoint)
-            // Live openings/reopenings stream; follow-ups acknowledge in JSON.
-            .header("Accept", "text/event-stream, application/json");
+        let mut builder = self.client.post(&self.endpoint).header(
+            "Accept",
+            if method == methods::SEND_LIVE_MESSAGE {
+                "text/event-stream, application/json"
+            } else {
+                "text/event-stream"
+            },
+        );
         for (key, values) in params {
             for v in values {
                 builder = builder.header(key, v);
@@ -521,8 +524,26 @@ pub(crate) fn parse_sse_stream_rest(
         if data.is_empty() {
             return None;
         }
-        if let Some(error) = crate::rest::rest_error(&data) {
-            return Some(Err(error));
+        let fatal_frame = event_text.lines().any(|line| {
+            line.strip_prefix("event:")
+                .is_some_and(|name| name.trim() == "error")
+        });
+        let status_code = serde_json::from_str::<Value>(&data)
+            .ok()
+            .and_then(|value| value.get("error")?.get("code").cloned());
+        // Empty/default StreamError codes are omitted by ProtoJSON. The SSE
+        // error event name or a numeric status code identifies a fatal binding
+        // error; a symbolic/absent live code stays on the live event stream.
+        let numeric_status = status_code.as_ref().is_some_and(|code| {
+            code.is_number()
+                || code
+                    .as_str()
+                    .is_some_and(|code| code.parse::<f64>().is_ok())
+        });
+        if fatal_frame || numeric_status {
+            return Some(Err(crate::rest::rest_error(&data).unwrap_or_else(|| {
+                A2AError::internal(format!("invalid REST error frame: {data}"))
+            })));
         }
 
         decode_stream_text(&data, "SSE parse error")
@@ -743,6 +764,54 @@ impl TransportFactory for JsonRpcTransportFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn empty_live_error_codes_are_not_fatal_rest_status_frames() {
+        for error in [
+            serde_json::json!({"code":"", "message":"rejected"}),
+            serde_json::json!({"taskId":"task", "message":"rejected"}),
+            serde_json::json!({"message":"rejected"}),
+        ] {
+            let frame = format!(
+                "data: {}\n\ndata: {}\n\n",
+                serde_json::json!({"error":error}),
+                serde_json::json!({"task":{"id":"task","contextId":"context","status":{"state":"TASK_STATE_WORKING"}}})
+            );
+            let events: Vec<_> = parse_sse_stream_rest(byte_stream(vec![frame]))
+                .collect()
+                .await;
+            assert_eq!(events.len(), 2);
+            assert!(
+                matches!(&events[0], Ok(StreamResponse::Error(error)) if error.code.is_empty())
+            );
+            assert!(matches!(&events[1], Ok(StreamResponse::Task(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_streaming_calls_only_advertise_event_stream_success() {
+        let (url, captured) = spawn_jsonrpc_server(
+            serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}).to_string(),
+        )
+        .await;
+        let request: SendMessageRequest = serde_json::from_value(
+            serde_json::json!({"message":{"messageId":"m","role":"ROLE_USER","parts":[]}}),
+        )
+        .unwrap();
+        let _ = JsonRpcTransport::new(Client::new(), url)
+            .send_streaming_message(&ServiceParams::new(), &request)
+            .await;
+        let raw = captured.await.unwrap();
+        let accept = raw
+            .lines()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("accept"))
+                    .map(|(_, value)| value.trim())
+            })
+            .unwrap();
+        assert_eq!(accept, "text/event-stream");
+    }
 
     #[tokio::test]
     async fn legacy_events_and_incomplete_envelopes_are_errors_on_both_http_streams() {
