@@ -8,6 +8,8 @@ use a2a::event::{StreamResponse, TaskStatusUpdateEvent};
 use a2a::*;
 use a2a_client::{Transport, TransportFactory};
 use a2a_grpc::{GrpcHandler, GrpcTransport, GrpcTransportFactory};
+use a2a_pb::proto;
+use a2a_pb::proto::a2a_service_client::A2aServiceClient;
 use a2a_pb::proto::a2a_service_server::A2aServiceServer;
 use a2a_server::{DefaultRequestHandler, InMemoryTaskStore, RequestHandler, ServiceParams};
 use async_trait::async_trait;
@@ -685,6 +687,257 @@ async fn grpc_transport_decodes_error_details_from_a_real_server() {
             description: "must be a UUID".to_string(),
         }])
     );
+
+    transport.destroy().await.unwrap();
+    handle.abort();
+}
+
+/// `Part.content` is a required oneof and `message` a REQUIRED field in
+/// a2a.proto: a request without either is INVALID_ARGUMENT naming the field,
+/// as a2a-go answers it, not an empty text part or an empty message.
+#[tokio::test]
+async fn grpc_server_rejects_a_missing_message_and_a_part_without_content() {
+    let (endpoint, handle) = spawn_grpc_server().await;
+    let mut client = A2aServiceClient::connect(endpoint).await.unwrap();
+
+    let cases = [
+        (
+            Some(proto::Message {
+                message_id: "msg-empty".to_string(),
+                role: proto::Role::User as i32,
+                parts: vec![proto::Part::default()],
+                ..Default::default()
+            }),
+            "message.parts[0]: must have one of: text, raw, url, data",
+        ),
+        (None, "message: is required"),
+    ];
+    for (message, expected) in cases {
+        let request = || {
+            let mut request = tonic::Request::new(proto::SendMessageRequest {
+                message: message.clone(),
+                ..Default::default()
+            });
+            request
+                .metadata_mut()
+                .insert("a2a-version", VERSION.parse().unwrap());
+            request
+        };
+        let status = client.send_message(request()).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        assert_eq!(status.message(), expected);
+        let status = client.send_streaming_message(request()).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        assert_eq!(status.message(), expected);
+    }
+
+    handle.abort();
+}
+
+/// A peer whose every response carries a part without content, which the
+/// native types cannot represent.
+struct EmptyPartService;
+
+fn empty_part_task() -> proto::Task {
+    proto::Task {
+        id: "task-1".to_string(),
+        history: vec![proto::Message {
+            message_id: "msg-empty".to_string(),
+            role: proto::Role::Agent as i32,
+            parts: vec![proto::Part::default()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+type EmptyPartStream = BoxStream<'static, Result<proto::StreamResponse, tonic::Status>>;
+
+fn empty_part_stream() -> tonic::Response<EmptyPartStream> {
+    let event = proto::StreamResponse {
+        payload: Some(proto::stream_response::Payload::Task(empty_part_task())),
+    };
+    tonic::Response::new(Box::pin(stream::once(async move { Ok(event) })))
+}
+
+#[tonic::async_trait]
+impl proto::a2a_service_server::A2aService for EmptyPartService {
+    async fn send_message(
+        &self,
+        _: tonic::Request<proto::SendMessageRequest>,
+    ) -> Result<tonic::Response<proto::SendMessageResponse>, tonic::Status> {
+        Ok(tonic::Response::new(proto::SendMessageResponse {
+            payload: Some(proto::send_message_response::Payload::Task(
+                empty_part_task(),
+            )),
+        }))
+    }
+
+    type SendStreamingMessageStream = EmptyPartStream;
+
+    async fn send_streaming_message(
+        &self,
+        _: tonic::Request<proto::SendMessageRequest>,
+    ) -> Result<tonic::Response<EmptyPartStream>, tonic::Status> {
+        Ok(empty_part_stream())
+    }
+
+    async fn get_task(
+        &self,
+        _: tonic::Request<proto::GetTaskRequest>,
+    ) -> Result<tonic::Response<proto::Task>, tonic::Status> {
+        Ok(tonic::Response::new(empty_part_task()))
+    }
+
+    async fn list_tasks(
+        &self,
+        _: tonic::Request<proto::ListTasksRequest>,
+    ) -> Result<tonic::Response<proto::ListTasksResponse>, tonic::Status> {
+        Ok(tonic::Response::new(proto::ListTasksResponse {
+            tasks: vec![proto::Task::default(), empty_part_task()],
+            ..Default::default()
+        }))
+    }
+
+    async fn cancel_task(
+        &self,
+        _: tonic::Request<proto::CancelTaskRequest>,
+    ) -> Result<tonic::Response<proto::Task>, tonic::Status> {
+        Ok(tonic::Response::new(empty_part_task()))
+    }
+
+    type SubscribeToTaskStream = EmptyPartStream;
+
+    async fn subscribe_to_task(
+        &self,
+        _: tonic::Request<proto::SubscribeToTaskRequest>,
+    ) -> Result<tonic::Response<EmptyPartStream>, tonic::Status> {
+        Ok(empty_part_stream())
+    }
+
+    async fn create_task_push_notification_config(
+        &self,
+        _: tonic::Request<proto::TaskPushNotificationConfig>,
+    ) -> Result<tonic::Response<proto::TaskPushNotificationConfig>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not used"))
+    }
+
+    async fn get_task_push_notification_config(
+        &self,
+        _: tonic::Request<proto::GetTaskPushNotificationConfigRequest>,
+    ) -> Result<tonic::Response<proto::TaskPushNotificationConfig>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not used"))
+    }
+
+    async fn list_task_push_notification_configs(
+        &self,
+        _: tonic::Request<proto::ListTaskPushNotificationConfigsRequest>,
+    ) -> Result<tonic::Response<proto::ListTaskPushNotificationConfigsResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not used"))
+    }
+
+    async fn get_extended_agent_card(
+        &self,
+        _: tonic::Request<proto::GetExtendedAgentCardRequest>,
+    ) -> Result<tonic::Response<proto::AgentCard>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not used"))
+    }
+
+    async fn delete_task_push_notification_config(
+        &self,
+        _: tonic::Request<proto::DeleteTaskPushNotificationConfigRequest>,
+    ) -> Result<tonic::Response<()>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not used"))
+    }
+}
+
+/// A response that carries a part without content is the peer's fault: the
+/// client reports INTERNAL_ERROR naming the part, as the JSON-RPC client does,
+/// not INVALID_PARAMS, which would blame the caller's request.
+#[tokio::test]
+async fn grpc_transport_reports_a_part_without_content_in_a_response_as_internal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let handle = tokio::spawn(
+        Server::builder()
+            .add_service(A2aServiceServer::new(EmptyPartService))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let transport = GrpcTransport::connect(endpoint).await.unwrap();
+    let params = versioned_params();
+    let get = GetTaskRequest {
+        id: "task-1".to_string(),
+        history_length: None,
+        tenant: None,
+    };
+    let in_task = "history[0].parts[0]: must have one of: text, raw, url, data";
+    let internal = |error: A2AError, path: &str| {
+        assert_eq!(error.code, error_code::INTERNAL_ERROR, "{error:?}");
+        assert_eq!(error.message, format!("invalid response: {path}{in_task}"));
+    };
+
+    internal(
+        transport
+            .send_message(&params, &send_message_request())
+            .await
+            .unwrap_err(),
+        "task.",
+    );
+    internal(transport.get_task(&params, &get).await.unwrap_err(), "");
+    internal(
+        transport
+            .list_tasks(
+                &params,
+                &ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err(),
+        "tasks[1].",
+    );
+    internal(
+        transport
+            .cancel_task(
+                &params,
+                &CancelTaskRequest {
+                    id: "task-1".to_string(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err(),
+        "",
+    );
+    let sent = transport
+        .send_streaming_message(&params, &send_message_request())
+        .await
+        .unwrap();
+    let subscribed = transport
+        .subscribe_to_task(
+            &params,
+            &SubscribeToTaskRequest {
+                id: "task-1".to_string(),
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    for stream in [sent, subscribed] {
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(events.len(), 1);
+        internal(events.into_iter().next().unwrap().unwrap_err(), "task.");
+    }
 
     transport.destroy().await.unwrap();
     handle.abort();

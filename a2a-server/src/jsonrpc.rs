@@ -572,6 +572,36 @@ mod tests {
         assert_eq!(error.code, error_code::INVALID_PARAMS);
     }
 
+    /// `Part.content` is a required oneof and `message` a REQUIRED field in
+    /// a2a.proto: a request without either is invalid params that name the
+    /// field, on the unary and the streaming method alike.
+    #[tokio::test]
+    async fn test_send_message_rejects_a_missing_message_and_a_part_without_content() {
+        let cases = [
+            (
+                serde_json::json!({"message": {
+                    "messageId": "m1",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "ok"}, {}]
+                }}),
+                "message.parts[1]: must have one of: text, raw, url, data",
+            ),
+            (serde_json::json!({}), "message: is required"),
+        ];
+        for method in [methods::SEND_MESSAGE, methods::SEND_STREAMING_MESSAGE] {
+            for (params, expected) in &cases {
+                let resp = post_jsonrpc(make_app(), method, params.clone()).await;
+                let error = resp.error.expect("expected an error");
+                assert_eq!(error.code, error_code::INVALID_PARAMS, "{method}");
+                assert!(
+                    error.message.ends_with(expected),
+                    "{method}: {}",
+                    error.message
+                );
+            }
+        }
+    }
+
     /// A2A §9.5: a `params` payload that fails to decode is
     /// `InvalidParamsError` (-32602) for *every* method, not just
     /// `message/send`. Each arm decodes its own request type, so guard the

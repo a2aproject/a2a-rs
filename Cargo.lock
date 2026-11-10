@@ -155,6 +155,7 @@ dependencies = [
  "prost-types",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

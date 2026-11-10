@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use a2a::{A2AError, Message, StreamResponse};
+use a2a::{A2AError, FieldViolation, Message, StreamResponse};
 use a2a_pb::pbconv;
 use a2a_pb::proto;
 use a2a_server::RequestHandler;
@@ -52,7 +52,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
             self.handler.clone(),
             METHOD_GET_TASK,
             "GetTaskRequest",
-            pbconv::from_proto_get_task_request,
+            |request| Ok(pbconv::from_proto_get_task_request(request)),
             |handler, params, request| {
                 Box::pin(async move { handler.get_task(&params, request).await })
             },
@@ -64,7 +64,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
             self.handler.clone(),
             METHOD_LIST_TASKS,
             "ListTasksRequest",
-            pbconv::from_proto_list_tasks_request,
+            |request| Ok(pbconv::from_proto_list_tasks_request(request)),
             |handler, params, request| {
                 Box::pin(async move { handler.list_tasks(&params, request).await })
             },
@@ -76,7 +76,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
             self.handler.clone(),
             METHOD_CANCEL_TASK,
             "CancelTaskRequest",
-            pbconv::from_proto_cancel_task_request,
+            |request| Ok(pbconv::from_proto_cancel_task_request(request)),
             |handler, params, request| {
                 Box::pin(async move { handler.cancel_task(&params, request).await })
             },
@@ -90,7 +90,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
             self.handler.clone(),
             METHOD_CREATE_PUSH_CONFIG,
             "TaskPushNotificationConfig",
-            pbconv::from_proto_create_task_push_notification_config_request,
+            |request| Ok(pbconv::from_proto_create_task_push_notification_config_request(request)),
             |handler, params, request| {
                 Box::pin(async move { handler.create_push_config(&params, request).await })
             },
@@ -104,7 +104,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
             self.handler.clone(),
             METHOD_GET_PUSH_CONFIG,
             "GetTaskPushNotificationConfigRequest",
-            pbconv::from_proto_get_task_push_notification_config_request,
+            |request| Ok(pbconv::from_proto_get_task_push_notification_config_request(request)),
             |handler, params, request| {
                 Box::pin(async move { handler.get_push_config(&params, request).await })
             },
@@ -118,7 +118,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
             self.handler.clone(),
             METHOD_LIST_PUSH_CONFIGS,
             "ListTaskPushNotificationConfigsRequest",
-            pbconv::from_proto_list_task_push_notification_configs_request,
+            |request| Ok(pbconv::from_proto_list_task_push_notification_configs_request(request)),
             |handler, params, request| {
                 Box::pin(async move { handler.list_push_configs(&params, request).await })
             },
@@ -134,7 +134,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
             self.handler.clone(),
             METHOD_GET_EXTENDED_AGENT_CARD,
             "GetExtendedAgentCardRequest",
-            pbconv::from_proto_get_extended_agent_card_request,
+            |request| Ok(pbconv::from_proto_get_extended_agent_card_request(request)),
             |handler, params, request| {
                 Box::pin(async move { handler.get_extended_agent_card(&params, request).await })
             },
@@ -146,7 +146,7 @@ impl<H: RequestHandler> SlimRpcHandler<H> {
             self.handler.clone(),
             METHOD_DELETE_PUSH_CONFIG,
             "DeleteTaskPushNotificationConfigRequest",
-            pbconv::from_proto_delete_task_push_notification_config_request,
+            |request| Ok(pbconv::from_proto_delete_task_push_notification_config_request(request)),
             |handler, params, request| {
                 Box::pin(async move {
                     handler.delete_push_config(&params, request).await?;
@@ -188,7 +188,15 @@ where
                             && let Ok(proto_message) =
                                 decode_proto_request::<a2a_pb::proto::Message>(bytes, "Message")
                         {
-                            on_message(pbconv::from_proto_message(&proto_message));
+                            match pbconv::from_proto_message(&proto_message) {
+                                Ok(message) => on_message(message),
+                                Err(violation) => tracing::warn!(
+                                    message_id = %proto_message.message_id,
+                                    field = %violation.field,
+                                    reason = %violation.description,
+                                    "dropping a Collaborate message with invalid content"
+                                ),
+                            }
                         }
                     }
                 });
@@ -196,6 +204,11 @@ where
             }
         },
     );
+}
+
+/// A request that fails conversion is the caller's: `INVALID_ARGUMENT`.
+fn invalid_request(violation: FieldViolation) -> slim_rpc::RpcError {
+    a2a_error_to_rpc_error(&pbconv::invalid_request(violation))
 }
 
 fn register_unary_unary<H, ReqProto, ReqNative, ResNative, DecodeReq, EncodeRes>(
@@ -214,7 +227,7 @@ fn register_unary_unary<H, ReqProto, ReqNative, ResNative, DecodeReq, EncodeRes>
     ReqProto: prost::Message + Default + Send + 'static,
     ReqNative: Send + 'static,
     ResNative: Send + 'static,
-    DecodeReq: Fn(&ReqProto) -> ReqNative + Send + Sync + 'static,
+    DecodeReq: Fn(&ReqProto) -> Result<ReqNative, FieldViolation> + Send + Sync + 'static,
     EncodeRes: Fn(&ResNative) -> Vec<u8> + Send + Sync + 'static,
 {
     let decode_req = Arc::new(decode_req);
@@ -233,7 +246,7 @@ fn register_unary_unary<H, ReqProto, ReqNative, ResNative, DecodeReq, EncodeRes>
             async move {
                 let proto_request = decode_proto_request::<ReqProto>(request, request_name)?;
                 let params = context_to_service_params(&context);
-                let request = decode_req(&proto_request);
+                let request = decode_req(&proto_request).map_err(invalid_request)?;
                 let response = call(handler, params, request)
                     .await
                     .map_err(|error| a2a_error_to_rpc_error(&error))?;
@@ -259,7 +272,8 @@ where
                     "SendMessageRequest",
                 )?;
                 let params = context_to_service_params(&context);
-                let request = pbconv::from_proto_send_message_request(&proto_request);
+                let request = pbconv::from_proto_send_message_request(&proto_request)
+                    .map_err(invalid_request)?;
                 let stream = handler
                     .send_streaming_message(&params, request)
                     .await

@@ -7,6 +7,8 @@
 //! in the `a2a` crate and the prost-generated types from `a2a.proto`.
 
 use crate::proto;
+use a2a::A2AError;
+use a2a::FieldViolation;
 use a2a::agent_card::*;
 use a2a::event::*;
 use a2a::types::*;
@@ -132,6 +134,71 @@ fn opt_metadata_from_proto(s: &Option<prost_types::Struct>) -> Option<HashMap<St
     s.as_ref().map(from_proto_struct)
 }
 
+// ---------------------------------------------------------------------------
+// Invalid content
+// ---------------------------------------------------------------------------
+//
+// A conversion from proto that finds a required field unset returns the field
+// as a `FieldViolation` whose `field` is the JSON path from the message being
+// converted (`message.parts[0]`). It is not an `A2AError` yet, because what it
+// means depends on the reader: see `invalid_request` and `invalid_response`.
+
+/// The error a server answers when a request fails conversion: the caller
+/// sent the field, so it is `INVALID_PARAMS`.
+pub fn invalid_request(violation: FieldViolation) -> A2AError {
+    A2AError::invalid_params(describe(&violation))
+}
+
+/// The error a client reports when a response fails conversion: the request
+/// was fine and the peer answered with invalid content, so it is
+/// `INTERNAL_ERROR`, as the JSON-RPC and HTTP+JSON clients report a response
+/// they cannot decode.
+pub fn invalid_response(violation: FieldViolation) -> A2AError {
+    A2AError::internal(format!("invalid response: {}", describe(&violation)))
+}
+
+/// `field: description`, or the description alone for the converted message
+/// itself.
+pub(crate) fn describe(violation: &FieldViolation) -> String {
+    if violation.field.is_empty() {
+        violation.description.clone()
+    } else {
+        format!("{}: {}", violation.field, violation.description)
+    }
+}
+
+fn required(field: &str) -> FieldViolation {
+    FieldViolation {
+        field: field.to_string(),
+        description: "is required".to_string(),
+    }
+}
+
+/// Moves a violation found inside `field` under that field's path.
+fn within(field: impl std::fmt::Display, inner: FieldViolation) -> FieldViolation {
+    FieldViolation {
+        field: if inner.field.is_empty() {
+            field.to_string()
+        } else {
+            format!("{field}.{}", inner.field)
+        },
+        description: inner.description,
+    }
+}
+
+/// Converts a repeated field, naming the element a violation was found in.
+fn each<P, T>(
+    field: &str,
+    items: &[P],
+    convert: impl Fn(&P) -> Result<T, FieldViolation>,
+) -> Result<Vec<T>, FieldViolation> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| convert(item).map_err(|v| within(format!("{field}[{index}]"), v)))
+        .collect()
+}
+
 fn empty_to_none(s: &str) -> Option<String> {
     if s.is_empty() {
         None
@@ -215,20 +282,28 @@ pub fn to_proto_part(p: &Part) -> proto::Part {
     }
 }
 
-pub fn from_proto_part(p: &proto::Part) -> Part {
+/// `Part.content` is a required oneof, so a part that carries none is
+/// invalid, as it is for a2a-go and for the native `Part` deserializer, not
+/// an empty text part.
+pub fn from_proto_part(p: &proto::Part) -> Result<Part, FieldViolation> {
     let content = match &p.content {
         Some(proto::part::Content::Text(t)) => PartContent::Text(t.clone()),
         Some(proto::part::Content::Raw(r)) => PartContent::Raw(r.clone()),
         Some(proto::part::Content::Url(u)) => PartContent::Url(u.clone()),
         Some(proto::part::Content::Data(d)) => PartContent::Data(proto_value_to_json_value(d)),
-        None => PartContent::Text(String::new()),
+        None => {
+            return Err(FieldViolation {
+                field: String::new(),
+                description: "must have one of: text, raw, url, data".to_string(),
+            });
+        }
     };
-    Part {
+    Ok(Part {
         content,
         filename: empty_to_none(&p.filename),
         media_type: empty_to_none(&p.media_type),
         metadata: opt_metadata_from_proto(&p.metadata),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -248,13 +323,13 @@ pub fn to_proto_message(m: &Message) -> proto::Message {
     }
 }
 
-pub fn from_proto_message(m: &proto::Message) -> Message {
-    Message {
+pub fn from_proto_message(m: &proto::Message) -> Result<Message, FieldViolation> {
+    Ok(Message {
         message_id: m.message_id.clone(),
         context_id: empty_to_none(&m.context_id),
         task_id: empty_to_none(&m.task_id),
         role: from_proto_role(m.role),
-        parts: m.parts.iter().map(from_proto_part).collect(),
+        parts: each("parts", &m.parts, from_proto_part)?,
         metadata: opt_metadata_from_proto(&m.metadata),
         extensions: if m.extensions.is_empty() {
             None
@@ -266,7 +341,7 @@ pub fn from_proto_message(m: &proto::Message) -> Message {
         } else {
             Some(m.reference_task_ids.clone())
         },
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -281,12 +356,17 @@ pub fn to_proto_task_status(s: &TaskStatus) -> proto::TaskStatus {
     }
 }
 
-pub fn from_proto_task_status(s: &proto::TaskStatus) -> TaskStatus {
-    TaskStatus {
+pub fn from_proto_task_status(s: &proto::TaskStatus) -> Result<TaskStatus, FieldViolation> {
+    Ok(TaskStatus {
         state: from_proto_task_state(s.state),
-        message: s.message.as_ref().map(from_proto_message),
+        message: s
+            .message
+            .as_ref()
+            .map(from_proto_message)
+            .transpose()
+            .map_err(|v| within("message", v))?,
         timestamp: s.timestamp.as_ref().and_then(from_proto_timestamp),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -304,19 +384,19 @@ pub fn to_proto_artifact(a: &Artifact) -> proto::Artifact {
     }
 }
 
-pub fn from_proto_artifact(a: &proto::Artifact) -> Artifact {
-    Artifact {
+pub fn from_proto_artifact(a: &proto::Artifact) -> Result<Artifact, FieldViolation> {
+    Ok(Artifact {
         artifact_id: a.artifact_id.clone(),
         name: empty_to_none(&a.name),
         description: empty_to_none(&a.description),
-        parts: a.parts.iter().map(from_proto_part).collect(),
+        parts: each("parts", &a.parts, from_proto_part)?,
         metadata: opt_metadata_from_proto(&a.metadata),
         extensions: if a.extensions.is_empty() {
             None
         } else {
             Some(a.extensions.clone())
         },
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -342,14 +422,16 @@ pub fn to_proto_task(t: &Task) -> proto::Task {
     }
 }
 
-pub fn from_proto_task(t: &proto::Task) -> Task {
-    Task {
+pub fn from_proto_task(t: &proto::Task) -> Result<Task, FieldViolation> {
+    Ok(Task {
         id: t.id.clone(),
         context_id: t.context_id.clone(),
         status: t
             .status
             .as_ref()
             .map(from_proto_task_status)
+            .transpose()
+            .map_err(|v| within("status", v))?
             .unwrap_or(TaskStatus {
                 state: TaskState::Unspecified,
                 message: None,
@@ -358,15 +440,15 @@ pub fn from_proto_task(t: &proto::Task) -> Task {
         artifacts: if t.artifacts.is_empty() {
             None
         } else {
-            Some(t.artifacts.iter().map(from_proto_artifact).collect())
+            Some(each("artifacts", &t.artifacts, from_proto_artifact)?)
         },
         history: if t.history.is_empty() {
             None
         } else {
-            Some(t.history.iter().map(from_proto_message).collect())
+            Some(each("history", &t.history, from_proto_message)?)
         },
         metadata: opt_metadata_from_proto(&t.metadata),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -476,20 +558,24 @@ pub fn to_proto_send_message_request(r: &SendMessageRequest) -> proto::SendMessa
     }
 }
 
-pub fn from_proto_send_message_request(r: &proto::SendMessageRequest) -> SendMessageRequest {
-    SendMessageRequest {
+/// `message` is REQUIRED in a2a.proto: a request without one is invalid, as
+/// it is for a2a-go, not a request to send an empty user message.
+pub fn from_proto_send_message_request(
+    r: &proto::SendMessageRequest,
+) -> Result<SendMessageRequest, FieldViolation> {
+    Ok(SendMessageRequest {
         tenant: empty_to_none(&r.tenant),
         message: r
             .message
             .as_ref()
-            .map(from_proto_message)
-            .unwrap_or_else(|| Message::new(Role::User, vec![])),
+            .ok_or_else(|| required("message"))
+            .and_then(|message| from_proto_message(message).map_err(|v| within("message", v)))?,
         configuration: r
             .configuration
             .as_ref()
             .map(from_proto_send_message_configuration),
         metadata: opt_metadata_from_proto(&r.metadata),
-    }
+    })
 }
 
 pub fn to_proto_get_task_request(r: &GetTaskRequest) -> proto::GetTaskRequest {
@@ -553,13 +639,15 @@ pub fn to_proto_list_tasks_response(r: &ListTasksResponse) -> proto::ListTasksRe
     }
 }
 
-pub fn from_proto_list_tasks_response(r: &proto::ListTasksResponse) -> ListTasksResponse {
-    ListTasksResponse {
-        tasks: r.tasks.iter().map(from_proto_task).collect(),
+pub fn from_proto_list_tasks_response(
+    r: &proto::ListTasksResponse,
+) -> Result<ListTasksResponse, FieldViolation> {
+    Ok(ListTasksResponse {
+        tasks: each("tasks", &r.tasks, from_proto_task)?,
         next_page_token: r.next_page_token.clone(),
         page_size: r.page_size,
         total_size: r.total_size,
-    }
+    })
 }
 
 pub fn to_proto_cancel_task_request(r: &CancelTaskRequest) -> proto::CancelTaskRequest {
@@ -726,16 +814,16 @@ pub fn to_proto_send_message_response(r: &SendMessageResponse) -> proto::SendMes
 
 pub fn from_proto_send_message_response(
     r: &proto::SendMessageResponse,
-) -> Option<SendMessageResponse> {
-    match &r.payload {
-        Some(proto::send_message_response::Payload::Task(t)) => {
-            Some(SendMessageResponse::Task(from_proto_task(t)))
-        }
-        Some(proto::send_message_response::Payload::Message(m)) => {
-            Some(SendMessageResponse::Message(from_proto_message(m)))
-        }
+) -> Result<Option<SendMessageResponse>, FieldViolation> {
+    Ok(match &r.payload {
+        Some(proto::send_message_response::Payload::Task(t)) => Some(SendMessageResponse::Task(
+            from_proto_task(t).map_err(|v| within("task", v))?,
+        )),
+        Some(proto::send_message_response::Payload::Message(m)) => Some(
+            SendMessageResponse::Message(from_proto_message(m).map_err(|v| within("message", v))?),
+        ),
         None => None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -755,21 +843,23 @@ pub fn to_proto_task_status_update_event(
 
 pub fn from_proto_task_status_update_event(
     e: &proto::TaskStatusUpdateEvent,
-) -> TaskStatusUpdateEvent {
-    TaskStatusUpdateEvent {
+) -> Result<TaskStatusUpdateEvent, FieldViolation> {
+    Ok(TaskStatusUpdateEvent {
         task_id: e.task_id.clone(),
         context_id: e.context_id.clone(),
         status: e
             .status
             .as_ref()
             .map(from_proto_task_status)
+            .transpose()
+            .map_err(|v| within("status", v))?
             .unwrap_or(TaskStatus {
                 state: TaskState::Unspecified,
                 message: None,
                 timestamp: None,
             }),
         metadata: opt_metadata_from_proto(&e.metadata),
-    }
+    })
 }
 
 pub fn to_proto_task_artifact_update_event(
@@ -787,14 +877,16 @@ pub fn to_proto_task_artifact_update_event(
 
 pub fn from_proto_task_artifact_update_event(
     e: &proto::TaskArtifactUpdateEvent,
-) -> TaskArtifactUpdateEvent {
-    TaskArtifactUpdateEvent {
+) -> Result<TaskArtifactUpdateEvent, FieldViolation> {
+    Ok(TaskArtifactUpdateEvent {
         task_id: e.task_id.clone(),
         context_id: e.context_id.clone(),
         artifact: e
             .artifact
             .as_ref()
             .map(from_proto_artifact)
+            .transpose()
+            .map_err(|v| within("artifact", v))?
             .unwrap_or(Artifact {
                 artifact_id: String::new(),
                 name: None,
@@ -806,7 +898,7 @@ pub fn from_proto_task_artifact_update_event(
         append: if e.append { Some(true) } else { None },
         last_chunk: if e.last_chunk { Some(true) } else { None },
         metadata: opt_metadata_from_proto(&e.metadata),
-    }
+    })
 }
 
 pub fn to_proto_stream_response(r: &StreamResponse) -> proto::StreamResponse {
@@ -825,22 +917,29 @@ pub fn to_proto_stream_response(r: &StreamResponse) -> proto::StreamResponse {
     proto::StreamResponse { payload }
 }
 
-pub fn from_proto_stream_response(r: &proto::StreamResponse) -> Option<StreamResponse> {
-    match &r.payload {
-        Some(proto::stream_response::Payload::Task(t)) => {
-            Some(StreamResponse::Task(from_proto_task(t)))
+pub fn from_proto_stream_response(
+    r: &proto::StreamResponse,
+) -> Result<Option<StreamResponse>, FieldViolation> {
+    Ok(match &r.payload {
+        Some(proto::stream_response::Payload::Task(t)) => Some(StreamResponse::Task(
+            from_proto_task(t).map_err(|v| within("task", v))?,
+        )),
+        Some(proto::stream_response::Payload::Message(m)) => Some(StreamResponse::Message(
+            from_proto_message(m).map_err(|v| within("message", v))?,
+        )),
+        Some(proto::stream_response::Payload::StatusUpdate(s)) => {
+            Some(StreamResponse::StatusUpdate(
+                from_proto_task_status_update_event(s).map_err(|v| within("statusUpdate", v))?,
+            ))
         }
-        Some(proto::stream_response::Payload::Message(m)) => {
-            Some(StreamResponse::Message(from_proto_message(m)))
+        Some(proto::stream_response::Payload::ArtifactUpdate(a)) => {
+            Some(StreamResponse::ArtifactUpdate(
+                from_proto_task_artifact_update_event(a)
+                    .map_err(|v| within("artifactUpdate", v))?,
+            ))
         }
-        Some(proto::stream_response::Payload::StatusUpdate(s)) => Some(
-            StreamResponse::StatusUpdate(from_proto_task_status_update_event(s)),
-        ),
-        Some(proto::stream_response::Payload::ArtifactUpdate(a)) => Some(
-            StreamResponse::ArtifactUpdate(from_proto_task_artifact_update_event(a)),
-        ),
         None => None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1347,7 +1446,7 @@ mod tests {
     fn test_part_text_roundtrip() {
         let part = Part::text("hello world");
         let proto_part = to_proto_part(&part);
-        let back = from_proto_part(&proto_part);
+        let back = from_proto_part(&proto_part).unwrap();
         assert_eq!(part, back);
     }
 
@@ -1355,7 +1454,7 @@ mod tests {
     fn test_part_raw_roundtrip() {
         let part = Part::raw(vec![1, 2, 3, 4]);
         let proto_part = to_proto_part(&part);
-        let back = from_proto_part(&proto_part);
+        let back = from_proto_part(&proto_part).unwrap();
         assert_eq!(part, back);
     }
 
@@ -1370,7 +1469,7 @@ mod tests {
             metadata: Some(meta),
         };
         let proto_part = to_proto_part(&part);
-        let back = from_proto_part(&proto_part);
+        let back = from_proto_part(&proto_part).unwrap();
         assert_eq!(part, back);
     }
 
@@ -1387,7 +1486,7 @@ mod tests {
             reference_task_ids: None,
         };
         let proto_msg = to_proto_message(&msg);
-        let back = from_proto_message(&proto_msg);
+        let back = from_proto_message(&proto_msg).unwrap();
         assert_eq!(msg, back);
     }
 
@@ -1413,7 +1512,7 @@ mod tests {
             metadata: None,
         };
         let proto_task = to_proto_task(&task);
-        let back = from_proto_task(&proto_task);
+        let back = from_proto_task(&proto_task).unwrap();
         // Compare fields individually since Message has random message_id
         assert_eq!(task.id, back.id);
         assert_eq!(task.context_id, back.context_id);
@@ -1434,7 +1533,7 @@ mod tests {
             metadata: None,
         });
         let proto_sr = to_proto_stream_response(&sr);
-        let back = from_proto_stream_response(&proto_sr).unwrap();
+        let back = from_proto_stream_response(&proto_sr).unwrap().unwrap();
         assert!(matches!(back, StreamResponse::StatusUpdate(_)));
     }
 
@@ -1453,7 +1552,9 @@ mod tests {
             metadata: None,
         });
         let proto_resp = to_proto_send_message_response(&resp);
-        let back = from_proto_send_message_response(&proto_resp).unwrap();
+        let back = from_proto_send_message_response(&proto_resp)
+            .unwrap()
+            .unwrap();
         assert!(matches!(back, SendMessageResponse::Task(_)));
     }
 
@@ -1566,7 +1667,7 @@ mod tests {
             tenant: Some("my-tenant".to_string()),
         };
         let proto = to_proto_send_message_request(&req);
-        let back = from_proto_send_message_request(&proto);
+        let back = from_proto_send_message_request(&proto).unwrap();
         assert_eq!(req.tenant, back.tenant);
         assert_eq!(req.message.message_id, back.message.message_id);
         assert_eq!(
@@ -1587,13 +1688,22 @@ mod tests {
     fn test_send_message_request_minimal() {
         let proto = proto::SendMessageRequest {
             tenant: String::new(),
-            message: None,
+            message: Some(proto::Message::default()),
             configuration: None,
             metadata: None,
         };
-        let back = from_proto_send_message_request(&proto);
+        let back = from_proto_send_message_request(&proto).unwrap();
         assert!(back.tenant.is_none());
-        assert_eq!(back.message.role, Role::User);
+        assert!(back.message.parts.is_empty());
+        assert!(back.configuration.is_none());
+    }
+
+    #[test]
+    fn test_send_message_request_without_a_message_is_rejected() {
+        let violation =
+            from_proto_send_message_request(&proto::SendMessageRequest::default()).unwrap_err();
+        assert_eq!(violation.field, "message");
+        assert_eq!(violation.description, "is required");
     }
 
     #[test]
@@ -1669,7 +1779,7 @@ mod tests {
             total_size: 1,
         };
         let proto = to_proto_list_tasks_response(&resp);
-        let back = from_proto_list_tasks_response(&proto);
+        let back = from_proto_list_tasks_response(&proto).unwrap();
         assert_eq!(resp.tasks.len(), back.tasks.len());
         assert_eq!(resp.next_page_token, back.next_page_token);
         assert_eq!(resp.page_size, back.page_size);
@@ -1772,14 +1882,14 @@ mod tests {
         let msg = Message::new(Role::Agent, vec![Part::text("hi")]);
         let resp = SendMessageResponse::Message(msg);
         let proto = to_proto_send_message_response(&resp);
-        let back = from_proto_send_message_response(&proto).unwrap();
+        let back = from_proto_send_message_response(&proto).unwrap().unwrap();
         assert!(matches!(back, SendMessageResponse::Message(_)));
     }
 
     #[test]
     fn test_send_message_response_none() {
         let proto = proto::SendMessageResponse { payload: None };
-        assert!(from_proto_send_message_response(&proto).is_none());
+        assert!(from_proto_send_message_response(&proto).unwrap().is_none());
     }
 
     #[test]
@@ -1798,7 +1908,7 @@ mod tests {
         };
         let sr = StreamResponse::Task(task);
         let proto = to_proto_stream_response(&sr);
-        let back = from_proto_stream_response(&proto).unwrap();
+        let back = from_proto_stream_response(&proto).unwrap().unwrap();
         assert!(matches!(back, StreamResponse::Task(_)));
     }
 
@@ -1807,7 +1917,7 @@ mod tests {
         let msg = Message::new(Role::Agent, vec![Part::text("hi")]);
         let sr = StreamResponse::Message(msg);
         let proto = to_proto_stream_response(&sr);
-        let back = from_proto_stream_response(&proto).unwrap();
+        let back = from_proto_stream_response(&proto).unwrap().unwrap();
         assert!(matches!(back, StreamResponse::Message(_)));
     }
 
@@ -1829,14 +1939,14 @@ mod tests {
             metadata: None,
         });
         let proto = to_proto_stream_response(&sr);
-        let back = from_proto_stream_response(&proto).unwrap();
+        let back = from_proto_stream_response(&proto).unwrap().unwrap();
         assert!(matches!(back, StreamResponse::ArtifactUpdate(_)));
     }
 
     #[test]
     fn test_stream_response_none() {
         let proto = proto::StreamResponse { payload: None };
-        assert!(from_proto_stream_response(&proto).is_none());
+        assert!(from_proto_stream_response(&proto).unwrap().is_none());
     }
 
     #[test]
@@ -2114,7 +2224,7 @@ mod tests {
             proto.timestamp.is_none(),
             "out-of-range timestamp is dropped, not emitted"
         );
-        let back = from_proto_task_status(&proto);
+        let back = from_proto_task_status(&proto).unwrap();
         assert!(back.timestamp.is_none());
     }
 
@@ -2126,7 +2236,7 @@ mod tests {
             timestamp: chrono::DateTime::from_timestamp(1700000000, 0),
         };
         let proto = to_proto_task_status(&ts);
-        let back = from_proto_task_status(&proto);
+        let back = from_proto_task_status(&proto).unwrap();
         assert_eq!(ts.state, back.state);
         assert!(back.timestamp.is_some());
         assert!(back.message.is_some());
@@ -2154,7 +2264,7 @@ mod tests {
             }),
         };
         let proto = to_proto_task(&task);
-        let back = from_proto_task(&proto);
+        let back = from_proto_task(&proto).unwrap();
         assert!(back.history.is_some());
         assert_eq!(back.history.unwrap().len(), 2);
         assert!(back.metadata.is_some());
@@ -2169,7 +2279,7 @@ mod tests {
             metadata: None,
         };
         let proto = to_proto_part(&part);
-        let back = from_proto_part(&proto);
+        let back = from_proto_part(&proto).unwrap();
         assert_eq!(part, back);
     }
 
@@ -2183,7 +2293,7 @@ mod tests {
             metadata: None,
         };
         let proto = to_proto_part(&part);
-        let back = from_proto_part(&proto);
+        let back = from_proto_part(&proto).unwrap();
         assert_eq!(part, back);
     }
 
@@ -2195,9 +2305,155 @@ mod tests {
             media_type: String::new(),
             metadata: None,
         };
-        let back = from_proto_part(&proto);
-        // None content maps to empty text
-        assert!(matches!(back.content, PartContent::Text(ref s) if s.is_empty()));
+        let violation = from_proto_part(&proto).unwrap_err();
+        assert_eq!(violation.field, "");
+        assert_eq!(
+            violation.description,
+            "must have one of: text, raw, url, data"
+        );
+    }
+
+    fn empty_part_message() -> proto::Message {
+        proto::Message {
+            message_id: "m1".to_string(),
+            parts: vec![to_proto_part(&Part::text("ok")), proto::Part::default()],
+            ..Default::default()
+        }
+    }
+
+    fn valid_message() -> proto::Message {
+        to_proto_message(&Message::new(Role::Agent, vec![Part::text("ok")]))
+    }
+
+    /// A part without content is rejected wherever it is nested, and the
+    /// violation names it by its JSON path from the converted message.
+    #[test]
+    fn test_part_without_content_is_named_by_its_path() {
+        let bad = empty_part_message;
+        let task = |task: proto::Task| proto::Task {
+            id: "t1".to_string(),
+            ..task
+        };
+        let in_history = task(proto::Task {
+            history: vec![valid_message(), bad()],
+            ..Default::default()
+        });
+        let in_artifact = task(proto::Task {
+            artifacts: vec![proto::Artifact {
+                artifact_id: "a1".to_string(),
+                parts: vec![proto::Part::default()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let in_status = task(proto::Task {
+            status: Some(proto::TaskStatus {
+                message: Some(bad()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let field = |result: Result<(), FieldViolation>| result.unwrap_err().field;
+
+        assert_eq!(field(from_proto_message(&bad()).map(drop)), "parts[1]");
+        assert_eq!(
+            field(from_proto_task(&in_history).map(drop)),
+            "history[1].parts[1]"
+        );
+        assert_eq!(
+            field(from_proto_task(&in_artifact).map(drop)),
+            "artifacts[0].parts[0]"
+        );
+        assert_eq!(
+            field(from_proto_task(&in_status).map(drop)),
+            "status.message.parts[1]"
+        );
+        assert_eq!(
+            field(
+                from_proto_send_message_request(&proto::SendMessageRequest {
+                    message: Some(bad()),
+                    ..Default::default()
+                })
+                .map(drop)
+            ),
+            "message.parts[1]"
+        );
+        assert_eq!(
+            field(
+                from_proto_list_tasks_response(&proto::ListTasksResponse {
+                    tasks: vec![proto::Task::default(), in_history.clone()],
+                    ..Default::default()
+                })
+                .map(drop)
+            ),
+            "tasks[1].history[1].parts[1]"
+        );
+
+        use proto::send_message_response::Payload as Sent;
+        for (payload, path) in [
+            (
+                Sent::Task(in_artifact.clone()),
+                "task.artifacts[0].parts[0]",
+            ),
+            (Sent::Message(bad()), "message.parts[1]"),
+        ] {
+            let response = proto::SendMessageResponse {
+                payload: Some(payload),
+            };
+            assert_eq!(
+                field(from_proto_send_message_response(&response).map(drop)),
+                path
+            );
+        }
+
+        use proto::stream_response::Payload as Event;
+        for (payload, path) in [
+            (
+                Event::Task(in_status.clone()),
+                "task.status.message.parts[1]",
+            ),
+            (Event::Message(bad()), "message.parts[1]"),
+            (
+                Event::StatusUpdate(proto::TaskStatusUpdateEvent {
+                    status: in_status.status.clone(),
+                    ..Default::default()
+                }),
+                "statusUpdate.status.message.parts[1]",
+            ),
+            (
+                Event::ArtifactUpdate(proto::TaskArtifactUpdateEvent {
+                    artifact: Some(in_artifact.artifacts[0].clone()),
+                    ..Default::default()
+                }),
+                "artifactUpdate.artifact.parts[0]",
+            ),
+        ] {
+            let response = proto::StreamResponse {
+                payload: Some(payload),
+            };
+            assert_eq!(field(from_proto_stream_response(&response).map(drop)), path);
+        }
+    }
+
+    /// The same violation is the caller's fault in a request and the peer's
+    /// in a response.
+    #[test]
+    fn test_a_violation_is_invalid_params_in_a_request_and_internal_in_a_response() {
+        let violation = || from_proto_message(&empty_part_message()).unwrap_err();
+
+        let request = invalid_request(within("message", violation()));
+        assert_eq!(request.code, a2a::error_code::INVALID_PARAMS);
+        assert_eq!(
+            request.message,
+            "message.parts[1]: must have one of: text, raw, url, data"
+        );
+
+        let response = invalid_response(from_proto_part(&proto::Part::default()).unwrap_err());
+        assert_eq!(response.code, a2a::error_code::INTERNAL_ERROR);
+        assert_eq!(
+            response.message,
+            "invalid response: must have one of: text, raw, url, data"
+        );
     }
 
     #[test]

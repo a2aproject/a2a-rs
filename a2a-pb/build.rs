@@ -84,6 +84,13 @@ const NULL_REPEATED_FIELD_REPLACEMENTS: &[(&str, &str)] = &[
         "history__ = Some(map_.next_value::<Option<_>>()?.unwrap_or_default());",
     ),
 ];
+/// `Part.data` is a `google.protobuf.Value`, for which JSON null is a value
+/// (`NullValue`), not an unset field: pbjson reads every null oneof member as
+/// unset, which would turn `{"data": null}` into a part without content.
+const NULL_DATA_PART_REPLACEMENT: (&str, &str) = (
+    "content__ = map_.next_value::<::std::option::Option<_>>()?.map(part::Content::Data)",
+    "content__ = Some(part::Content::Data(map_.next_value()?))",
+);
 const NULL_MAP_REPLACEMENT: (&str, &str) = (
     "map_.next_value::<std::collections::HashMap<_, _>>()?",
     "map_.next_value::<Option<std::collections::HashMap<_, _>>>()?.unwrap_or_default()",
@@ -144,6 +151,11 @@ fn patch_generated_protojson_serde(
     let mut generated = std::fs::read_to_string(&serde_path)?;
 
     generated = replace_if_present(generated, NULL_MAP_REPLACEMENT.0, NULL_MAP_REPLACEMENT.1);
+    generated = replace_if_present(
+        generated,
+        NULL_DATA_PART_REPLACEMENT.0,
+        NULL_DATA_PART_REPLACEMENT.1,
+    );
 
     for &(from, to) in NULL_REPEATED_FIELD_REPLACEMENTS {
         generated = replace_if_present(generated, from, to);

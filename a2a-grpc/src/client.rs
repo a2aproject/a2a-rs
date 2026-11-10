@@ -88,6 +88,7 @@ impl Transport for GrpcTransport {
             .await
             .map_err(|s| status_to_a2a_error(&s))?;
         pbconv::from_proto_send_message_response(response.get_ref())
+            .map_err(pbconv::invalid_response)?
             .ok_or_else(|| A2AError::internal("empty SendMessageResponse payload"))
     }
 
@@ -105,6 +106,7 @@ impl Transport for GrpcTransport {
             .map_err(|s| status_to_a2a_error(&s))?;
         let stream = response.into_inner().map(|item| match item {
             Ok(proto_sr) => pbconv::from_proto_stream_response(&proto_sr)
+                .map_err(pbconv::invalid_response)?
                 .ok_or_else(|| A2AError::internal("empty StreamResponse payload")),
             Err(s) => Err(status_to_a2a_error(&s)),
         });
@@ -123,7 +125,7 @@ impl Transport for GrpcTransport {
             .get_task(grpc_req)
             .await
             .map_err(|s| status_to_a2a_error(&s))?;
-        Ok(pbconv::from_proto_task(response.get_ref()))
+        pbconv::from_proto_task(response.get_ref()).map_err(pbconv::invalid_response)
     }
 
     async fn list_tasks(
@@ -138,7 +140,7 @@ impl Transport for GrpcTransport {
             .list_tasks(grpc_req)
             .await
             .map_err(|s| status_to_a2a_error(&s))?;
-        Ok(pbconv::from_proto_list_tasks_response(response.get_ref()))
+        pbconv::from_proto_list_tasks_response(response.get_ref()).map_err(pbconv::invalid_response)
     }
 
     async fn cancel_task(
@@ -153,7 +155,7 @@ impl Transport for GrpcTransport {
             .cancel_task(grpc_req)
             .await
             .map_err(|s| status_to_a2a_error(&s))?;
-        Ok(pbconv::from_proto_task(response.get_ref()))
+        pbconv::from_proto_task(response.get_ref()).map_err(pbconv::invalid_response)
     }
 
     async fn subscribe_to_task(
@@ -170,6 +172,7 @@ impl Transport for GrpcTransport {
             .map_err(|s| status_to_a2a_error(&s))?;
         let stream = response.into_inner().map(|item| match item {
             Ok(proto_sr) => pbconv::from_proto_stream_response(&proto_sr)
+                .map_err(pbconv::invalid_response)?
                 .ok_or_else(|| A2AError::internal("empty StreamResponse payload")),
             Err(s) => Err(status_to_a2a_error(&s)),
         });
