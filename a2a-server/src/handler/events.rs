@@ -20,7 +20,8 @@ pub(super) type FailureSignal = watch::Sender<Option<A2AError>>;
 #[derive(Clone)]
 pub(super) struct ExecutionEvent {
     pub(super) sequence: u64,
-    /// Highest input generation read when this output was emitted, not when it was delivered.
+    /// Highest input generation read when the server polled this output from
+    /// the executor stream. Buffered producer-side creation can precede this.
     pub(super) input_generation: i64,
     pub(super) result: Result<StreamResponse, A2AError>,
     pub(super) kind: EventKind,
@@ -409,6 +410,11 @@ pub(super) fn subscription_stream(
                     Ok(event) if event.sequence <= state.min_sequence => continue,
                     Ok(event) => {
                         state.min_sequence = event.sequence;
+                        if event.kind == EventKind::InvocationEnded
+                            && event.input_generation < state.receiver.required_input
+                        {
+                            continue;
+                        }
                         let decision = filter.decide(event.kind, &event.result);
                         if matches!(decision, EventDecision::Skip) {
                             continue;

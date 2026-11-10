@@ -105,6 +105,62 @@ async fn check_reloaded_question(state: TaskState, newer_generation: bool) {
 
 struct Empty;
 
+struct ReadAndEnd;
+
+impl AgentExecutor for ReadAndEnd {
+    fn cancel(&self, _: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        stream::empty().boxed()
+    }
+    fn execute(
+        &self,
+        mut ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        Box::pin(async_stream::stream! {
+            yield Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: ctx.task_id.clone(), context_id: ctx.context_id.clone(),
+                generation: 0, metadata: None,
+                status: TaskStatus { state: TaskState::Working, message: None, timestamp: None },
+            }));
+            let _ = ctx.inputs.recv().await;
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_turn_that_reads_an_answer_then_ends_returns_the_working_snapshot() {
+    let handler = DefaultRequestHandler::new(ReadAndEnd, InMemoryTaskStore::new())
+        .with_capabilities(caps(Some(true), None));
+    old_question(&handler).await;
+    let mut events = handler
+        .send_streaming_message(&ServiceParams::new(), answer("opening"))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        while let Some(event) = events.next().await {
+            if matches!(event.unwrap(), StreamResponse::StatusUpdate(update) if update.status.state == TaskState::Working) {
+                break;
+            }
+        }
+    }).await.unwrap();
+    let result = timeout(
+        Duration::from_secs(2),
+        handler.send_message(&ServiceParams::new(), answer("answer")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(result, SendMessageResponse::Task(task) if task.status.state == TaskState::Working)
+    );
+    assert!(
+        timeout(Duration::from_millis(30), events.next())
+            .await
+            .is_err(),
+        "streaming follows the nonterminal task"
+    );
+    handler.shutdown().await;
+}
+
 impl AgentExecutor for Empty {
     fn execute(&self, _: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         stream::empty().boxed()
@@ -115,10 +171,10 @@ impl AgentExecutor for Empty {
 }
 
 #[tokio::test]
-async fn an_answering_turn_without_output_does_not_repeat_the_old_question() {
+async fn an_answering_turn_without_output_returns_its_current_snapshot() {
     let handler = DefaultRequestHandler::new(Empty, InMemoryTaskStore::new());
     old_question(&handler).await;
-    let mut response = tokio::spawn({
+    let response = tokio::spawn({
         let handler = handler.clone();
         async move {
             handler
@@ -134,19 +190,13 @@ async fn an_answering_turn_without_output_does_not_repeat_the_old_question() {
     })
     .await
     .expect("the empty turn finished");
-    assert!(
-        timeout(Duration::from_millis(30), &mut response)
-            .await
-            .is_err()
-    );
-    cancel(&handler).await;
     let result = timeout(Duration::from_secs(2), response)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
     assert!(
-        matches!(result, SendMessageResponse::Task(task) if task.status.state == TaskState::Canceled)
+        matches!(result, SendMessageResponse::Task(task) if task.status.state == TaskState::InputRequired)
     );
     handler.shutdown().await;
 }

@@ -367,6 +367,16 @@ impl TaskController {
             return;
         };
         let unread = self.take_unread_inputs(active);
+        // End only the blocking responses whose inputs this invocation read.
+        // Subscribers stay attached; unread inputs still follow the successor.
+        active.emitted_output();
+        active
+            .publish_kind(
+                Ok(&StreamResponse::Task(snapshot.clone())),
+                None,
+                EventKind::InvocationEnded,
+            )
+            .await;
         if unread.is_empty() {
             release_execution(active, task_id, self).await;
             return;

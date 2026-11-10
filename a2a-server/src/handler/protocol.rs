@@ -395,6 +395,8 @@ impl ExecutionProtocol {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum EventKind {
     Normal,
+    /// Local completion of the invocation that consumed a blocking send's input.
+    InvocationEnded,
     /// A `Task` snapshot that changed nothing. It sits at a generation that was
     /// already announced, so streams meant for clients leave it out; the
     /// blocking send, which only needs to know the executor spoke, keeps it.
@@ -628,12 +630,14 @@ impl EventFilter {
         result: &Result<StreamResponse, A2AError>,
     ) -> EventDecision {
         if (kind == EventKind::Repeated && !self.include_repeats)
+            || (kind == EventKind::InvocationEnded && !self.task_snapshots)
             || matches!(kind, EventKind::ResponseOnly(recipient) if recipient.is_none() || recipient != self.response_id)
             || (!self.message_updates && matches!(result, Ok(StreamResponse::MessageUpdate(_))))
         {
             return EventDecision::Skip;
         }
         if result.as_ref().map_or(true, is_terminal_event)
+            || kind == EventKind::InvocationEnded
             || kind == EventKind::Reply
             || (!self.live && matches!(kind, EventKind::ResponseOnly(_)))
         {

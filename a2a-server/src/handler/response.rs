@@ -386,11 +386,18 @@ pub(super) fn task_response(
             yield Ok(StreamResponse::Task(task));
         }
         if let Some(mut events) = inner {
+            let mut delivered = false;
             while let Some(item) = events.next().await {
+                delivered = true;
                 if let Some(generation) = item.as_ref().ok().and_then(generation_of) {
                     last_generation = last_generation.max(generation);
                 }
                 yield item;
+            }
+            // A blocking subscription closes on its consuming invocation's
+            // completion even when the executor left the Task nonterminal.
+            if delivered && policy.mode() == super::protocol::StartMode::Blocking {
+                return;
             }
         }
         // An invocation ending does not end a task. Recover a newer snapshot,
@@ -641,7 +648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocking_response_waits_after_a_working_turn_ends() {
+    async fn blocking_response_returns_the_snapshot_after_its_turn_ends() {
         let handler = make_handler();
         seed_task(&handler, "working", "context").await;
         let mut task = handler.tasks.load("working").await.unwrap();
@@ -661,27 +668,10 @@ mod tests {
         );
         let events = run.start(None, Some(events), 0);
         let tasks = handler.tasks.clone();
-        let mut response = tokio::spawn(async move {
+        let response = tokio::spawn(async move {
             unary_response(tasks.clone(), tasks.task("working"), events).await
         });
         drained.notified().await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), &mut response)
-                .await
-                .is_err(),
-            "ending the executor turn must not return a working task"
-        );
-        handler
-            .cancel_task(
-                &ServiceParams::new(),
-                CancelTaskRequest {
-                    id: "working".into(),
-                    metadata: None,
-                    tenant: None,
-                },
-            )
-            .await
-            .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), response)
             .await
             .unwrap()
@@ -690,7 +680,8 @@ mod tests {
         let SendMessageResponse::Task(task) = result else {
             panic!("expected a task")
         };
-        assert_eq!(task.status.state, TaskState::Canceled);
+        assert_eq!(task.status.state, TaskState::Working);
+        handler.shutdown().await;
     }
     #[tokio::test]
     async fn queued_and_normal_events_obey_the_same_completion_policy() {
