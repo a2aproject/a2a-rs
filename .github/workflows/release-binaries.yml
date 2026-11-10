@@ -8,11 +8,25 @@ on:
   pull_request:
     paths-ignore:
       - 'itk/**'
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.in'
+      - 'requirements-docs.txt'
+      - 'lychee.toml'
+      - '.typos.toml'
+      - '.github/workflows/docs.yml'
   push:
     branches:
       - main
     paths-ignore:
       - 'itk/**'
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.in'
+      - 'requirements-docs.txt'
+      - 'lychee.toml'
+      - '.typos.toml'
+      - '.github/workflows/docs.yml'
 
 env:
   CARGO_TERM_COLOR: always

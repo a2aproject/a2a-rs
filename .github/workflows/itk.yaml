@@ -34,8 +34,16 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
 
+      - name: Detect code changes
+        id: changes
+        uses: ./.github/actions/changes
+
+      # Skipped for a docs-only change; see ci.yml.
       - name: Clone a2a-itk
+        if: steps.changes.outputs.code == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: a2aproject/a2a-itk
@@ -43,9 +51,11 @@ jobs:
           path: itk/a2a-itk
 
       - name: Set up Docker Buildx
+        if: steps.changes.outputs.code == 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build itk_service image (GHA layer cache)
+        if: steps.changes.outputs.code == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: itk/a2a-itk
@@ -55,6 +65,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=itk_service
 
       - name: Cache launcher peer-SDK checkouts + build outputs
+        if: steps.changes.outputs.code == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/a2a-itk-launcher
@@ -63,6 +74,7 @@ jobs:
             itk-launcher-${{ runner.os }}-
 
       - name: Run ITK PR Suite
+        if: steps.changes.outputs.code == 'true'
         run: bash run_itk.sh
         working-directory: itk
         env:
