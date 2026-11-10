@@ -2,6 +2,8 @@ name: Docs
 
 # Not a required check: a workflow skipped by `paths` never reports, which
 # would leave a required check pending on every other pull request.
+# A pull request builds what a push to `main` publishes, so keep the two path
+# lists identical.
 on:
   pull_request:
     paths:
@@ -15,15 +17,31 @@ on:
       - 'mkdocs.yml'
       - 'requirements-docs.in'
       - 'requirements-docs.txt'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/docs.yml'
+      - '.typos.toml'
+      - 'a2acli/README.md'
+      - 'docs/**'
+      - 'examples/**'
+      - 'justfile'
+      - 'lychee.toml'
+      - 'mkdocs.yml'
+      - 'requirements-docs.in'
+      - 'requirements-docs.txt'
 
-# Least privilege: nothing here writes to the repository, an issue or a pull request.
+# Least privilege: every job is read-only except `deploy`, which can publish to
+# GitHub Pages and nothing else.
 permissions:
   contents: read
 
-# A newer push to a pull request cancels its earlier run.
+# A newer push to a pull request cancels its earlier run. A run on `main` is
+# never cancelled, so a deployment is not cut off half way.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -52,6 +70,7 @@ jobs:
         run: just docs-build
 
       - name: Upload the site
+        if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docs-site
@@ -59,7 +78,16 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: Upload the site for GitHub Pages
+        if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+      # Pull requests only: a third-party site that is down must not hold back
+      # a deployment, and a pull request has already checked these links.
       - name: Check links
+        if: github.event_name == 'pull_request'
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
           lycheeVersion: v0.24.2
@@ -70,6 +98,7 @@ jobs:
 
   spelling:
     name: Check spelling
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
 
     steps:
@@ -83,3 +112,25 @@ jobs:
         with:
           config: .typos.toml
           files: docs mkdocs.yml a2acli/README.md
+
+  # The only job that can publish. The `github-pages` environment also limits
+  # deployments to `main`. Settings -> Pages -> Source must be "GitHub Actions".
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
