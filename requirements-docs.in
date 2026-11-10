@@ -1,0 +1,4 @@
+# Direct dependencies of the docs site. Regenerate requirements-docs.txt with:
+#   uv pip compile requirements-docs.in --universal --python-version 3.11 --generate-hashes -o requirements-docs.txt
+mkdocs==1.6.1
+mkdocs-material==9.8.1

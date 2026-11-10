@@ -1,0 +1,10 @@
+# Spelling check for the docs: .github/workflows/docs.yml runs `typos` on
+# docs/, mkdocs.yml and a2acli/README.md. Words that look like misspellings but
+# are not go in the allowlist below, each with the reason.
+
+[files]
+extend-exclude = ["*.svg"]
+
+[default.extend-words]
+# The CLI's own error messages and the README spell it this way.
+unparseable = "unparseable"

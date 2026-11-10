@@ -1,0 +1,17 @@
+name: Detect code changes
+description: >-
+  Sets `code` to `false` when a pull request or merge queue entry changes only
+  the docs site, so the Rust jobs can skip their work and still report. Needs
+  a checkout with `fetch-depth: 2`; with less it answers `true`.
+
+outputs:
+  code:
+    description: "'false' when only the docs site changed, 'true' otherwise"
+    value: ${{ steps.detect.outputs.code }}
+
+runs:
+  using: composite
+  steps:
+    - id: detect
+      shell: bash
+      run: bash "${{ github.action_path }}/../../../scripts/ci-changes.sh"

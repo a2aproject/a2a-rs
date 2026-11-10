@@ -41,8 +41,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The base of the merge commit, so the next step can diff against it.
+          fetch-depth: 2
+
+      - name: Detect code changes
+        id: changes
+        uses: ./.github/actions/changes
+
+      # A change that only touches the docs site skips the steps below. The job
+      # still runs and reports, so the required checks pass without a build.
 
       - name: Setup Rust
+        if: steps.changes.outputs.code == 'true'
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           components: clippy, rustfmt
@@ -51,11 +62,13 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install just
+        if: steps.changes.outputs.code == 'true'
         uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
         with:
           tool: just
 
       - name: Check lockfile is up to date
+        if: steps.changes.outputs.code == 'true'
         # `--locked` fails if Cargo.lock would need changing. The release
         # workflows already build with `--locked`, so a lockfile that drifts
         # on main breaks every pull request's release-binary job.
@@ -67,20 +80,23 @@ jobs:
         run: cargo metadata --locked --format-version 1 > /dev/null
 
       - name: Check compilation
+        if: steps.changes.outputs.code == 'true'
         run: just check-compile
 
       - name: Check formatting
-        if: runner.os == 'Linux'
+        if: steps.changes.outputs.code == 'true' && runner.os == 'Linux'
         run: just fmt-check
 
       - name: Clippy lints
+        if: steps.changes.outputs.code == 'true'
         run: just lint
 
       - name: Run tests
+        if: steps.changes.outputs.code == 'true'
         run: just test
 
       - name: Check copyright headers
-        if: matrix.os != 'windows-latest'
+        if: steps.changes.outputs.code == 'true' && matrix.os != 'windows-latest'
         shell: bash
         run: |
           missing=0

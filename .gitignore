@@ -22,3 +22,7 @@ fuzz/coverage/
 fuzz/target/
 # Derived from the root Cargo.lock; see `just fuzz-lock`.
 fuzz/Cargo.lock
+
+# Docs site: `just docs-build` output and its Python environment
+/site/
+/.venv-docs/
