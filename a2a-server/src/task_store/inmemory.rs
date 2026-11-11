@@ -23,9 +23,18 @@ const MAX_LISTINGS: usize = 1024;
 const MAX_LISTING_IDS: usize = 1_000_000;
 const MAX_PRINCIPAL_LISTINGS: usize = 32;
 const MAX_PRINCIPAL_IDS: usize = 250_000;
+const MAX_ANONYMOUS_LISTINGS: usize = 8;
+const MAX_ANONYMOUS_IDS: usize = 64_000;
 const MAX_TENANT_LISTINGS: usize = 256;
 const MAX_TENANT_IDS: usize = 500_000;
 const LISTING_TTL: Duration = Duration::from_secs(300);
+
+fn principal(scope: &TaskListScope) -> Option<&str> {
+    scope
+        .principal
+        .as_ref()
+        .and_then(|(authenticated, name)| authenticated.then_some(name.as_str()))
+}
 
 struct Listing {
     id: uuid::Uuid,
@@ -367,11 +376,18 @@ impl TaskStore for InMemoryTaskStore {
                             (count + 1, size + entry.tasks.len())
                         })
                 };
-                let principal = usage(&|entry| entry.scope == *scope);
+                // The request's tenant cannot create a new caller budget.
+                // Unauthenticated names share one smaller anonymous budget.
+                let principal_usage = usage(&|entry| principal(&entry.scope) == principal(scope));
+                let (list_limit, id_limit) = if principal(scope).is_some() {
+                    (MAX_PRINCIPAL_LISTINGS, MAX_PRINCIPAL_IDS)
+                } else {
+                    (MAX_ANONYMOUS_LISTINGS, MAX_ANONYMOUS_IDS)
+                };
                 let tenant = usage(&|entry| entry.scope.tenant == scope.tenant);
                 let global = usage(&|_| true);
-                if principal.0 >= MAX_PRINCIPAL_LISTINGS
-                    || ids.len() > MAX_PRINCIPAL_IDS.saturating_sub(principal.1)
+                if principal_usage.0 >= list_limit
+                    || ids.len() > id_limit.saturating_sub(principal_usage.1)
                     || (scope.tenant.is_some()
                         && (tenant.0 >= MAX_TENANT_LISTINGS
                             || ids.len() > MAX_TENANT_IDS.saturating_sub(tenant.1)))
@@ -557,12 +573,12 @@ mod tests {
         let store = dated_store().await;
         let mut req = list_request(1);
         req.page_token = Some(store.list(&req).await.unwrap().next_page_token);
-        for _ in 1..MAX_PRINCIPAL_LISTINGS {
+        for _ in 1..MAX_ANONYMOUS_LISTINGS {
             store.list(&list_request(1)).await.unwrap();
         }
         assert_eq!(
             store.tasks.read().await.listings.len(),
-            MAX_PRINCIPAL_LISTINGS
+            MAX_ANONYMOUS_LISTINGS
         );
         assert!(store.list(&list_request(1)).await.is_err());
         assert_eq!(store.list(&req).await.unwrap().tasks[0].id, "b");
@@ -644,6 +660,58 @@ mod tests {
                 .list_for_scope(&continuation, &alice, None)
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn principal_budget_spans_tenants_and_anonymous_names_share_a_smaller_budget() {
+        let store = dated_store().await;
+        for index in 0..MAX_PRINCIPAL_LISTINGS {
+            let tenant = Some(format!("tenant-{index}"));
+            let scope = TaskListScope {
+                tenant: tenant.clone(),
+                principal: Some((true, "alice".into())),
+            };
+            let mut request = list_request(1);
+            request.tenant = tenant;
+            store.list_for_scope(&request, &scope, None).await.unwrap();
+        }
+        let extra = TaskListScope {
+            tenant: Some("another-tenant".into()),
+            principal: Some((true, "alice".into())),
+        };
+        assert_eq!(
+            store
+                .list_for_scope(&list_request(1), &extra, None)
+                .await
+                .unwrap_err()
+                .code,
+            error_code::INVALID_REQUEST
+        );
+        for index in 0..MAX_ANONYMOUS_LISTINGS {
+            let scope = TaskListScope {
+                tenant: Some(format!("anonymous-{index}")),
+                principal: Some((false, format!("untrusted-name-{index}"))),
+            };
+            store
+                .list_for_scope(&list_request(1), &scope, None)
+                .await
+                .unwrap();
+        }
+        assert!(store.list(&list_request(1)).await.is_err());
+        let bob = TaskListScope {
+            tenant: None,
+            principal: Some((true, "bob".into())),
+        };
+        assert!(
+            store
+                .list_for_scope(&list_request(1), &bob, None)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            store.tasks.read().await.listings.len(),
+            MAX_PRINCIPAL_LISTINGS + MAX_ANONYMOUS_LISTINGS + 1
         );
     }
 
