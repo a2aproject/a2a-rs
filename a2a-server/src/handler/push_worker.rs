@@ -363,11 +363,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_permanent_config_lookup_failure_releases_its_http_slot() {
-        struct FailingGet;
+        struct FailingGet(u8);
         #[async_trait::async_trait]
         impl crate::PushConfigStore for FailingGet {
             async fn get(&self, _: &str, _: &str) -> Result<TaskPushNotificationConfig, A2AError> {
-                Err(A2AError::internal("store unavailable"))
+                match self.0 {
+                    1 => std::future::pending().await,
+                    2 => Ok(serde_json::from_value(serde_json::json!({
+                        "taskId":"task", "url":"https://example.com/replaced"
+                    }))
+                    .unwrap()),
+                    _ => Err(A2AError::internal("store unavailable")),
+                }
             }
             async fn save(
                 &self,
@@ -386,31 +393,40 @@ mod tests {
             }
         }
         install_crypto_provider();
-        let sender = Arc::new(crate::HttpPushSender::new(Some(
-            crate::HttpPushSenderConfig {
-                timeout: Duration::from_secs(1),
-                validate_urls: false,
-                ..Default::default()
-            },
-        )));
-        let source = TaskHandle::new("task".into(), None);
-        source
-            .configure_pushes(super::super::push_delivery::PushService::new(
-                FailingGet,
-                crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+        for mode in [0, 1, 2] {
+            let sender = Arc::new(crate::HttpPushSender::new(Some(
+                crate::HttpPushSenderConfig {
+                    timeout: Duration::from_secs(if mode == 1 { 31 } else { 1 }),
                     validate_urls: false,
                     ..Default::default()
-                })),
-            ))
-            .ok()
-            .unwrap();
-        let job = notification("task", 1, "https://example.com/hook", &sender, &source);
-        let done = timeout(Duration::from_secs(2), job.deliver())
-            .await
-            .expect("an unavailable config store cannot hold a delivery slot forever");
-        assert_eq!(done.0, "task");
+                },
+            )));
+            let source = TaskHandle::new("task".into(), None);
+            source
+                .configure_pushes(super::super::push_delivery::PushService::new(
+                    FailingGet(mode),
+                    crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                        validate_urls: false,
+                        ..Default::default()
+                    })),
+                ))
+                .ok()
+                .unwrap();
+            let job = notification("task", 1, "https://example.com/hook", &sender, &source);
+            let started = tokio::time::Instant::now();
+            let done = timeout(Duration::from_secs(32), job.deliver())
+                .await
+                .expect("an unavailable config store cannot hold a delivery slot forever");
+            assert_eq!(done.0, "task");
+            if mode == 2 {
+                assert_eq!(
+                    started.elapsed(),
+                    Duration::ZERO,
+                    "a changed registration must not send to its old URL"
+                );
+            }
+        }
     }
-
     #[tokio::test]
     async fn one_tasks_slow_fanout_cannot_fill_all_http_slots() {
         install_crypto_provider();

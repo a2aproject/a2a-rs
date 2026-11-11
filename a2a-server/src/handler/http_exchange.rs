@@ -644,4 +644,203 @@ mod tests {
         handler.shutdown().await;
         assert!(handler.http_live_responses.open.read().is_empty());
     }
+    fn routed_input(
+        handler: &DefaultRequestHandler,
+        capacity: usize,
+        exchange: Option<&str>,
+    ) -> (AuthorizedMessage, mpsc::Receiver<Incoming>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        handler
+            .http_live_responses
+            .register(sender.clone(), exchange.map(str::to_owned), None)
+            .unwrap();
+        handler.http_live_responses.bind(&sender, "task");
+        (
+            AuthorizedMessage {
+                request: send_req(Some("task"), Some("context")),
+                params: ServiceParams::new(),
+                user: None,
+                response_id: None,
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_lost_processing_receipt_recovers_only_recorded_input() {
+        for cached in [false, true] {
+            for recorded in [false, true] {
+                let handler = make_handler();
+                seed_task(&handler, "task", "context").await;
+                let (input, mut receiver) = routed_input(&handler, 1, None);
+                let mut snapshot = handler.tasks.load("task").await.unwrap();
+                if recorded {
+                    snapshot.history = Some(vec![input.request.message.clone().unwrap()]);
+                    handler
+                        .tasks
+                        .store()
+                        .update(snapshot.clone())
+                        .await
+                        .unwrap();
+                }
+                let source = handler.tasks.task("task");
+                if cached {
+                    source.set_snapshot(snapshot.clone());
+                }
+                let (result, ()) = tokio::join!(route(&handler, &input, None), async {
+                    // A panic/disconnect after begin loses the receipt; it
+                    // cannot make already committed input eligible for replay.
+                    drop(
+                        receiver
+                            .recv()
+                            .await
+                            .unwrap()
+                            .receipt
+                            .unwrap()
+                            .begin()
+                            .unwrap(),
+                    );
+                });
+                if recorded {
+                    assert_eq!(*result.unwrap().unwrap(), snapshot);
+                } else {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .message
+                            .contains("failed while handling")
+                    );
+                }
+                handler.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lost_receipt_storage_recovery_has_a_deadline() {
+        let handler = DefaultRequestHandler::new(EchoExecutor, PausedReadStore::default())
+            .with_http_followup_timeout(Duration::from_secs(1));
+        let (input, mut receiver) = routed_input(&handler, 1, None);
+        let (result, ()) = tokio::join!(route(&handler, &input, None), async {
+            drop(
+                receiver
+                    .recv()
+                    .await
+                    .unwrap()
+                    .receipt
+                    .unwrap()
+                    .begin()
+                    .unwrap(),
+            );
+        });
+        assert!(result.unwrap_err().message.contains("recovery timed out"));
+        handler.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_http_queue_times_out_without_admitting_another_input() {
+        let handler = make_handler().with_http_followup_timeout(Duration::from_secs(1));
+        let (input, mut receiver) = routed_input(&handler, 1, None);
+        let (_, sender) = handler
+            .http_live_responses
+            .route("task", None, &None)
+            .unwrap()
+            .unwrap();
+        sender
+            .try_send(Incoming {
+                request: IncomingRequest::message(input.request.clone()),
+                receipt: None,
+            })
+            .unwrap_or_else(|_| panic!("empty queue"));
+        let error = route(&handler, &input, None).await.unwrap_err();
+        assert!(error.message.contains("queue timed out"));
+        assert!(receiver.try_recv().is_ok());
+        assert!(
+            receiver.try_recv().is_err(),
+            "timed-out input was never enqueued"
+        );
+        handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_queue_closed_while_reserving_reports_that_processing_never_started() {
+        let handler = make_handler();
+        let (input, mut receiver) = routed_input(&handler, 1, None);
+        let (_, sender) = handler
+            .http_live_responses
+            .route("task", None, &None)
+            .unwrap()
+            .unwrap();
+        sender
+            .try_send(Incoming {
+                request: IncomingRequest::message(input.request.clone()),
+                receipt: None,
+            })
+            .unwrap_or_else(|_| panic!("empty queue"));
+        let (result, ()) = tokio::join!(route(&handler, &input, None), async {
+            receiver.close();
+        });
+        assert!(
+            result.unwrap().is_none(),
+            "a new exchange can safely retry this input"
+        );
+        handler.shutdown().await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn an_owned_http_timeout_cannot_fabricate_a_missing_snapshot() {
+        let handler = make_handler().with_http_followup_timeout(Duration::from_secs(1));
+        let (input, mut receiver) = routed_input(&handler, 1, None);
+        let (result, ()) = tokio::join!(route(&handler, &input, None), async {
+            let _receipt = receiver
+                .recv()
+                .await
+                .unwrap()
+                .receipt
+                .unwrap()
+                .begin()
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        assert_eq!(result.unwrap_err().code, error_code::TASK_NOT_FOUND);
+        handler.shutdown().await;
+    }
+
+    struct DenyTask;
+    impl crate::RequestAuthorizer for DenyTask {
+        fn authorize(&self, _: &ServiceParams, task: Option<&str>) -> Result<(), A2AError> {
+            assert!(task.is_none() || task == Some("task"));
+            Err(A2AError::invalid_request(
+                "credential cannot access bound task",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cross_task_route_reauthorizes_the_task_an_ack_would_disclose() {
+        let handler = make_handler().with_authorizer(DenyTask);
+        let (mut input, _receiver) = routed_input(&handler, 1, Some("bound"));
+        input.request.message.as_mut().unwrap().task_id = Some("other".into());
+        let error = route(&handler, &input, Some("bound")).await.unwrap_err();
+        assert!(error.message.contains("credential"));
+        handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_http_opening_still_requires_authorization() {
+        let handler = make_handler().with_authorizer(DenyTask);
+        let error = open(
+            &handler,
+            &ServiceParams::new(),
+            StreamRequest {
+                tenant: None,
+                payload: StreamRequestPayload::Unrecognised,
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.message.contains("credential"));
+        assert!(handler.http_live_responses.open.read().is_empty());
+        handler.shutdown().await;
+    }
 }

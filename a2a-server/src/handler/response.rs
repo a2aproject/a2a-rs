@@ -1130,4 +1130,56 @@ mod subscription_tests {
         );
         assert!(events.next().await.is_none());
     }
+    #[tokio::test]
+    async fn unary_without_a_final_snapshot_reads_the_committed_task() {
+        use crate::handler::test_support::{make_handler, seed_task};
+        use futures::stream;
+        let handler = make_handler();
+        seed_task(&handler, "task", "context").await;
+        let expected = handler.tasks.load("task").await.unwrap();
+        let response = unary_response(
+            handler.tasks.clone(),
+            handler.tasks.task("task"),
+            stream::empty().boxed(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, SendMessageResponse::Task(expected));
+        handler.shutdown().await;
+    }
+    #[tokio::test]
+    async fn a_live_half_close_flushes_pending_output_after_execution_has_ended() {
+        use crate::handler::test_support::{make_handler, seed_task};
+        use futures::stream;
+        for pending_output in [false, true] {
+            let handler = make_handler();
+            seed_task(&handler, "task", "context").await;
+            let task = handler.tasks.load("task").await.unwrap();
+            let mut run = Run::new(
+                handler.clone(),
+                ServiceParams::new(),
+                handler.tasks.task("task"),
+                ResponsePolicy::new(StartMode::Bidi, false),
+            );
+            let mut inner = pending_output
+                .then(|| stream::iter([Ok(StreamResponse::Task(task.clone()))]).boxed());
+            let (sender, mut output) = mpsc::channel(2);
+            let mut uplink_open = true;
+            let mut generation = 0;
+            assert!(
+                !run.handle_uplink(None, &mut uplink_open, &mut inner, &mut generation, &sender)
+                    .await
+            );
+            assert!(!uplink_open);
+            assert!(inner.is_none());
+            if pending_output {
+                assert_eq!(
+                    output.try_recv().unwrap().unwrap(),
+                    StreamResponse::Task(task)
+                );
+            }
+            assert!(output.try_recv().is_err());
+            handler.shutdown().await;
+        }
+    }
 }
