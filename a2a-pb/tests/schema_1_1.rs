@@ -238,7 +238,7 @@ fn unknown_binary_timeline_entries_leave_the_task_generation_intact() {
 #[test]
 fn request_fields_survive_protobuf_and_protojson() {
     let send = SendMessageRequest {
-        message: Message::new(Role::User, vec![Part::text("hi")]),
+        message: Some(Message::new(Role::User, vec![Part::text("hi")])),
         configuration: Some(SendMessageConfiguration {
             accepted_output_modes: None,
             task_push_notification_config: Some(TaskPushNotificationConfig {
@@ -477,7 +477,7 @@ fn stream_request_round_trips() {
     let send = StreamRequest {
         tenant: Some("acme".into()),
         payload: StreamRequestPayload::SendMessage(SendMessageRequest {
-            message: Message::new(Role::User, vec![Part::text("hi")]),
+            message: Some(Message::new(Role::User, vec![Part::text("hi")])),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -501,8 +501,8 @@ fn stream_request_round_trips() {
 
 #[test]
 fn artifact_only_request_has_no_message_on_the_wire() {
-    let mut request = SendMessageRequest {
-        message: Message::new(Role::User, vec![]),
+    let request = SendMessageRequest {
+        message: None,
         configuration: None,
         metadata: None,
         tenant: None,
@@ -526,30 +526,28 @@ fn artifact_only_request_has_no_message_on_the_wire() {
             generation: 0,
         }],
     };
-    // An artifact-only request has no message: no id, and no role.
-    request.message.message_id = String::new();
-    request.message.role = Role::Unspecified;
-
+    let native_json = serde_json::to_value(&request).unwrap();
+    assert!(native_json.get("message").is_none());
+    assert_eq!(
+        serde_json::from_value::<SendMessageRequest>(native_json).unwrap(),
+        request
+    );
     let proto = pbconv::to_proto_send_message_request(&request);
     assert!(proto.message.is_none(), "the message is omitted");
     let back = pbconv::from_proto_send_message_request(&proto);
-    assert!(
-        back.message.message_id.is_empty(),
-        "and comes back marked as absent"
-    );
+    assert!(back.message.is_none(), "and comes back marked as absent");
     assert_eq!(back.artifact_updates, request.artifact_updates);
 
     let json = protojson_conv::to_value(&request).unwrap();
     assert!(json.get("message").is_none(), "{json}");
     let from_json: SendMessageRequest = protojson_conv::from_value(json).unwrap();
-    assert!(from_json.message.message_id.is_empty());
+    assert!(from_json.message.is_none());
 
     // Without artifacts absence must remain invalid, rather than receiving
     // a generated ID that would bypass the handler's required-field checks.
     let decoded =
         pbconv::from_proto_send_message_request(&a2a_pb::proto::SendMessageRequest::default());
-    assert!(decoded.message.message_id.is_empty());
-    assert_eq!(decoded.message.role, Role::Unspecified);
+    assert!(decoded.message.is_none());
 }
 
 #[test]
@@ -600,18 +598,18 @@ fn an_artifact_only_request_is_a_fixed_point_of_the_json_conversion() {
     };
     let mut empty = Message::new(Role::Unspecified, vec![]);
     empty.message_id = String::new();
-    let mut variants = vec![empty.clone()];
+    let mut variants = vec![None, Some(empty.clone())];
     for role in [Role::User, Role::Agent] {
         let mut m = empty.clone();
         m.role = role;
-        variants.push(m);
+        variants.push(Some(m));
     }
     let mut m = empty.clone();
     m.reference_task_ids = Some(vec![String::new()]);
-    variants.push(m);
+    variants.push(Some(m));
     let mut m = empty.clone();
     m.extensions = Some(vec!["x".into()]);
-    variants.push(m);
+    variants.push(Some(m));
     for message in variants {
         let request = SendMessageRequest {
             message,

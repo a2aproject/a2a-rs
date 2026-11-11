@@ -337,7 +337,7 @@ fn integers_in_data_parts_stay_integers() {
     }))
     .unwrap();
 
-    let a2a::PartContent::Data(data) = &request.message.parts[0].content else {
+    let a2a::PartContent::Data(data) = &request.message.as_ref().unwrap().parts[0].content else {
         panic!("expected a data part");
     };
     assert_eq!(

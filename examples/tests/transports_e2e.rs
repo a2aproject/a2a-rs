@@ -116,7 +116,13 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        let task_id = req.message.task_id.unwrap_or_else(|| "task-1".to_string());
+        let task_id = req
+            .message
+            .as_ref()
+            .unwrap()
+            .task_id
+            .clone()
+            .unwrap_or_else(|| "task-1".to_string());
         Ok(SendMessageResponse::Task(sample_task(
             &task_id,
             TaskState::Completed,
@@ -453,7 +459,7 @@ fn versioned_params() -> ServiceParams {
 fn send_message_request() -> SendMessageRequest {
     SendMessageRequest {
         artifact_updates: Vec::new(),
-        message: sample_message(Role::User, "hello"),
+        message: Some(sample_message(Role::User, "hello")),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -884,8 +890,8 @@ async fn rest_transport_push_delivery_end_to_end() {
         .unwrap();
 
     let mut request = send_message_request();
-    request.message.task_id = Some("task-rest-push".to_string());
-    request.message.context_id = Some("ctx-rest-push".to_string());
+    request.message.as_mut().unwrap().task_id = Some("task-rest-push".to_string());
+    request.message.as_mut().unwrap().context_id = Some("ctx-rest-push".to_string());
 
     let response = transport
         .send_message(&versioned_params(), &request)
@@ -932,8 +938,8 @@ async fn jsonrpc_transport_push_delivery_end_to_end() {
     let transport = JsonRpcTransport::new(Client::new(), format!("{base_url}/rpc"));
 
     let mut request = send_message_request();
-    request.message.task_id = Some("task-rpc-push".to_string());
-    request.message.context_id = Some("ctx-rpc-push".to_string());
+    request.message.as_mut().unwrap().task_id = Some("task-rpc-push".to_string());
+    request.message.as_mut().unwrap().context_id = Some("ctx-rpc-push".to_string());
     request.configuration = Some(SendMessageConfiguration {
         if_generation_match: None,
         timeline_length: None,

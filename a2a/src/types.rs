@@ -677,7 +677,9 @@ pub struct SendMessageConfiguration {
 #[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct SendMessageRequest {
-    pub message: Message,
+    /// Absent for an artifact-only update to an existing task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<Message>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configuration: Option<SendMessageConfiguration>,
@@ -1214,7 +1216,7 @@ mod tests {
     fn test_send_message_request_serde() {
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: Message::new(Role::User, vec![Part::text("hello")]),
+            message: Some(Message::new(Role::User, vec![Part::text("hello")])),
             configuration: Some(SendMessageConfiguration {
                 if_generation_match: None,
                 timeline_length: None,

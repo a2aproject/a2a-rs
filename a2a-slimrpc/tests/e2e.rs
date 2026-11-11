@@ -94,7 +94,7 @@ fn sample_agent_card(target: &str) -> AgentCard {
 fn send_message_request(task_id: &str) -> SendMessageRequest {
     SendMessageRequest {
         artifact_updates: Vec::new(),
-        message: sample_message(Role::User, "hello", task_id),
+        message: Some(sample_message(Role::User, "hello", task_id)),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -210,13 +210,13 @@ impl RequestHandler for TestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        if req.message.task_id.as_deref() == Some("metadata-required")
+        if req.message.as_ref().unwrap().task_id.as_deref() == Some("metadata-required")
             && params.get("x-trace") != Some(&vec!["alpha, beta".to_string()])
         {
             return Err(A2AError::invalid_params("missing x-trace metadata"));
         }
 
-        if req.message.task_id.as_deref() == Some("identity-required") {
+        if req.message.as_ref().unwrap().task_id.as_deref() == Some("identity-required") {
             // The caller's identity comes from the session: its SLIM name and
             // the verified subject of its shared-secret token (id plus a
             // per-instance suffix), never the spoofed values it sent.
@@ -236,7 +236,7 @@ impl RequestHandler for TestHandler {
             }
         }
 
-        if req.message.task_id.as_deref() == Some("message-response") {
+        if req.message.as_ref().unwrap().task_id.as_deref() == Some("message-response") {
             return Ok(SendMessageResponse::Message(sample_message(
                 Role::Agent,
                 "pong",
@@ -246,6 +246,8 @@ impl RequestHandler for TestHandler {
 
         let task_id = req
             .message
+            .as_ref()
+            .unwrap()
             .task_id
             .clone()
             .unwrap_or_else(|| "task-1".to_string());
@@ -261,7 +263,7 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        if req.message.task_id.as_deref() == Some("stream-error") {
+        if req.message.as_ref().unwrap().task_id.as_deref() == Some("stream-error") {
             return Ok(Box::pin(stream::iter(vec![
                 Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
                     generation: 0,

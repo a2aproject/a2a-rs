@@ -105,7 +105,7 @@ async fn snapshot(updates: Vec<Update>, streaming: bool) -> Result<Task, A2AErro
     );
     let request = SendMessageRequest {
         artifact_updates: Vec::new(),
-        message: Message::new(Role::User, vec![Part::text("hi")]),
+        message: Some(Message::new(Role::User, vec![Part::text("hi")])),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -366,7 +366,7 @@ async fn applying_events_to_a_known_task_does_not_read_the_store() {
     );
     let request = SendMessageRequest {
         artifact_updates: Vec::new(),
-        message: Message::new(Role::User, vec![Part::text("hi")]),
+        message: Some(Message::new(Role::User, vec![Part::text("hi")])),
         configuration: None,
         metadata: None,
         tenant: None,

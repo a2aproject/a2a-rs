@@ -153,7 +153,7 @@ async fn run(operation: &str, endpoint: &str) -> Result<Value, A2AError> {
             let response = client
                 .send_message(&SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message: Message::new(Role::User, vec![Part::text("acts")]),
+                    message: Some(Message::new(Role::User, vec![Part::text("acts")])),
                     configuration: None,
                     metadata: None,
                     tenant: None,

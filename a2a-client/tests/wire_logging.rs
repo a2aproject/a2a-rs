@@ -106,7 +106,7 @@ fn http_truncated() -> &'static str {
 fn send_request() -> SendMessageRequest {
     SendMessageRequest {
         artifact_updates: Vec::new(),
-        message: Message {
+        message: Some(Message {
             message_id: "m1".to_string(),
             context_id: None,
             task_id: None,
@@ -115,7 +115,7 @@ fn send_request() -> SendMessageRequest {
             metadata: None,
             extensions: None,
             reference_task_ids: None,
-        },
+        }),
         configuration: None,
         metadata: None,
         tenant: None,

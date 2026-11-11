@@ -237,7 +237,7 @@ impl<T: Transport> SendMessageExt for A2AClient<T> {
         let msg = Message::new(Role::User, vec![Part::text(text)]);
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: msg,
+            message: Some(msg),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -546,7 +546,7 @@ mod tests {
         let client = make_client();
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: Message::new(Role::User, vec![Part::text("hi")]),
+            message: Some(Message::new(Role::User, vec![Part::text("hi")])),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -572,7 +572,7 @@ mod tests {
 
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: Message::new(Role::User, vec![Part::text("hi")]),
+            message: Some(Message::new(Role::User, vec![Part::text("hi")])),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -612,7 +612,7 @@ mod tests {
 
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: Message::new(Role::User, vec![Part::text("hi")]),
+            message: Some(Message::new(Role::User, vec![Part::text("hi")])),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -634,7 +634,7 @@ mod tests {
         let client = make_client();
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: Message::new(Role::User, vec![Part::text("hi")]),
+            message: Some(Message::new(Role::User, vec![Part::text("hi")])),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -768,7 +768,7 @@ mod tests {
     fn send_request() -> SendMessageRequest {
         SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: Message::new(Role::User, vec![Part::text("hi")]),
+            message: Some(Message::new(Role::User, vec![Part::text("hi")])),
             configuration: None,
             metadata: None,
             tenant: None,

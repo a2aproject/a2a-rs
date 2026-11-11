@@ -262,7 +262,7 @@ impl ItkExecutor {
     ) -> Result<Vec<String>, String> {
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: msg,
+            message: Some(msg),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -280,7 +280,7 @@ impl ItkExecutor {
     ) -> Result<Vec<String>, String> {
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: msg,
+            message: Some(msg),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -317,7 +317,7 @@ impl ItkExecutor {
 
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: msg,
+            message: Some(msg),
             configuration: Some(SendMessageConfiguration {
                 if_generation_match: None,
                 timeline_length: None,
@@ -359,7 +359,7 @@ impl ItkExecutor {
 
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: msg,
+            message: Some(msg),
             configuration: None,
             metadata: None,
             tenant: None,

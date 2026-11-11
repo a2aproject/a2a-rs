@@ -604,7 +604,7 @@ impl RequestHandler for TestHandler {
             .unwrap()
             .push(req.tenant.clone());
 
-        let text = req.message.text().unwrap_or_default();
+        let text = req.message.as_ref().unwrap().text().unwrap_or_default();
         if text == "send-error" {
             return Err(A2AError::invalid_request("send failed"));
         }
@@ -613,12 +613,12 @@ impl RequestHandler for TestHandler {
         // task, and a --context-id given alongside it must match that
         // task's actual context — the server rejects a mismatch rather
         // than reconciling it (SPEC.md §8.1, INTERACT_002).
-        if let Some(requested_task_id) = &req.message.task_id {
+        if let Some(requested_task_id) = &req.message.as_ref().unwrap().task_id {
             let tasks = self.state.tasks.lock().unwrap();
             match tasks.get(requested_task_id) {
                 None => return Err(A2AError::task_not_found(requested_task_id)),
                 Some(existing) => {
-                    if let Some(requested_context_id) = &req.message.context_id {
+                    if let Some(requested_context_id) = &req.message.as_ref().unwrap().context_id {
                         if requested_context_id != &existing.context_id {
                             return Err(A2AError::invalid_params(format!(
                                 "task {requested_task_id} belongs to context {}, not {requested_context_id}",
@@ -632,11 +632,15 @@ impl RequestHandler for TestHandler {
 
         let task_id = req
             .message
+            .as_ref()
+            .unwrap()
             .task_id
             .clone()
             .unwrap_or_else(|| "task-send".to_string());
         let context_id = req
             .message
+            .as_ref()
+            .unwrap()
             .context_id
             .clone()
             .unwrap_or_else(|| "ctx-send".to_string());
@@ -677,8 +681,8 @@ impl RequestHandler for TestHandler {
         // on the exact parts (and their order/media types) the CLI sent;
         // a single-part message keeps the simpler "Echo: {text}" form so
         // existing single-part assertions are unaffected.
-        let response_parts = if req.message.parts.len() > 1 {
-            req.message.parts.clone()
+        let response_parts = if req.message.as_ref().unwrap().parts.len() > 1 {
+            req.message.as_ref().unwrap().parts.clone()
         } else {
             vec![Part::text(format!("Echo: {text}"))]
         };
@@ -711,15 +715,19 @@ impl RequestHandler for TestHandler {
             .push("send_streaming_message");
         let task_id = req
             .message
+            .as_ref()
+            .unwrap()
             .task_id
             .clone()
             .unwrap_or_else(|| "task-stream".to_string());
         let context_id = req
             .message
+            .as_ref()
+            .unwrap()
             .context_id
             .clone()
             .unwrap_or_else(|| "ctx-stream".to_string());
-        let text = req.message.text().unwrap_or_default();
+        let text = req.message.as_ref().unwrap().text().unwrap_or_default();
         if text == "stream-error" {
             return Ok(Box::pin(stream::once(async {
                 Err(A2AError::internal("stream failed"))
@@ -735,7 +743,7 @@ impl RequestHandler for TestHandler {
             ])));
         }
         if text == "stream-client-file" {
-            let mut input = req.message;
+            let mut input = req.message.unwrap();
             input.task_id = Some(task_id.clone());
             input.context_id = Some(context_id.clone());
             let completed = make_task_with_parts(

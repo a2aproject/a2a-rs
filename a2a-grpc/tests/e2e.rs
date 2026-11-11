@@ -92,7 +92,13 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        let task_id = req.message.task_id.unwrap_or_else(|| "task-1".to_string());
+        let task_id = req
+            .message
+            .as_ref()
+            .unwrap()
+            .task_id
+            .clone()
+            .unwrap_or_else(|| "task-1".to_string());
         Ok(SendMessageResponse::Task(sample_task(
             &task_id,
             TaskState::Completed,
@@ -364,7 +370,7 @@ fn versioned_params() -> ServiceParams {
 fn send_message_request() -> SendMessageRequest {
     SendMessageRequest {
         artifact_updates: Vec::new(),
-        message: sample_message(Role::User, "hello"),
+        message: Some(sample_message(Role::User, "hello")),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -607,7 +613,7 @@ async fn grpc_transport_treats_zero_page_size_as_unset() {
             &versioned_params(),
             &SendMessageRequest {
                 artifact_updates: Vec::new(),
-                message: Message::new(Role::User, vec![Part::text("hello")]),
+                message: Some(Message::new(Role::User, vec![Part::text("hello")])),
                 configuration: None,
                 metadata: None,
                 tenant: None,

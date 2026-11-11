@@ -593,7 +593,7 @@ mod tests {
         let h = handler();
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: fake_message(),
+            message: Some(fake_message()),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -611,7 +611,7 @@ mod tests {
         let h = handler();
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: fake_message(),
+            message: Some(fake_message()),
             configuration: None,
             metadata: None,
             tenant: None,

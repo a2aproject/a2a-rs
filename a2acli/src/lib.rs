@@ -1585,7 +1585,7 @@ fn build_send_message_request(
 
     SendMessageRequest {
         artifact_updates: Vec::new(),
-        message,
+        message: Some(message),
         configuration,
         metadata: None,
         tenant,
@@ -3653,15 +3653,19 @@ mod tests {
         ) -> Result<SendMessageResponse, A2AError> {
             let task_id = req
                 .message
+                .as_ref()
+                .unwrap()
                 .task_id
                 .clone()
                 .unwrap_or_else(|| "task-send".to_string());
             let context_id = req
                 .message
+                .as_ref()
+                .unwrap()
                 .context_id
                 .clone()
                 .unwrap_or_else(|| "ctx-send".to_string());
-            let text = req.message.text().unwrap_or_default();
+            let text = req.message.as_ref().unwrap().text().unwrap_or_default();
             if text == "send-error" {
                 return Err(A2AError::invalid_request("send failed"));
             }
@@ -3687,15 +3691,19 @@ mod tests {
         ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
             let task_id = req
                 .message
+                .as_ref()
+                .unwrap()
                 .task_id
                 .clone()
                 .unwrap_or_else(|| "task-stream".to_string());
             let context_id = req
                 .message
+                .as_ref()
+                .unwrap()
                 .context_id
                 .clone()
                 .unwrap_or_else(|| "ctx-stream".to_string());
-            let text = req.message.text().unwrap_or_default();
+            let text = req.message.as_ref().unwrap().text().unwrap_or_default();
             if text == "stream-error" {
                 return Ok(Box::pin(stream::once(async {
                     Err(A2AError::internal("stream failed"))
@@ -4046,9 +4054,15 @@ mod tests {
             Some("tenant-1".to_string()),
         );
 
-        assert_eq!(request.message.text(), Some("hello"));
-        assert_eq!(request.message.context_id.as_deref(), Some("ctx-1"));
-        assert_eq!(request.message.task_id.as_deref(), Some("task-1"));
+        assert_eq!(request.message.as_ref().unwrap().text(), Some("hello"));
+        assert_eq!(
+            request.message.as_ref().unwrap().context_id.as_deref(),
+            Some("ctx-1")
+        );
+        assert_eq!(
+            request.message.as_ref().unwrap().task_id.as_deref(),
+            Some("task-1")
+        );
         assert_eq!(request.tenant.as_deref(), Some("tenant-1"));
         assert_eq!(
             request
@@ -4087,7 +4101,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(request.message.text(), Some("hello"));
+        assert_eq!(request.message.as_ref().unwrap().text(), Some("hello"));
         assert!(request.configuration.is_none());
         assert!(request.tenant.is_none());
     }
@@ -4703,7 +4717,7 @@ mod tests {
                     &params,
                     &SendMessageRequest {
                         artifact_updates: Vec::new(),
-                        message: Message::new(Role::User, vec![Part::text("hello")]),
+                        message: Some(Message::new(Role::User, vec![Part::text("hello")])),
                         configuration: None,
                         metadata: None,
                         tenant: None,
@@ -4717,7 +4731,7 @@ mod tests {
                     &params,
                     &SendMessageRequest {
                         artifact_updates: Vec::new(),
-                        message: Message::new(Role::User, vec![Part::text("hello")]),
+                        message: Some(Message::new(Role::User, vec![Part::text("hello")])),
                         configuration: None,
                         metadata: None,
                         tenant: None,

@@ -169,7 +169,7 @@ pub fn build_agent_card(interfaces: Vec<AgentInterface>) -> AgentCard {
 pub fn req(text: &str) -> SendMessageRequest {
     SendMessageRequest {
         artifact_updates: Vec::new(),
-        message: Message::new(Role::User, vec![Part::text(text)]),
+        message: Some(Message::new(Role::User, vec![Part::text(text)])),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -179,7 +179,10 @@ pub fn req(text: &str) -> SendMessageRequest {
 pub fn wait_req(text: &str) -> SendMessageRequest {
     SendMessageRequest {
         artifact_updates: Vec::new(),
-        message: Message::new(Role::User, vec![Part::text(format!("wait:{text}"))]),
+        message: Some(Message::new(
+            Role::User,
+            vec![Part::text(format!("wait:{text}"))],
+        )),
         configuration: Some(SendMessageConfiguration {
             if_generation_match: None,
             timeline_length: None,
@@ -335,7 +338,7 @@ pub async fn exercise_client<T: Transport>(protocol: &str, client: &A2AClient<T>
     // ---- send_streaming_message ------------------------------------------
     let stream_req = SendMessageRequest {
         artifact_updates: Vec::new(),
-        message: Message::new(Role::User, vec![Part::text("Stream me!")]),
+        message: Some(Message::new(Role::User, vec![Part::text("Stream me!")])),
         configuration: None,
         metadata: None,
         tenant: None,

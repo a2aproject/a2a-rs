@@ -539,26 +539,10 @@ pub fn from_proto_send_message_configuration(
 // Request types
 // ---------------------------------------------------------------------------
 
-/// A request that carries only `artifactUpdates` has no message on the wire;
-/// natively that is a message with nothing in it: no id, no role, no parts and
-/// no other field. A message with anything set is sent, or that would be lost.
-fn is_absent_message(r: &SendMessageRequest) -> bool {
-    let m = &r.message;
-    !r.artifact_updates.is_empty()
-        && m.role == Role::Unspecified
-        && m.message_id.is_empty()
-        && m.parts.is_empty()
-        && m.task_id.is_none()
-        && m.context_id.is_none()
-        && m.metadata.is_none()
-        && m.extensions.is_none()
-        && m.reference_task_ids.is_none()
-}
-
 pub fn to_proto_send_message_request(r: &SendMessageRequest) -> proto::SendMessageRequest {
     proto::SendMessageRequest {
         tenant: r.tenant.clone().unwrap_or_default(),
-        message: (!is_absent_message(r)).then(|| to_proto_message(&r.message)),
+        message: r.message.as_ref().map(to_proto_message),
         configuration: r
             .configuration
             .as_ref()
@@ -575,18 +559,7 @@ pub fn to_proto_send_message_request(r: &SendMessageRequest) -> proto::SendMessa
 pub fn from_proto_send_message_request(r: &proto::SendMessageRequest) -> SendMessageRequest {
     SendMessageRequest {
         tenant: empty_to_none(&r.tenant),
-        message: r
-            .message
-            .as_ref()
-            .map(from_proto_message)
-            .unwrap_or_else(|| {
-                // Preserve absence so the handler can reject missing messages
-                // or accept artifact-only updates for an existing task. Never
-                // generate an ID that makes missing required input look valid.
-                let mut message = Message::new(Role::Unspecified, vec![]);
-                message.message_id = String::new();
-                message
-            }),
+        message: r.message.as_ref().map(from_proto_message),
         configuration: r
             .configuration
             .as_ref()
@@ -1781,7 +1754,7 @@ mod tests {
     fn test_send_message_request_roundtrip() {
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: Message {
+            message: Some(Message {
                 message_id: "m1".to_string(),
                 context_id: Some("ctx".to_string()),
                 task_id: Some("t1".to_string()),
@@ -1790,7 +1763,7 @@ mod tests {
                 metadata: None,
                 extensions: None,
                 reference_task_ids: Some(vec!["ref1".to_string()]),
-            },
+            }),
             configuration: Some(SendMessageConfiguration {
                 if_generation_match: None,
                 timeline_length: None,
@@ -1816,7 +1789,10 @@ mod tests {
         let proto = to_proto_send_message_request(&req);
         let back = from_proto_send_message_request(&proto);
         assert_eq!(req.tenant, back.tenant);
-        assert_eq!(req.message.message_id, back.message.message_id);
+        assert_eq!(
+            req.message.as_ref().unwrap().message_id,
+            back.message.as_ref().unwrap().message_id
+        );
         assert_eq!(
             req.configuration.as_ref().unwrap().accepted_output_modes,
             back.configuration.as_ref().unwrap().accepted_output_modes
@@ -1834,11 +1810,7 @@ mod tests {
     #[test]
     fn test_artifact_only_request_survives_the_round_trip_unchanged() {
         let request = SendMessageRequest {
-            message: Message {
-                role: Role::Unspecified,
-                message_id: String::new(),
-                ..Message::new(Role::Unspecified, vec![])
-            },
+            message: None,
             configuration: None,
             metadata: None,
             tenant: None,
@@ -1865,21 +1837,26 @@ mod tests {
         let back = from_proto_send_message_request(&to_proto_send_message_request(&request));
         assert_eq!(back, request);
 
-        // An empty message that has anything set is a message, and keeps it.
+        // An explicitly present message stays present, including an empty one.
+        let mut request = request;
+        request.message = Some(Message {
+            message_id: String::new(),
+            ..Message::new(Role::Unspecified, vec![])
+        });
         let mut variants = Vec::new();
         for role in [Role::User, Role::Agent] {
             let mut with_role = request.clone();
-            with_role.message.role = role;
+            with_role.message.as_mut().unwrap().role = role;
             variants.push(with_role);
         }
         let mut with_references = request.clone();
-        with_references.message.reference_task_ids = Some(vec![String::new()]);
+        with_references.message.as_mut().unwrap().reference_task_ids = Some(vec![String::new()]);
         variants.push(with_references);
         let mut with_extensions = request.clone();
-        with_extensions.message.extensions = Some(vec!["x".into()]);
+        with_extensions.message.as_mut().unwrap().extensions = Some(vec!["x".into()]);
         variants.push(with_extensions);
         let mut with_metadata = request.clone();
-        with_metadata.message.metadata = Some(HashMap::new());
+        with_metadata.message.as_mut().unwrap().metadata = Some(HashMap::new());
         variants.push(with_metadata);
         for variant in variants {
             let back = from_proto_send_message_request(&to_proto_send_message_request(&variant));
@@ -1898,9 +1875,7 @@ mod tests {
         };
         let back = from_proto_send_message_request(&proto);
         assert!(back.tenant.is_none());
-        assert_eq!(back.message.role, Role::Unspecified);
-        assert!(back.message.message_id.is_empty());
-        assert!(back.message.parts.is_empty());
+        assert!(back.message.is_none());
     }
 
     #[test]
