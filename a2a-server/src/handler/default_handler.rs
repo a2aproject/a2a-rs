@@ -130,8 +130,10 @@ impl DefaultRequestHandler {
     /// Bounds a blocking `SendMessage` response after input admission.
     ///
     /// The default has no deadline: A2A requires waiting for completion or
-    /// interruption. Expiry returns an internal error and drops the response;
-    /// admitted task execution continues. Streaming, live, and `returnImmediately`
+    /// interruption. Expiry returns the current committed Task, so callers do
+    /// not mistake an admitted input for a failed send. Before lazy creation
+    /// has committed any Task, expiry remains an error. Execution continues.
+    /// Streaming, live, and `returnImmediately`
     /// responses use their own completion policies and have no such deadline.
     pub fn with_blocking_response_timeout(mut self, timeout: Duration) -> Self {
         self.blocking_response_timeout = Some(timeout);
@@ -431,16 +433,28 @@ impl RequestHandler for DefaultRequestHandler {
             .admit_message(params, MessageInput::Raw(req), policy)
             .await?;
         let events = self.response_stream(params, (task.clone(), events), policy, None, None);
-        let response = unary_response(self.tasks.clone(), task, events);
-        let mut response = match self
-            .blocking_response_timeout
-            .filter(|_| !policy.return_immediately())
-        {
-            Some(timeout) => tokio::time::timeout(timeout, response)
-                .await
-                .map_err(|_| A2AError::from(ProtocolError::BlockingResponseTimedOut))??,
-            None => response.await?,
-        };
+        let response = unary_response(self.tasks.clone(), task.clone(), events);
+        let mut response =
+            match self
+                .blocking_response_timeout
+                .filter(|_| !policy.return_immediately())
+            {
+                Some(timeout) => match tokio::time::timeout(timeout, response).await {
+                    Ok(response) => response?,
+                    Err(_) => {
+                        let uncreated = task.active().is_some_and(|active| {
+                            active.uncreated.load(std::sync::atomic::Ordering::Acquire)
+                        });
+                        if uncreated {
+                            return Err(ProtocolError::BlockingResponseTimedOut.into());
+                        }
+                        SendMessageResponse::Task(task.snapshot().ok_or_else(|| {
+                            A2AError::from(ProtocolError::BlockingResponseTimedOut)
+                        })?)
+                    }
+                },
+                None => response.await?,
+            };
         if let SendMessageResponse::Task(task) = &mut response {
             policy.trim(task);
         }

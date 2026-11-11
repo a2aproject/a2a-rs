@@ -149,12 +149,20 @@ async fn wait_for_completion(handler: &DefaultRequestHandler, id: &str) -> Task 
 async fn check_timeout(opening: Opening) {
     let (handler, mut started, finish) = handler(opening);
     let handler = handler.with_blocking_response_timeout(DEADLINE);
-    let error = timeout(DEADLINE * 2, handler.send_message(&params(), request()))
+    let response = timeout(DEADLINE * 2, handler.send_message(&params(), request()))
         .await
-        .expect("the configured deadline bounds the response")
-        .unwrap_err();
-    assert_eq!(error.code, error_code::INTERNAL_ERROR);
-    assert_eq!(error.message, "blocking response timed out");
+        .expect("the configured deadline bounds the response");
+    match opening {
+        Opening::Silent => {
+            let error = response.unwrap_err();
+            assert_eq!(error.code, error_code::INTERNAL_ERROR);
+            assert_eq!(error.message, "blocking response timed out");
+        }
+        Opening::Working => assert!(
+            matches!(response.unwrap(), SendMessageResponse::Task(task) if task.status.state == TaskState::Working)
+        ),
+        _ => unreachable!(),
+    }
     let id = started.recv().await.unwrap();
     match opening {
         Opening::Silent => assert_eq!(
