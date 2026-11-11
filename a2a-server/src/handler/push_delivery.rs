@@ -197,30 +197,19 @@ pub(super) fn needs_notification(event: &ExecutionEvent) -> bool {
 
 /// Clients observe committed events immediately. Webhooks own reserved queue
 /// capacity and never await configuration or HTTP inside the task controller.
-pub(super) async fn broadcast(
-    source: &TaskHandle,
-    settings: &Arc<PushService>,
-    event: ExecutionEvent,
-) {
+pub(super) fn broadcast(source: &TaskHandle, settings: &Arc<PushService>, event: ExecutionEvent) {
     let _ = source.sender().send(event.clone());
     if !needs_notification(&event) {
         return;
     }
-    if source.buffer_notification(event.clone()) {
-        return;
-    }
-    // Direct publishers (outside a task operation) may backpressure their own
-    // future. The controller reserves capacity before executing its operation.
-    match source
-        .publications()
-        .reserve(source, super::task_handle::TaskOperation::Output)
-        .await
-    {
-        Ok(Some(permit)) => source
-            .publications()
-            .submit(source.clone(), vec![event], permit),
-        Ok(None) => unreachable!("output publication reserves capacity"),
-        Err(error) => signal_failure(&settings.sender, &event, error),
+    if !source.buffer_notification(event.clone()) {
+        // All notification publishers must reserve and enter the task mailbox
+        // before assigning a cursor. Never reintroduce an unordered fallback.
+        signal_failure(
+            &settings.sender,
+            &event,
+            A2AError::internal("webhook publication bypassed the task controller"),
+        );
     }
 }
 
@@ -290,6 +279,38 @@ async fn receive_batches(mut batches: tokio::sync::mpsc::UnboundedReceiver<Publi
 mod tests {
     use super::*;
     use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn a_publication_bypassing_the_controller_reports_failure() {
+        let (source, mut notifications) = captured_source(8, true).await;
+        let (failure, signal) = tokio::sync::watch::channel(None);
+        let mut events = source.sender().subscribe();
+        broadcast(
+            &source,
+            source.pushes().unwrap(),
+            ExecutionEvent {
+                sequence: 1,
+                input_generation: 0,
+                result: Ok(StreamResponse::Task(task_with_history(
+                    "task", "context", 0,
+                ))),
+                kind: EventKind::Normal,
+                failure: Some(failure),
+                response_task: None,
+            },
+        );
+        assert!(
+            signal
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("bypassed the task controller")
+        );
+        assert_eq!(events.recv().await.unwrap().sequence, 1);
+        assert!(notifications.try_recv().is_err());
+        source.background_tasks().shutdown().await;
+    }
 
     #[tokio::test]
     async fn a_closed_publication_queue_reports_failure_for_each_accepted_event() {

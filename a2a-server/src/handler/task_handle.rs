@@ -705,7 +705,7 @@ impl TaskHandle {
             event
         };
         if let Some(pushes) = self.pushes() {
-            super::push_delivery::broadcast(self, pushes, event).await;
+            super::push_delivery::broadcast(self, pushes, event);
         } else {
             let _ = self.inner.sender.send(event);
         }
