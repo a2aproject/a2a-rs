@@ -26,7 +26,7 @@ struct Gates {
 
 struct Gated {
     gates: Arc<Gates>,
-    handoff: bool,
+    finish_unread: bool,
 }
 
 fn status(ctx: &ExecutorContext, state: TaskState) -> StreamResponse {
@@ -50,12 +50,12 @@ impl AgentExecutor for Gated {
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         self.gates.calls.fetch_add(1, Ordering::SeqCst);
         let gates = self.gates.clone();
-        let handoff = self.handoff;
+        let finish_unread = self.finish_unread;
         Box::pin(async_stream::stream! {
             if ctx.message.as_ref().and_then(Message::text) == Some("start") {
                 yield Ok(status(&ctx, TaskState::Working));
                 gates.finish.notified().await;
-                if handoff {return;}
+                if finish_unread {return;}
                 let input = ctx.inputs.recv().await.expect("the accepted join input");
                 assert_eq!(input.message.text(), Some("join"));
             } else {
@@ -70,7 +70,7 @@ impl AgentExecutor for Gated {
     }
 }
 
-fn handler(handoff: bool) -> (DefaultRequestHandler, Arc<Gates>) {
+fn handler(finish_unread: bool) -> (DefaultRequestHandler, Arc<Gates>) {
     let gates = Arc::new(Gates {
         calls: AtomicUsize::new(0),
         finish: Notify::new(),
@@ -80,7 +80,7 @@ fn handler(handoff: bool) -> (DefaultRequestHandler, Arc<Gates>) {
     let handler = DefaultRequestHandler::new(
         Gated {
             gates: gates.clone(),
-            handoff,
+            finish_unread,
         },
         InMemoryTaskStore::new(),
     )
@@ -235,7 +235,7 @@ async fn the_opening_includes_client_artifacts_and_applies_response_lengths() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_streaming_join_follows_a_silent_handoff_without_repeating_its_opening() {
+async fn a_streaming_join_is_rejected_unread_and_a_fresh_request_starts_execution() {
     let (handler, gates) = handler(true);
     let (task, owner) = owner(&handler).await;
     let mut events = handler
@@ -244,21 +244,35 @@ async fn a_streaming_join_follows_a_silent_handoff_without_repeating_its_opening
         .unwrap();
     assert!(matches!(next(&mut events).await, StreamResponse::Task(_)));
     gates.finish.notify_one();
-    timeout(WAIT, gates.successor.notified())
+    let error = timeout(WAIT, events.next())
         .await
-        .expect("unread input starts a successor");
-    assert_eq!(gates.calls.load(Ordering::SeqCst), 2);
-    assert!(
-        timeout(Duration::from_millis(1), events.next())
-            .await
-            .is_err(),
-        "the old invocation ending does not repeat the opening snapshot"
-    );
-    gates.finish_successor.notify_one();
-    assert!(
-        matches!(next(&mut events).await, StreamResponse::StatusUpdate(update) if update.status.state == TaskState::Completed)
-    );
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.message.contains("before reading"));
     assert!(timeout(WAIT, events.next()).await.unwrap().is_none());
+    assert_eq!(gates.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        timeout(Duration::from_millis(1), gates.successor.notified())
+            .await
+            .is_err()
+    );
+    let fresh = handler
+        .send_streaming_message(&params(), request("fresh", Some(&task)))
+        .await
+        .unwrap();
+    timeout(WAIT, gates.successor.notified()).await.unwrap();
+    assert_eq!(gates.calls.load(Ordering::SeqCst), 2);
+    gates.finish_successor.notify_one();
+    let response = timeout(WAIT, fresh.collect::<Vec<_>>()).await.unwrap();
+    assert!(response.iter().all(Result::is_ok));
+    assert!(response.iter().any(|event| matches!(event,
+        Ok(StreamResponse::Task(task)) if task.status.state == TaskState::Completed)
+        || matches!(event, Ok(StreamResponse::StatusUpdate(update)) if update.status.state == TaskState::Completed)));
+    assert_eq!(
+        get(&handler, &task.id).await.status.state,
+        TaskState::Completed
+    );
     timeout(WAIT, owner.collect::<Vec<_>>()).await.unwrap();
     handler.shutdown().await;
 }

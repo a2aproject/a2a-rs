@@ -57,8 +57,8 @@ pub struct ExecutorContext {
     pub tenant: Option<String>,
     /// Client messages queued for this task while this execution runs, on a
     /// live stream or sent to the working task. The executor can read them
-    /// alongside its own work. Messages left unread at the end of a nonterminal
-    /// turn are handed to the next execution.
+    /// alongside its own work. Messages left unread when execution ends are
+    /// rejected to their senders, never replayed into another execution.
     pub inputs: ClientInputs,
     /// Owned output for spawned workers. `send_for` preserves the producing
     /// input's generation; the ordinary execute stream remains available.
@@ -168,7 +168,7 @@ pub trait AgentExecutor: Send + Sync + 'static {
     /// associated with the opener, never with a newer input read by that worker.
     /// To continue producing after inline EOF, opt in with
     /// `ctx.outputs.clone().into_worker()` before returning the stream. Passive
-    /// context/sender clones do not extend the turn; EOF revokes their inbox.
+    /// context/sender clones do not extend the execution; EOF revokes their inbox.
     fn execute(&self, ctx: ExecutorContext)
     -> BoxStream<'static, Result<StreamResponse, A2AError>>;
 
@@ -256,7 +256,7 @@ pub enum Start {
 /// at once or create a task, and that works on tasks once they exist.
 ///
 /// [`Agent::start`] makes that one decision. Everything about a task, its first
-/// turn included, is [`Agent::execute`]: the task is always there, and the
+/// execution included, is [`Agent::execute`]: the task is always there, and the
 /// client's messages queue for it only from then on. An agent that never keeps
 /// tasks implements `start` alone. [`AgentExecutor`] is the same contract as
 /// one stream of events, whose first event decides; it runs on the server
@@ -267,7 +267,7 @@ pub trait Agent: Send + Sync + 'static {
     async fn start(&self, msg: NewMessage) -> Result<Start, A2AError>;
 
     /// A message to an existing task (`ctx.stored_task` is set): the work of a
-    /// turn, as a stream of status and artifact events. The first message of a
+    /// execution, as a stream of status and artifact events. The first message of a
     /// task [`Agent::start`] created arrives here too. Fails by default, for an
     /// agent that keeps no tasks.
     fn execute(&self, ctx: ExecutorContext) -> EventStream {
@@ -343,7 +343,7 @@ impl<A: Agent> AgentExecutor for AgentExecutorAdapter<A> {
                         let mut ctx = ctx;
                         let opening = StreamResponse::Task(task.clone());
                         futures::stream::once(async move { Ok(opening) })
-                            // The turn starts once the task has been created.
+                            // The execution starts once the task has been created.
                             .chain(
                                 futures::stream::once(async move {
                                     // The handler polls us again only after accepting

@@ -7,7 +7,7 @@ use super::super::cancellation::CancellationStart;
 use super::super::delivery::{AuthorizedMessage, Delivery};
 use super::super::events::ActiveExecution;
 use super::super::execution::{
-    self, ExecutionState, Invocation, TurnEnd, reject_unread_inputs, release_execution,
+    self, ExecutionEnd, ExecutionState, Invocation, reject_unread_inputs, release_execution,
     save_pending_push_config,
 };
 use super::super::protocol::{
@@ -310,7 +310,7 @@ impl TaskController {
         handler: &DefaultRequestHandler,
         task_id: TaskId,
         active: Arc<ActiveExecution>,
-        end: TurnEnd,
+        end: ExecutionEnd,
     ) {
         if !self.execution.is_current(&active) {
             return;
@@ -321,10 +321,10 @@ impl TaskController {
             return;
         }
         match end {
-            TurnEnd::Finished => {
-                self.end_turn(handler, &active, &task_id).await;
+            ExecutionEnd::Finished => {
+                self.finish_execution(handler, &active, &task_id).await;
             }
-            TurnEnd::Terminal(mut event) => {
+            ExecutionEnd::Terminal(mut event) => {
                 reject_unread_inputs(&active, &task_id, self).await;
                 if !active.snapshot_is_terminal() {
                     if let Err(error) = self.apply_output(handler, &active, &mut event).await {
@@ -333,12 +333,12 @@ impl TaskController {
                 }
                 self.release(&active);
             }
-            TurnEnd::Failed(error) => {
+            ExecutionEnd::Failed(error) => {
                 reject_unread_inputs(&active, &task_id, self).await;
                 execution::publish_failure(handler, &active, &task_id, &error).await;
                 release_execution(&active, &task_id, self).await;
             }
-            TurnEnd::Stopped => {
+            ExecutionEnd::Stopped => {
                 release_execution(&active, &task_id, self).await;
             }
         }
@@ -346,14 +346,13 @@ impl TaskController {
         active.task.notify();
     }
 
-    /// Keep a nonterminal Task and hand unread accepted input to a new invocation.
-    async fn end_turn(
+    /// Finish this execution without replaying its inbox into another call.
+    async fn finish_execution(
         &mut self,
         handler: &DefaultRequestHandler,
         active: &Arc<ActiveExecution>,
         task_id: &TaskId,
     ) {
-        // Finish deferred creation before deciding whether another invocation is needed.
         if let Err(error) = self.persist_deferred_task(handler, active).await {
             reject_unread_inputs(active, task_id, self).await;
             execution::publish_failure(handler, active, task_id, &error).await;
@@ -361,37 +360,22 @@ impl TaskController {
             return;
         }
 
-        // Only a nonterminal task can hand accepted input to a successor.
-        let Some(snapshot) = active
+        // Give every unread input an outcome before completing sending calls.
+        reject_unread_inputs(active, task_id, self).await;
+        if let Some(snapshot) = active
             .snapshot()
             .filter(|task| !task.status.state.is_terminal())
-        else {
-            release_execution(active, task_id, self).await;
-            return;
-        };
-        let unread = self.take_unread_inputs(active);
-        // End only the blocking responses whose inputs this invocation read.
-        // Subscribers stay attached; unread inputs still follow the successor.
-        active.emitted_output();
-        active
-            .publish_kind(
-                Ok(&StreamResponse::Task(snapshot.clone())),
-                None,
-                EventKind::InvocationEnded,
-            )
-            .await;
-        if unread.is_empty() {
-            release_execution(active, task_id, self).await;
-            return;
-        }
-
-        // Release the old invocation before reserving its successor.
-        self.release(active);
-        if let Err(unread) =
-            execution::start_next_turn(handler, task_id, snapshot, unread, self).await
         {
-            execution::reject_inputs(active, task_id, unread).await;
+            active.emitted_output();
+            active
+                .publish_kind(
+                    Ok(&StreamResponse::Task(snapshot)),
+                    None,
+                    EventKind::InvocationEnded,
+                )
+                .await;
         }
+        self.release(active);
     }
 
     async fn persist_deferred_task(
@@ -414,13 +398,6 @@ impl TaskController {
         let event = StreamResponse::Task(task.clone());
         active.publish(Ok(&event), Some(task)).await;
         Ok(())
-    }
-
-    fn take_unread_inputs(&mut self, active: &Arc<ActiveExecution>) -> Vec<crate::ClientInput> {
-        self.execution
-            .bookkeeping(active)
-            .map(|invocation| invocation.drain_inputs(&active.inputs))
-            .unwrap_or_default()
     }
 
     pub(in crate::handler) async fn panicked(
@@ -523,7 +500,7 @@ pub(in crate::handler) enum TaskCommand {
     Finished {
         handler: DefaultRequestHandler,
         active: Arc<ActiveExecution>,
-        end: TurnEnd,
+        end: ExecutionEnd,
         reply: super::CommandReply<()>,
     },
     Panicked {
@@ -654,7 +631,9 @@ mod tests {
                 .track_input(input);
             active.inputs.sender.try_send(queued).unwrap();
             let mut events = active.subscribe();
-            controller.end_turn(&handler, &active, &task.id).await;
+            controller
+                .finish_execution(&handler, &active, &task.id)
+                .await;
             let event = events.recv().await.unwrap().result.unwrap();
             assert!(matches!(event, StreamResponse::Error(ref error)
                 if error.code == "UNAVAILABLE" && error.reference_id.as_deref() == Some(reference.as_str())));
@@ -678,7 +657,7 @@ mod tests {
         let (next, _inputs) = runtime.reserve(&handler, "task").await.unwrap();
         let sequence = next.sequence();
         runtime
-            .finished(&handler, "task".into(), old.clone(), TurnEnd::Stopped)
+            .finished(&handler, "task".into(), old.clone(), ExecutionEnd::Stopped)
             .await;
         let action = runtime
             .output(
@@ -720,7 +699,7 @@ mod tests {
             .unwrap();
         assert!(matches!(plan, CancellationStart::Started(_)));
         runtime
-            .finished(&handler, "task".into(), active, TurnEnd::Stopped)
+            .finished(&handler, "task".into(), active, ExecutionEnd::Stopped)
             .await;
         assert!(matches!(
             runtime.execution,

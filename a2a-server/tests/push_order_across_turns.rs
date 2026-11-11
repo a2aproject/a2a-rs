@@ -55,7 +55,9 @@ impl AgentExecutor for Agent {
             Ok(status(
                 &t,
                 &c,
-                TaskState::InputRequired,
+                // A blocking caller waits for EOF, so its next request starts
+                // a fresh execution rather than joining this inbox.
+                TaskState::Working,
                 &format!("reply-to-{text}"),
             ))
         }))
@@ -201,9 +203,8 @@ async fn pushes_of_a_later_turn_and_a_cancel_wait_for_the_last_push_of_the_turn_
         .send_message(&params(), req("two", Some(&task_id), None))
         .await
         .unwrap();
-    // The second turn may start a moment after the call returns (a message
-    // that reaches the first turn as it ends is taken up by the next): cancel
-    // once it has said its piece.
+    // Wait for the second execution's reply before cancellation, so both
+    // execution batches must precede the canceled notification.
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let task = h

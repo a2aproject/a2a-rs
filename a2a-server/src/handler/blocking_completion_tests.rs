@@ -7,6 +7,7 @@ use super::protocol::{ResponsePolicy, StartMode};
 use super::response::{Run, unary_response};
 use super::test_support::*;
 use crate::AgentExecutor;
+use futures::TryStreamExt;
 
 fn answer(text: &str) -> SendMessageRequest {
     let mut request = send_request();
@@ -201,13 +202,13 @@ async fn an_answering_turn_without_output_returns_its_current_snapshot() {
     handler.shutdown().await;
 }
 
-struct Handoff {
+struct ReturnWithoutReading {
     finish_first: Arc<Notify>,
-    release_successor: Arc<Notify>,
+    release_fresh: Arc<Notify>,
     started: mpsc::UnboundedSender<(String, String)>,
 }
 
-impl AgentExecutor for Handoff {
+impl AgentExecutor for ReturnWithoutReading {
     fn execute(
         &self,
         ctx: ExecutorContext,
@@ -230,7 +231,7 @@ impl AgentExecutor for Handoff {
             .filter_map(futures::future::ready)
             .boxed();
         }
-        let release = self.release_successor.clone();
+        let release = self.release_fresh.clone();
         stream::once(async move {
             release.notified().await;
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
@@ -254,73 +255,194 @@ impl AgentExecutor for Handoff {
 }
 
 #[tokio::test]
-async fn a_queued_answer_follows_the_successor_until_it_emits_its_own_question() {
+async fn unread_sends_are_rejected_without_starting_another_execution() {
+    for streaming in [false, true] {
+        let finish_first = Arc::new(Notify::new());
+        let release_fresh = Arc::new(Notify::new());
+        let (started, mut invocations) = mpsc::unbounded_channel();
+        let handler = DefaultRequestHandler::new(
+            ReturnWithoutReading {
+                finish_first: finish_first.clone(),
+                release_fresh: release_fresh.clone(),
+                started,
+            },
+            InMemoryTaskStore::new(),
+        )
+        .with_capabilities(AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        });
+        old_question(&handler).await;
+        let first = tokio::spawn({
+            let handler = handler.clone();
+            async move {
+                handler
+                    .send_message(&ServiceParams::new(), answer("first"))
+                    .await
+            }
+        });
+        let (first_id, _) = timeout(Duration::from_secs(2), invocations.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = tokio::spawn({
+            let handler = handler.clone();
+            async move {
+                if streaming {
+                    handler
+                        .send_streaming_message(&ServiceParams::new(), answer("unread"))
+                        .await?
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .map(|_| ())
+                } else {
+                    handler
+                        .send_message(&ServiceParams::new(), answer("unread"))
+                        .await
+                        .map(|_| ())
+                }
+            }
+        });
+        input_is_stored(&handler, "unread").await;
+        finish_first.notify_one();
+        let error = timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.message.contains("before reading this message"));
+        timeout(Duration::from_secs(2), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            invocations.try_recv().is_err(),
+            "EOF must not replay the queued input"
+        );
+
+        // The old input remains history. Only this fresh request starts execute again.
+        let fresh = tokio::spawn({
+            let handler = handler.clone();
+            async move {
+                handler
+                    .send_message(&ServiceParams::new(), answer("fresh"))
+                    .await
+            }
+        });
+        let (next_id, next_message) = timeout(Duration::from_secs(2), invocations.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first_id, next_id);
+        assert_eq!(next_message, "fresh");
+        release_fresh.notify_one();
+        timeout(Duration::from_secs(2), fresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let task = handler.tasks.load("task").await.unwrap();
+        assert_eq!(
+            task.history
+                .iter()
+                .flatten()
+                .filter(|message| message.text() == Some("unread"))
+                .count(),
+            1
+        );
+        handler.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn live_unread_input_is_rejected_and_only_a_fresh_input_starts_execute() {
     let finish_first = Arc::new(Notify::new());
-    let release_successor = Arc::new(Notify::new());
+    let release_fresh = Arc::new(Notify::new());
     let (started, mut invocations) = mpsc::unbounded_channel();
     let handler = DefaultRequestHandler::new(
-        Handoff {
+        ReturnWithoutReading {
             finish_first: finish_first.clone(),
-            release_successor: release_successor.clone(),
+            release_fresh: release_fresh.clone(),
             started,
         },
         InMemoryTaskStore::new(),
-    );
-    old_question(&handler).await;
-    let first = tokio::spawn({
-        let handler = handler.clone();
-        async move {
-            handler
-                .send_message(&ServiceParams::new(), answer("first"))
-                .await
-        }
+    )
+    .with_capabilities(AgentCapabilities {
+        streaming: Some(true),
+        ..Default::default()
     });
+    old_question(&handler).await;
+    let live = |request| StreamRequest {
+        tenant: None,
+        payload: StreamRequestPayload::SendMessage(request),
+    };
+    let (sender, receiver) = mpsc::unbounded_channel();
+    sender.send(live(answer("first"))).unwrap();
+    let uplink = stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|request| (request, receiver))
+    })
+    .boxed();
+    let params = ServiceParams::from([(a2a::SVC_PARAM_VERSION.into(), vec!["1.1".into()])]);
+    let mut downlink = handler.send_live_message(&params, uplink).await.unwrap();
     let (first_id, _) = timeout(Duration::from_secs(2), invocations.recv())
         .await
         .unwrap()
         .unwrap();
-    let mut response = tokio::spawn({
-        let handler = handler.clone();
-        async move {
-            handler
-                .send_message(&ServiceParams::new(), answer("answer"))
-                .await
-        }
-    });
-    input_is_stored(&handler, "answer").await;
+    let unread = answer("unread-live");
+    let reference = unread.message.as_ref().unwrap().message_id.clone();
+    sender.send(live(unread)).unwrap();
+    input_is_stored(&handler, "unread-live").await;
     finish_first.notify_one();
-    let (next_id, next_message) = timeout(Duration::from_secs(2), invocations.recv())
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let StreamResponse::Error(error) = downlink.next().await.unwrap().unwrap() {
+                assert_eq!(error.reference_id.as_deref(), Some(reference.as_str()));
+                assert_eq!(error.code, "UNAVAILABLE");
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(2), async {
+        while handler.tasks.task("task").active().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(invocations.try_recv().is_err());
+
+    sender.send(live(answer("fresh-live"))).unwrap();
+    let (next_id, message) = timeout(Duration::from_secs(2), invocations.recv())
         .await
         .unwrap()
         .unwrap();
-    assert_ne!(
-        first_id, next_id,
-        "the answer was handed to a new execution"
-    );
-    assert_eq!(next_message, "answer");
-    assert!(
-        timeout(Duration::from_millis(30), &mut response)
-            .await
-            .is_err(),
-        "the previous execution ending cannot return its old question"
-    );
-    release_successor.notify_one();
-    let result = timeout(Duration::from_secs(2), response)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let SendMessageResponse::Task(task) = result else {
-        panic!("task response")
-    };
+    assert_ne!(first_id, next_id);
+    assert_eq!(message, "fresh-live");
+    release_fresh.notify_one();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let StreamResponse::StatusUpdate(update) = downlink.next().await.unwrap().unwrap()
+                && update.status.message.as_ref().and_then(Message::text) == Some("new question")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let task = handler.tasks.load("task").await.unwrap();
     assert_eq!(
-        task.status.message.as_ref().and_then(Message::text),
-        Some("new question")
+        task.history
+            .iter()
+            .flatten()
+            .filter(|message| message.text() == Some("unread-live"))
+            .count(),
+        1
     );
-    timeout(Duration::from_secs(2), first)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    drop(sender);
+    drop(downlink);
     handler.shutdown().await;
 }

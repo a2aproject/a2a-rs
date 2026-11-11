@@ -62,8 +62,8 @@ impl ExecutorOutputSender {
 
     /// Explicitly keep this invocation alive after its inline stream ends.
     /// Call before returning/detaching the stream, then move this sender into
-    /// the worker. Merely capturing ExecutorContext does not extend a turn.
-    /// Dropping all opted-in sender clones lets the turn finish.
+    /// the worker. Merely capturing ExecutorContext does not extend a execution.
+    /// Dropping all opted-in sender clones lets the execution finish.
     pub fn into_worker(mut self) -> Result<Self, A2AError> {
         if self.worker_lease.is_none()
             && let Some(workers) = &self.workers
@@ -208,7 +208,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), workers.ended())
             .await
             .unwrap();
-        // The passive sender still exists and does not retain the turn.
+        // The passive sender still exists and does not retain the execution.
         drop(sender);
     }
 

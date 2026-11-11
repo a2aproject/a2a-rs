@@ -202,7 +202,7 @@ pub(super) struct ActiveExecution {
     pub(super) finished: tokio_util::sync::CancellationToken,
     prepared: std::sync::atomic::AtomicBool,
     /// Where messages sent to this task go while the executor runs. The queue
-    /// belongs to the execution turn and is handed off with unread inputs.
+    /// belongs only to this execution; unread input is rejected when it ends.
     pub(super) inputs: ClientInputSender,
     /// Completed after the runner has revoked the inbox and rejected unread input.
     pub(super) inputs_drained: tokio_util::sync::CancellationToken,
@@ -477,8 +477,8 @@ pub(super) fn subscription_stream(
                                     input_generation,
                                     &StreamResponse::Task(task.clone()),
                                 ) {
-                                    // This invocation ended without answering this input. A successor
-                                    // can still consume it, so follow the task instead of the old turn.
+                                    // Input admission can outrun output publication. Wait for its
+                                    // answer or explicit rejection, never return an older question.
                                     if closed {
                                         state.receiver.finished = None;
                                     }

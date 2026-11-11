@@ -1,7 +1,7 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Drive executors, own invocation bookkeeping, and finish or hand off execution.
+//! Drive executors, own invocation bookkeeping, and finish executions.
 
 use super::DefaultRequestHandler;
 use super::cancellation::Cancellation;
@@ -117,7 +117,7 @@ impl From<crate::ExecutorContext> for ExecutionRequest {
 
 /// The output stream has been dropped before these reach the runner. Input
 /// receipts let the server recover unread messages from an owned inbox.
-pub(super) enum TurnEnd {
+pub(super) enum ExecutionEnd {
     Finished,
     Terminal(Box<StreamResponse>),
     Failed(A2AError),
@@ -160,7 +160,7 @@ async fn poll_executor(
     handler: &DefaultRequestHandler,
     active: &Arc<ActiveExecution>,
     request: impl Into<ExecutionRequest> + Send,
-) -> TurnEnd {
+) -> ExecutionEnd {
     let mut request = request.into();
     let (outputs, mut produced, mut workers) = crate::ExecutorOutputSender::for_execution(
         super::TASK_INPUT_CAPACITY,
@@ -178,7 +178,7 @@ async fn poll_executor(
             let _ = accepted.send(stream.is_some());
             match stream {
                 Some(stream) => stream,
-                None => return TurnEnd::Finished,
+                None => return ExecutionEnd::Finished,
             }
         }
     };
@@ -190,14 +190,14 @@ async fn poll_executor(
     loop {
         // Cancellation and terminal state take precedence over a late delivery error.
         if active.inputs.closed.is_cancelled() {
-            return TurnEnd::Stopped;
+            return ExecutionEnd::Stopped;
         }
         let failure = push_failure.borrow_and_update().clone();
         if let Some(error) = failure {
             if active.snapshot_is_terminal() {
-                return TurnEnd::Stopped;
+                return ExecutionEnd::Stopped;
             }
-            return TurnEnd::Failed(error);
+            return ExecutionEnd::Failed(error);
         }
         // A selected inline item follows the worker items already buffered
         // when it was polled. Bound the drain to that snapshot so continuous
@@ -219,7 +219,7 @@ async fn poll_executor(
             active.inputs.revoke_reads();
             match produced.try_recv() {
                 Ok(output) => (output.result, output.input_generation),
-                Err(_) => return TurnEnd::Finished,
+                Err(_) => return ExecutionEnd::Finished,
             }
         } else {
             enum Next {
@@ -229,7 +229,7 @@ async fn poll_executor(
             }
             let next = tokio::select! {
                 biased;
-                _ = active.inputs.closed.cancelled() => return TurnEnd::Stopped,
+                _ = active.inputs.closed.cancelled() => return ExecutionEnd::Stopped,
                 _ = push_failure.changed() => continue,
                 output = async {
                     tokio::select! {
@@ -272,20 +272,20 @@ async fn poll_executor(
             }
         };
         if generation < 0 || generation > active.inputs.received_generation() {
-            return TurnEnd::Failed(A2AError::new(
+            return ExecutionEnd::Failed(A2AError::new(
                 error_code::INVALID_AGENT_RESPONSE,
                 "executor output names an input that was not consumed",
             ));
         }
         active.produced_for(generation);
         if active.snapshot_is_terminal() {
-            return TurnEnd::Stopped;
+            return ExecutionEnd::Stopped;
         }
         match result {
             Ok(event) => {
                 match output_protocol.accept(&event) {
-                    Ok(OutputKind::Terminal) => return TurnEnd::Terminal(Box::new(event)),
-                    Err(error) => return TurnEnd::Failed(error),
+                    Ok(OutputKind::Terminal) => return ExecutionEnd::Terminal(Box::new(event)),
+                    Err(error) => return ExecutionEnd::Failed(error),
                     _ => {}
                 }
                 let action = active
@@ -300,11 +300,11 @@ async fn poll_executor(
                     .and_then(std::convert::identity);
                 match action {
                     Ok(super::task_handle::OutputAction::Continue) => {}
-                    Ok(super::task_handle::OutputAction::Stopped) => return TurnEnd::Stopped,
-                    Err(error) => return TurnEnd::Failed(error),
+                    Ok(super::task_handle::OutputAction::Stopped) => return ExecutionEnd::Stopped,
+                    Err(error) => return ExecutionEnd::Failed(error),
                 }
             }
-            Err(error) => return TurnEnd::Failed(error),
+            Err(error) => return ExecutionEnd::Failed(error),
         }
     }
 }
@@ -358,60 +358,8 @@ async fn report_controller_error(
     active.task.execution_failed(active, &error).await;
 }
 
-/// Starts the invocation that takes over `unread` inside the completion
-/// command. Gives the messages back if reservation fails.
-pub(super) async fn start_next_turn(
-    handler: &DefaultRequestHandler,
-    task_id: &TaskId,
-    snapshot: Task,
-    mut unread: Vec<crate::executor::ClientInput>,
-    state: &mut TaskController,
-) -> Result<(), Vec<crate::executor::ClientInput>> {
-    let Ok((next, inputs)) = state.reserve(handler, task_id).await else {
-        return Err(unread);
-    };
-    next.set_snapshot(snapshot.clone());
-    let first = unread.remove(0);
-    next.inputs.received(first.generation);
-    let mut rejected = Vec::new();
-    for input in unread {
-        if let Ok(permit) = next.inputs.sender.clone().try_reserve_owned() {
-            permit.send(
-                state
-                    .execution
-                    .bookkeeping(&next)
-                    .unwrap()
-                    .track_input(input),
-            );
-        } else {
-            rejected.push(input);
-        }
-    }
-    reject_inputs(&next, task_id, rejected).await;
-
-    let exec_ctx = crate::ExecutorContext {
-        outputs: Default::default(),
-        execution_id: next.execution_id.clone(),
-        message: Some(first.message),
-        task_id: task_id.clone(),
-        stored_task: Some(snapshot.clone()),
-        context_id: snapshot.context_id.clone(),
-        metadata: first.metadata,
-        user: first.user,
-        service_params: first.service_params,
-        tenant: first.tenant,
-        inputs,
-        new_task: false,
-        task_snapshot: None,
-    };
-    handler
-        .tasks
-        .spawn_execution(handler.clone(), next, exec_ctx);
-    Ok(())
-}
-
-/// Close input delivery and unregister in one task operation. Later
-/// input commands either join a successor or start a new invocation.
+/// Reject unread input and unregister in one task operation. Only a fresh
+/// request can start another execution; this inbox is never replayed.
 pub(super) async fn release_execution(
     active: &Arc<ActiveExecution>,
     task_id: &str,
@@ -437,7 +385,7 @@ pub(super) async fn save_pending_push_config(
 
 /// Closes the task-input queue and tells the exchanges about each
 /// message the executor never read. Those messages were accepted, recorded and
-/// announced; the executor's turn ended without handling them, which the
+/// announced; the executor's execution ended without handling them, which the
 /// client that sent one is told by a `StreamError` naming it, rather than by
 /// silence.
 pub(super) async fn reject_unread_inputs(
@@ -750,7 +698,7 @@ mod driver_tests {
             }
             assert!(matches!(
                 poll_executor(&runtime, &active, context).await,
-                TurnEnd::Stopped
+                ExecutionEnd::Stopped
             ));
             assert!(active.snapshot().is_some());
         }
@@ -782,7 +730,7 @@ mod driver_tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            TurnEnd::Stopped
+            ExecutionEnd::Stopped
         ));
         assert_eq!(
             runtime
@@ -1110,87 +1058,9 @@ mod driver_tests {
 }
 
 #[cfg(test)]
-mod turn_tests {
+mod completion_tests {
     use super::*;
     use crate::handler::test_support::*;
-
-    #[tokio::test]
-    async fn handoff_capacity_failure_rejects_every_input_it_cannot_queue() {
-        struct Pending;
-        impl crate::AgentExecutor for Pending {
-            fn execute(
-                &self,
-                _: crate::ExecutorContext,
-            ) -> futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>> {
-                Box::pin(futures::stream::pending())
-            }
-            fn cancel(
-                &self,
-                _: crate::ExecutorContext,
-            ) -> futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>> {
-                Box::pin(futures::stream::empty())
-            }
-        }
-        let runtime = DefaultRequestHandler::new(Pending, InMemoryTaskStore::new());
-        let task = task_with_history("handoff-capacity", "context", 0);
-        let handle = runtime.tasks.task(&task.id);
-        let mut events = handle.sender().subscribe();
-        let capacity = crate::handler::TASK_INPUT_CAPACITY;
-        let inputs = (0..capacity + 3)
-            .map(|index| {
-                let mut message = make_message();
-                message.message_id = format!("input-{index}");
-                crate::ClientInput::new(message, index as i64 + 1)
-            })
-            .collect();
-        start_next_turn(
-            &runtime,
-            &task.id,
-            task.clone(),
-            inputs,
-            &mut TaskController::default(),
-        )
-        .await
-        .unwrap();
-        for index in capacity + 1..capacity + 3 {
-            let event = events.recv().await.unwrap();
-            assert!(
-                matches!(event.result, Ok(StreamResponse::Error(error)) if error.reference_id == Some(format!("input-{index}")))
-            );
-        }
-        assert!(events.try_recv().is_err());
-        runtime.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn a_busy_handoff_returns_input_with_its_caller_identity_intact() {
-        let runtime = make_handler();
-        let task = task_with_history("busy-handoff", "context", 0);
-        let (active, _inputs, _invocation) = runtime.tasks.task(&task.id).reserve().unwrap();
-        active.set_snapshot(task.clone());
-        let mut input = crate::ClientInput::new(make_message(), 7);
-        input.user = Some(crate::User::authenticated("alice"));
-        input.tenant = Some("tenant-a".into());
-        input.metadata = Some(std::collections::HashMap::from([(
-            "trace".into(),
-            serde_json::json!(42),
-        )]));
-        let returned = start_next_turn(
-            &runtime,
-            &task.id,
-            task.clone(),
-            vec![input.clone()],
-            &mut TaskController::default(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(returned.len(), 1);
-        assert_eq!(returned[0].message, input.message);
-        assert_eq!(returned[0].user, input.user);
-        assert_eq!(returned[0].metadata, input.metadata);
-        assert_eq!(returned[0].tenant, input.tenant);
-        assert!(runtime.tasks.task(&task.id).active().is_some());
-    }
 
     #[tokio::test]
     async fn rejected_pending_push_configuration_does_not_replace_existing_endpoints() {
@@ -1256,110 +1126,6 @@ mod turn_tests {
         assert_eq!(error.task_id, "task");
         assert_eq!(error.code, "UNAVAILABLE");
         assert_eq!(error.reference_id, None);
-    }
-    struct CaptureTurn(
-        tokio::sync::mpsc::UnboundedSender<(crate::ExecutorContext, Vec<crate::ClientInput>)>,
-    );
-
-    impl crate::AgentExecutor for CaptureTurn {
-        fn execute(
-            &self,
-            mut context: crate::ExecutorContext,
-        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-            let queued = std::iter::from_fn(|| context.inputs.try_recv()).collect();
-            let mut task = context.stored_task.clone().unwrap();
-            task.status.state = TaskState::Completed;
-            self.0
-                .send((context, queued))
-                .unwrap_or_else(|_| panic!("observer dropped"));
-            Box::pin(stream::once(async move { Ok(StreamResponse::Task(task)) }))
-        }
-        fn cancel(
-            &self,
-            context: crate::ExecutorContext,
-        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-            crate::AgentExecutor::cancel(&EchoExecutor, context)
-        }
-    }
-
-    #[tokio::test]
-    async fn a_handoff_preserves_the_trigger_and_queues_remaining_inputs_in_order() {
-        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = DefaultRequestHandler::new(CaptureTurn(sent), InMemoryTaskStore::new());
-        let mut task = task_with_history("next-turn", "context", 0);
-        task.status.state = TaskState::Working;
-        runtime.tasks.store().create(task.clone()).await.unwrap();
-        let inputs: Vec<_> = ["first", "second", "third"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, id)| {
-                let mut message = make_message();
-                message.message_id = id.into();
-                let mut input = crate::ClientInput::new(message, index as i64 + 1);
-                input.user = Some(crate::User::authenticated("alice"));
-                input.tenant = Some("tenant-a".into());
-                input.metadata = Some(std::collections::HashMap::from([(
-                    "trace".into(),
-                    serde_json::json!(id),
-                )]));
-                input
-            })
-            .collect();
-        let _lease = runtime.tasks.test_lease(&task.id);
-        let handler = runtime.clone();
-        let snapshot = task.clone();
-        let accepted = inputs.clone();
-        let started = runtime
-            .tasks
-            .test_update(&task.id, move |state| {
-                Box::pin(async move {
-                    start_next_turn(&handler, &snapshot.id, snapshot.clone(), accepted, state).await
-                })
-            })
-            .await
-            .unwrap();
-        assert!(started.is_ok());
-        let (context, queued) = timeout(Duration::from_secs(1), received.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(context.message, Some(inputs[0].message.clone()));
-        assert_eq!(context.metadata, inputs[0].metadata);
-        assert_eq!(context.user, inputs[0].user);
-        assert_eq!(context.tenant, inputs[0].tenant);
-        assert_eq!(
-            queued
-                .iter()
-                .map(|input| input.message.message_id.as_str())
-                .collect::<Vec<_>>(),
-            ["second", "third"]
-        );
-        assert_eq!(
-            queued
-                .iter()
-                .map(|input| input.generation)
-                .collect::<Vec<_>>(),
-            [2, 3]
-        );
-        timeout(Duration::from_secs(1), async {
-            while runtime.tasks.task(&task.id).active().is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            runtime
-                .tasks
-                .store()
-                .get(&task.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status
-                .state,
-            TaskState::Completed
-        );
     }
 }
 
@@ -1457,7 +1223,7 @@ mod failure_tests {
     }
     #[tokio::test]
     async fn an_executor_failure_releases_its_owner_even_when_failure_persistence_is_down() {
-        use crate::handler::{execution::TurnEnd, task_handle::TaskController};
+        use crate::handler::{execution::ExecutionEnd, task_handle::TaskController};
         for read_outage in [true, false] {
             let store = UnavailableStore::default();
             let handler = DefaultRequestHandler::new(EchoExecutor, store.clone());
@@ -1474,7 +1240,7 @@ mod failure_tests {
                     &handler,
                     "task".into(),
                     active.clone(),
-                    TurnEnd::Failed(A2AError::internal("agent failed")),
+                    ExecutionEnd::Failed(A2AError::internal("agent failed")),
                 )
                 .await;
             assert!(events.recv().await.unwrap().result.is_err());

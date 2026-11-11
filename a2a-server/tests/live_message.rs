@@ -924,7 +924,7 @@ async fn an_idle_exchange_follows_a_turn_another_client_starts() {
 }
 
 #[tokio::test]
-async fn input_the_agent_never_read_when_its_turn_ends_is_taken_up_by_the_next_turn() {
+async fn unread_inputs_are_rejected_without_being_replayed_into_another_execution() {
     let (handler, release) = handler(true);
     let p = params("1.1");
     let (up, uplink) = new_uplink();
@@ -932,57 +932,68 @@ async fn input_the_agent_never_read_when_its_turn_ends_is_taken_up_by_the_next_t
     let mut down = handler.send_live_message(&p, uplink).await.unwrap();
     let task_id = task_of(next(&mut down).await).id;
     assert_eq!(state_text(&next(&mut down).await).1, "lazy");
-
+    let mut references = Vec::new();
     for text in ["x", "y"] {
-        up.send(send(text, Some(&task_id))).await.unwrap();
+        let request = send(text, Some(&task_id));
+        if let StreamRequestPayload::SendMessage(message) = &request.payload {
+            references.push(message.message.as_ref().unwrap().message_id.clone());
+        }
+        up.send(request).await.unwrap();
         assert!(matches!(
             next(&mut down).await,
             StreamResponse::MessageUpdate(_)
         ));
     }
     release.notify_one();
-
-    // The turn ends without reading either. They were accepted, so a turn
-    // takes them up, "x" as its message and "y" from its input: nobody is
-    // told they were not read.
-    let handled = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let task = handler
-                .get_task(
-                    &p,
-                    GetTaskRequest {
-                        id: task_id.clone(),
-                        history_length: None,
-                        tenant: None,
-                        timeline_length: None,
-                        current_generation: None,
-                    },
-                )
-                .await
-                .unwrap();
-            let said = |text: &str| {
-                task.timeline.iter().flatten().any(|entry| {
-                    matches!(
-                        &entry.content,
-                        TimelineContent::Status(status)
-                            if status.message.as_ref().and_then(|m| m.text()) == Some(text)
-                    )
-                })
-            };
-            if said("got: y") {
-                return;
+    let rejected = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut rejected = Vec::new();
+        while rejected.len() < 2 {
+            if let StreamResponse::Error(error) = next(&mut down).await {
+                assert_eq!(error.code, "UNAVAILABLE");
+                rejected.push(error.reference_id.unwrap());
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        rejected
     })
-    .await;
-    assert!(handled.is_ok(), "the next turn read the queued message");
-    while let Ok(Some(item)) = tokio::time::timeout(Duration::from_millis(300), down.next()).await {
-        assert!(
-            !matches!(item, Ok(StreamResponse::Error(_))),
-            "a message that was taken up was turned away: {item:?}"
+    .await
+    .unwrap();
+    assert_eq!(rejected, references);
+    let get = || GetTaskRequest {
+        id: task_id.clone(),
+        history_length: None,
+        tenant: None,
+        timeline_length: None,
+        current_generation: None,
+    };
+    let task = handler.get_task(&p, get()).await.unwrap();
+    assert_eq!(task.status.state, TaskState::InputRequired);
+    for reference in &references {
+        assert_eq!(
+            task.history
+                .iter()
+                .flatten()
+                .filter(|message| &message.message_id == reference)
+                .count(),
+            1
         );
     }
+    assert!(!task.timeline.iter().flatten().any(|entry| matches!(&entry.content, TimelineContent::Status(status) if status.message.as_ref().and_then(Message::text) == Some("got: y"))));
+
+    // The live exchange remains usable, but only a fresh request starts execute.
+    up.send(send("quick", Some(&task_id))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let StreamResponse::StatusUpdate(update) = next(&mut down).await
+                && update.status.state == TaskState::Completed
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    ended(&mut down).await;
+    handler.shutdown().await;
 }
 
 #[tokio::test]
@@ -2139,11 +2150,10 @@ async fn messages_racing_an_executor_that_fails_are_never_refused_for_a_closed_q
     }
 }
 
-/// A client that answers INPUT_REQUIRED the moment it sees it reaches a turn
-/// that has asked for input but not yet returned. Its answer is not swallowed:
-/// the turn that follows handles it.
+/// Input arriving at EOF either belongs to the finishing execution and is
+/// explicitly rejected unread, or starts a fresh execution. It is never replayed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn an_answer_sent_as_the_turn_asks_for_input_is_handled_by_a_turn() {
+async fn an_answer_racing_execution_end_is_rejected_or_starts_a_fresh_execution() {
     for round in 0..30 {
         let (handler, _) = handler(true);
         let p = params("1.1");
@@ -2155,49 +2165,57 @@ async fn an_answer_sent_as_the_turn_asks_for_input_is_handled_by_a_turn() {
         };
         let task_id = task_of(next(&mut stream).await).id;
         loop {
-            if let StreamResponse::StatusUpdate(update) = next(&mut stream).await {
-                if update.status.state == TaskState::InputRequired {
-                    break;
-                }
+            if let StreamResponse::StatusUpdate(update) = next(&mut stream).await
+                && update.status.state == TaskState::InputRequired
+            {
+                break;
             }
         }
-        // "quick" completes the task, which only a turn that ran can do.
-        let reply = tokio::time::timeout(
-            Duration::from_secs(5),
-            handler.send_message(&p, message_request("quick", &task_id)),
-        )
-        .await
-        .expect("no hang")
-        .expect("accepted");
-        let SendMessageResponse::Task(task) = reply else {
-            panic!("a task is returned");
+        let request = message_request("quick", &task_id);
+        let reference = request.message.as_ref().unwrap().message_id.clone();
+        let reply = tokio::time::timeout(Duration::from_secs(5), handler.send_message(&p, request))
+            .await
+            .expect("no hang");
+        let get = || GetTaskRequest {
+            id: task_id.clone(),
+            history_length: None,
+            tenant: None,
+            timeline_length: None,
+            current_generation: None,
         };
-        let completed = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let stored = handler
-                    .get_task(
-                        &p,
-                        GetTaskRequest {
-                            id: task_id.clone(),
-                            history_length: None,
-                            tenant: None,
-                            timeline_length: None,
-                            current_generation: None,
-                        },
-                    )
+        match reply {
+            Ok(SendMessageResponse::Task(task)) => {
+                assert_eq!(task.status.state, TaskState::Completed)
+            }
+            Ok(_) => panic!("a task response is required"),
+            Err(error) => {
+                assert!(
+                    error.message.contains("before reading this message"),
+                    "round {round}: {error:?}"
+                );
+                let task = handler.get_task(&p, get()).await.unwrap();
+                assert_eq!(task.status.state, TaskState::InputRequired);
+                assert_eq!(
+                    task.history
+                        .iter()
+                        .flatten()
+                        .filter(|message| message.message_id == reference)
+                        .count(),
+                    1
+                );
+                let reply = handler
+                    .send_message(&p, message_request("quick", &task_id))
                     .await
                     .unwrap();
-                if stored.status.state == TaskState::Completed {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                assert!(
+                    matches!(reply, SendMessageResponse::Task(task) if task.status.state == TaskState::Completed)
+                );
             }
-        })
-        .await;
-        assert!(
-            completed.is_ok(),
-            "round {round}: the answer was recorded ({:?}) but no turn handled it",
-            task.status.state
+        }
+        assert_eq!(
+            handler.get_task(&p, get()).await.unwrap().status.state,
+            TaskState::Completed
         );
+        handler.shutdown().await;
     }
 }

@@ -736,7 +736,7 @@ impl Rejection {
     }
 
     pub(super) fn unread_input() -> Self {
-        Self::Declined("the agent finished its turn before reading this message".into())
+        Self::Declined("the agent ended its execution before reading this message".into())
     }
 
     /// The error to give a caller that is not on a stream yet.

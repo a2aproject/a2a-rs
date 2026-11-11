@@ -225,35 +225,55 @@ fn caller(observed: Observed, user: &str, text: &str, initial: bool) -> String {
 }
 
 #[tokio::test]
-async fn caller_context_survives_unread_handoff_and_remaining_queued_inputs() {
+async fn unread_inputs_are_private_and_fresh_requests_keep_their_own_caller_context() {
     let (handler, mut receiver, release) = handler();
     let (id, _owner) = start(&handler, &params("alice", Some("a")), "hold").await;
     let first_execution = caller(seen(&mut receiver).await, "alice", "hold", true);
-    let mut bob = open(
+    let bob_request = send("resume", Some(&id));
+    let alice_request = send("finish", Some(&id));
+    let reference = |request: &StreamRequest| match &request.payload {
+        StreamRequestPayload::SendMessage(request) => {
+            request.message.as_ref().unwrap().message_id.clone()
+        }
+        _ => unreachable!(),
+    };
+    let bob_id = reference(&bob_request);
+    let alice_id = reference(&alice_request);
+    let mut bob = open(&handler, &params("bob", Some("b")), bob_request).await;
+    next(&mut bob).await;
+    let mut alice = open(&handler, &params("alice", Some("c")), alice_request).await;
+    next(&mut alice).await;
+    release.notify_one();
+    for (downlink, id) in [(&mut bob, bob_id), (&mut alice, alice_id)] {
+        loop {
+            if let StreamResponse::Error(error) = next(downlink).await {
+                assert_eq!(error.code, "UNAVAILABLE");
+                assert_eq!(error.reference_id.as_deref(), Some(id.as_str()));
+                break;
+            }
+        }
+    }
+    assert!(
+        receiver.try_recv().is_err(),
+        "unread inputs cannot start another execution"
+    );
+    ack(
         &handler,
         &params("bob", Some("b")),
-        send("resume", Some(&id)),
+        send("resume-fresh", Some(&id)),
     )
     .await;
-    next(&mut bob).await; // Queued, with Bob's own downlink.
-    let mut alice = open(
+    let next_execution = caller(seen(&mut receiver).await, "bob", "resume-fresh", true);
+    assert_ne!(first_execution, next_execution);
+    ack(
         &handler,
         &params("alice", Some("c")),
         send("finish", Some(&id)),
     )
     .await;
-    next(&mut alice).await;
-    release.notify_one();
-    let next_execution = caller(seen(&mut receiver).await, "bob", "resume", true);
-    let queued_execution = caller(seen(&mut receiver).await, "alice", "finish", false);
-    assert_ne!(
-        first_execution, next_execution,
-        "handoff starts a new execution for the same task"
-    );
-    assert_eq!(
-        next_execution, queued_execution,
-        "queued inputs share their receiving execution"
-    );
+    let receiving_execution = caller(seen(&mut receiver).await, "alice", "finish", false);
+    assert_eq!(next_execution, receiving_execution);
+    handler.shutdown().await;
 }
 
 #[tokio::test]

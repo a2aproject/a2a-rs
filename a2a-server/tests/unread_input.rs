@@ -16,7 +16,7 @@ enum End {
     Completed,
     Failed,
     Canceled,
-    Handoff,
+    Returned,
 }
 #[derive(Clone, Copy)]
 enum Mode {
@@ -28,7 +28,6 @@ enum Mode {
 struct Gates {
     finish: Notify,
     read: Notify,
-    finish_successor: Notify,
 }
 struct Gated {
     gates: Arc<Gates>,
@@ -62,17 +61,16 @@ impl AgentExecutor for Gated {
             if ctx.message.as_ref().and_then(Message::text) == Some("start") {
                 yield Ok(status(&ctx, TaskState::Working));
                 gates.finish.notified().await;
-                if matches!(end, End::Handoff) {return;}
                 let input = ctx.inputs.recv().await.expect("the first queued input is read");
                 assert_eq!(input.message.text(), Some("read"));
             } else {
                 assert_eq!(ctx.message.as_ref().and_then(Message::text), Some("read"));
             }
             gates.read.notify_one();
-            if matches!(end, End::Handoff) {gates.finish_successor.notified().await;}
             for _ in 0..burst {yield Ok(status(&ctx, TaskState::Working));}
             match end {
-                End::Completed | End::Handoff => yield Ok(status(&ctx, TaskState::Completed)),
+                End::Completed => yield Ok(status(&ctx, TaskState::Completed)),
+                End::Returned => {},
                 End::Failed => yield Err(A2AError::internal("execution failed")),
                 End::Canceled => futures::future::pending::<()>().await,
             }
@@ -157,7 +155,6 @@ async fn check(end: End, mode: Mode, burst: usize) {
     let gates = Arc::new(Gates {
         finish: Notify::new(),
         read: Notify::new(),
-        finish_successor: Notify::new(),
     });
     let handler = DefaultRequestHandler::new(
         Gated {
@@ -199,7 +196,7 @@ async fn check(end: End, mode: Mode, burst: usize) {
     input_arrived(&mut observer, &read_id).await;
     let unread = request("unread", Some(&task.id));
     let unread_id = unread.message.as_ref().unwrap().message_id.clone();
-    let (mut unary, events) = match mode {
+    let (mut unary, mut events) = match mode {
         Mode::Unary => (
             Some(Box::pin({
                 let handler = handler.clone();
@@ -229,10 +226,25 @@ async fn check(end: End, mode: Mode, burst: usize) {
     // Both inputs are accepted, but only the peer's input will be consumed.
     gates.finish.notify_one();
     timeout(WAIT, gates.read.notified()).await.unwrap();
-    if matches!(end, End::Handoff) {
-        gates.finish_successor.notify_one();
+    // A nonterminal EOF rejects unread input before any later cancellation.
+    let mut early_events = Vec::new();
+    let mut early_error = None;
+    if matches!(end, End::Returned) {
+        if let Some(call) = unary.as_mut() {
+            early_error = Some(timeout(WAIT, call).await.unwrap().unwrap_err());
+        } else {
+            let stream = events.as_mut().unwrap();
+            loop {
+                let event = timeout(WAIT, stream.next()).await.unwrap().unwrap();
+                let rejected = event.is_err() || matches!(event, Ok(StreamResponse::Error(_)));
+                early_events.push(event);
+                if rejected {
+                    break;
+                }
+            }
+        }
     }
-    if matches!(end, End::Canceled) {
+    if matches!(end, End::Canceled | End::Returned) {
         handler
             .cancel_task(
                 &params(),
@@ -249,12 +261,17 @@ async fn check(end: End, mode: Mode, burst: usize) {
     shared_outcome(&collect(observer).await, end);
     match mode {
         Mode::Unary => {
-            let error = timeout(WAIT, unary.unwrap()).await.unwrap().unwrap_err();
+            let error = match early_error {
+                Some(error) => error,
+                None => timeout(WAIT, unary.unwrap()).await.unwrap().unwrap_err(),
+            };
             assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
             assert!(error.message.contains("before reading"));
         }
         Mode::Streaming => {
-            let events = collect(events.unwrap()).await;
+            let mut collected = early_events;
+            collected.extend(collect(events.unwrap()).await);
+            let events = collected;
             assert!(
                 !events
                     .iter()
@@ -274,7 +291,9 @@ async fn check(end: End, mode: Mode, burst: usize) {
             assert!(errors[0].message.contains("before reading"));
         }
         Mode::Live => {
-            let events = collect(events.unwrap()).await;
+            let mut collected = early_events;
+            collected.extend(collect(events.unwrap()).await);
+            let events = collected;
             let private: Vec<_> = events
                 .iter()
                 .filter_map(|event| match event {
@@ -307,9 +326,9 @@ async fn check(end: End, mode: Mode, burst: usize) {
         .await
         .unwrap();
     let expected = match end {
-        End::Completed | End::Handoff => TaskState::Completed,
+        End::Completed => TaskState::Completed,
         End::Failed => TaskState::Failed,
-        End::Canceled => TaskState::Canceled,
+        End::Canceled | End::Returned => TaskState::Canceled,
     };
     assert_eq!(stored.status.state, expected);
     assert!(
@@ -324,9 +343,9 @@ async fn check(end: End, mode: Mode, burst: usize) {
 }
 
 #[tokio::test(start_paused = true)]
-async fn unread_input_is_reported_only_to_its_sender_on_completion_failure_cancellation_or_handoff()
+async fn unread_input_is_reported_only_to_its_sender_on_completion_failure_cancellation_or_return()
 {
-    for end in [End::Completed, End::Failed, End::Canceled, End::Handoff] {
+    for end in [End::Completed, End::Failed, End::Canceled, End::Returned] {
         for mode in [Mode::Unary, Mode::Streaming, Mode::Live] {
             check(end, mode, 0).await;
         }

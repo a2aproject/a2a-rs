@@ -187,7 +187,23 @@ async fn detached_receiver_is_revoked_without_waiting_for_its_worker_to_finish()
         StreamResponse::MessageUpdate(_)
     ));
     end_turn.notify_one();
-    // The next invocation must complete while the old worker still owns its receiver.
+    // EOF rejects the unread input; owning its old inbox cannot cause replay.
+    loop {
+        if let StreamResponse::Error(error) = next(&mut stream).await {
+            assert_eq!(error.code, "UNAVAILABLE");
+            break;
+        }
+    }
+    assert!(messages.try_recv().is_err());
+    // Only this fresh request starts execution, even while the old worker still
+    // owns its revoked receiver.
+    assert!(matches!(
+        handler
+            .send_live_request(&p, send("finish", Some(&task.id)))
+            .await
+            .unwrap(),
+        LiveResponse::Ack(_)
+    ));
     assert_eq!(received(&mut messages).await, "finish");
     loop {
         let event = next(&mut stream).await;
@@ -202,9 +218,12 @@ async fn detached_receiver_is_revoked_without_waiting_for_its_worker_to_finish()
     read_old_inbox.notify_one();
     assert!(
         received(&mut old_results).await.is_none(),
-        "the old worker cannot steal handed-off input"
+        "the old worker cannot read rejected input"
     );
-    assert!(messages.try_recv().is_err(), "the input is processed once");
+    assert!(
+        messages.try_recv().is_err(),
+        "only the fresh input is processed"
+    );
 }
 
 #[tokio::test]

@@ -51,6 +51,14 @@ may remain nonterminal after an invocation returns; later input can start a
 new invocation. `execution_id` identifies an invocation, not a client or task.
 The owned input receiver can move into a spawned Tokio worker.
 
+Input queues belong to one execution. If that execution ends before reading
+an accepted input, a waiting sending call receives an explicit rejection (a private
+`StreamError` on a live exchange). The input remains in persisted task history
+but is never automatically replayed into another `execute` call. A fresh
+request after completion may start another execution; task history does not
+implicitly become its inbox. An already returned `returnImmediately` response
+acknowledges persistence, not executor consumption.
+
 The default handler validates each client input, persists it, and delivers it
 through the task's execution input queue. Custom `TaskStore` implementations
 retain their existing required methods. Authorized listings require an
@@ -86,7 +94,7 @@ capability in the final `with_capabilities` call.
   To keep producing after the inline stream ends, call
   `ctx.outputs.clone().into_worker()` before returning it. `ExecutorOutput`
   is non-exhaustive; construct outputs through the sender API. Passive context
-  captures do not extend the turn; inline EOF revokes their input receiver and
+  captures do not extend the execution; inline EOF revokes their input receiver and
   drains buffered output. Opted-in workers finish by dropping their senders.
 - HTTP live follow-ups have a default 30-second acknowledgement deadline,
   configurable with `with_http_followup_timeout`. Pending requests can be

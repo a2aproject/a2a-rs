@@ -79,9 +79,9 @@ impl ClientInput {
 /// or sent to the working task (see [`super::ExecutorContext::inputs`]).
 ///
 /// The receiver is owned and can move into a Tokio task. The server tracks
-/// delivery receipts: a message still unread at the end of a nonterminal
-/// turn is handed to the next execution. If the task ends, a waiting unary or
-/// streaming sender receives an error; a live sender receives a private
+/// delivery receipts: a message still unread when its execution ends is never
+/// replayed into another call. A waiting unary or streaming sender receives
+/// an error; a live sender receives a private
 /// `StreamError`. An executor reads with [`recv`](Self::recv),
 /// alongside its own work.
 pub struct ClientInputs {
@@ -207,7 +207,7 @@ const RECEIVED: u8 = 1;
 const RECLAIMED: u8 = 2;
 
 /// Reading and reclaiming race through one atomic receipt. This lets a worker
-/// own the receiver without letting it read messages handed to a later turn.
+/// own the receiver without letting it read messages already rejected at EOF.
 #[derive(Clone)]
 pub(crate) struct QueuedInput {
     input: Arc<ClientInput>,
@@ -401,11 +401,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handler_drains_only_unread_inputs_at_turn_end() {
+    async fn handler_rejects_only_unread_inputs_at_execution_end() {
         let (sender, mut inputs) = ClientInputs::channel(3);
         sender.try_send(input("read")).unwrap();
-        sender.try_send(input("next-turn-first")).unwrap();
-        sender.try_send(input("next-turn-second")).unwrap();
+        sender.try_send(input("unread-first")).unwrap();
+        sender.try_send(input("unread-second")).unwrap();
         assert_eq!(inputs.recv().await.unwrap().message.message_id, "read");
         let unread = inputs.close_and_drain();
         assert_eq!(
@@ -413,7 +413,7 @@ mod tests {
                 .iter()
                 .map(|i| i.message.message_id.as_str())
                 .collect::<Vec<_>>(),
-            ["next-turn-first", "next-turn-second"]
+            ["unread-first", "unread-second"]
         );
         assert!(inputs.recv().await.is_none());
         assert!(sender.try_send(input("late")).is_err());
@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn a_concurrent_reader_and_handoff_deliver_each_input_once() {
+    fn a_concurrent_reader_and_rejection_dispose_of_each_input_once() {
         for _ in 0..64 {
             let queued = QueuedInput::new(input("raced"));
             let reader = queued.clone();
@@ -441,9 +441,9 @@ mod tests {
                     reading.wait();
                     reader.claim()
                 });
-                let handing_off = &start;
+                let rejecting = &start;
                 let reclaim = scope.spawn(move || {
-                    handing_off.wait();
+                    rejecting.wait();
                     queued.reclaim()
                 });
                 start.wait();
@@ -473,16 +473,16 @@ mod tests {
         assert!(inputs.try_recv().is_none());
 
         let (sender, mut inputs) = ClientInputs::channel(1);
-        sender.try_send(input("handed-off")).unwrap();
+        sender.try_send(input("rejected")).unwrap();
         sender.revoke();
         assert!(inputs.try_recv().is_none());
         assert!(inputs.recv().await.is_none());
     }
 
     #[tokio::test]
-    async fn recv_skips_receipts_already_reclaimed_for_a_later_turn() {
+    async fn recv_skips_receipts_already_reclaimed_for_rejection() {
         let (sender, mut inputs) = ClientInputs::channel(2);
-        let first = QueuedInput::new(input("handed-off"));
+        let first = QueuedInput::new(input("rejected"));
         assert!(first.clone().reclaim().is_some());
         sender.sender.try_send(first).unwrap();
         sender.try_send(input("still-unread")).unwrap();
