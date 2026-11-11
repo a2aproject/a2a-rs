@@ -48,7 +48,9 @@ pub fn check_framing(data: &[u8]) {
                         "malformed RPC envelope was ignored"
                     );
                 }
-                let framed = text
+                // Encode every SSE line, including bare-CR JSON whitespace.
+                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                let framed = normalized
                     .lines()
                     .map(|line| format!("data:{line}\n"))
                     .collect::<String>()
@@ -122,6 +124,17 @@ mod tests {
                     .to_string()
                     .as_bytes(),
             );
+        }
+    }
+
+    #[test]
+    fn oracle_encodes_json_whitespace_without_creating_sse_boundaries() {
+        for newline in ["\n", "\r", "\r\n"] {
+            let envelope = format!(
+                "{{\"jsonrpc\":\"2.0\",{newline}{newline}\"id\":1,\"result\":{{\"futureEvent\":{{}}}}}}"
+            );
+            assert!(serde_json::from_str::<a2a::JsonRpcResponse>(&envelope).is_ok());
+            check_framing(envelope.as_bytes());
         }
     }
 
