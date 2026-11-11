@@ -102,7 +102,7 @@ fn send(text: &str, task_id: Option<&str>) -> SendMessageRequest {
     let mut message = Message::new(Role::User, vec![Part::text(text)]);
     message.task_id = task_id.map(Into::into);
     SendMessageRequest {
-        message,
+        message: Some(message),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -1292,9 +1292,7 @@ fn artifact_only(task_id: &str, text: &str) -> SendMessageRequest {
     let mut update = artifact_update(text);
     update.task_id = task_id.into();
     let mut request = send("", None);
-    request.message.role = Role::Unspecified;
-    request.message.message_id = String::new();
-    request.message.parts.clear();
+    request.message = None;
     request.artifact_updates = vec![update];
     request
 }
@@ -1567,7 +1565,7 @@ async fn a_message_with_content_is_never_treated_as_artifact_only() {
     // No messageId, but a body and a task of its own, plus an update for
     // another task: ambiguous, so refused rather than guessed at.
     let mut request = send("real body", Some(&first.id));
-    request.message.message_id = String::new();
+    request.message.as_mut().unwrap().message_id = String::new();
     request.artifact_updates = vec![{
         let mut update = artifact_update("x");
         update.task_id = "some-other-task".into();

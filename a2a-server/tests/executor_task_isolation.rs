@@ -26,7 +26,7 @@ fn send(id: Option<&str>) -> SendMessageRequest {
     let mut message = Message::new(Role::User, vec![Part::text("input")]);
     message.task_id = id.map(Into::into);
     SendMessageRequest {
-        message,
+        message: Some(message),
         tenant: None,
         configuration: None,
         metadata: None,

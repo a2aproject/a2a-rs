@@ -570,17 +570,9 @@ fn merge_artifact(task: &mut Task, update: &mut TaskArtifactUpdateEvent) -> Resu
     Ok(generation)
 }
 
-/// A request that carries only `artifactUpdates` for an existing task. The
-/// native `message` is not optional, so the wire's absent message arrives as
-/// an empty one with no id (see the protobuf conversion); a message that has
-/// an id, a body or a task of its own is never mistaken for it.
+/// An artifact-only update explicitly omits its message.
 fn is_artifact_only(req: &SendMessageRequest) -> bool {
-    !req.artifact_updates.is_empty()
-        && req.message.role == Role::Unspecified
-        && req.message.message_id.is_empty()
-        && req.message.parts.is_empty()
-        && req.message.task_id.is_none()
-        && req.message.context_id.is_none()
+    req.message.is_none() && !req.artifact_updates.is_empty()
 }
 
 /// The task a send request names: the message's, or for an artifact-only
@@ -593,7 +585,9 @@ fn request_task_id(req: &SendMessageRequest) -> Option<String> {
             .find(|task_id| !task_id.is_empty())
             .map(str::to_string)
     } else {
-        req.message.task_id.clone()
+        req.message
+            .as_ref()
+            .and_then(|message| message.task_id.clone())
     }
 }
 
@@ -653,12 +647,12 @@ fn apply_client_artifacts(
 /// Records a follow-up client message in the task's timeline, then applies
 /// the artifacts sent with it (A2A 1.1 §3.4: the message first).
 fn record_client_input(task: &mut Task, req: &SendMessageRequest) -> Result<(), A2AError> {
-    if !is_artifact_only(req) {
+    if let Some(message) = &req.message {
         task.generation += 1;
         task.timeline
             .get_or_insert_with(Vec::new)
             .push(TimelineEntry {
-                content: TimelineContent::Message(req.message.clone()),
+                content: TimelineContent::Message(message.clone()),
                 generation: task.generation,
             });
     }
@@ -1381,7 +1375,13 @@ impl DefaultRequestHandler {
         // and client-provided ids for *creating* tasks are not supported. Only
         // an absent taskId may mint a new one.
         let stored = self.task_store.get(task_id).await?;
-        if stored.is_none() && (req.message.task_id.is_some() || artifact_only) {
+        if stored.is_none()
+            && (req
+                .message
+                .as_ref()
+                .is_some_and(|message| message.task_id.is_some())
+                || artifact_only)
+        {
             return Err(A2AError::task_not_found(task_id));
         }
         if stored
@@ -1415,7 +1415,11 @@ impl DefaultRequestHandler {
         // contextId from the task when only taskId is given.
         let context_id = match stored.as_ref() {
             Some(task) => {
-                if let Some(requested) = req.message.context_id.as_deref() {
+                if let Some(requested) = req
+                    .message
+                    .as_ref()
+                    .and_then(|message| message.context_id.as_deref())
+                {
                     if requested != task.context_id {
                         return Err(A2AError::invalid_params(format!(
                             "contextId {requested} does not match task {task_id}, \
@@ -1428,8 +1432,8 @@ impl DefaultRequestHandler {
             }
             None => req
                 .message
-                .context_id
-                .clone()
+                .as_ref()
+                .and_then(|message| message.context_id.clone())
                 .unwrap_or_else(new_context_id),
         };
 
@@ -1441,7 +1445,7 @@ impl DefaultRequestHandler {
             // only ever merges status/artifact deltas onto the snapshot
             // started here, never anything content-derived. Append it so
             // `history` actually accumulates across turns.
-            if !artifact_only {
+            if let Some(message) = &req.message {
                 let asked = existing.status.message.clone();
                 let history = existing.history.get_or_insert_with(Vec::new);
                 if let Some(asked) = asked.filter(|asked| {
@@ -1451,7 +1455,7 @@ impl DefaultRequestHandler {
                 }) {
                     history.push(asked);
                 }
-                history.push(req.message.clone());
+                history.push(message.clone());
             }
             record_client_input(&mut existing, req)?;
             // Persisted now rather than with the executor's first event, so
@@ -1460,10 +1464,14 @@ impl DefaultRequestHandler {
             self.task_store.update(existing.clone()).await?;
             existing
         } else {
+            let message = req
+                .message
+                .as_ref()
+                .ok_or_else(|| A2AError::invalid_params("message is required"))?;
             let mut task = Task {
                 generation: 1,
                 timeline: Some(vec![TimelineEntry {
-                    content: TimelineContent::Message(req.message.clone()),
+                    content: TimelineContent::Message(message.clone()),
                     generation: 1,
                 }]),
                 id: task_id.to_string(),
@@ -1474,7 +1482,7 @@ impl DefaultRequestHandler {
                     timestamp: Some(chrono::Utc::now()),
                 },
                 artifacts: None,
-                history: Some(vec![req.message.clone()]),
+                history: Some(vec![message.clone()]),
                 metadata: None,
             };
             apply_client_artifacts(&mut task, req, true)?;
@@ -1828,15 +1836,19 @@ impl DefaultRequestHandler {
     ) -> Result<(Task, broadcast::Receiver<ExecutionEvent>), A2AError> {
         let artifact_only = is_artifact_only(&req);
         if !artifact_only {
-            if req.message.message_id.is_empty()
-                || req.message.parts.is_empty()
-                || req.message.role != Role::User
+            let message = req
+                .message
+                .as_ref()
+                .ok_or_else(|| A2AError::invalid_params("message is required"))?;
+            if message.message_id.is_empty()
+                || message.parts.is_empty()
+                || message.role != Role::User
             {
                 return Err(A2AError::invalid_params(
                     "a message sent with artifactUpdates must have a messageId",
                 ));
             }
-            self.validate_content_types(&req.message)?;
+            self.validate_content_types(message)?;
         }
         self.validate_artifact_updates(&req)?;
         let task_id = match request_task_id(&req) {
@@ -1897,7 +1909,7 @@ impl DefaultRequestHandler {
         drop(writer_guard);
 
         let exec_ctx = crate::ExecutorContext {
-            message: (!artifact_only).then_some(req.message),
+            message: req.message,
             task_id: task_id.clone(),
             // The task as it stands once the request is applied. A task this
             // request created is withheld unless the caller asked for it
@@ -3020,7 +3032,7 @@ mod tests {
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
 
-                    message: make_message(),
+                    message: Some(make_message()),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -3239,7 +3251,7 @@ mod tests {
         let params = ServiceParams::new();
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: make_message(),
+            message: Some(make_message()),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -3260,7 +3272,7 @@ mod tests {
         let params = ServiceParams::new();
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: make_message(),
+            message: Some(make_message()),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -3281,7 +3293,7 @@ mod tests {
         let params = ServiceParams::new();
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: make_message(),
+            message: Some(make_message()),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -3522,7 +3534,7 @@ mod tests {
                 &params,
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message,
+                    message: Some(message),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -3881,7 +3893,7 @@ mod tests {
         );
         let params = ServiceParams::new();
         let ask = SendMessageRequest {
-            message: Message::new(Role::User, vec![Part::text("ask")]),
+            message: Some(Message::new(Role::User, vec![Part::text("ask")])),
             ..send_request()
         };
         handler.send_message(&params, ask).await.unwrap();
@@ -3906,10 +3918,10 @@ mod tests {
             .id
             .clone();
         let answer = SendMessageRequest {
-            message: Message {
+            message: Some(Message {
                 task_id: Some(task_id.clone()),
                 ..Message::new(Role::User, vec![Part::text("main.rs")])
-            },
+            }),
             ..send_request()
         };
         handler.send_message(&params, answer).await.unwrap();
@@ -3983,7 +3995,7 @@ mod tests {
         async fn turn(handler: &DefaultRequestHandler, streaming: bool, message: Message) {
             let params = ServiceParams::new();
             let request = SendMessageRequest {
-                message,
+                message: Some(message),
                 ..send_request()
             };
             if streaming {
@@ -4310,7 +4322,7 @@ mod tests {
         msg.context_id = context_id.map(Into::into);
         SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: msg,
+            message: Some(msg),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -4322,7 +4334,7 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
         let mut req = send_req(None, None);
-        req.message.parts = vec![
+        req.message.as_mut().unwrap().parts = vec![
             Part::data(serde_json::json!({"value": "unsupported"}))
                 .with_media_type("application/x-unsupported-type-12345"),
         ];
@@ -4338,7 +4350,8 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
         let mut req = send_req(None, None);
-        req.message.parts = vec![Part::text("hello").with_media_type("text/plain")];
+        req.message.as_mut().unwrap().parts =
+            vec![Part::text("hello").with_media_type("text/plain")];
         handler
             .send_message(&ServiceParams::new(), req)
             .await
@@ -4350,7 +4363,7 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler();
         let mut req = send_req(None, None);
-        req.message.parts = vec![
+        req.message.as_mut().unwrap().parts = vec![
             Part::data(serde_json::json!({"value": "x"})).with_media_type("application/x-anything"),
         ];
         handler
@@ -4456,7 +4469,7 @@ mod tests {
                 &ServiceParams::new(),
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message: turn1,
+                    message: Some(turn1),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -4478,7 +4491,7 @@ mod tests {
                     &ServiceParams::new(),
                     SendMessageRequest {
                         artifact_updates: Vec::new(),
-                        message: turn,
+                        message: Some(turn),
                         configuration: None,
                         metadata: None,
                         tenant: None,
@@ -4512,7 +4525,7 @@ mod tests {
                 &ServiceParams::new(),
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message,
+                    message: Some(message),
                     configuration: Some(SendMessageConfiguration {
                         if_generation_match: None,
                         timeline_length: None,
@@ -4591,7 +4604,7 @@ mod tests {
         seed_task(&handler, "t1", "c1").await;
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: msg,
+            message: Some(msg),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -4981,7 +4994,7 @@ mod tests {
                     &params,
                     SendMessageRequest {
                         artifact_updates: Vec::new(),
-                        message: make_message(),
+                        message: Some(make_message()),
                         configuration: None,
                         metadata: None,
                         tenant: None,
@@ -5338,7 +5351,7 @@ mod tests {
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
 
-                    message: follow_up,
+                    message: Some(follow_up),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -5410,7 +5423,7 @@ mod tests {
                 &params,
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message,
+                    message: Some(message),
                     configuration: Some(SendMessageConfiguration {
                         if_generation_match: None,
                         timeline_length: None,
@@ -5953,7 +5966,7 @@ mod tests {
                 &params,
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message,
+                    message: Some(message),
                     configuration: Some(SendMessageConfiguration {
                         if_generation_match: None,
                         timeline_length: None,
@@ -6056,7 +6069,7 @@ mod tests {
                 &params,
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message,
+                    message: Some(message),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -6389,7 +6402,7 @@ mod tests {
     fn send_request() -> SendMessageRequest {
         SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: Message::new(Role::User, vec![Part::text("hi")]),
+            message: Some(Message::new(Role::User, vec![Part::text("hi")])),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -6790,7 +6803,7 @@ mod tests {
         let (handler, _release) = make_resumable_handler();
         seed_task(&handler, "active-cancel", "context").await;
         let mut request = send_req(Some("active-cancel"), Some("context"));
-        request.message.parts = vec![Part::text("wait")];
+        request.message.as_mut().unwrap().parts = vec![Part::text("wait")];
         let mut events = handler
             .send_streaming_message(&ServiceParams::new(), request)
             .await
