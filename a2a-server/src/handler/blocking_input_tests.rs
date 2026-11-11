@@ -439,6 +439,12 @@ async fn a_detached_context_cannot_keep_an_ended_turn_or_claim_its_successors_in
                     // Force ownership of the whole context, including outputs.
                     let mut ctx = ctx;
                     read_input.store(ctx.inputs.recv().await.is_some(), Ordering::SeqCst);
+                    assert!(
+                        ctx.outputs
+                            .send(question(&ctx, TaskState::Working, "late"))
+                            .await
+                            .is_err()
+                    );
                     drop(ctx);
                     stopped.notify_one();
                 });

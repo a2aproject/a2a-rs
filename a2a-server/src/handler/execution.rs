@@ -214,6 +214,8 @@ async fn poll_executor(
         let (result, generation) = if let Some(output) = ready {
             output
         } else if stream_ended && workers_ended {
+            // Passive senders cannot extend the drain with new output.
+            produced.close();
             active.inputs.revoke_reads();
             match produced.try_recv() {
                 Ok(output) => (output.result, output.input_generation),
@@ -245,6 +247,7 @@ async fn poll_executor(
                 }
                 Next::WorkersEnded => {
                     workers_ended = true;
+                    produced.close();
                     active.inputs.revoke_reads();
                     continue;
                 }
@@ -261,6 +264,7 @@ async fn poll_executor(
                     stream = Box::pin(futures::stream::empty());
                     workers_ended = workers.inline_ended();
                     if workers_ended {
+                        produced.close();
                         active.inputs.revoke_reads();
                     }
                     continue;
