@@ -47,7 +47,7 @@ fn config() -> SendMessageConfiguration {
 }
 fn request(text: &str) -> SendMessageRequest {
     SendMessageRequest {
-        message: Message::new(Role::User, vec![Part::text(text)]),
+        message: Some(Message::new(Role::User, vec![Part::text(text)])),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -186,7 +186,7 @@ async fn delayed_message_reply_survives_later_turns_and_broadcast_lag() {
         ..Default::default()
     });
     let mut req = request("reply");
-    req.message.task_id = Some("shared".into());
+    req.message.as_mut().unwrap().task_id = Some("shared".into());
     let mut delayed = h.send_streaming_message(&params(), req).await.unwrap();
     // The mailbox barrier runs after the first reply's output command.
     let barrier = h
@@ -203,7 +203,7 @@ async fn delayed_message_reply_survives_later_turns_and_broadcast_lag() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     for _ in 0..super::EXECUTION_BUFFER_CAPACITY + 8 {
         let mut req = request("tick");
-        req.message.task_id = Some("shared".into());
+        req.message.as_mut().unwrap().task_id = Some("shared".into());
         h.send_message(&params(), req).await.unwrap();
     }
     let observed = tokio::time::timeout(Duration::from_secs(2), delayed.next())
@@ -330,7 +330,7 @@ async fn queued_webhook_cannot_start_after_configuration_deletion() {
             })),
         );
     let mut req = request("start");
-    req.message.task_id = Some("task".into());
+    req.message.as_mut().unwrap().task_id = Some("task".into());
     let down = h.send_streaming_message(&params(), req).await.unwrap();
     let event = || {
         StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
@@ -527,9 +527,7 @@ async fn empty_turn_webhook_save_failure_reaches_the_caller() {
 async fn artifact_only_inputs_enforce_declared_media_types() {
     let h = handler().with_default_input_modes(vec!["text/plain".into()]);
     let mut req = request("wait");
-    req.message.message_id.clear();
-    req.message.parts.clear();
-    req.message.task_id = Some("uncreated".into());
+    req.message = None;
     req.artifact_updates.push(serde_json::from_value(serde_json::json!({
         "taskId":"uncreated", "contextId":"", "artifact":{ "artifactId":"unsupported", "parts":[{"text":"payload", "mediaType":"application/octet-stream"}] }
     })).unwrap());
@@ -560,7 +558,7 @@ async fn http_live_acknowledgement_applies_its_own_response_limits() {
         panic!("opening task");
     };
     let mut followup = request("again");
-    followup.message.task_id = Some(task.id);
+    followup.message.as_mut().unwrap().task_id = Some(task.id);
     let mut limits = config();
     limits.history_length = Some(0);
     limits.timeline_length = Some(0);
@@ -604,7 +602,7 @@ async fn immediate_unary_returns_a_persisted_task_without_executor_output() {
             super::test_support::seed_task(&h, "task", "ctx").await;
         }
         let mut req = request("pending");
-        req.message.task_id = existing.then(|| "task".to_owned());
+        req.message.as_mut().unwrap().task_id = existing.then(|| "task".to_owned());
         let mut options = config();
         options.return_immediately = Some(true);
         req.configuration = Some(options);
@@ -659,7 +657,7 @@ async fn direct_replies_only_name_tasks_that_exist() {
                 super::test_support::seed_task(&h, "task", "ctx").await;
             }
             let mut req = request("reply");
-            req.message.task_id = existing.then(|| "task".into());
+            req.message.as_mut().unwrap().task_id = existing.then(|| "task".into());
             let message = if streaming {
                 let mut events = h.send_streaming_message(&params(), req).await.unwrap();
                 let StreamResponse::Message(message) = events.next().await.unwrap().unwrap() else {
@@ -1217,7 +1215,7 @@ async fn duplicate_snapshot_artifact_ids_are_rejected_without_changing_user_arti
             store,
         );
         let mut req = request("artifacts");
-        req.message.task_id = existing.then(|| "task".into());
+        req.message.as_mut().unwrap().task_id = existing.then(|| "task".into());
         assert_eq!(
             h.send_message(&params(), req).await.unwrap_err().code,
             error_code::INVALID_AGENT_RESPONSE
@@ -1251,7 +1249,7 @@ async fn history_only_snapshot_changes_advance_generation_but_replayed_messages_
     );
     for first in [true, false] {
         let mut req = request("input");
-        req.message.task_id = Some("task".into());
+        req.message.as_mut().unwrap().task_id = Some("task".into());
         let SendMessageResponse::Task(reply) = h.send_message(&params(), req).await.unwrap() else {
             panic!("snapshot");
         };
@@ -1295,7 +1293,7 @@ async fn metadata_only_snapshot_changes_advance_generation_once() {
     );
     for first in [true, false] {
         let mut req = request("input");
-        req.message.task_id = Some("task".into());
+        req.message.as_mut().unwrap().task_id = Some("task".into());
         let SendMessageResponse::Task(reply) = h.send_message(&params(), req).await.unwrap() else {
             panic!("snapshot");
         };
@@ -1405,7 +1403,7 @@ async fn snapshot_artifact_stamps_and_ownership_come_from_server_state() {
                 store,
             );
             let mut req = request("artifact");
-            req.message.task_id = existing.then(|| "task".into());
+            req.message.as_mut().unwrap().task_id = existing.then(|| "task".into());
             let SendMessageResponse::Task(task) = h.send_message(&params(), req).await.unwrap()
             else {
                 panic!("task");
@@ -1446,7 +1444,7 @@ async fn outgoing_artifact_chunks_have_authoritative_stamps_and_keep_chunk_parts
                 ..Default::default()
             });
             let mut req = request("artifact");
-            req.message.task_id = append.then(|| "task".into());
+            req.message.as_mut().unwrap().task_id = append.then(|| "task".into());
             let mut events = h.send_streaming_message(&params(), req).await.unwrap();
             let update = tokio::time::timeout(Duration::from_secs(1), async {
                 loop {
@@ -1497,7 +1495,7 @@ async fn executor_updates_preserve_client_artifact_ownership_even_if_they_claim_
             store,
         );
         let mut req = request("artifact");
-        req.message.task_id = Some("task".into());
+        req.message.as_mut().unwrap().task_id = Some("task".into());
         h.send_message(&params(), req).await.unwrap();
         let stored = h.tasks.load("task").await.unwrap();
         let artifact = &stored.artifacts.as_ref().unwrap()[0];
@@ -1562,7 +1560,7 @@ async fn a_stale_snapshot_cannot_undo_an_explicit_edit_to_a_client_originated_ar
                 ..Default::default()
             });
         let mut req = request("edit");
-        req.message.task_id = Some("task".into());
+        req.message.as_mut().unwrap().task_id = Some("task".into());
         let events: Vec<_> = tokio::time::timeout(Duration::from_secs(2), async {
             h.send_streaming_message(&params(), req)
                 .await
@@ -1626,10 +1624,10 @@ async fn forged_snapshot_ownership_does_not_allow_client_writes_to_agent_artifac
         ..Default::default()
     });
     let mut req = request("artifact");
-    req.message.task_id = Some("task".into());
+    req.message.as_mut().unwrap().task_id = Some("task".into());
     h.send_message(&params(), req).await.unwrap();
     let mut client = request("overwrite");
-    client.message.task_id = Some("task".into());
+    client.message.as_mut().unwrap().task_id = Some("task".into());
     client.artifact_updates.push(serde_json::from_value(serde_json::json!({
         "taskId":"task", "contextId":"ctx", "artifact":{"artifactId":"artifact","parts":[{"text":"client overwrite"}]}
     })).unwrap());
@@ -1665,7 +1663,7 @@ async fn restated_status_snapshots_preserve_the_committed_timestamp_and_generati
         store,
     );
     let mut req = request("timestamp");
-    req.message.task_id = Some("task".into());
+    req.message.as_mut().unwrap().task_id = Some("task".into());
     let SendMessageResponse::Task(reply) = h.send_message(&params(), req).await.unwrap() else {
         panic!("task");
     };
@@ -1748,7 +1746,7 @@ async fn cancellation_cleanup_preserves_the_snapshot_observed_during_the_hook() 
             super::test_support::seed_task(&h, "task", "ctx").await;
             if running {
                 let mut req = request("pending");
-                req.message.task_id = Some("task".into());
+                req.message.as_mut().unwrap().task_id = Some("task".into());
                 let mut options = config();
                 options.return_immediately = Some(true);
                 req.configuration = Some(options);

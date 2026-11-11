@@ -62,7 +62,7 @@ fn request(id: Option<&str>) -> SendMessageRequest {
     message.task_id = id.map(str::to_owned);
     message.context_id = Some("context".into());
     SendMessageRequest {
-        message,
+        message: Some(message),
         artifact_updates: vec![
             serde_json::from_value(serde_json::json!({
                 "taskId": "", "contextId": "", "artifact": {

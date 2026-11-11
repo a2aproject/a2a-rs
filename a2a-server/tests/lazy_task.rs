@@ -163,7 +163,7 @@ fn params() -> ServiceParams {
 
 fn send(text: &str) -> SendMessageRequest {
     SendMessageRequest {
-        message: Message::new(Role::User, vec![Part::text(text)]),
+        message: Some(Message::new(Role::User, vec![Part::text(text)])),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -466,7 +466,7 @@ async fn an_agent_that_starts_a_task_reads_the_clients_messages_from_then_on() {
     assert_eq!(tasks(&handler).await, 1);
 
     let mut follow_up = send("ping");
-    follow_up.message.task_id = Some(task.id.clone());
+    follow_up.message.as_mut().unwrap().task_id = Some(task.id.clone());
     let mut second = handler
         .send_streaming_message(&params(), follow_up)
         .await

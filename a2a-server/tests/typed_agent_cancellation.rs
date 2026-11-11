@@ -81,7 +81,7 @@ async fn default_cleanup_cancels_active_typed_execution_and_notifies_subscribers
         ..Default::default()
     });
     let request = SendMessageRequest {
-        message: Message::new(Role::User, vec![Part::text("work")]),
+        message: Some(Message::new(Role::User, vec![Part::text("work")])),
         configuration: Some(
             serde_json::from_value(serde_json::json!({"returnImmediately":true})).unwrap(),
         ),

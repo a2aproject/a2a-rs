@@ -539,8 +539,8 @@ mod store_compatibility_tests {
             assert_eq!(initial.status.state, TaskState::Submitted);
             assert!(handler.tasks.task("task").active().is_none());
             let mut request = send_request();
-            let message_id = request.message.message_id.clone();
-            request.message.task_id = Some("task".into());
+            let message_id = request.message.as_ref().unwrap().message_id.clone();
+            request.message.as_mut().unwrap().task_id = Some("task".into());
             // Keep transport output alive independently of the task subscriber.
             let _output = match mode {
                 StartMode::Blocking => {
@@ -926,7 +926,7 @@ mod routing_tests {
                 &params,
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message,
+                    message: Some(message),
                     configuration: None,
                     metadata: None,
                     tenant: None,

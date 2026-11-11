@@ -159,7 +159,7 @@ fn send(text: &str, task_id: Option<&str>) -> StreamRequest {
     StreamRequest {
         tenant: None,
         payload: StreamRequestPayload::SendMessage(SendMessageRequest {
-            message,
+            message: Some(message),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -264,7 +264,7 @@ async fn rejected_follow_up(binding: Binding) {
     let StreamRequestPayload::SendMessage(request) = &mut stale.payload else {
         unreachable!()
     };
-    let reference = request.message.message_id.clone();
+    let reference = request.message.as_ref().unwrap().message_id.clone();
     request.configuration = Some(SendMessageConfiguration {
         if_generation_match: Some(-1),
         return_immediately: None,

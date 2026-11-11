@@ -888,8 +888,8 @@ mod delivery_tests {
                     ResponsePolicy::new(StartMode::Bidi, wants_messages),
                 );
                 let mut request = send_request();
-                let message_id = request.message.message_id.clone();
-                request.message.task_id = Some("task".into());
+                let message_id = request.message.as_ref().unwrap().message_id.clone();
+                request.message.as_mut().unwrap().task_id = Some("task".into());
                 request.artifact_updates.push(TaskArtifactUpdateEvent {
                     task_id: "task".into(),
                     context_id: "context".into(),

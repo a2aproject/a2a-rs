@@ -59,7 +59,9 @@ pub(super) async fn open(
             if let Ok(Some(task)) = &bound_task
                 && request_task_id(input.request()).is_none()
             {
-                input.request_mut().message.task_id = Some(task.clone());
+                if let Some(message) = &mut input.request_mut().message {
+                    message.task_id = Some(task.clone());
+                }
             }
             let message = handler
                 .authorize_message(params, *input, None)

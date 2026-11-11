@@ -100,7 +100,7 @@ fn request(text: &str, task: Option<&Task>) -> SendMessageRequest {
     let mut message = Message::new(Role::User, vec![Part::text(text)]);
     message.task_id = task.map(|task| task.id.clone());
     SendMessageRequest {
-        message,
+        message: Some(message),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -152,7 +152,7 @@ async fn check_join(with_artifact: bool) {
     let (handler, gates) = handler(false);
     let (before, owner) = owner(&handler).await;
     let mut input = request("join", Some(&before));
-    let message_id = input.message.message_id.clone();
+    let message_id = input.message.as_ref().unwrap().message_id.clone();
     if with_artifact {
         input.configuration = Some(
             serde_json::from_value(serde_json::json!({"historyLength":1,"timelineLength":1}))

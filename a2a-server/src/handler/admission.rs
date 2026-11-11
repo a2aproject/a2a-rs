@@ -30,8 +30,8 @@ pub(super) async fn prepare(
         .map(|task| task.context_id.clone())
         .unwrap_or_else(|| {
             req.message
-                .context_id
-                .clone()
+                .as_ref()
+                .and_then(|message| message.context_id.clone())
                 .unwrap_or_else(new_context_id)
         });
 
@@ -165,14 +165,17 @@ fn deliver_input(
     let Some(permit) = permit else {
         return;
     };
-    let input = ClientInput::received(
-        &message.request,
-        message_generation.expect("a reserved input has a message"),
-        message.user.clone(),
-        &message.params,
-        message.response_id,
-    );
-    permit.send(invocation.track_input(input));
+    if let Some(input) = message_generation.and_then(|generation| {
+        ClientInput::received(
+            &message.request,
+            generation,
+            message.user.clone(),
+            &message.params,
+            message.response_id,
+        )
+    }) {
+        permit.send(invocation.track_input(input));
+    }
 }
 
 #[cfg(test)]
@@ -192,7 +195,7 @@ mod tests {
             ActiveExecution::with_task(handler.tasks.task("task"));
         let mut inputs = Some(inputs);
         let mut request = send_request();
-        request.message.task_id = Some("task".into());
+        request.message.as_mut().unwrap().task_id = Some("task".into());
         let message = AuthorizedMessage {
             request,
             params: ServiceParams::new(),

@@ -10,7 +10,6 @@ use super::super::execution::{
     self, ExecutionState, Invocation, TurnEnd, reject_unread_inputs, release_execution,
     save_pending_push_config,
 };
-use super::super::protocol::is_artifact_only;
 use super::super::protocol::{
     self, EventKind, ExecutionFailure, OutputKind, ProtocolError, Rejection, StartMode,
     classify_output, prepare_agent_reply, request_task_id,
@@ -159,7 +158,7 @@ impl TaskController {
             active.inputs.received(task.generation);
             let context = crate::ExecutorContext {
                 execution_id: active.execution_id.clone(),
-                message: (!is_artifact_only(&message.request)).then_some(message.request.message),
+                message: message.request.message,
                 task_id: task.id.clone(),
                 context_id: task.context_id.clone(),
                 stored_task: Some(task),

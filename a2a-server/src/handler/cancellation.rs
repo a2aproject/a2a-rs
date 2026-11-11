@@ -286,7 +286,7 @@ mod tests {
         seed_task(&handler, "task", "context").await;
         // Cancellation also works after an invocation returns without completing its Task.
         let mut request = send_request();
-        request.message.task_id = Some("task".into());
+        request.message.as_mut().unwrap().task_id = Some("task".into());
         request.configuration = Some(SendMessageConfiguration {
             return_immediately: Some(true),
             ..serde_json::from_value(serde_json::json!({})).unwrap()
@@ -369,7 +369,7 @@ mod tests {
         seed_task(&handler, "task", "context").await;
         // Cancellation also works after an invocation returns without completing its Task.
         let mut request = send_request();
-        request.message.task_id = Some("task".into());
+        request.message.as_mut().unwrap().task_id = Some("task".into());
         request.configuration = Some(SendMessageConfiguration {
             return_immediately: Some(true),
             ..serde_json::from_value(serde_json::json!({})).unwrap()

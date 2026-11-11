@@ -154,7 +154,10 @@ impl<'a> RequestRules<'a> {
                 )
             });
         }
-        let message = &request.message;
+        let message = request
+            .message
+            .as_ref()
+            .ok_or_else(|| A2AError::invalid_params("message is required"))?;
         self.validate_input_parts(&message.parts)?;
         if message.message_id.is_empty() || message.parts.is_empty() || message.role != Role::User {
             return Err(A2AError::invalid_params(
@@ -199,20 +202,9 @@ pub(crate) enum StartMode {
     Bidi,
 }
 
-/// A request that carries only `artifactUpdates` for an existing task. The
-/// native `message` is not optional, so the wire's absent message arrives as
-/// an empty one with no id (see the protobuf conversion); a message that has
-/// an id, a body or a task of its own is never mistaken for it.
+/// An artifact-only update explicitly omits its message.
 pub(super) fn is_artifact_only(req: &SendMessageRequest) -> bool {
-    !req.artifact_updates.is_empty()
-        && req.message.role == Role::Unspecified
-        && req.message.message_id.is_empty()
-        && req.message.parts.is_empty()
-        && req.message.task_id.is_none()
-        && req.message.context_id.is_none()
-        && req.message.metadata.is_none()
-        && req.message.extensions.is_none()
-        && req.message.reference_task_ids.is_none()
+    req.message.is_none() && !req.artifact_updates.is_empty()
 }
 
 /// The task a send request names: the message's, or for an artifact-only
@@ -225,7 +217,9 @@ pub(super) fn request_task_id(req: &SendMessageRequest) -> Option<String> {
             .find(|task_id| !task_id.is_empty())
             .map(str::to_string)
     } else {
-        req.message.task_id.clone()
+        req.message
+            .as_ref()
+            .and_then(|message| message.task_id.clone())
     }
 }
 
@@ -240,7 +234,9 @@ pub(super) fn bind_request_task(
         ))),
         Some(_) => Ok(()),
         None => {
-            request.message.task_id = Some(bound.to_owned());
+            if let Some(message) = &mut request.message {
+                message.task_id = Some(bound.to_owned());
+            }
             Ok(())
         }
     }
@@ -253,7 +249,12 @@ pub(super) fn validate_task_reference(
     task_id: &str,
 ) -> Result<(), A2AError> {
     match stored {
-        None if request.message.task_id.is_some() || is_artifact_only(request) => {
+        None if request
+            .message
+            .as_ref()
+            .is_some_and(|message| message.task_id.is_some())
+            || is_artifact_only(request) =>
+        {
             Err(A2AError::task_not_found(task_id))
         }
         Some(task) => validate_existing_task(task, request),
@@ -283,7 +284,11 @@ pub(super) fn validate_existing_task(
             ));
         }
     }
-    if let Some(requested) = req.message.context_id.as_deref() {
+    if let Some(requested) = req
+        .message
+        .as_ref()
+        .and_then(|message| message.context_id.as_deref())
+    {
         if requested != task.context_id {
             return Err(A2AError::invalid_params(format!(
                 "contextId {requested} does not match task {}, which belongs to context {}",
@@ -334,7 +339,10 @@ impl IncomingRequest {
             Self::Subscribe(subscribe) => return Some(subscribe.id.clone()),
             Self::Invalid => return None,
         };
-        Some(message.message.message_id.clone())
+        message
+            .message
+            .as_ref()
+            .map(|message| message.message_id.clone())
             .filter(|id| !id.is_empty())
             .or_else(|| {
                 message
@@ -933,7 +941,7 @@ pub(super) fn record_client_input(
 ) -> Result<RecordedInput, A2AError> {
     let mut events = Vec::new();
     let mut message_generation = None;
-    if !is_artifact_only(req) {
+    if let Some(message) = &req.message {
         let asked = task.status.message.clone();
         let history = task.history.get_or_insert_with(Vec::new);
         if !creating
@@ -945,16 +953,16 @@ pub(super) fn record_client_input(
         {
             history.push(asked);
         }
-        history.push(req.message.clone());
+        history.push(message.clone());
         task.generation += 1;
         message_generation = Some(task.generation);
         task.timeline
             .get_or_insert_with(Vec::new)
             .push(TimelineEntry {
-                content: TimelineContent::Message(req.message.clone()),
+                content: TimelineContent::Message(message.clone()),
                 generation: task.generation,
             });
-        events.push(client_message_event(task, &req.message));
+        events.push(client_message_event(task, message));
     }
     events.extend(
         apply_client_artifacts(task, req, creating)?
@@ -2085,7 +2093,10 @@ mod policy_tests {
     fn request_binding_and_generation_checks_use_the_authoritative_task() {
         let mut request = send_request();
         bind_request_task(&mut request, "task").unwrap();
-        assert_eq!(request.message.task_id.as_deref(), Some("task"));
+        assert_eq!(
+            request.message.as_ref().unwrap().task_id.as_deref(),
+            Some("task")
+        );
         let before = request.clone();
         assert_eq!(
             bind_request_task(&mut request, "other").unwrap_err().code,

@@ -57,8 +57,8 @@ fn question(ctx: &ExecutorContext, state: TaskState, text: &str) -> StreamRespon
 
 fn request(text: &str) -> SendMessageRequest {
     let mut request = send_request();
-    request.message = Message::new(Role::User, vec![Part::text(text)]);
-    request.message.task_id = Some("task".into());
+    request.message = Some(Message::new(Role::User, vec![Part::text(text)]));
+    request.message.as_mut().unwrap().task_id = Some("task".into());
     request
 }
 

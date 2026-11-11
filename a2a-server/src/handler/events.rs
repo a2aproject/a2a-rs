@@ -585,7 +585,7 @@ mod tests {
                     &ServiceParams::new(),
                     policy.response_id(),
                 );
-                super::super::execution::reject_inputs(&active, "task", vec![input]).await;
+                super::super::execution::reject_inputs(&active, "task", vec![input.unwrap()]).await;
                 if hook_failure {
                     active
                         .publish(Err(&A2AError::internal("cleanup failed")), None)

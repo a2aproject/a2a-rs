@@ -120,7 +120,7 @@ fn send(id: Option<&str>) -> SendMessageRequest {
     let mut message = Message::new(Role::User, vec![Part::text("finish")]);
     message.task_id = id.map(str::to_owned);
     SendMessageRequest {
-        message,
+        message: Some(message),
         artifact_updates: vec![],
         metadata: None,
         tenant: None,

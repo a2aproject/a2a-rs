@@ -821,7 +821,7 @@ mod tests {
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
 
-                    message: make_message(),
+                    message: Some(make_message()),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -852,7 +852,7 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
         let mut req = send_req(None, None);
-        req.message.parts = vec![
+        req.message.as_mut().unwrap().parts = vec![
             Part::data(serde_json::json!({"value": "unsupported"}))
                 .with_media_type("application/x-unsupported-type-12345"),
         ];
@@ -868,7 +868,8 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
         let mut req = send_req(None, None);
-        req.message.parts = vec![Part::text("hello").with_media_type("text/plain")];
+        req.message.as_mut().unwrap().parts =
+            vec![Part::text("hello").with_media_type("text/plain")];
         handler
             .send_message(&ServiceParams::new(), req)
             .await
@@ -880,7 +881,7 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler();
         let mut req = send_req(None, None);
-        req.message.parts = vec![
+        req.message.as_mut().unwrap().parts = vec![
             Part::data(serde_json::json!({"value": "x"})).with_media_type("application/x-anything"),
         ];
         handler
@@ -906,7 +907,7 @@ mod tests {
                     &params,
                     SendMessageRequest {
                         artifact_updates: Vec::new(),
-                        message: make_message(),
+                        message: Some(make_message()),
                         configuration: None,
                         metadata: None,
                         tenant: None,
@@ -1440,7 +1441,7 @@ mod tests {
         let params = ServiceParams::new();
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: make_message(),
+            message: Some(make_message()),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -1504,7 +1505,7 @@ mod tests {
                 &params,
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message,
+                    message: Some(message),
                     configuration: Some(SendMessageConfiguration {
                         if_generation_match: None,
                         timeline_length: None,
@@ -2082,7 +2083,7 @@ mod tests {
                 .is_err()
         );
         let mut follow_up = send_req(Some(&opening.id), None);
-        follow_up.message.parts = vec![Part::text("done")];
+        follow_up.message.as_mut().unwrap().parts = vec![Part::text("done")];
         handler.send_message(&params, follow_up).await.unwrap();
         loop {
             let event = tokio::time::timeout(Duration::from_secs(2), events.next())
@@ -2103,7 +2104,7 @@ mod tests {
         let params = ServiceParams::new();
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: make_message(),
+            message: Some(make_message()),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -2240,7 +2241,7 @@ mod tests {
                 &ServiceParams::new(),
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message: turn1,
+                    message: Some(turn1),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -2262,7 +2263,7 @@ mod tests {
                     &ServiceParams::new(),
                     SendMessageRequest {
                         artifact_updates: Vec::new(),
-                        message: turn,
+                        message: Some(turn),
                         configuration: None,
                         metadata: None,
                         tenant: None,
@@ -2300,7 +2301,7 @@ mod tests {
                 &ServiceParams::new(),
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message,
+                    message: Some(message),
                     configuration: Some(SendMessageConfiguration {
                         if_generation_match: None,
                         timeline_length: None,
@@ -2380,7 +2381,7 @@ mod tests {
         seed_task(&handler, "t1", "c1").await;
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: msg,
+            message: Some(msg),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -2754,7 +2755,7 @@ mod tests {
         let (handler, _release) = make_resumable_handler();
         seed_task(&handler, "active-cancel", "context").await;
         let mut request = send_req(Some("active-cancel"), Some("context"));
-        request.message.parts = vec![Part::text("wait")];
+        request.message.as_mut().unwrap().parts = vec![Part::text("wait")];
         let mut events = handler
             .send_streaming_message(&ServiceParams::new(), request)
             .await
@@ -3233,8 +3234,7 @@ mod tests {
         let active = handler.tasks.task(&task.id).active().unwrap();
         let capacity = active.inputs.sender.capacity();
         let mut request = send_req(None, None);
-        request.message = Message::new(Role::Unspecified, Vec::new());
-        request.message.message_id.clear();
+        request.message = None;
         request.artifact_updates = vec![TaskArtifactUpdateEvent {
             task_id: task.id.clone(),
             context_id: task.context_id.clone(),
@@ -3530,7 +3530,7 @@ mod tests {
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
 
-                    message: follow_up,
+                    message: Some(follow_up),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -4041,7 +4041,7 @@ mod upstream_regressions {
         );
         let params = ServiceParams::new();
         let ask = SendMessageRequest {
-            message: Message::new(Role::User, vec![Part::text("ask")]),
+            message: Some(Message::new(Role::User, vec![Part::text("ask")])),
             ..send_request()
         };
         handler.send_message(&params, ask).await.unwrap();
@@ -4066,10 +4066,10 @@ mod upstream_regressions {
             .id
             .clone();
         let answer = SendMessageRequest {
-            message: Message {
+            message: Some(Message {
                 task_id: Some(task_id.clone()),
                 ..Message::new(Role::User, vec![Part::text("main.rs")])
-            },
+            }),
             ..send_request()
         };
         handler.send_message(&params, answer).await.unwrap();
@@ -4143,7 +4143,7 @@ mod upstream_regressions {
         async fn turn(handler: &DefaultRequestHandler, streaming: bool, message: Message) {
             let params = ServiceParams::new();
             let request = SendMessageRequest {
-                message,
+                message: Some(message),
                 ..send_request()
             };
             if streaming {

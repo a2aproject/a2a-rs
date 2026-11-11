@@ -96,7 +96,7 @@ fn params() -> ServiceParams {
 }
 fn request() -> SendMessageRequest {
     SendMessageRequest {
-        message: Message::new(Role::User, vec![Part::text("work")]),
+        message: Some(Message::new(Role::User, vec![Part::text("work")])),
         configuration: None,
         metadata: None,
         tenant: None,

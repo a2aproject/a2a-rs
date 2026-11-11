@@ -90,7 +90,7 @@ fn request(text: &str, id: Option<&str>) -> SendMessageRequest {
     let mut message = Message::new(Role::User, vec![Part::text(text)]);
     message.task_id = id.map(str::to_owned);
     SendMessageRequest {
-        message,
+        message: Some(message),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -194,11 +194,11 @@ async fn check(end: End, mode: Mode, burst: usize) {
         .unwrap();
     next(&mut observer).await;
     let read_request = request("read", Some(&task.id));
-    let read_id = read_request.message.message_id.clone();
+    let read_id = read_request.message.as_ref().unwrap().message_id.clone();
     let peer = live(&handler, read_request).await;
     input_arrived(&mut observer, &read_id).await;
     let unread = request("unread", Some(&task.id));
-    let unread_id = unread.message.message_id.clone();
+    let unread_id = unread.message.as_ref().unwrap().message_id.clone();
     let (mut unary, events) = match mode {
         Mode::Unary => (
             Some(Box::pin({
