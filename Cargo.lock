@@ -178,6 +178,7 @@ dependencies = [
  "agntcy-slim-config",
  "agntcy-slim-datapath",
  "agntcy-slim-service",
+ "async-stream",
  "async-trait",
  "clap",
  "futures",

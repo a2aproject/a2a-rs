@@ -25,6 +25,7 @@ use a2a_pb::proto::a2a_service_server::A2aServiceServer;
 use a2a_server::RequestHandler;
 use a2a_slimrpc::{SlimRpcTransport, parse_slimrpc_target};
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use slim_service::service::{Service, ServiceBuilder};
 use tonic::transport::server::TcpIncoming;
@@ -79,6 +80,53 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
         self.transport
             .send_streaming_message(&forward_params(params), &req)
             .await
+    }
+
+    async fn send_live_message(
+        &self,
+        params: &ServiceParams,
+        mut uplink: BoxStream<'static, StreamRequest>,
+    ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        let first = uplink
+            .next()
+            .await
+            .ok_or_else(|| A2AError::invalid_request("a live exchange needs a first request"))?;
+        let connection = self
+            .transport
+            .send_live_message(&forward_params(params), &first)
+            .await?;
+        Ok(Box::pin(async_stream::stream! {
+            let mut events = connection.events;
+            let mut sender = Some(connection.sender);
+            let mut pending: Option<futures::future::BoxFuture<'static, Result<a2a_client::LiveAck, A2AError>>> = None;
+            loop {
+                tokio::select! {
+                    // Deliver replies even while the remote uplink is full.
+                    event = events.next() => match event {
+                        Some(event) => yield event,
+                        None => break,
+                    },
+                    request = uplink.next(), if pending.is_none() && sender.is_some() => match request {
+                        Some(request) => {
+                            let sender = sender.as_ref().unwrap().clone();
+                            pending = Some(Box::pin(async move { sender.send(request).await }));
+                        }
+                        None => sender = None,
+                    },
+                    result = async { pending.as_mut().unwrap().await }, if pending.is_some() => {
+                        pending = None;
+                        match result {
+                            Ok(a2a_client::LiveAck::Reopened(connection)) => {
+                                events = connection.events;
+                                sender = Some(connection.sender);
+                            }
+                            Ok(_) => {}
+                            Err(error) => { yield Err(error); break; }
+                        }
+                    }
+                }
+            }
+        }))
     }
 
     async fn get_task(
@@ -371,7 +419,6 @@ mod tests {
     use std::sync::Mutex;
 
     use futures::stream;
-    use futures::stream::StreamExt;
 
     use super::super::scratch::ScratchFile;
     use super::*;
@@ -384,6 +431,7 @@ mod tests {
     #[derive(Default)]
     struct FakeTransport {
         last_params: Mutex<Option<ServiceParams>>,
+        live_requests: Arc<Mutex<Vec<StreamRequest>>>,
     }
 
     impl FakeTransport {
@@ -393,6 +441,23 @@ mod tests {
 
         fn record(&self, params: &ServiceParams) {
             *self.last_params.lock().unwrap() = Some(params.clone());
+        }
+    }
+
+    struct RecordingUplink {
+        requests: Arc<Mutex<Vec<StreamRequest>>>,
+        output: tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
+    }
+
+    #[async_trait]
+    impl a2a_client::LiveUplink for RecordingUplink {
+        async fn send(&self, request: StreamRequest) -> Result<a2a_client::LiveAck, A2AError> {
+            self.requests.lock().unwrap().push(request);
+            self.output
+                .send(Ok(StreamResponse::Task(fake_task())))
+                .await
+                .map_err(|_| A2AError::internal("closed"))?;
+            Ok(a2a_client::LiveAck::Sent)
         }
     }
 
@@ -456,6 +521,29 @@ mod tests {
         ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
             self.record(params);
             Ok(stream::iter(vec![Ok(StreamResponse::Task(fake_task()))]).boxed())
+        }
+
+        async fn send_live_message(
+            &self,
+            params: &ServiceParams,
+            first: &StreamRequest,
+        ) -> Result<a2a_client::LiveConnection, A2AError> {
+            self.record(params);
+            self.live_requests.lock().unwrap().push(first.clone());
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            sender
+                .try_send(Ok(StreamResponse::Task(fake_task())))
+                .unwrap();
+            Ok(a2a_client::LiveConnection {
+                sender: a2a_client::LiveSender::new(Arc::new(RecordingUplink {
+                    requests: self.live_requests.clone(),
+                    output: sender,
+                })),
+                events: stream::unfold(receiver, |mut receiver| async move {
+                    receiver.recv().await.map(|item| (item, receiver))
+                })
+                .boxed(),
+            })
         }
 
         async fn get_task(
@@ -622,6 +710,49 @@ mod tests {
             .unwrap();
         let first = stream.next().await.unwrap().unwrap();
         assert!(matches!(first, StreamResponse::Task(t) if t.id == "task-1"));
+    }
+
+    #[tokio::test]
+    async fn live_proxy_forwards_opening_followups_and_downlink_with_backpressure() {
+        let h = handler();
+        let first = StreamRequest {
+            tenant: Some("acme".into()),
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task-1".into(),
+                tenant: Some("acme".into()),
+                last_seen_generation: None,
+            }),
+        };
+        let followup = StreamRequest {
+            tenant: Some("acme".into()),
+            payload: StreamRequestPayload::SendMessage(SendMessageRequest {
+                message: Some(fake_message()),
+                configuration: None,
+                metadata: None,
+                tenant: Some("acme".into()),
+                artifact_updates: Vec::new(),
+            }),
+        };
+        let requests: Vec<_> = std::iter::once(first)
+            .chain(std::iter::repeat_n(followup, 40))
+            .collect();
+        let output = h
+            .send_live_message(&sample_params(), stream::iter(requests.clone()).boxed())
+            .await
+            .unwrap();
+        let output: Vec<_> =
+            tokio::time::timeout(std::time::Duration::from_secs(2), output.collect())
+                .await
+                .unwrap();
+        assert_eq!(output.len(), requests.len());
+        assert!(output.iter().all(Result::is_ok));
+        assert_eq!(*h.transport.live_requests.lock().unwrap(), requests);
+        assert!(
+            !h.transport
+                .last_params()
+                .unwrap()
+                .contains_key(TOKEN_HEADER)
+        );
     }
 
     #[tokio::test]
