@@ -105,3 +105,56 @@ pub trait TaskStore: Send + Sync + 'static {
     /// holds its write lock across both.
     async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task_store::InMemoryTaskStore;
+
+    // Deliberately implements only the original required interface.
+    struct LegacyStore(InMemoryTaskStore);
+    #[async_trait]
+    impl TaskStore for LegacyStore {
+        async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.0.create(task).await
+        }
+        async fn update(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.0.update(task).await
+        }
+        async fn get(&self, id: &str) -> Result<Option<Task>, A2AError> {
+            self.0.get(id).await
+        }
+        async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+            self.0.list(req).await
+        }
+        async fn begin_cancel(&self, id: &str) -> Result<Task, A2AError> {
+            self.0.begin_cancel(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_listing_preserves_custom_store_compatibility_and_fails_closed() {
+        let store = LegacyStore(InMemoryTaskStore::new());
+        let request = serde_json::from_value(serde_json::json!({})).unwrap();
+        let scope = TaskListScope {
+            tenant: None,
+            principal: Some((true, "alice".into())),
+        };
+        assert!(
+            store
+                .list_for_scope(&request, &scope, None)
+                .await
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .list_for_scope(&request, &scope, Some(&|_| true))
+                .await
+                .unwrap_err()
+                .code,
+            error_code::UNSUPPORTED_OPERATION
+        );
+    }
+}
