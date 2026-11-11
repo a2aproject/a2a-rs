@@ -77,6 +77,35 @@ fn live_downlink(
     }).boxed()
 }
 
+async fn open_live_downlink(
+    opening: impl std::future::Future<
+        Output = Result<
+            futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>>,
+            A2AError,
+        >,
+    >,
+    mut fault: futures::future::BoxFuture<'static, tonic::Status>,
+) -> Result<BoxStreamResult<proto::StreamResponse>, tonic::Status> {
+    tokio::pin!(opening);
+    let events = tokio::select! {
+        biased;
+        // Prefer an already-open response so its ready events can drain.
+        events = &mut opening => match events {
+            Ok(events) => events,
+            Err(error) => return Err((&mut fault).now_or_never().unwrap_or_else(|| a2a_error_to_status(&error))),
+        },
+        error = &mut fault => {
+            // Poll once after the malformed frame closed the input. Never
+            // wait for unrelated executor work just to report bad framing.
+            if let Some(Ok(events)) = opening.now_or_never() {
+                return Ok(live_downlink(events, futures::future::ready(error).boxed()));
+            }
+            return Err(error);
+        },
+    };
+    Ok(live_downlink(events, fault))
+}
+
 /// gRPC server handler — wraps a `RequestHandler` as a tonic gRPC service.
 ///
 /// This bridges the transport-agnostic `RequestHandler` interface to the
@@ -242,26 +271,10 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
     ) -> Result<tonic::Response<Self::SendLiveMessageStream>, tonic::Status> {
         let params = extract_service_params(request.metadata());
         validate_protocol_version(&params)?;
-        let (uplink, mut fault) = decode_live_uplink(request.into_inner());
-        let opening = self.handler.send_live_message(&params, uplink);
-        tokio::pin!(opening);
-        let events = tokio::select! {
-            biased;
-            // Prefer an already-open response so its ready events can drain.
-            events = &mut opening => match events {
-                Ok(events) => events,
-                Err(error) => return Err((&mut fault).now_or_never().unwrap_or_else(|| a2a_error_to_status(&error))),
-            },
-            error = &mut fault => {
-                // Poll once after the malformed frame closed the input. Never
-                // wait for unrelated executor work just to report bad framing.
-                if let Some(Ok(events)) = opening.now_or_never() {
-                    return Ok(tonic::Response::new(live_downlink(events, futures::future::ready(error).boxed())));
-                }
-                return Err(error);
-            },
-        };
-        Ok(tonic::Response::new(live_downlink(events, fault)))
+        let (uplink, fault) = decode_live_uplink(request.into_inner());
+        let events =
+            open_live_downlink(self.handler.send_live_message(&params, uplink), fault).await?;
+        Ok(tonic::Response::new(events))
     }
 
     async fn create_task_push_notification_config(
@@ -401,6 +414,22 @@ mod tests {
             assert_eq!(received, if infinite { 128 } else { 1 });
             assert!(output.next().await.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_first_frame_preserves_transport_status_during_opening() {
+        let (mut input, fault) = decode_live_uplink(futures::stream::iter([Err(
+            tonic::Status::data_loss("bad first frame"),
+        )]));
+        let opening = async move {
+            assert!(input.next().await.is_none());
+            Err(A2AError::invalid_request(
+                "a response needs a first request",
+            ))
+        };
+        let error = open_live_downlink(opening, fault).await.err().unwrap();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+        assert_eq!(error.message(), "bad first frame");
     }
 
     #[tokio::test]
