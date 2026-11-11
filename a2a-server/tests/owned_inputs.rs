@@ -119,7 +119,7 @@ fn send(text: &str, task: Option<&str>) -> StreamRequest {
     StreamRequest {
         tenant: None,
         payload: StreamRequestPayload::SendMessage(SendMessageRequest {
-            message,
+            message: Some(message),
             tenant: None,
             configuration: None,
             metadata: None,
