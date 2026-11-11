@@ -132,9 +132,11 @@ impl DefaultRequestHandler {
     /// Bounds a blocking `SendMessage` response after input admission.
     ///
     /// The default has no deadline: A2A requires waiting for completion or
-    /// interruption. Expiry returns the current committed Task, so callers do
-    /// not mistake an admitted input for a failed send. Before lazy creation
-    /// has committed any Task, expiry remains an error. Execution continues.
+    /// interruption. Expiry re-reads the committed Task. An interrupted task
+    /// returns an explicit deadline error with inputCommitted/taskId details,
+    /// rather than presenting an older question as the answer. Other states
+    /// return the stored snapshot. Execution continues; do not repeat committed
+    /// input. Before lazy creation commits a Task, expiry remains an error.
     /// Streaming, live, and `returnImmediately`
     /// responses use their own completion policies and have no such deadline.
     pub fn with_blocking_response_timeout(mut self, timeout: Duration) -> Self {
@@ -352,6 +354,7 @@ impl DefaultRequestHandler {
             MessageInput::Raw(request) => {
                 self.authorize(params, request_task_id(&request).as_deref())?;
                 Ok(AuthorizedMessage {
+                    receipt: None,
                     request,
                     params: params.clone(),
                     user: self.authenticated_user(params)?,
@@ -444,27 +447,43 @@ impl RequestHandler for DefaultRequestHandler {
             .await?;
         let events = self.response_stream(params, (task.clone(), events), policy, None, None);
         let response = unary_response(self.tasks.clone(), task.clone(), events);
-        let mut response =
-            match self
-                .blocking_response_timeout
-                .filter(|_| !policy.return_immediately())
-            {
-                Some(timeout) => match tokio::time::timeout(timeout, response).await {
-                    Ok(response) => response?,
-                    Err(_) => {
-                        let uncreated = task.active().is_some_and(|active| {
-                            active.uncreated.load(std::sync::atomic::Ordering::Acquire)
-                        });
-                        if uncreated {
-                            return Err(ProtocolError::BlockingResponseTimedOut.into());
-                        }
-                        SendMessageResponse::Task(task.snapshot().ok_or_else(|| {
-                            A2AError::from(ProtocolError::BlockingResponseTimedOut)
-                        })?)
+        let mut response = match self
+            .blocking_response_timeout
+            .filter(|_| !policy.return_immediately())
+        {
+            Some(timeout) => match tokio::time::timeout(timeout, response).await {
+                Ok(response) => response?,
+                Err(_) => {
+                    let uncreated = task.active().is_some_and(|active| {
+                        active.uncreated.load(std::sync::atomic::Ordering::Acquire)
+                    });
+                    if uncreated {
+                        return Err(ProtocolError::BlockingResponseTimedOut.into());
                     }
-                },
-                None => response.await?,
-            };
+                    // A deadline must never turn a provisional cache entry or
+                    // an older question into this input's successful answer.
+                    let stored = tokio::time::timeout(timeout, self.tasks.load(task.id()))
+                            .await
+                            .map_err(|_| A2AError::internal("blocking response timed out; input outcome is unknown; inspect the task before retrying"))??;
+                    if matches!(
+                        stored.status.state,
+                        TaskState::InputRequired | TaskState::AuthRequired
+                    ) {
+                        return Err(A2AError::internal("blocking response timed out after input committed; execution continues; do not resend this input")
+                                .with_details(vec![TypedDetail::error_info(
+                                    "RESPONSE_DEADLINE_EXCEEDED", "a2a-rs",
+                                    Some(std::collections::HashMap::from([
+                                        ("inputCommitted".into(), "true".into()),
+                                        ("taskId".into(), stored.id.clone()),
+                                        ("generation".into(), stored.generation.to_string()),
+                                    ])),
+                                )]));
+                    }
+                    SendMessageResponse::Task(stored)
+                }
+            },
+            None => response.await?,
+        };
         if let SendMessageResponse::Task(task) = &mut response {
             policy.trim(task);
         }

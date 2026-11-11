@@ -22,6 +22,8 @@ pub(super) struct QueuedCommand {
     command: TaskCommand,
     // Keep this mailbox registered until its admitted operation finishes.
     _lease: Arc<TaskSender>,
+    publication: Option<super::push_delivery::PublicationPermit>,
+    operation: TaskOperation,
 }
 
 /// A typed reply also reports interruption when unwinding drops its command.
@@ -70,8 +72,7 @@ struct State {
     last_error: Option<(u64, A2AError)>,
     interrupted_input_generation: i64,
     completed_input: Option<(u64, i64)>,
-    publication_cancel: tokio_util::sync::CancellationToken,
-    cancel_requests: usize,
+    notifications: Option<Vec<ExecutionEvent>>,
     push_queue: Weak<TaskPushQueue>,
     // Outstanding receivers retain their direct reply or private input rejection.
     // No task-wide reply history survives after those receivers are dropped.
@@ -90,23 +91,6 @@ pub(super) struct ReplyRetention {
 #[derive(Clone)]
 pub(super) struct TaskHandle {
     inner: Arc<TaskInner>,
-}
-
-pub(super) struct CancelPublicationLease(TaskHandle);
-
-impl Drop for CancelPublicationLease {
-    fn drop(&mut self) {
-        let mut state = self.0.inner.state.write();
-        state.cancel_requests -= 1;
-        if state.cancel_requests == 0
-            && state
-                .snapshot
-                .as_ref()
-                .is_none_or(|task| !task.status.state.is_terminal())
-        {
-            state.publication_cancel = tokio_util::sync::CancellationToken::new();
-        }
-    }
 }
 
 /// Weak routing reference that does not retain a task's channels or snapshot.
@@ -135,20 +119,54 @@ struct TaskInner {
     sender: broadcast::Sender<ExecutionEvent>,
     state: RwLock<State>,
     notifications: std::sync::OnceLock<Arc<super::push_delivery::PushService>>,
-    webhook_subscribed: std::sync::Mutex<super::push_delivery::SubscriptionState>,
+    publications: std::sync::OnceLock<super::push_delivery::PublicationQueue>,
 }
 
 impl TaskHandle {
-    pub(super) fn cancel_publications(&self) -> CancelPublicationLease {
-        let mut state = self.inner.state.write();
-        state.cancel_requests += 1;
-        state.publication_cancel.cancel();
-        CancelPublicationLease(self.clone())
+    pub(super) fn publications(&self) -> &super::push_delivery::PublicationQueue {
+        self.inner
+            .publications
+            .get_or_init(|| super::push_delivery::PublicationQueue::new(self))
     }
 
-    pub(super) fn publication_cancellation(&self) -> tokio_util::sync::CancellationToken {
-        self.inner.state.read().publication_cancel.clone()
+    pub(super) fn buffer_notification(&self, event: ExecutionEvent) -> bool {
+        let mut state = self.inner.state.write();
+        if let Some(events) = &mut state.notifications {
+            events.push(event);
+            true
+        } else {
+            false
+        }
     }
+
+    fn finish_notifications(&self, permit: Option<super::push_delivery::PublicationPermit>) {
+        let events = self
+            .inner
+            .state
+            .write()
+            .notifications
+            .take()
+            .unwrap_or_default();
+        if events.is_empty() {
+            return;
+        }
+        let permit = permit.or_else(|| self.publications().try_reserve());
+        match permit {
+            Some(permit) => self.publications().submit(self.clone(), events, permit),
+            None => {
+                if let Some(settings) = self.pushes() {
+                    for event in events {
+                        super::push_worker::signal_failure(
+                            settings.sender(),
+                            &event,
+                            A2AError::internal("webhook publication capacity was not reserved"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A bounded checkpoint lets blocking senders recover a missed local
     /// invocation-completion event without retaining another task snapshot.
     pub(super) fn completed_input(&self, required: i64, after: u64) -> Option<ExecutionEvent> {
@@ -190,7 +208,7 @@ impl TaskHandle {
                     ..State::default()
                 }),
                 notifications: std::sync::OnceLock::new(),
-                webhook_subscribed: std::sync::Mutex::default(),
+                publications: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -254,15 +272,6 @@ impl TaskHandle {
         self.inner.notifications.set(service)
     }
 
-    pub(super) fn webhook_subscription(
-        &self,
-    ) -> std::sync::MutexGuard<'_, super::push_delivery::SubscriptionState> {
-        self.inner
-            .webhook_subscribed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// The worker holds this handle, but the handle keeps only a weak sender.
     /// Once callers and drivers release the sender, the idle worker can retire.
     pub(super) fn operations(&self) -> Arc<TaskSender> {
@@ -285,13 +294,22 @@ impl TaskHandle {
             let mut state = TaskController::default();
             while let Some(work) = commands.recv().await {
                 tracing::trace!(task_id = %task.id(), "processing task operation");
+                task.inner.state.write().notifications = Some(Vec::new());
                 if std::panic::AssertUnwindSafe(work.command.run(&mut state))
                     .catch_unwind()
                     .await
                     .is_err()
                 {
-                    state.recover_preparation();
+                    tracing::error!(task_id = %task.id(), "task controller operation panicked");
+                    if !matches!(work.operation, TaskOperation::Subscribe) {
+                        state.recover_panic();
+                        let error = A2AError::internal("task transition failed unexpectedly");
+                        task.publish(Err(&error), None, EventKind::Normal, None, 0)
+                            .await;
+                        task.notify();
+                    }
                 }
+                task.finish_notifications(work.publication);
                 drop(work._lease);
             }
         });
@@ -305,6 +323,11 @@ impl TaskHandle {
         command: impl FnOnce(CommandReply<T>) -> TaskCommand,
     ) -> Result<T, A2AError> {
         self.background_tasks().check_running()?;
+        let publication = if self.pushes().is_some() {
+            self.publications().reserve(self, operation).await?
+        } else {
+            None
+        };
         let queue = self.operations();
         let (sender, result) = tokio::sync::oneshot::channel();
         let work = QueuedCommand {
@@ -313,6 +336,8 @@ impl TaskHandle {
                 operation,
             }),
             _lease: queue.clone(),
+            publication,
+            operation,
         };
         queue
             .send(work)

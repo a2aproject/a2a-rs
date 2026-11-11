@@ -77,6 +77,7 @@ impl Cancellation {
 
         let cancel_inputs = ClientInputs::closed();
         let exec_ctx = crate::ExecutorContext {
+            outputs: Default::default(),
             execution_id: active_execution.as_ref().map_or_else(
                 || uuid::Uuid::now_v7().to_string(),
                 |active| active.execution_id.clone(),
@@ -191,7 +192,7 @@ pub(super) async fn cancel(
     // This workflow is owned by TaskService, so caller disconnection cannot
     // reset the signal while its cancellation is still queued.
     let handle = handler.tasks.task(&task_id);
-    let _publications = handle.cancel_publications();
+    handler.attach_pushes(&handle);
     let plan = match handler
         .tasks
         .task(&task_id)
@@ -251,10 +252,12 @@ pub(super) async fn run(
     handler
         .tasks
         .task(&task_id)
-        .request(TaskOperation::Cancel, |reply| TaskCommand::CancelFinished {
-            handler: handler.clone(),
-            failure,
-            reply,
+        .request(TaskOperation::Finished, |reply| {
+            TaskCommand::CancelFinished {
+                handler: handler.clone(),
+                failure,
+                reply,
+            }
         })
         .await?
 }

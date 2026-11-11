@@ -6,7 +6,6 @@
 use super::delivery::Delivery;
 use super::events::{ExecutionReceiver, subscription_stream};
 use super::http_exchange::RegistrationLease;
-#[cfg(test)]
 use super::protocol::StartMode;
 use super::protocol::{
     self, DeliveryPlan, IncomingRequest, InputCursor, OpeningPolicy, Rejection, ResponsePolicy,
@@ -550,7 +549,11 @@ pub(super) fn attach_delivery(
 ) -> (Task, ResponseStream) {
     let (task, receiver, sequence) = match delivery {
         Delivery::Started { task, receiver } => {
-            let receiver = receiver.for_input(task.generation);
+            let receiver = if policy.mode() == StartMode::Blocking {
+                receiver.for_input(task.generation)
+            } else {
+                receiver
+            };
             (task, plan.attach_receiver.then_some(receiver), 0)
         }
         Delivery::Injected {
@@ -567,7 +570,11 @@ pub(super) fn attach_delivery(
             (
                 task,
                 plan.attach_receiver
-                    .then_some(receiver.for_input(input_generation.unwrap_or(0))),
+                    .then_some(if policy.mode() == StartMode::Blocking {
+                        receiver.for_input(input_generation.unwrap_or(0))
+                    } else {
+                        receiver
+                    }),
                 sequence,
             )
         }
@@ -1100,6 +1107,53 @@ mod task_response_tests {
 #[cfg(test)]
 mod subscription_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streaming_lag_resynchronizes_after_a_nonterminal_invocation_ends() {
+        use crate::handler::events::ActiveExecution;
+        use crate::handler::protocol::EventKind;
+        use crate::handler::test_support::{send_request, task_with_history};
+        let mut task = task_with_history("task", "context", 0);
+        task.generation = 1;
+        let active = ActiveExecution::new(Some(task.clone()));
+        let receiver = active.subscribe();
+        let settings = ResponsePolicy::message(
+            StartMode::Streaming,
+            &crate::ServiceParams::new(),
+            &send_request(),
+        );
+        let (_, mut events) = attach_delivery(
+            settings,
+            Delivery::Injected {
+                task: task.clone(),
+                receiver,
+                sequence_before: 0,
+                sequence_after: 0,
+                input_generation: Some(1),
+            },
+            settings.delivery_plan(true),
+        );
+        for _ in 0..super::super::EXECUTION_BUFFER_CAPACITY + 2 {
+            task.generation += 1;
+            active
+                .publish(Ok(&StreamResponse::Task(task.clone())), Some(task.clone()))
+                .await;
+        }
+        active.produced_for(1);
+        active
+            .publish_kind(
+                Ok(&StreamResponse::Task(task.clone())),
+                None,
+                EventKind::InvocationEnded,
+            )
+            .await;
+        let resync = tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(resync, StreamResponse::Task(task));
+    }
 
     #[tokio::test]
     async fn immediate_unary_joins_return_a_snapshot_without_waiting_for_executor_events() {

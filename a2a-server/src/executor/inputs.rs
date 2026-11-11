@@ -154,6 +154,7 @@ impl ClientInputs {
             if let Some(input) = input.claim() {
                 self.received_generation
                     .fetch_max(input.generation, Ordering::AcqRel);
+                super::outputs::input_read(&self.received_generation, input.generation);
                 return Some(input);
             }
         }
@@ -175,6 +176,7 @@ impl ClientInputs {
         let input = input.claim()?;
         self.received_generation
             .fetch_max(input.generation, Ordering::AcqRel);
+        super::outputs::input_read(&self.received_generation, input.generation);
         Some(input)
     }
 
@@ -262,6 +264,10 @@ impl ClientInputSender {
     pub(crate) fn received(&self, generation: i64) {
         self.received_generation
             .fetch_max(generation, Ordering::AcqRel);
+    }
+
+    pub(crate) fn progress(&self) -> Arc<AtomicI64> {
+        self.received_generation.clone()
     }
 
     pub(crate) fn received_generation(&self) -> i64 {

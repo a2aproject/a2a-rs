@@ -221,3 +221,159 @@ async fn output_records_input_progress_before_persistence_can_suspend() {
         "reading during persistence cannot change an already-emitted output's input progress"
     );
 }
+
+/// A detached producer buffers A's question, then reads B before the runner
+/// polls that question. B must wait for a question explicitly tagged for B.
+#[tokio::test]
+async fn detached_outputs_keep_the_producing_inputs_generation() {
+    struct Detached {
+        read: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+    impl AgentExecutor for Detached {
+        fn execute(
+            &self,
+            mut ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let read = self.read.clone();
+            let release = self.release.clone();
+            let (sender, mut receiver) = mpsc::channel(2);
+            let ready = Arc::new(Notify::new());
+            let producer_ready = ready.clone();
+            tokio::spawn(async move {
+                let first = question(&ctx, TaskState::InputRequired, "first question");
+                // Both reads and buffering happen outside the polled stream.
+                sender.send(Ok(first)).await.unwrap();
+                let input = ctx.inputs.recv().await.unwrap();
+                read.notify_one();
+                producer_ready.notify_one();
+                release.notified().await;
+                ctx.outputs
+                    .send_for(
+                        &input,
+                        question(&ctx, TaskState::AuthRequired, "second question"),
+                    )
+                    .await
+                    .unwrap();
+            });
+            Box::pin(async_stream::stream! {
+                ready.notified().await;
+                while let Some(event) = receiver.recv().await { yield event; }
+            })
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    let read = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let handler = DefaultRequestHandler::new(
+        Detached {
+            read: read.clone(),
+            release: release.clone(),
+        },
+        InMemoryTaskStore::new(),
+    );
+    seed_task(&handler, "task", "context").await;
+    let params = ServiceParams::new();
+    let first = tokio::spawn({
+        let handler = handler.clone();
+        let params = params.clone();
+        async move { handler.send_message(&params, request("first")).await }
+    });
+    wait_for_input(&handler, "first").await;
+    let mut second = tokio::spawn({
+        let handler = handler.clone();
+        let params = params.clone();
+        async move { handler.send_message(&params, request("second")).await }
+    });
+    timeout(Duration::from_secs(2), read.notified())
+        .await
+        .unwrap();
+    let first = timeout(Duration::from_secs(2), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(first, SendMessageResponse::Task(task) if task.status.state == TaskState::InputRequired)
+    );
+    assert!(
+        timeout(Duration::from_millis(20), &mut second)
+            .await
+            .is_err()
+    );
+    release.notify_one();
+    let SendMessageResponse::Task(task) = timeout(Duration::from_secs(2), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("Task expected")
+    };
+    assert_eq!(
+        task.status.message.as_ref().and_then(Message::text),
+        Some("second question")
+    );
+    handler.shutdown().await;
+}
+
+#[tokio::test]
+async fn deadline_does_not_return_an_old_question_as_a_new_answer() {
+    struct Silent;
+    impl AgentExecutor for Silent {
+        fn execute(
+            &self,
+            _ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::pending().boxed()
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    for state in [TaskState::InputRequired, TaskState::Working] {
+        let handler = DefaultRequestHandler::new(Silent, InMemoryTaskStore::new())
+            .with_blocking_response_timeout(Duration::from_millis(10));
+        seed_task(&handler, "task", "context").await;
+        let mut task = handler.tasks.load("task").await.unwrap();
+        task.status.state = state.clone();
+        task.status.message = Some(Message::new(Role::Agent, vec![Part::text("old question")]));
+        handler.tasks.store().update(task).await.unwrap();
+        let response = handler
+            .send_message(&ServiceParams::new(), request("answer"))
+            .await;
+        if state == TaskState::InputRequired {
+            let error = response.unwrap_err();
+            assert!(error.message.contains("do not resend"));
+            let details = error.details.unwrap();
+            assert_eq!(details[0].value["metadata"]["inputCommitted"], "true");
+            assert_eq!(details[0].value["metadata"]["taskId"], "task");
+        } else {
+            assert!(
+                matches!(response.unwrap(), SendMessageResponse::Task(task) if task.status.state == TaskState::Working)
+            );
+        }
+        assert_eq!(
+            handler
+                .tasks
+                .load("task")
+                .await
+                .unwrap()
+                .history
+                .unwrap()
+                .iter()
+                .filter(|message| message.text() == Some("answer"))
+                .count(),
+            1
+        );
+        handler.shutdown().await;
+    }
+}

@@ -15,6 +15,7 @@ pub(super) struct AuthorizedMessage {
     pub(super) params: ServiceParams,
     pub(super) user: Option<crate::middleware::User>,
     pub(super) response_id: Option<uuid::Uuid>,
+    pub(super) receipt: Option<super::uplink::ReceiptState>,
 }
 
 /// Message-only input. HTTP routing can retain the original caller's authorization.

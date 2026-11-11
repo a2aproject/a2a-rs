@@ -104,6 +104,7 @@ pub(super) fn signal_failure(
     event: &ExecutionEvent,
     error: A2AError,
 ) {
+    tracing::warn!(sequence = event.sequence, %error, "webhook delivery failed");
     if sender.fail_on_error()
         && let Some(signal) = &event.failure
     {
@@ -246,9 +247,9 @@ async fn dispatch(
     let mut busy = Vec::<Endpoint>::new();
     let mut requests = FuturesUnordered::<BoxFuture<'static, Endpoint>>::new();
     let mut closed = false;
-    // A fan-out on one task cannot occupy the entire handler pool. Keep at
-    // least two URLs concurrent for a task when the pool can support them.
-    let per_task = (concurrency / 2).max(2).min(concurrency);
+    // A task can occupy at most two HTTP slots, regardless of fan-out, and
+    // cannot monopolize a smaller pool. Other tasks retain independent slots.
+    let per_task = concurrency.saturating_sub(1).clamp(1, 2);
     loop {
         // Rotate tasks after each opportunity. Within a task, skip busy URLs
         // without letting later work overtake an earlier job for the same URL.
@@ -428,7 +429,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn one_tasks_slow_fanout_cannot_fill_all_http_slots() {
+    async fn two_slow_fanouts_leave_http_slots_for_another_task() {
         install_crypto_provider();
         let sender = Arc::new(crate::HttpPushSender::new(Some(
             crate::HttpPushSenderConfig {
@@ -439,22 +440,25 @@ mod tests {
         )));
         let (url, mut seen, server) = endpoint(true).await;
         let source = TaskHandle::new("a".into(), None);
+        let second = TaskHandle::new("c".into(), None);
         let other = TaskHandle::new("b".into(), None);
         let (queue, receiver) = PushDispatcher::channel(32);
-        for generation in 1..=16 {
-            queue
-                .submit(notification(
-                    "a",
-                    generation,
-                    &format!("{url}/{generation}"),
-                    &sender,
-                    &source,
-                ))
-                .await;
+        for source in [&source, &second] {
+            for generation in 1..=16 {
+                queue
+                    .submit(notification(
+                        source.id(),
+                        generation,
+                        &format!("{url}/{}/{generation}", source.id()),
+                        &sender,
+                        source,
+                    ))
+                    .await;
+            }
         }
         let delivery = tokio::spawn(dispatch(receiver, queue.released.clone(), 16));
         let mut releases = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..4 {
             releases.push(
                 timeout(Duration::from_secs(2), seen.recv())
                     .await
@@ -473,7 +477,7 @@ mod tests {
         assert_eq!(task, "b");
         drop(release);
         drop(releases);
-        for _ in 0..8 {
+        for _ in 0..28 {
             let (_, _, release) = timeout(Duration::from_secs(2), seen.recv())
                 .await
                 .unwrap()
@@ -623,7 +627,7 @@ mod tests {
             );
         }
         drop(source);
-        let delivery = tokio::spawn(dispatch(receiver, queue.released.clone(), 2));
+        let delivery = tokio::spawn(dispatch(receiver, queue.released.clone(), 4));
         drop(queue);
         let mut release_first = None;
         let mut independent = Vec::new();

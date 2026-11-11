@@ -206,8 +206,9 @@ impl TaskService {
         task_id: &str,
     ) -> Result<bool, A2AError> {
         // Re-read and reserve in one task operation, skipping already active tasks.
-        let started = self
-            .task(task_id)
+        let task = self.task(task_id);
+        handler.attach_pushes(&task);
+        let started = task
             .request(TaskOperation::Input, |reply| TaskCommand::Restart {
                 handler: handler.clone(),
                 id: task_id.to_owned(),
@@ -232,16 +233,17 @@ impl TaskService {
     ) -> Result<Delivery, Rejection> {
         let task_id = request_task_id(&message.request).unwrap_or_else(new_task_id);
         let id = task_id.clone();
-        self.task(&task_id)
-            .request(TaskOperation::Input, |reply| TaskCommand::Admit {
-                handler,
-                message: Box::new(message),
-                mode,
-                id,
-                reply,
-            })
-            .await
-            .map_err(Rejection::Interrupted)?
+        let task = self.task(&task_id);
+        handler.attach_pushes(&task);
+        task.request(TaskOperation::Input, |reply| TaskCommand::Admit {
+            handler,
+            message: Box::new(message),
+            mode,
+            id,
+            reply,
+        })
+        .await
+        .map_err(Rejection::Interrupted)?
     }
 
     /// Capture the snapshot and event cursor in the same mailbox as mutations.
@@ -362,10 +364,10 @@ impl TaskService {
         let base = active.snapshot();
         let creating = active.uncreated.load(std::sync::atomic::Ordering::SeqCst);
         let applied = self.persist(base, event, creating).await;
+        let (snapshot, repeated) = applied?;
         active
             .uncreated
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let (snapshot, repeated) = applied?;
         if creating {
             // Preserve the committed generation even if configuration persistence
             // fails, so error finalization cannot overwrite a newer snapshot.
@@ -466,6 +468,11 @@ impl TaskService {
             self.store.update(task.clone()).await?;
         } else if !lazy {
             self.store.create(task.clone()).await?;
+        }
+        if existed || !lazy {
+            if let Some(receipt) = &message.receipt {
+                receipt.committed(task);
+            }
         }
         Ok(())
     }

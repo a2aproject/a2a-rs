@@ -132,6 +132,9 @@ async fn persist_input(
         .save_request_push_config(&message.params, task_id, &message.request)
         .await?;
     let task = handler.tasks.save(task, false).await?;
+    if let Some(receipt) = &message.receipt {
+        receipt.committed(&task);
+    }
     Ok((task, recorded))
 }
 
@@ -197,6 +200,7 @@ mod tests {
         let mut request = send_request();
         request.message.as_mut().unwrap().task_id = Some("task".into());
         let message = AuthorizedMessage {
+            receipt: None,
             request,
             params: ServiceParams::new(),
             user: None,

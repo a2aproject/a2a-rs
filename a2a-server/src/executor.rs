@@ -8,8 +8,10 @@ use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 
 mod inputs;
+pub(crate) mod outputs;
 pub use inputs::{ClientInput, ClientInputSender, ClientInputs};
 pub(crate) use inputs::{QueuedInput, ReturnedInputs};
+pub use outputs::{ExecutorOutput, ExecutorOutputSender};
 
 /// Context passed to the [`AgentExecutor`] for each execution.
 ///
@@ -58,6 +60,9 @@ pub struct ExecutorContext {
     /// alongside its own work. Messages left unread at the end of a nonterminal
     /// turn are handed to the next execution.
     pub inputs: ClientInputs,
+    /// Owned output for spawned workers. `send_for` preserves the producing
+    /// input's generation; the ordinary execute stream remains available.
+    pub outputs: ExecutorOutputSender,
     /// Whether this is the task's first invocation. This remains true for a
     /// typed agent's first `execute` call after `start` has created the task.
     pub new_task: bool,
@@ -77,6 +82,7 @@ impl ExecutorContext {
         inputs: ClientInputs,
     ) -> Self {
         ExecutorContext {
+            outputs: Default::default(),
             execution_id: uuid::Uuid::now_v7().to_string(),
             message: None,
             task_id: task_id.into(),
@@ -155,14 +161,11 @@ impl ExecutorContext {
 /// client or executor edits. Use artifact update events to edit those artifacts.
 #[async_trait::async_trait]
 pub trait AgentExecutor: Send + Sync + 'static {
-    /// Output/input correlation is sampled when the SDK polls the returned
-    /// stream. It cannot infer when an event was created in an executor-owned
-    /// buffer. In particular, do not buffer an interruption for input A, consume
-    /// input B, and then expose A's interruption: a concurrent blocking sender
-    /// can otherwise see that old question. Yield interruptions before reading
-    /// the next input, or end the invocation and let a later input start a new
-    /// one. The task generation orders persisted mutations, not producer work.
-    /// Execute a message. Returns an owned stream of events.
+    /// Execute a message and return owned output. Inline reads from `ctx.inputs`
+    /// correlate subsequent yielded interruptions. A spawned worker should use
+    /// `ctx.outputs.send_for(&input, event)` so its buffered output keeps the
+    /// producing input's generation. Untagged worker output is conservatively
+    /// associated with the opener, never with a newer input read by that worker.
     fn execute(&self, ctx: ExecutorContext)
     -> BoxStream<'static, Result<StreamResponse, A2AError>>;
 
@@ -379,6 +382,7 @@ mod tests {
     fn test_executor_context_task_info() {
         let inputs = ClientInputs::closed();
         let ctx = ExecutorContext {
+            outputs: Default::default(),
             execution_id: uuid::Uuid::now_v7().to_string(),
             message: None,
             task_id: "t1".into(),

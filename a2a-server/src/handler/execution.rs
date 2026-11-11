@@ -129,19 +129,29 @@ async fn drive_execution(
     active: Arc<ActiveExecution>,
     request: ExecutionRequest,
 ) {
-    let end = poll_executor(&handler, &active, request).await;
-    // Shutdown can close the mailbox after output polling has completed.
-    // The driver's cleanup guard still runs; this is not an executor panic.
-    let _ = active
+    active.inline_input_generation.store(
+        active.inputs.received_generation(),
+        std::sync::atomic::Ordering::Release,
+    );
+    let end = crate::executor::outputs::scope(
+        active.inputs.progress(),
+        active.inline_input_generation.clone(),
+        poll_executor(&handler, &active, request),
+    )
+    .await;
+    let finished = active
         .task
         .clone()
         .request(TaskOperation::Finished, |reply| TaskCommand::Finished {
             handler: handler.clone(),
-            active,
+            active: active.clone(),
             end,
             reply,
         })
         .await;
+    if let Err(error) = finished {
+        report_controller_error(&handler, &active, error).await;
+    }
 }
 
 /// Cancellation drops the owned output stream; input receipts can be reclaimed
@@ -151,7 +161,17 @@ async fn poll_executor(
     active: &Arc<ActiveExecution>,
     request: impl Into<ExecutionRequest> + Send,
 ) -> TurnEnd {
-    let mut stream = match request.into() {
+    let mut request = request.into();
+    let (outputs, mut produced) = crate::ExecutorOutputSender::for_execution(
+        super::TASK_INPUT_CAPACITY,
+        active.inputs.received_generation(),
+    );
+    match &mut request {
+        ExecutionRequest::Message(context) | ExecutionRequest::Restart { context, .. } => {
+            context.outputs = outputs
+        }
+    }
+    let mut stream = match request {
         ExecutionRequest::Message(context) => handler.tasks.executor.execute(context),
         ExecutionRequest::Restart { context, accepted } => {
             let stream = handler.tasks.executor.restart(context);
@@ -164,7 +184,11 @@ async fn poll_executor(
     };
     let mut push_failure = active.push_failure.subscribe();
     let mut output_protocol = ExecutionProtocol::default();
+    let (mut stream_ended, mut outputs_ended) = (false, false);
     loop {
+        if stream_ended && outputs_ended {
+            return TurnEnd::Finished;
+        }
         // Cancellation and terminal state take precedence over a late delivery error.
         if active.inputs.closed.is_cancelled() {
             return TurnEnd::Stopped;
@@ -176,16 +200,44 @@ async fn poll_executor(
             }
             return TurnEnd::Failed(error);
         }
-        let result = tokio::select! {
+        let next = tokio::select! {
             biased;
             _ = active.inputs.closed.cancelled() => return TurnEnd::Stopped,
             _ = push_failure.changed() => continue,
-            result = stream.next() => result,
+            output = async {
+                tokio::select! {
+                    output = produced.recv(), if !outputs_ended => futures::future::Either::Left(output),
+                    output = stream.next(), if !stream_ended => futures::future::Either::Right(output),
+                }
+            } => output,
         };
-        let Some(result) = result else {
-            return TurnEnd::Finished;
+        let (result, generation) = match next {
+            futures::future::Either::Left(Some(output)) => (output.result, output.input_generation),
+            futures::future::Either::Right(Some(output)) => (
+                output,
+                active
+                    .inline_input_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ),
+            futures::future::Either::Left(None) => {
+                outputs_ended = true;
+                continue;
+            }
+            futures::future::Either::Right(None) => {
+                stream_ended = true;
+                // A completed custom stream may still own its context/sender.
+                // Drop it now so it cannot keep the secondary output open.
+                stream = Box::pin(futures::stream::empty());
+                continue;
+            }
         };
-        active.emitted_output();
+        if generation < 0 || generation > active.inputs.received_generation() {
+            return TurnEnd::Failed(A2AError::new(
+                error_code::INVALID_AGENT_RESPONSE,
+                "executor output names an input that was not consumed",
+            ));
+        }
+        active.produced_for(generation);
         if active.snapshot_is_terminal() {
             return TurnEnd::Stopped;
         }
@@ -239,15 +291,33 @@ pub(super) async fn drive_execution_guarded(
         return;
     }
 
-    let _ = active
+    let result = active
         .task
         .clone()
         .request(TaskOperation::Finished, |reply| TaskCommand::Panicked {
-            handler: recovery,
-            active,
+            handler: recovery.clone(),
+            active: active.clone(),
             reply,
         })
         .await;
+    if let Err(error) = result {
+        report_controller_error(&recovery, &active, error).await;
+    }
+}
+
+async fn report_controller_error(
+    handler: &DefaultRequestHandler,
+    active: &Arc<ActiveExecution>,
+    error: A2AError,
+) {
+    if handler.tasks.background_tasks.check_running().is_err() {
+        return;
+    }
+    tracing::error!(task_id = %active.task.id(), execution_id = %active.execution_id, %error, "execution finalization failed");
+    active.inputs.revoke();
+    active.task.unregister(active);
+    active.publish(Err(&error), None).await;
+    active.task.notify();
 }
 
 /// Starts the invocation that takes over `unread` inside the completion
@@ -282,6 +352,7 @@ pub(super) async fn start_next_turn(
     reject_inputs(&next, task_id, rejected).await;
 
     let exec_ctx = crate::ExecutorContext {
+        outputs: Default::default(),
         execution_id: next.execution_id.clone(),
         message: Some(first.message),
         task_id: task_id.clone(),
@@ -399,6 +470,11 @@ pub(super) async fn publish_failure(
     error: &A2AError,
 ) {
     let failed = persist_failure(handler, active, task_id, error).await;
+    if failed.is_some() {
+        active
+            .uncreated
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
     active.publish(Err(error), failed.clone()).await;
     if let Some(task) = failed {
         let event = protocol::current_status_event(task);

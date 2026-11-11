@@ -60,20 +60,23 @@ and advertise client artifact support before accepting artifact updates.
   terminal state, the call returns the current task snapshot. This can still
   have a `WORKING` or `INPUT_REQUIRED` state.
 - `with_blocking_response_timeout` can bound waits on an executor that never finishes.
-  After input is committed, expiry returns the current task, so a caller is
-  not encouraged to repeat a committed input. If no task was created, expiry
-  is an error. The timeout does not cancel execution.
-- Buffered executor outputs have a correlation limitation: input progress is
-  sampled when the server polls the stream, not when a detached producer
-  creates an output. Yield an interrupt before consuming the next input, or
-  end the invocation, rather than buffering one caller's question across
-  consumption of another caller's input. This API does not provide an
-  explicit producer-supplied interrupt generation.
+  Expiry re-reads storage. A stored interrupt is not presented as a new
+  answer: a deadline error includes SDK `ErrorInfo` with `inputCommitted`,
+  `taskId` and `generation`. Do not resend that input. Other states return
+  the stored snapshot. An uncreated task or uncertain storage outcome is an
+  error. The timeout does not cancel execution.
+- `AgentExecutor::execute` keeps its signature. An executor can move both
+  `ctx.inputs` and the new `ctx.outputs` into owned workers. Use
+  `outputs.send_for(&input, event)` to tag output at production time. The
+  runner cannot infer the producer of arbitrary custom buffered stream items;
+  detached reads no longer advance legacy output correlation. Use the owned
+  output sender for prompt per-input blocking replies from detached workers.
 - HTTP live follow-ups have a default 30-second acknowledgement deadline,
-  configurable with `with_http_followup_timeout`. A queued request revoked
-  before processing cannot later mutate the task. Once processing owns it,
-  an acknowledgement reports the current committed task; the downlink
-  carries any subsequent input rejection.
+  configurable with `with_http_followup_timeout`. Pending requests can be
+  revoked before admission. Owned requests are ACKed on timeout only when a
+  post-save receipt proves commit. Otherwise the error explicitly reports an
+  unknown outcome: inspect the task before retrying. Lost receipts re-read
+  storage; an artifact-only update needs an explicit commit receipt.
 - The SDK's HTTP live exchange header is an SDK routing convention, not a
   field defined by the A2A specification. Exchange identifiers are scoped to
   the authenticated caller; anonymous calls share the anonymous scope.
@@ -83,15 +86,20 @@ and advertise client artifact support before accepting artifact updates.
 
 ## Listing and webhook bounds
 
-In-memory list cursors preserve the initial ordered task IDs for five minutes,
+In-memory list cursors preserve the initial ordered task IDs for five minutes of inactivity,
 while each continuation reads current contents and rechecks filters and
 permissions. New tasks require a new listing. Concurrent updates may change
-ordering across page boundaries. Cursor capacity rejects new allocations
-rather than evicting active traversals; expired cursors require a fresh list.
+ordering across page boundaries. Cursor ownership and quotas are scoped by stable principal and tenant.
+Capacity rejects new allocations rather than evicting active traversals;
+active continuations refresh expiry. Custom stores can override the additive
+`list_for_scope` method without changing existing required trait methods.
 
 Webhook work uses bounded per-task queues and a shared HTTP concurrency pool.
-Cancellation can proceed while publication is backpressured; publications
-remain ordered. Delivery/configuration retries have deadlines. A single task
+Ordinary output waits for a bounded publication-batch permit outside the
+controller. Input admission rejects before persistence when that queue is
+full; subscriptions and cancellation still proceed. Finalization has reserved
+capacity. Notifications remain ordered, and two slow fan-outs cannot occupy
+the whole HTTP pool. Delivery/configuration retries have deadlines. A single task
 cannot occupy every HTTP slot, but many slow tasks can still queue behind the
 finite shared pool. Delivery failure is reported through server diagnostics;
 webhook delivery is not a durable, exactly-once outbox.

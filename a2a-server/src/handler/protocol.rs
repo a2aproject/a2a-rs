@@ -1572,14 +1572,13 @@ pub(super) fn records_message(task: &Task, request: &StreamRequest) -> bool {
         return true;
     };
     let Some(message) = &send.message else {
-        return true;
+        return false;
     };
     let id = &message.message_id;
-    id.is_empty()
-        || task.history.iter().flatten().any(|m| &m.message_id == id)
+    !id.is_empty() && (task.history.iter().flatten().any(|m| &m.message_id == id)
         || task.timeline.iter().flatten().any(
             |entry| matches!(&entry.content, TimelineContent::Message(m) if &m.message_id == id),
-        )
+        ))
 }
 
 // Failures detected outside this module: canonical codes and messages.

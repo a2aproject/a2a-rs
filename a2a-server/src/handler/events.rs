@@ -20,8 +20,8 @@ pub(super) type FailureSignal = watch::Sender<Option<A2AError>>;
 #[derive(Clone)]
 pub(super) struct ExecutionEvent {
     pub(super) sequence: u64,
-    /// Highest input generation read when the server polled this output from
-    /// the executor stream. Buffered producer-side creation can precede this.
+    /// Input correlated by the producer, or by a read in the inline executor
+    /// stream. Detached reads cannot advance legacy stream correlation.
     pub(super) input_generation: i64,
     pub(super) result: Result<StreamResponse, A2AError>,
     pub(super) kind: EventKind,
@@ -212,6 +212,7 @@ pub(super) struct ActiveExecution {
     /// the executor answers with a message alone.
     pub(super) uncreated: std::sync::atomic::AtomicBool,
     output_input_generation: std::sync::atomic::AtomicI64,
+    pub(super) inline_input_generation: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl ActiveExecution {
@@ -243,6 +244,7 @@ impl ActiveExecution {
                 push_failure: tokio::sync::watch::channel(None).0,
                 uncreated: std::sync::atomic::AtomicBool::new(false),
                 output_input_generation: std::sync::atomic::AtomicI64::new(0),
+                inline_input_generation: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             }),
             receiver,
             InvocationState::new(returned_inputs),
@@ -303,6 +305,11 @@ impl ActiveExecution {
     ) {
         self.publish_kind(result, snapshot_task, EventKind::Normal)
             .await;
+    }
+
+    pub(super) fn produced_for(&self, generation: i64) {
+        self.output_input_generation
+            .store(generation, std::sync::atomic::Ordering::Release);
     }
 
     /// Capture causality before persistence or publication can await other work.

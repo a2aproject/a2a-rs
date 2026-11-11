@@ -85,7 +85,7 @@ pub mod tls;
 pub use agent_card::{AgentCardProducer, StaticAgentCard, WELL_KNOWN_AGENT_CARD_PATH};
 pub use executor::{
     Agent, AgentExecutor, ClientInput, ClientInputSender, ClientInputs, ExecutorContext,
-    NewMessage, Start,
+    ExecutorOutput, ExecutorOutputSender, NewMessage, Start,
 };
 pub use handler::{
     DefaultRequestHandler, ExtendedAgentCardResolver, LiveResponse, RequestAuthorizer,

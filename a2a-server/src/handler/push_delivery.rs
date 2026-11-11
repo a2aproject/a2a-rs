@@ -1,7 +1,7 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Consume the shared task broadcast with backpressure for webhook delivery.
+//! Queue bounded webhook batches without blocking the task controller.
 
 use super::events::ExecutionEvent;
 use super::protocol::EventKind;
@@ -13,11 +13,10 @@ use std::{
     sync::{Arc, Weak},
     time::Duration,
 };
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::Mutex;
 
 pub(super) const PUSH_QUEUE_CAPACITY: usize = 1024;
 const PUSH_CONFIG_TIMEOUT: Duration = Duration::from_secs(30);
-const PUSH_WORKER_IDLE: Duration = Duration::from_secs(60);
 
 type DeliveryGates = parking_lot::Mutex<HashMap<(TaskId, String), Weak<Mutex<()>>>>;
 
@@ -41,6 +40,10 @@ impl PushService {
             dispatcher: Arc::default(),
             gates: Arc::default(),
         })
+    }
+
+    pub(super) fn sender(&self) -> &crate::HttpPushSender {
+        &self.sender
     }
 
     pub(super) fn store(&self) -> &dyn crate::PushConfigStore {
@@ -90,35 +93,99 @@ impl PushService {
     }
 }
 
-#[derive(Default)]
-pub(super) struct SubscriptionState {
-    /// Last sequence removed from the broadcast by the webhook receiver.
-    cursor: Option<watch::Sender<u64>>,
-    publication: Option<Arc<Mutex<()>>>,
-    lookup_failed: bool,
+/// Bounded batches reserved before task mutations enter the controller.
+/// Two finalization slots let a committed terminal state bypass ordinary load.
+pub(super) struct PublicationQueue {
+    sender: tokio::sync::mpsc::UnboundedSender<PublicationBatch>,
+    regular: Arc<tokio::sync::Semaphore>,
+    terminal: Arc<tokio::sync::Semaphore>,
 }
 
-/// Clear the cursor on every worker exit, including cancellation or unwinding,
-/// so a publisher cannot wait forever for a receiver that no longer exists.
-struct SubscriptionLease {
-    events: TaskHandle,
-    cursor: watch::Sender<u64>,
+pub(super) struct PublicationBatch {
+    source: TaskHandle,
+    events: Vec<ExecutionEvent>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-impl Drop for SubscriptionLease {
-    fn drop(&mut self) {
-        let mut state = self.events.webhook_subscription();
-        if state
-            .cursor
-            .as_ref()
-            .is_some_and(|cursor| cursor.same_channel(&self.cursor))
-        {
-            state.cursor = None;
+pub(super) type PublicationPermit = tokio::sync::OwnedSemaphorePermit;
+
+impl PublicationQueue {
+    pub(super) fn new(source: &TaskHandle) -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        source.background_tasks().spawn(receive_batches(receiver));
+        Self {
+            sender,
+            regular: Arc::new(tokio::sync::Semaphore::new(
+                super::EXECUTION_BUFFER_CAPACITY,
+            )),
+            terminal: Arc::new(tokio::sync::Semaphore::new(2)),
+        }
+    }
+
+    pub(super) fn try_reserve(&self) -> Option<PublicationPermit> {
+        self.regular.clone().try_acquire_owned().ok()
+    }
+
+    pub(super) async fn reserve(
+        &self,
+        source: &TaskHandle,
+        operation: super::task_handle::TaskOperation,
+    ) -> Result<Option<PublicationPermit>, A2AError> {
+        use super::task_handle::TaskOperation;
+        let capacity = match operation {
+            TaskOperation::Subscribe | TaskOperation::Cancel => return Ok(None),
+            TaskOperation::Input => {
+                return self
+                    .regular
+                    .clone()
+                    .try_acquire_owned()
+                    .map(Some)
+                    .map_err(|_| {
+                        A2AError::invalid_request(
+                            "webhook publication queue is full; input was not admitted",
+                        )
+                    });
+            }
+            TaskOperation::Output => self.regular.clone(),
+            TaskOperation::Finished => self.terminal.clone(),
+        };
+        let execution = (matches!(operation, TaskOperation::Output))
+            .then(|| source.active().map(|active| active.inputs.closed.clone()))
+            .flatten();
+        tokio::select! {
+            biased;
+            () = source.background_tasks().cancelled() => Err(A2AError::internal("handler is shutting down")),
+            () = async { match execution { Some(token) => token.cancelled().await, None => std::future::pending().await } } => Err(A2AError::internal("execution stopped while waiting for publication capacity")),
+            permit = capacity.acquire_owned() => permit.map(Some).map_err(|_| A2AError::internal("webhook publication queue closed")),
+        }
+    }
+
+    pub(super) fn submit(
+        &self,
+        source: TaskHandle,
+        events: Vec<ExecutionEvent>,
+        permit: PublicationPermit,
+    ) {
+        if let Err(error) = self.sender.send(PublicationBatch {
+            source,
+            events,
+            _permit: permit,
+        }) {
+            let batch = error.0;
+            if let Some(settings) = batch.source.pushes() {
+                for event in &batch.events {
+                    signal_failure(
+                        &settings.sender,
+                        event,
+                        A2AError::internal("webhook intake unavailable"),
+                    );
+                }
+            }
         }
     }
 }
 
-fn needs_notification(event: &ExecutionEvent) -> bool {
+pub(super) fn needs_notification(event: &ExecutionEvent) -> bool {
     event.kind == EventKind::Normal
         && event
             .result
@@ -126,176 +193,92 @@ fn needs_notification(event: &ExecutionEvent) -> bool {
             .is_ok_and(|event| super::protocol::task_id_for_event(event).is_some())
 }
 
-/// Mailbox-serialized publications share one broadcast. Only its webhook
-/// receiver applies backpressure; ordinary subscribers can still lag/resync.
+/// Clients observe committed events immediately. Webhooks own reserved queue
+/// capacity and never await configuration or HTTP inside the task controller.
 pub(super) async fn broadcast(
-    events: &TaskHandle,
+    source: &TaskHandle,
     settings: &Arc<PushService>,
     event: ExecutionEvent,
 ) {
-    // Cancellation releases the controller, while the owned publication keeps
-    // draining. A single per-task gate preserves ordering across that handoff.
-    let gate = events
-        .webhook_subscription()
-        .publication
-        .get_or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone();
-    let cancellation = events.publication_cancellation();
-    let background = events.background_tasks().clone();
-    let source = events.clone();
-    let settings = settings.clone();
-    let mut publication = Box::pin(async move {
-        let _order = gate.lock().await;
-        broadcast_ordered(&source, &settings, event).await;
-    });
-    tokio::select! {
-        biased;
-        () = &mut publication => {},
-        () = cancellation.cancelled() => { background.spawn(publication); },
+    let _ = source.sender().send(event.clone());
+    if !needs_notification(&event) {
+        return;
+    }
+    if source.buffer_notification(event.clone()) {
+        return;
+    }
+    // Direct publishers (outside a task operation) may backpressure their own
+    // future. The controller reserves capacity before executing its operation.
+    match source
+        .publications()
+        .reserve(source, super::task_handle::TaskOperation::Output)
+        .await
+    {
+        Ok(Some(permit)) => source
+            .publications()
+            .submit(source.clone(), vec![event], permit),
+        Ok(None) => unreachable!("output publication reserves capacity"),
+        Err(error) => signal_failure(&settings.sender, &event, error),
     }
 }
 
-async fn broadcast_ordered(
-    events: &TaskHandle,
-    settings: &Arc<PushService>,
-    event: ExecutionEvent,
-) {
-    let cursor = {
-        let mut state = events.webhook_subscription();
-        let terminal_after_failure = state.lookup_failed
-            && events
-                .snapshot()
-                .is_some_and(|task| task.status.state.is_terminal());
-        if state.cursor.is_none() && needs_notification(&event) && !terminal_after_failure {
-            let receiver = events.sender().subscribe();
-            let (cursor, _) = watch::channel(event.sequence - 1);
-            state.cursor = Some(cursor.clone());
-            events
-                .background_tasks()
-                .spawn(receive_events(events.clone(), receiver, cursor));
-        }
-        state.cursor.as_ref().map(watch::Sender::subscribe)
-    };
-    if let Some(mut cursor) = cursor {
-        // Count every event, including filtered/private ones: they all occupy
-        // the same ring buffer and must not overwrite pending webhook events.
-        while event.sequence.saturating_sub(*cursor.borrow_and_update())
-            > super::EXECUTION_BUFFER_CAPACITY as u64
-        {
-            tokio::select! {
-                () = events.background_tasks().cancelled() => return,
-                changed = cursor.changed() => {
-                    if changed.is_err() {
-                        signal_failure(&settings.sender, &event, A2AError::internal("webhook subscriber unavailable"));
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    let _ = events.sender().send(event);
-}
-
-async fn receive_events(
-    events: TaskHandle,
-    mut receiver: broadcast::Receiver<ExecutionEvent>,
-    cursor: watch::Sender<u64>,
-) {
-    let _lease = SubscriptionLease {
-        events: events.clone(),
-        cursor: cursor.clone(),
-    };
-    loop {
-        let result = match tokio::time::timeout(PUSH_WORKER_IDLE, receiver.recv()).await {
-            Ok(result) => result,
-            Err(_) => {
-                let mut state = events.webhook_subscription();
-                match receiver.try_recv() {
-                    Ok(event) => Ok(event),
-                    Err(broadcast::error::TryRecvError::Empty)
-                        if *cursor.borrow() == events.sequence() =>
-                    {
-                        // Startup/publication use this same short lock. A new
-                        // publisher either prevents retirement or starts a receiver.
-                        state.cursor = None;
-                        return;
-                    }
-                    Err(broadcast::error::TryRecvError::Empty) => continue,
-                    Err(broadcast::error::TryRecvError::Closed) => {
-                        Err(broadcast::error::RecvError::Closed)
-                    }
-                    Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                        Err(broadcast::error::RecvError::Lagged(skipped))
-                    }
-                }
-            }
-        };
-        let event = match result {
-            Ok(event) => event,
-            Err(error) => {
-                tracing::error!(task_id = %events.id(), %error, "webhook broadcast ended before its receiver caught up");
-                events.webhook_subscription().cursor = None;
-                return;
-            }
-        };
-        // The event is now retained locally until configuration lookup and
-        // dispatcher admission finish; its broadcast slot can be reused.
-        cursor.send_replace(event.sequence);
-        if !needs_notification(&event) {
+async fn receive_batches(mut batches: tokio::sync::mpsc::UnboundedReceiver<PublicationBatch>) {
+    while let Some(batch) = batches.recv().await {
+        let Some(settings) = batch.source.pushes() else {
             continue;
-        }
-        let settings = events.pushes().unwrap();
-        // Retain across transient failures, but do not retain a finished task's
-        // worker forever when its configuration store remains unavailable.
-        let configs = tokio::time::timeout(PUSH_CONFIG_TIMEOUT, async {
-          loop {
-            match settings.store.list(events.id()).await {
-                Ok(configs) => break configs,
-                Err(error) => {
-                    signal_failure(&settings.sender, &event, error.clone());
-                    tracing::warn!(task_id = %events.id(), %error, "could not load webhook configurations; retrying");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-          }
-        }).await;
-        let configs = match configs {
-            Ok(configs) => {
-                events.webhook_subscription().lookup_failed = false;
-                configs
-            }
-            Err(_) => {
-                events.webhook_subscription().lookup_failed = true;
-                signal_failure(
-                    &settings.sender,
-                    &event,
-                    A2AError::internal("webhook configuration lookup timed out"),
-                );
-                return;
-            }
         };
-        let event = Arc::new(event);
-        for config in configs {
-            if matches!(event.result, Ok(StreamResponse::MessageUpdate(_)))
-                && !super::protocol::is_at_least_1_1(
-                    config.protocol_version.as_deref().unwrap_or("1.0"),
-                )
-            {
-                continue;
-            }
-            if !settings
-                .dispatcher
-                .get_or_init(|| PushDispatcher::spawn(events.background_tasks()))
-                .submit(Notification {
-                    config,
-                    event: event.clone(),
-                    sender: settings.sender.clone(),
-                    source: events.clone(),
-                })
-                .await
-            {
-                events.webhook_subscription().cursor = None;
-                return;
+        for event in &batch.events {
+            // A failed lookup affects this event, not the remaining queue.
+            // Every accepted event is either submitted or explicitly failed.
+            let configs = tokio::time::timeout(PUSH_CONFIG_TIMEOUT, async {
+                loop {
+                    match settings.store.list(batch.source.id()).await {
+                        Ok(configs) => break configs,
+                        Err(error) => {
+                            signal_failure(&settings.sender, event, error.clone());
+                            tracing::warn!(task_id = %batch.source.id(), %error, "could not load webhook configurations; retrying");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }).await;
+            let configs = match configs {
+                Ok(configs) => configs,
+                Err(_) => {
+                    signal_failure(
+                        &settings.sender,
+                        event,
+                        A2AError::internal("webhook configuration lookup timed out"),
+                    );
+                    continue;
+                }
+            };
+            let event = Arc::new(event.clone());
+            for config in configs {
+                if matches!(event.result, Ok(StreamResponse::MessageUpdate(_)))
+                    && !super::protocol::is_at_least_1_1(
+                        config.protocol_version.as_deref().unwrap_or("1.0"),
+                    )
+                {
+                    continue;
+                }
+                if !settings
+                    .dispatcher
+                    .get_or_init(|| PushDispatcher::spawn(batch.source.background_tasks()))
+                    .submit(Notification {
+                        config,
+                        event: event.clone(),
+                        sender: settings.sender.clone(),
+                        source: batch.source.clone(),
+                    })
+                    .await
+                {
+                    signal_failure(
+                        &settings.sender,
+                        &event,
+                        A2AError::internal("webhook dispatcher unavailable"),
+                    );
+                }
             }
         }
     }
@@ -306,11 +289,15 @@ mod tests {
     use super::*;
     use crate::handler::test_support::*;
 
-    #[tokio::test]
-    async fn cancellation_bypasses_webhook_backpressure_without_reordering_publications() {
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_and_subscriptions_bypass_a_full_webhook_queue() {
         install_crypto_provider();
+        let entered = Arc::new(Notify::new());
         let handler = make_handler().with_push_notifications(
-            InMemoryPushConfigStore::new(),
+            HangingStore {
+                entered: entered.clone(),
+                dropped: Arc::default(),
+            },
             crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
                 validate_urls: false,
                 ..Default::default()
@@ -321,8 +308,6 @@ mod tests {
         let task = handler.tasks.load("task").await.unwrap();
         source.set_snapshot(task.clone());
         handler.attach_pushes(&source);
-        let (cursor, _receiver) = watch::channel(0);
-        source.webhook_subscription().cursor = Some(cursor.clone());
         for _ in 0..super::super::EXECUTION_BUFFER_CAPACITY {
             source
                 .publish(
@@ -334,38 +319,35 @@ mod tests {
                 )
                 .await;
         }
+        entered.notified().await;
         let mut observed = source.sender().subscribe();
-        let queue = source.clone();
-        let publisher = source.clone();
-        let blocked = tokio::spawn(async move {
-            queue
-                .submit(
-                    super::super::task_handle::TaskOperation::Output,
-                    move |_| {
-                        Box::pin(async move {
-                            publisher
-                                .publish(
-                                    Ok(&StreamResponse::Task(task)),
-                                    None,
-                                    EventKind::Normal,
-                                    None,
-                                    0,
-                                )
-                                .await;
-                        })
-                    },
-                )
-                .await
-        });
-        timeout(Duration::from_secs(2), async {
-            while source.sequence() <= super::super::EXECUTION_BUFFER_CAPACITY as u64 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let before = handler.tasks.load("task").await.unwrap();
+        let error = handler
+            .send_message(&ServiceParams::new(), send_req(Some("task"), None))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("not admitted"));
+        assert_eq!(handler.tasks.load("task").await.unwrap(), before);
+        let mut subscription = timeout(
+            Duration::from_secs(1),
+            handler.subscribe_to_task(
+                &ServiceParams::new(),
+                SubscribeToTaskRequest {
+                    id: "task".into(),
+                    tenant: None,
+                    last_seen_generation: None,
+                },
+            ),
+        )
         .await
+        .unwrap()
         .unwrap();
+        assert!(matches!(
+            subscription.next().await,
+            Some(Ok(StreamResponse::Task(_)))
+        ));
         let canceled = timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(1),
             handler.cancel_task(
                 &ServiceParams::new(),
                 CancelTaskRequest {
@@ -376,26 +358,13 @@ mod tests {
             ),
         )
         .await
-        .expect("cancel must not wait for a webhook cursor")
+        .expect("cancel is independent of webhook delivery")
         .unwrap();
         assert_eq!(canceled.status.state, TaskState::Canceled);
-        blocked.await.unwrap().unwrap();
+        let notification = observed.recv().await.unwrap();
         assert!(
-            observed.try_recv().is_err(),
-            "publications remain queued in order"
-        );
-        cursor.send_replace(super::super::EXECUTION_BUFFER_CAPACITY as u64);
-        let first = timeout(Duration::from_secs(2), observed.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let last = timeout(Duration::from_secs(2), observed.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.sequence + 1, last.sequence);
-        assert!(
-            last.result
+            notification
+                .result
                 .as_ref()
                 .is_ok_and(super::super::protocol::is_terminal_event)
         );
@@ -471,7 +440,7 @@ mod tests {
                     observed.borrow().as_ref().unwrap().message,
                     "webhook configuration lookup timed out"
                 );
-                tokio::time::advance(PUSH_WORKER_IDLE + Duration::from_secs(1)).await;
+                tokio::task::yield_now().await;
                 for _ in 0..8 {
                     tokio::task::yield_now().await;
                 }
@@ -644,7 +613,7 @@ mod tests {
                 0,
             )
             .await;
-        assert!(source.webhook_subscription().cursor.is_none());
+        assert_eq!(source.background_tasks().count(), 0);
         assert_eq!(source.sender().receiver_count(), 0);
     }
 
@@ -736,7 +705,7 @@ mod tests {
         assert!(
             matches!(
                 ordinary.try_recv(),
-                Err(broadcast::error::TryRecvError::Lagged(_))
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
             ),
             "ordinary subscribers can lag without holding up publication"
         );
@@ -1287,34 +1256,11 @@ mod tests {
         assert_eq!(error.code, error_code::PUSH_NOTIFICATION_NOT_SUPPORTED);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn idle_webhook_subscribers_retire_and_restart_without_changing_task_source() {
-        let handler = make_push_delivery_handler();
-        let source = handler.tasks.task("task");
-        handler.attach_pushes(&source);
-        let event = StreamResponse::Task(task_with_history("task", "context", 0));
-        source
-            .publish(Ok(&event), None, EventKind::Normal, None, 0)
-            .await;
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(PUSH_WORKER_IDLE + Duration::from_secs(1)).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert!(source.webhook_subscription().cursor.is_none());
-        source
-            .publish(Ok(&event), None, EventKind::Normal, None, 0)
-            .await;
-        assert!(source.webhook_subscription().cursor.is_some());
-        assert!(source.ptr_eq(&handler.tasks.task("task")));
-    }
-
     #[tokio::test]
-    async fn a_closed_dispatcher_retires_the_intake() {
-        let (source, rx) = captured_source(2, false).await;
-        drop(rx);
+    async fn webhook_intake_does_not_retain_an_idle_task_handle() {
+        let (source, mut notifications) = captured_source(2, false).await;
+        let weak = source.downgrade();
+        let background = source.background_tasks().clone();
         source
             .publish(
                 Ok(&StreamResponse::Task(task_with_history(
@@ -1326,10 +1272,42 @@ mod tests {
                 0,
             )
             .await;
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
+        drop(notifications.recv().await.unwrap());
+        drop(source);
+        drop(notifications);
+        timeout(Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        background.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_closed_dispatcher_reports_every_accepted_notification() {
+        let (source, receiver) = captured_source(2, true).await;
+        drop(receiver);
+        let (failure, mut observed) = tokio::sync::watch::channel(None);
+        for generation in 1..=2 {
+            source
+                .publish(
+                    Ok(&StreamResponse::Task(task_with_history(
+                        "task", "context", generation,
+                    ))),
+                    None,
+                    EventKind::Normal,
+                    Some(failure.clone()),
+                    0,
+                )
+                .await;
+            timeout(Duration::from_secs(2), observed.changed())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(observed.borrow().is_some());
         }
-        assert!(source.webhook_subscription().cursor.is_none());
         source.background_tasks().shutdown().await;
     }
 }

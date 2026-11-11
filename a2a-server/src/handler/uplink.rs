@@ -26,8 +26,8 @@ use tokio::sync::{mpsc, oneshot};
 //   unambiguous legacy exchange for their authenticated caller. Independent
 //   callers sharing the same identity must use exchange identifiers.
 // - A call lost to a panic is acknowledged when its message is in the task,
-//   even if no executor read it; an artifact-only call, or one with no
-//   message id, cannot be checked and is acknowledged.
+//   even if no executor read it. Artifact-only calls require an explicit
+//   post-save receipt; otherwise their outcome is reported as unknown.
 // - A message injected into a turn another client started reaches an idle
 //   exchange through the next snapshot, not as events.
 // - A stream that falls further behind than the execution buffer holds
@@ -56,11 +56,25 @@ pub(super) struct Receipt {
 }
 
 #[derive(Clone)]
-pub(super) struct ReceiptState(Arc<std::sync::atomic::AtomicU8>);
+pub(super) struct ReceiptState(Arc<ReceiptProgress>);
+
+#[derive(Default)]
+struct ReceiptProgress {
+    phase: std::sync::atomic::AtomicU8,
+    committed: std::sync::OnceLock<Task>,
+}
 
 impl ReceiptState {
+    pub(super) fn committed(&self, task: &Task) {
+        let _ = self.0.committed.set(task.clone());
+    }
+    pub(super) fn committed_task(&self) -> Option<Task> {
+        self.0.committed.get().cloned()
+    }
+
     pub(super) fn cancel_pending(&self) -> bool {
         self.0
+            .phase
             .compare_exchange(
                 0,
                 2,
@@ -75,7 +89,7 @@ impl Receipt {
     pub(super) fn new(sender: oneshot::Sender<Option<Task>>) -> Self {
         Self {
             sender: Some(sender),
-            state: ReceiptState(Arc::new(std::sync::atomic::AtomicU8::new(0))),
+            state: ReceiptState(Arc::new(ReceiptProgress::default())),
         }
     }
 
@@ -86,6 +100,7 @@ impl Receipt {
     pub(super) fn begin(self) -> Option<Self> {
         self.state
             .0
+            .phase
             .compare_exchange(
                 0,
                 1,
@@ -105,7 +120,13 @@ impl Receipt {
 
 impl Drop for Receipt {
     fn drop(&mut self) {
-        if self.state.0.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        if self
+            .state
+            .0
+            .phase
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
             if let Some(sender) = self.sender.take() {
                 let _ = sender.send(None);
             }
@@ -194,6 +215,16 @@ pub(super) fn exchange_id(params: &ServiceParams) -> Result<Option<String>, A2AE
     Ok(Some(value.clone()))
 }
 
+fn same_principal(left: &Option<User>, right: &Option<User>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.authenticated == right.authenticated && left.name == right.name
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 impl HttpLiveResponses {
     /// Recover the bound task before authorizing an HTTP uplink that omits it.
     pub(super) fn task_for_exchange(
@@ -205,7 +236,7 @@ impl HttpLiveResponses {
         let Some(response) = open.iter().find(|response| {
             !response.sender.is_closed()
                 && response.exchange_id.as_deref() == Some(id)
-                && &response.user == user
+                && same_principal(&response.user, user)
         }) else {
             return Ok(None);
         };
@@ -226,9 +257,9 @@ impl HttpLiveResponses {
         let mut open = self.open.write();
         open.retain(|response| !response.sender.is_closed());
         if exchange_id.is_some()
-            && open
-                .iter()
-                .any(|response| response.exchange_id == exchange_id && response.user == user)
+            && open.iter().any(|response| {
+                response.exchange_id == exchange_id && same_principal(&response.user, &user)
+            })
         {
             return Err(ProtocolError::ExchangeIdentifierInUse.into());
         }
@@ -265,12 +296,13 @@ impl HttpLiveResponses {
             !response.sender.is_closed()
                 && match exchange_id {
                     Some(id) => {
-                        response.exchange_id.as_deref() == Some(id) && &response.user == user
+                        response.exchange_id.as_deref() == Some(id)
+                            && same_principal(&response.user, user)
                     }
                     None => {
                         response.task_id.as_deref() == Some(task_id)
                             && response.exchange_id.is_none()
-                            && &response.user == user
+                            && same_principal(&response.user, user)
                     }
                 }
         });
@@ -280,7 +312,7 @@ impl HttpLiveResponses {
         if candidates.next().is_some() {
             return Err(ProtocolError::AmbiguousExchange.into());
         }
-        if &response.user != user {
+        if !same_principal(&response.user, user) {
             return Err(ProtocolError::ForeignExchangeCaller.into());
         }
         let bound_task = response
@@ -300,6 +332,34 @@ impl HttpLiveResponses {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refreshed_claims_keep_the_same_exchange_identity() {
+        let registry = HttpLiveResponses::default();
+        let original = User::authenticated("alice");
+        let mut refreshed = original.clone();
+        refreshed
+            .attributes
+            .insert("expiry".into(), serde_json::json!(123));
+        let (sender, _receiver) = mpsc::channel(1);
+        registry
+            .register(sender.clone(), Some("exchange".into()), Some(original))
+            .unwrap();
+        registry.bind(&sender, "task");
+        assert_eq!(
+            registry
+                .task_for_exchange("exchange", &Some(refreshed.clone()))
+                .unwrap()
+                .as_deref(),
+            Some("task")
+        );
+        let (other, _other) = mpsc::channel(1);
+        assert!(
+            registry
+                .register(other, Some("exchange".into()), Some(refreshed))
+                .is_err()
+        );
+    }
 
     #[test]
     fn different_callers_can_independently_use_the_same_exchange_identifier() {

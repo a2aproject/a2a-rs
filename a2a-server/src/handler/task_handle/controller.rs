@@ -105,13 +105,19 @@ impl TaskController {
         active.task.unregister(active);
     }
 
-    /// A panicking preparation has not started a driver to clean up its inbox.
-    pub(in crate::handler) fn recover_preparation(&mut self) {
-        if let ExecutionState::Running(invocation) = &self.execution
-            && !invocation.active.is_prepared()
-        {
-            invocation.active.inputs.close();
-            self.execution = ExecutionState::Idle;
+    /// A failed task operation cannot leave an invocation registered without
+    /// a driver that can complete it. Storage remains authoritative on retry.
+    pub(in crate::handler) fn recover_panic(&mut self) {
+        let active = match std::mem::take(&mut self.execution) {
+            ExecutionState::Running(invocation) => Some(invocation.active),
+            ExecutionState::Canceling { progress, .. } => Some(progress.active.clone()),
+            ExecutionState::Idle => None,
+        };
+        if let Some(active) = active {
+            active.inputs.revoke();
+            active.task.unregister(&active);
+            active.inputs_drained.cancel();
+            active.task.notify();
         }
     }
 
@@ -157,6 +163,7 @@ impl TaskController {
             // The invocation owns its inbox and caller context independently of this request.
             active.inputs.received(task.generation);
             let context = crate::ExecutorContext {
+                outputs: Default::default(),
                 execution_id: active.execution_id.clone(),
                 message: message.request.message,
                 task_id: task.id.clone(),
@@ -327,9 +334,6 @@ impl TaskController {
                 self.release(&active);
             }
             TurnEnd::Failed(error) => {
-                active
-                    .uncreated
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 reject_unread_inputs(&active, &task_id, self).await;
                 execution::publish_failure(handler, &active, &task_id, &error).await;
                 release_execution(&active, &task_id, self).await;
@@ -716,6 +720,7 @@ mod invalid_lifecycle_tests {
         let task = handler.tasks.task("missing");
         let mut controller = TaskController::default();
         let message = AuthorizedMessage {
+            receipt: None,
             request: send_req(Some("missing"), None),
             params: ServiceParams::new(),
             user: None,

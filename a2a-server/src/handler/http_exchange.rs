@@ -149,6 +149,7 @@ async fn route(
             permit.send(Incoming {
                 request: IncomingRequest::Message(Box::new(MessageInput::Authorized(
                     AuthorizedMessage {
+                        receipt: Some(state.clone()),
                         request: authorized.request.clone(),
                         params: authorized.params.clone(),
                         user: authorized.user.clone(),
@@ -172,35 +173,35 @@ async fn route(
                     "live acknowledgement timed out; input was not admitted",
                 ));
             }
-            // Processing is owned by the live runner. ACK is receipt, not an
-            // acceptance verdict; a later refusal still goes to its downlink.
-            let task = handler
-                .tasks
-                .task(&bound_task)
-                .snapshot()
-                .ok_or_else(|| A2AError::task_not_found(&bound_task))?;
-            Ok(Some(Box::new(task)))
+            match state.committed_task() {
+                Some(task) => Ok(Some(Box::new(task))),
+                None => Err(A2AError::internal(
+                    "live acknowledgement timed out; input outcome is unknown; inspect the task before retrying",
+                )),
+            }
         }
         Ok(Err(_)) => {
-            // Processing began but its receipt was lost. Recover from
-            // storage instead of delivering possibly recorded input twice.
-            let task = match handler.tasks.task(&bound_task).snapshot() {
-                Some(task) => task,
-                None => tokio::time::timeout_at(deadline, handler.tasks.load(&bound_task))
-                    .await
-                    .map_err(|_| {
-                        A2AError::internal(
+            // Cache publication can trail persistence. Only storage or the
+            // receipt written immediately after a successful save proves commit.
+            let committed = state.committed_task();
+            let task =
+                match tokio::time::timeout_at(deadline, handler.tasks.load(&bound_task)).await {
+                    Ok(Ok(task)) => task,
+                    _ if committed.is_some() => committed.clone().unwrap(),
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(A2AError::internal(
                             "live receipt recovery timed out; input outcome is unknown",
-                        )
-                    })??,
-            };
+                        ));
+                    }
+                };
             let raw = StreamRequest {
                 tenant: message.tenant.clone(),
                 payload: StreamRequestPayload::SendMessage(message.clone()),
             };
-            if !records_message(&task, &raw) {
+            if committed.is_none() && !records_message(&task, &raw) {
                 return Err(A2AError::internal(
-                    "the live exchange failed while handling the request",
+                    "the live exchange failed while handling the request; input outcome is unknown",
                 ));
             }
             Ok(Some(Box::new(task)))
@@ -266,45 +267,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_http_deadline_acknowledges_an_owned_request_without_retrying_it() {
-        let handler = make_handler().with_http_followup_timeout(Duration::from_millis(10));
-        seed_task(&handler, "task", "context").await;
-        let source = handler.tasks.task("task");
-        source.set_snapshot(handler.tasks.load("task").await.unwrap());
-        let params = ServiceParams::new();
-        let HttpOpening::Attached {
-            registration,
-            mut uplink,
-        } = open(
-            &handler,
-            &params,
-            StreamRequest {
-                tenant: None,
-                payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
-                    id: "task".into(),
+    async fn an_owned_http_deadline_requires_evidence_of_commit() {
+        for committed in [false, true] {
+            let handler = make_handler().with_http_followup_timeout(Duration::from_millis(10));
+            seed_task(&handler, "task", "context").await;
+            let source = handler.tasks.task("task");
+            source.set_snapshot(handler.tasks.load("task").await.unwrap());
+            let params = ServiceParams::new();
+            let HttpOpening::Attached {
+                registration,
+                mut uplink,
+            } = open(
+                &handler,
+                &params,
+                StreamRequest {
                     tenant: None,
-                    last_seen_generation: None,
-                }),
-            },
-        )
-        .await
-        .unwrap()
-        else {
-            panic!("opening")
-        };
-        registration.bind("task");
-        uplink.next().await.unwrap();
-        let request = StreamRequest {
-            tenant: None,
-            payload: StreamRequestPayload::SendMessage(send_req(Some("task"), Some("context"))),
-        };
-        let (response, _) = tokio::join!(open(&handler, &params, request), async {
-            let queued = uplink.next().await.unwrap();
-            let _owned = queued.receipt.unwrap().begin().unwrap();
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        });
-        assert!(matches!(response.unwrap(), HttpOpening::Acknowledged(task) if task.id == "task"));
-        drop(registration);
+                    payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                        id: "task".into(),
+                        tenant: None,
+                        last_seen_generation: None,
+                    }),
+                },
+            )
+            .await
+            .unwrap()
+            else {
+                panic!("opening")
+            };
+            registration.bind("task");
+            uplink.next().await.unwrap();
+            let request = StreamRequest {
+                tenant: None,
+                payload: StreamRequestPayload::SendMessage(send_req(Some("task"), Some("context"))),
+            };
+            let (response, _) = tokio::join!(open(&handler, &params, request), async {
+                let queued = uplink.next().await.unwrap();
+                let owned = queued.receipt.unwrap().begin().unwrap();
+                if committed {
+                    owned.state().committed(&source.snapshot().unwrap());
+                }
+                let _owned = owned;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            });
+            if committed {
+                assert!(
+                    matches!(response.unwrap(), HttpOpening::Acknowledged(task) if task.id == "task")
+                );
+            } else {
+                assert!(
+                    response
+                        .err()
+                        .unwrap()
+                        .message
+                        .contains("outcome is unknown")
+                );
+            }
+            drop(registration);
+        }
     }
 
     async fn bound_run(handler: &DefaultRequestHandler) -> Run {
@@ -657,6 +676,7 @@ mod tests {
         handler.http_live_responses.bind(&sender, "task");
         (
             AuthorizedMessage {
+                receipt: None,
                 request: send_req(Some("task"), Some("context")),
                 params: ServiceParams::new(),
                 user: None,
@@ -685,7 +705,14 @@ mod tests {
                 }
                 let source = handler.tasks.task("task");
                 if cached {
-                    source.set_snapshot(snapshot.clone());
+                    let mut stale = snapshot.clone();
+                    // Deliberately disagree with storage in both directions.
+                    stale.history = if recorded {
+                        None
+                    } else {
+                        Some(vec![input.request.message.clone().unwrap()])
+                    };
+                    source.set_snapshot(stale);
                 }
                 let (result, ()) = tokio::join!(route(&handler, &input, None), async {
                     // A panic/disconnect after begin loses the receipt; it
@@ -801,7 +828,7 @@ mod tests {
                 .unwrap();
             tokio::time::sleep(Duration::from_secs(2)).await;
         });
-        assert_eq!(result.unwrap_err().code, error_code::TASK_NOT_FOUND);
+        assert!(result.unwrap_err().message.contains("outcome is unknown"));
         handler.shutdown().await;
     }
 
