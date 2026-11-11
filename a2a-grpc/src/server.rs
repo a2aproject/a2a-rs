@@ -16,6 +16,11 @@ use crate::errors::a2a_error_to_status;
 
 type BoxStreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
 
+struct UplinkFailure {
+    status: tonic::Status,
+    had_input: bool,
+}
+
 /// Tonic decoding failures are fatal transport errors, not a normal half-close.
 /// Keep the error alongside the normalized input so it can reach the downlink
 /// even when the handler is still waiting for its first request.
@@ -23,16 +28,22 @@ fn decode_live_uplink(
     input: impl Stream<Item = Result<proto::StreamRequest, tonic::Status>> + Send + 'static,
 ) -> (
     futures::stream::BoxStream<'static, a2a::StreamRequest>,
-    futures::future::BoxFuture<'static, tonic::Status>,
+    futures::future::BoxFuture<'static, UplinkFailure>,
 ) {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let input = input
-        .scan(Some(sender), |sender, item| {
+        .scan((Some(sender), false), |(sender, had_input), item| {
             futures::future::ready(match item {
-                Ok(request) => Some(pbconv::from_proto_stream_request(&request)),
-                Err(error) => {
+                Ok(request) => {
+                    *had_input = true;
+                    Some(pbconv::from_proto_stream_request(&request))
+                }
+                Err(status) => {
                     if let Some(sender) = sender.take() {
-                        let _ = sender.send(error);
+                        let _ = sender.send(UplinkFailure {
+                            status,
+                            had_input: *had_input,
+                        });
                     }
                     None
                 }
@@ -50,31 +61,58 @@ fn decode_live_uplink(
     (input, fault)
 }
 
+struct LiveDownlinkState {
+    events: futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>>,
+    fault: futures::future::BoxFuture<'static, UplinkFailure>,
+    failure: Option<UplinkFailure>,
+    remaining: usize,
+    delivered: bool,
+}
+
 fn live_downlink(
     events: futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>>,
-    fault: futures::future::BoxFuture<'static, tonic::Status>,
+    fault: futures::future::BoxFuture<'static, UplinkFailure>,
 ) -> BoxStreamResult<proto::StreamResponse> {
-    // A transport failure must follow output already ready for earlier valid
-    // inputs. Bound the drain so an always-ready executor cannot hide the error.
-    futures::stream::unfold(Some((events, fault, None, 128usize)), |state| async move {
-        let (mut events, mut fault, mut failed, mut remaining) = state?;
+    let state = LiveDownlinkState {
+        events,
+        fault,
+        failure: None,
+        remaining: 128,
+        delivered: false,
+    };
+    futures::stream::unfold(Some(state), |state| async move {
+        let mut state = state?;
         loop {
-            if let Some(error) = failed {
-                if remaining > 0 {
-                    if let Some(Some(event)) = events.next().now_or_never() {
-                        remaining -= 1;
-                        return Some((map_proto_stream_item(event), Some((events, fault, Some(error), remaining))));
-                    }
+            if let Some(failure) = state.failure.take() {
+                // A received request may have committed before its opening
+                // snapshot is polled. Preserve that response before the fault.
+                let event = if state.remaining == 0 {
+                    None
+                } else if failure.had_input && !state.delivered {
+                    state.events.next().await
+                } else {
+                    state.events.next().now_or_never().flatten()
+                };
+                if let Some(event) = event {
+                    state.delivered = true;
+                    state.remaining -= 1;
+                    state.failure = Some(failure);
+                    return Some((map_proto_stream_item(event), Some(state)));
                 }
-                return Some((Err(error), None));
+                return Some((Err(failure.status), None));
             }
             tokio::select! {
                 biased;
-                error = &mut fault => failed = Some(error),
-                event = events.next() => return event.map(|event| (map_proto_stream_item(event), Some((events, fault, None, remaining)))),
+                failure = &mut state.fault => state.failure = Some(failure),
+                event = state.events.next() => {
+                    let event = event?;
+                    state.delivered = true;
+                    return Some((map_proto_stream_item(event), Some(state)));
+                },
             }
         }
-    }).boxed()
+    })
+    .boxed()
 }
 
 async fn open_live_downlink(
@@ -84,7 +122,7 @@ async fn open_live_downlink(
             A2AError,
         >,
     >,
-    mut fault: futures::future::BoxFuture<'static, tonic::Status>,
+    mut fault: futures::future::BoxFuture<'static, UplinkFailure>,
 ) -> Result<BoxStreamResult<proto::StreamResponse>, tonic::Status> {
     tokio::pin!(opening);
     let events = tokio::select! {
@@ -92,15 +130,17 @@ async fn open_live_downlink(
         // Prefer an already-open response so its ready events can drain.
         events = &mut opening => match events {
             Ok(events) => events,
-            Err(error) => return Err((&mut fault).now_or_never().unwrap_or_else(|| a2a_error_to_status(&error))),
+            Err(error) => return Err((&mut fault).now_or_never().map(|failure| failure.status).unwrap_or_else(|| a2a_error_to_status(&error))),
         },
-        error = &mut fault => {
-            // Poll once after the malformed frame closed the input. Never
-            // wait for unrelated executor work just to report bad framing.
-            if let Some(Ok(events)) = opening.now_or_never() {
-                return Ok(live_downlink(events, futures::future::ready(error).boxed()));
+        failure = &mut fault => {
+            if !failure.had_input { return Err(failure.status); }
+            // Admission owns the first request. A later malformed frame must
+            // not drop its opening while persistence is still completing.
+            match opening.await {
+                Ok(events) => return Ok(live_downlink(events, futures::future::ready(failure).boxed())),
+                Err(_) => return Err(failure.status),
             }
-            return Err(error);
+
         },
     };
     Ok(live_downlink(events, fault))
@@ -378,7 +418,7 @@ mod tests {
         assert!(input.next().await.is_some());
         assert!(input.next().await.is_none());
         assert!(input.next().await.is_none());
-        let mut output = live_downlink(futures::stream::pending().boxed(), fault);
+        let mut output = live_downlink(futures::stream::empty().boxed(), fault);
         let error = output.next().await.unwrap().unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
         assert_eq!(error.message(), "bad protobuf frame");
@@ -397,8 +437,11 @@ mod tests {
             } else {
                 futures::stream::iter([Ok(event.clone())]).boxed()
             };
-            let fault =
-                futures::future::ready(tonic::Status::data_loss("bad protobuf frame")).boxed();
+            let fault = futures::future::ready(UplinkFailure {
+                status: tonic::Status::data_loss("bad protobuf frame"),
+                had_input: false,
+            })
+            .boxed();
             let mut output = live_downlink(events, fault);
             let mut received = 0;
             loop {
@@ -420,7 +463,11 @@ mod tests {
     async fn opening_fault_does_not_wait_for_unrelated_executor_work() {
         let error = open_live_downlink(
             futures::future::pending(),
-            futures::future::ready(tonic::Status::data_loss("broken input")).boxed(),
+            futures::future::ready(UplinkFailure {
+                status: tonic::Status::data_loss("broken input"),
+                had_input: false,
+            })
+            .boxed(),
         )
         .await
         .err()
@@ -451,10 +498,54 @@ mod tests {
         });
         let mut events = open_live_downlink(
             opening,
-            futures::future::ready(tonic::Status::data_loss("broken input")).boxed(),
+            futures::future::ready(UplinkFailure {
+                status: tonic::Status::data_loss("broken input"),
+                had_input: true,
+            })
+            .boxed(),
         )
         .await
         .unwrap();
+        assert!(events.next().await.unwrap().is_ok());
+        assert_eq!(
+            events.next().await.unwrap().unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_later_malformed_frame_preserves_a_pending_admitted_opening() {
+        let frame = proto::StreamRequest::default();
+        let (mut input, fault) = decode_live_uplink(futures::stream::iter([
+            Ok(frame),
+            Err(tonic::Status::data_loss("bad later frame")),
+        ]));
+        let opening = async move {
+            assert!(input.next().await.is_some());
+            assert!(input.next().await.is_none());
+            // Admission and then its first response need additional polls.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            Ok(futures::stream::once(async {
+                tokio::task::yield_now().await;
+                Ok(StreamResponse::Task(a2a::Task {
+                    id: "committed".into(),
+                    context_id: "context".into(),
+                    generation: 1,
+                    timeline: None,
+                    status: a2a::TaskStatus {
+                        state: a2a::TaskState::Working,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: None,
+                    metadata: None,
+                }))
+            })
+            .boxed())
+        };
+        let mut events = open_live_downlink(opening, fault).await.unwrap();
         assert!(events.next().await.unwrap().is_ok());
         assert_eq!(
             events.next().await.unwrap().unwrap_err().code(),
