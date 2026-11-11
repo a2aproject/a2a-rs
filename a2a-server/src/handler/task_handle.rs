@@ -15,6 +15,11 @@ mod controller;
 
 pub(super) use controller::{OutputAction, TaskCommand, TaskController};
 
+tokio::task_local! {
+    // A publication can join only the batch of the controller executing it.
+    static CONTROLLER: TaskHandle;
+}
+
 const TASK_QUEUE_CAPACITY: usize = 32;
 pub(super) type TaskSender = tokio::sync::mpsc::Sender<QueuedCommand>;
 
@@ -57,6 +62,7 @@ pub(super) enum TaskOperation {
     Input,
     Subscribe,
     Output,
+    Publication,
     Finished,
     Cancel,
 }
@@ -129,7 +135,16 @@ impl TaskHandle {
             .get_or_init(|| super::push_delivery::PublicationQueue::new(self))
     }
 
+    fn in_controller(&self) -> bool {
+        CONTROLLER
+            .try_with(|task| Arc::ptr_eq(&task.inner, &self.inner))
+            .unwrap_or(false)
+    }
+
     pub(super) fn buffer_notification(&self, event: ExecutionEvent) -> bool {
+        if !self.in_controller() {
+            return false;
+        }
         let mut state = self.inner.state.write();
         if let Some(events) = &mut state.notifications {
             events.push(event);
@@ -289,7 +304,7 @@ impl TaskHandle {
         let (sender, mut commands) =
             tokio::sync::mpsc::channel::<QueuedCommand>(TASK_QUEUE_CAPACITY);
         let background_tasks = task.background_tasks().clone();
-        background_tasks.spawn(async move {
+        background_tasks.spawn(CONTROLLER.scope(task.clone(), async move {
             use futures::FutureExt;
             let mut state = TaskController::default();
             while let Some(work) = commands.recv().await {
@@ -312,7 +327,7 @@ impl TaskHandle {
                 task.finish_notifications(work.publication);
                 drop(work._lease);
             }
-        });
+        }));
         Arc::new(sender)
     }
 
@@ -574,6 +589,51 @@ impl TaskHandle {
         input_generation: Option<i64>,
         execution: Option<&Arc<ActiveExecution>>,
     ) {
+        // Reserve capacity before assigning a cursor. Direct publishers use the
+        // same mailbox as controller batches, preserving client/webhook order.
+        if !self.in_controller()
+            && self.pushes().is_some()
+            && execution.is_none()
+            && kind == EventKind::Normal
+            && result.is_ok_and(|event| super::protocol::task_id_for_event(event).is_some())
+        {
+            let publication = self
+                .request(TaskOperation::Publication, |reply| TaskCommand::Publish {
+                    source: self.clone(),
+                    event: Box::new(result.cloned().map_err(Clone::clone)),
+                    snapshot: snapshot.map(Box::new),
+                    kind,
+                    failure: failure.clone(),
+                    input_generation,
+                    reply,
+                })
+                .await;
+            if let Err(error) = publication {
+                let event = ExecutionEvent {
+                    sequence: 0,
+                    input_generation: input_generation.unwrap_or(0),
+                    result: result.cloned().map_err(Clone::clone),
+                    kind,
+                    failure,
+                    response_task: None,
+                };
+                super::push_worker::signal_failure(self.pushes().unwrap().sender(), &event, error);
+            }
+            return;
+        }
+        self.publish_event_inner(result, snapshot, kind, failure, input_generation, execution)
+            .await;
+    }
+
+    async fn publish_event_inner(
+        &self,
+        result: Result<&StreamResponse, &A2AError>,
+        snapshot: Option<Task>,
+        kind: EventKind,
+        failure: Option<FailureSignal>,
+        input_generation: Option<i64>,
+        execution: Option<&Arc<ActiveExecution>>,
+    ) {
         let event = {
             let mut state = self.inner.state.write();
             if let Some(execution) = execution {
@@ -744,19 +804,26 @@ mod tests {
         let permits: Vec<_> = (0..super::super::push_delivery::PUSH_OUTPUT_BATCHES)
             .map(|_| task.publications().try_reserve().unwrap())
             .collect();
-        task.inner.state.write().notifications = Some(Vec::new());
-        let (failure, signal) = watch::channel(None);
-        task.publish(
-            Ok(&StreamResponse::Task(task_with_history(
-                "task", "context", 0,
-            ))),
-            None,
-            EventKind::Normal,
-            Some(failure),
-            0,
-        )
-        .await;
-        task.finish_notifications(None);
+        let (failure, mut signal) = watch::channel(None);
+        let source = task.clone();
+        task.submit(TaskOperation::Subscribe, move |_| {
+            Box::pin(async move {
+                source
+                    .publish(
+                        Ok(&StreamResponse::Task(task_with_history(
+                            "task", "context", 0,
+                        ))),
+                        None,
+                        EventKind::Normal,
+                        Some(failure),
+                        0,
+                    )
+                    .await;
+            })
+        })
+        .await
+        .unwrap();
+        signal.changed().await.unwrap();
         assert!(
             signal
                 .borrow()

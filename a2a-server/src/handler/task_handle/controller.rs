@@ -511,6 +511,15 @@ pub(in crate::handler) enum TaskCommand {
         event: Box<StreamResponse>,
         reply: super::CommandReply<Result<OutputAction, A2AError>>,
     },
+    Publish {
+        source: super::TaskHandle,
+        event: Box<Result<StreamResponse, A2AError>>,
+        snapshot: Option<Box<Task>>,
+        kind: protocol::EventKind,
+        failure: Option<super::FailureSignal>,
+        input_generation: Option<i64>,
+        reply: super::CommandReply<()>,
+    },
     Finished {
         handler: DefaultRequestHandler,
         active: Arc<ActiveExecution>,
@@ -570,6 +579,27 @@ impl TaskCommand {
                 event,
                 reply,
             } => reply.complete(state.output(&handler, active, *event).await),
+            Self::Publish {
+                source,
+                event,
+                snapshot,
+                kind,
+                failure,
+                input_generation,
+                reply,
+            } => {
+                source
+                    .publish_event_inner(
+                        event.as_ref().as_ref(),
+                        snapshot.map(|task| *task),
+                        kind,
+                        failure,
+                        input_generation,
+                        None,
+                    )
+                    .await;
+                reply.complete(());
+            }
             Self::Finished {
                 handler,
                 active,

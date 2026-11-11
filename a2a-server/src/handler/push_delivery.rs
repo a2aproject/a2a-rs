@@ -148,7 +148,7 @@ impl PublicationQueue {
                         )
                     });
             }
-            TaskOperation::Output => self.regular.clone(),
+            TaskOperation::Output | TaskOperation::Publication => self.regular.clone(),
             TaskOperation::Finished => self.terminal.clone(),
         };
         let execution = (matches!(operation, TaskOperation::Output))
@@ -743,6 +743,50 @@ mod tests {
             .await;
         assert_eq!(source.background_tasks().count(), 0);
         assert_eq!(source.sender().receiver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_publication_orders_with_controller_batches_after_capacity_wait() {
+        let (source, mut notifications) = captured_source(8, false).await;
+        let mut events = source.sender().subscribe();
+        let permits: Vec<_> = std::iter::from_fn(|| source.publications().try_reserve()).collect();
+        assert_eq!(permits.len(), PUSH_OUTPUT_BATCHES);
+
+        let direct_event = StreamResponse::Task(task_with_history("task", "context", 0));
+        let direct = source.publish(Ok(&direct_event), None, EventKind::Normal, None, 0);
+        tokio::pin!(direct);
+        assert!(futures::poll!(&mut direct).is_pending());
+        // The direct call has not allocated a cursor while waiting for space.
+        assert!(events.try_recv().is_err());
+
+        let controller_source = source.clone();
+        source
+            .submit(super::super::task_handle::TaskOperation::Input, move |_| {
+                Box::pin(async move {
+                    let event = StreamResponse::Task(task_with_history("task", "context", 1));
+                    controller_source
+                        .publish(Ok(&event), None, EventKind::Normal, None, 0)
+                        .await;
+                })
+            })
+            .await
+            .unwrap();
+        let first = timeout(Duration::from_secs(1), notifications.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.event.sequence, 1);
+        assert_eq!(events.recv().await.unwrap().sequence, first.event.sequence);
+
+        drop(permits);
+        timeout(Duration::from_secs(1), &mut direct).await.unwrap();
+        let next = timeout(Duration::from_secs(1), notifications.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.event.sequence, 2);
+        assert_eq!(events.recv().await.unwrap().sequence, next.event.sequence);
+        source.background_tasks().shutdown().await;
     }
 
     #[tokio::test]
