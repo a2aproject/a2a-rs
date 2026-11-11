@@ -60,6 +60,52 @@ impl<T: Transport + 'static> TransportHandler<T> {
     }
 }
 
+/// A Task ACK is a snapshot, so it supersedes older events from the other
+/// HTTP channel. Retain one task cursor per live exchange, without a registry.
+#[derive(Default)]
+struct LiveTaskCursor {
+    observed: Option<(TaskId, i64)>,
+    acknowledged: Option<(TaskId, i64)>,
+}
+
+impl LiveTaskCursor {
+    fn observe(&mut self, event: &StreamResponse) -> bool {
+        let (id, generation) = match event {
+            StreamResponse::Task(task) => (&task.id, task.generation),
+            StreamResponse::StatusUpdate(event) => (&event.task_id, event.generation),
+            StreamResponse::ArtifactUpdate(event) => (&event.task_id, event.generation),
+            StreamResponse::MessageUpdate(event) => (&event.task_id, event.generation),
+            _ => return true,
+        };
+        if self
+            .acknowledged
+            .as_ref()
+            .is_some_and(|(task, snapshot)| task == id && generation <= *snapshot)
+            || self
+                .observed
+                .as_ref()
+                .is_some_and(|(task, seen)| task == id && generation < *seen)
+        {
+            return false;
+        }
+        self.observed = Some((id.clone(), generation));
+        true
+    }
+
+    fn acknowledge(&mut self, task: &Task) -> bool {
+        if self
+            .observed
+            .as_ref()
+            .is_some_and(|(id, generation)| id == &task.id && task.generation <= *generation)
+        {
+            return false;
+        }
+        self.acknowledged = Some((task.id.clone(), task.generation));
+        self.observed = self.acknowledged.clone();
+        true
+    }
+}
+
 #[async_trait]
 impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
     async fn send_message(
@@ -97,13 +143,17 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
             .await?;
         Ok(Box::pin(async_stream::stream! {
             let mut events = connection.events;
+            let mut progress = LiveTaskCursor::default();
             let mut sender = Some(connection.sender);
             let mut pending: Option<futures::future::BoxFuture<'static, Result<a2a_client::LiveAck, A2AError>>> = None;
             loop {
                 tokio::select! {
                     // Deliver replies even while the remote uplink is full.
                     event = events.next() => match event {
-                        Some(event) => yield event,
+                        Some(event) => {
+                            if event.as_ref().is_ok_and(|event| !progress.observe(event)) { continue; }
+                            yield event;
+                        }
                         None => break,
                     },
                     request = uplink.next(), if pending.is_none() && sender.is_some() => match request {
@@ -119,10 +169,11 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
                             Ok(a2a_client::LiveAck::Task(task)) => {
                                 // HTTP-backed transports can acknowledge an
                                 // input with a snapshot outside the downlink.
-                                yield Ok(StreamResponse::Task(*task));
+                                if progress.acknowledge(&task) { yield Ok(StreamResponse::Task(*task)); }
                             }
                             Ok(a2a_client::LiveAck::Reopened(connection)) => {
                                 events = connection.events;
+                                progress = LiveTaskCursor::default();
                                 sender = Some(connection.sender);
                             }
                             Ok(_) => {}
@@ -438,6 +489,7 @@ mod tests {
         last_params: Mutex<Option<ServiceParams>>,
         live_requests: Arc<Mutex<Vec<StreamRequest>>>,
         live_task_ack: bool,
+        ack_release: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl FakeTransport {
@@ -454,6 +506,7 @@ mod tests {
         requests: Arc<Mutex<Vec<StreamRequest>>>,
         output: tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
         task_ack: bool,
+        ack_release: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[async_trait]
@@ -461,6 +514,15 @@ mod tests {
         async fn send(&self, request: StreamRequest) -> Result<a2a_client::LiveAck, A2AError> {
             self.requests.lock().unwrap().push(request);
             if self.task_ack {
+                if let Some(release) = &self.ack_release {
+                    let mut newer = fake_task();
+                    newer.generation = 43;
+                    self.output
+                        .send(Ok(StreamResponse::Task(newer)))
+                        .await
+                        .unwrap();
+                    release.notified().await;
+                }
                 let mut task = fake_task();
                 task.generation = 42;
                 return Ok(a2a_client::LiveAck::Task(Box::new(task)));
@@ -551,6 +613,7 @@ mod tests {
                     requests: self.live_requests.clone(),
                     output: sender,
                     task_ack: self.live_task_ack,
+                    ack_release: self.ack_release.clone(),
                 })),
                 events: stream::unfold(receiver, |mut receiver| async move {
                     receiver.recv().await.map(|item| (item, receiver))
@@ -768,6 +831,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_acknowledgements_and_downlink_updates_cannot_regress_each_other() {
+        let mut task = fake_task();
+        task.generation = 5;
+        let events = [
+            StreamResponse::Task(task.clone()),
+            StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: task.id.clone(),
+                context_id: task.context_id.clone(),
+                status: task.status.clone(),
+                metadata: None,
+                generation: 5,
+            }),
+            StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                task_id: task.id.clone(),
+                context_id: task.context_id.clone(),
+                artifact: serde_json::from_value(
+                    serde_json::json!({"artifactId":"artifact", "parts":[{"text":"part"}]}),
+                )
+                .unwrap(),
+                append: None,
+                last_chunk: None,
+                metadata: None,
+                generation: 5,
+            }),
+            StreamResponse::MessageUpdate(TaskMessageUpdateEvent {
+                task_id: task.id.clone(),
+                context_id: task.context_id.clone(),
+                message: fake_message(),
+                metadata: None,
+                generation: 5,
+            }),
+        ];
+        let mut progress = LiveTaskCursor::default();
+        // Different updates at one generation are preserved before any ACK.
+        for event in &events {
+            assert!(progress.observe(event));
+        }
+        task.generation = 4;
+        assert!(!progress.acknowledge(&task));
+        task.generation = 6;
+        assert!(progress.acknowledge(&task));
+        assert!(!progress.acknowledge(&task));
+        for event in &events {
+            assert!(!progress.observe(event));
+        }
+        task.generation = 7;
+        assert!(progress.observe(&StreamResponse::Task(task.clone())));
+        task.generation = 6;
+        assert!(!progress.acknowledge(&task));
+        assert!(progress.observe(&StreamResponse::Message(fake_message())));
+    }
+
     #[tokio::test]
     async fn live_proxy_preserves_http_task_acknowledgements() {
         let handler = TransportHandler::new(FakeTransport {
@@ -793,13 +909,59 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(2), response.collect())
                 .await
                 .unwrap();
-        assert_eq!(events.len(), 2);
-        // ACKs and downlink events are independently ready; preserve both
-        // without requiring one channel to win the select first.
+        // The newer ACK may supersede an opening still buffered on the other
+        // channel. In either ordering, clients see monotonically fresh state.
+        let generations: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(StreamResponse::Task(task)) => Some(task.generation),
+                _ => None,
+            })
+            .collect();
+        assert!(generations.windows(2).all(|pair| pair[0] <= pair[1]));
         assert!(
             events.iter().any(
                 |event| matches!(event, Ok(StreamResponse::Task(task)) if task.generation == 42)
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delayed_http_ack_cannot_replace_a_newer_downlink_snapshot() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = TransportHandler::new(FakeTransport {
+            live_task_ack: true,
+            ack_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task-1".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        let mut events = handler
+            .send_live_message(
+                &sample_params(),
+                stream::iter([request.clone(), request]).boxed(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(events.next().await.unwrap().unwrap(), StreamResponse::Task(task) if task.generation == 43) { break; }
+            }
+        }).await.unwrap();
+        release.notify_one();
+        let remaining: Vec<_> =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.collect())
+                .await
+                .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "the delayed generation-42 ACK was superseded"
         );
     }
 
