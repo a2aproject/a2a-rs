@@ -5,7 +5,7 @@ mod inmemory;
 mod store;
 
 pub use inmemory::InMemoryTaskStore;
-pub use store::{StoredTask, TaskStore, TaskVersion};
+pub use store::{StoredTask, TaskListScope, TaskStore, TaskVersion};
 
 use a2a::Task;
 

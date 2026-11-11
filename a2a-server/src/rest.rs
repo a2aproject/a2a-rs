@@ -457,7 +457,18 @@ async fn handle_post_task_action<H: RequestHandler>(
         .await;
     }
 
-    rest_error_response(A2AError::invalid_request("unsupported task action"))
+    (
+        StatusCode::NOT_FOUND,
+        Json(RestErrorEnvelope {
+            error: RestErrorStatus {
+                code: 404,
+                status: "NOT_FOUND",
+                message: "unknown task action".into(),
+                details: Vec::new(),
+            },
+        }),
+    )
+        .into_response()
 }
 
 async fn handle_cancel_task_legacy<H: RequestHandler>(
@@ -1078,6 +1089,25 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unknown_task_actions_are_http_not_found() {
+        let response = make_app()
+            .oneshot(
+                Request::builder()
+                    .header("A2A-Version", "1.1")
+                    .uri("/tasks/task:unknownAction")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["error"]["code"], 404);
     }
 
     #[tokio::test]

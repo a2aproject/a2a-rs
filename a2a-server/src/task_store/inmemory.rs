@@ -6,11 +6,12 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::time::Instant;
 
 use super::apply_history_length;
-use super::store::{TaskStore, TaskVersion};
+use super::store::{TaskListScope, TaskStore, TaskVersion};
 use crate::pagination::resolve_page_size;
 
 struct StoredEntry {
@@ -20,13 +21,18 @@ struct StoredEntry {
 
 const MAX_LISTINGS: usize = 1024;
 const MAX_LISTING_IDS: usize = 1_000_000;
+const MAX_PRINCIPAL_LISTINGS: usize = 32;
+const MAX_PRINCIPAL_IDS: usize = 250_000;
+const MAX_TENANT_LISTINGS: usize = 256;
+const MAX_TENANT_IDS: usize = 500_000;
 const LISTING_TTL: Duration = Duration::from_secs(300);
 
 struct Listing {
     id: uuid::Uuid,
     expires: Instant,
     query: ListTasksRequest,
-    tasks: Vec<TaskId>,
+    tasks: Arc<Vec<TaskId>>,
+    scope: TaskListScope,
 }
 
 fn listing_query(req: &ListTasksRequest) -> ListTasksRequest {
@@ -74,7 +80,7 @@ impl Tasks {
 ///
 /// Keeps every task for the life of the process unless
 /// [`Self::with_terminal_task_limit`] bounds how many finished ones it holds.
-/// List continuations retain ordered IDs for up to five minutes. Each page
+/// List continuations retain ordered IDs for five minutes of inactivity. Each page
 /// reads current contents and permissions, so concurrent updates remain visible
 /// without skipping IDs that moved in the sort order. New tasks require a new
 /// list. At most 1024 lists and one million IDs are retained; exhaustion rejects
@@ -82,6 +88,7 @@ impl Tasks {
 pub struct InMemoryTaskStore {
     tasks: RwLock<Tasks>,
     terminal_task_limit: Option<usize>,
+    listing_ttl: Duration,
 }
 
 impl InMemoryTaskStore {
@@ -89,7 +96,14 @@ impl InMemoryTaskStore {
         InMemoryTaskStore {
             tasks: RwLock::new(Tasks::default()),
             terminal_task_limit: None,
+            listing_ttl: LISTING_TTL,
         }
+    }
+
+    /// Expire a list after this much inactivity. Successful continuations renew it.
+    pub fn with_listing_ttl(mut self, ttl: Duration) -> Self {
+        self.listing_ttl = ttl;
+        self
     }
 
     /// Keep at most `limit` tasks in a terminal state, purging the one that
@@ -214,13 +228,29 @@ impl TaskStore for InMemoryTaskStore {
         req: &ListTasksRequest,
         visible: &(dyn for<'id> Fn(&'id str) -> bool + Send + Sync),
     ) -> Result<ListTasksResponse, A2AError> {
-        let mut store = self.tasks.write().await;
-        store.expire_listings();
+        self.list_for_scope(
+            req,
+            &TaskListScope {
+                tenant: req.tenant.clone(),
+                principal: None,
+            },
+            Some(visible),
+        )
+        .await
+    }
+
+    async fn list_for_scope(
+        &self,
+        req: &ListTasksRequest,
+        scope: &TaskListScope,
+        visible: Option<&(dyn for<'id> Fn(&'id str) -> bool + Send + Sync)>,
+    ) -> Result<ListTasksResponse, A2AError> {
+        self.tasks.write().await.expire_listings();
         let page_size = resolve_page_size(req.page_size);
         let token = req.page_token.as_deref().filter(|token| !token.is_empty());
         let continuation = token.and_then(|token| token.strip_prefix("snapshot:"));
         let matches = |task: &Task| {
-            visible(&task.id)
+            visible.is_none_or(|visible| visible(&task.id))
                 && req
                     .context_id
                     .as_ref()
@@ -242,22 +272,33 @@ impl TaskStore for InMemoryTaskStore {
             let position = position
                 .parse::<usize>()
                 .map_err(|_| A2AError::invalid_params("invalid page token"))?;
+            let mut store = self.tasks.write().await;
+            store.expire_listings();
             let listing = store
                 .listings
-                .iter()
+                .iter_mut()
                 .find(|listing| listing.id == id)
                 .ok_or_else(|| A2AError::invalid_params("page token expired; start a new list"))?;
-            if listing.query != listing_query(req) || position > listing.tasks.len() {
+            if listing.scope != *scope
+                || listing.query != listing_query(req)
+                || position > listing.tasks.len()
+            {
                 return Err(A2AError::invalid_params("invalid page token"));
             }
+            listing.expires = Instant::now() + self.listing_ttl;
             (listing.tasks.clone(), position, id)
         } else {
-            let mut tasks: Vec<_> = store
-                .entries
-                .values()
-                .map(|entry| &entry.task)
-                .filter(|task| matches(task))
-                .collect();
+            // Copy only Arcs under the read lock. Authorization and sorting run
+            // without a store lock, so a slow listing never holds up writes.
+            let mut tasks: Vec<_> = {
+                let store = self.tasks.read().await;
+                store
+                    .entries
+                    .values()
+                    .map(|entry| entry.task.clone())
+                    .collect()
+            };
+            tasks.retain(|task| matches(task));
             tasks.sort_by_key(|task| (std::cmp::Reverse(task.status.timestamp), task.id.clone()));
             let start = match token {
                 None => 0,
@@ -278,52 +319,75 @@ impl TaskStore for InMemoryTaskStore {
                 }
             };
             (
-                tasks
-                    .into_iter()
-                    .map(|task| task.id.clone())
-                    .collect::<Vec<_>>(),
+                Arc::new(
+                    tasks
+                        .into_iter()
+                        .map(|task| task.id.clone())
+                        .collect::<Vec<_>>(),
+                ),
                 start,
                 uuid::Uuid::now_v7(),
             )
         };
-        // Keep membership/positions stable while reading fresh values and
-        // rechecking filters, deletion and authorization on every page.
-        let current = |id: &TaskId| {
-            store
-                .entries
-                .get(id)
-                .map(|entry| &entry.task)
-                .filter(|task| matches(task))
+        // Refresh contents without cloning whole Tasks while holding a lock.
+        let current: Vec<_> = {
+            let store = self.tasks.read().await;
+            ids.iter()
+                .enumerate()
+                .filter_map(|(position, id)| {
+                    store
+                        .entries
+                        .get(id)
+                        .map(|entry| (position, entry.task.clone()))
+                })
+                .collect()
         };
-        let total_size = ids.iter().filter(|id| current(id).is_some()).count();
-        let mut page: Vec<_> = ids
-            .iter()
-            .enumerate()
-            .skip(start)
-            .filter_map(|(position, id)| current(id).map(|task| (position, (**task).clone())))
-            .take(page_size + 1)
-            .collect();
+        let mut total_size = 0;
+        let mut page = Vec::with_capacity(page_size + 1);
+        for (position, task) in current {
+            if matches(&task) {
+                total_size += 1;
+                if position >= start && page.len() <= page_size {
+                    page.push((position, task));
+                }
+            }
+        }
         let has_more = page.len() > page_size;
         page.truncate(page_size);
         let next_page_token = if has_more {
             if continuation.is_none() {
-                let retained_ids: usize = store
-                    .listings
-                    .iter()
-                    .map(|listing| listing.tasks.len())
-                    .sum();
-                if store.listings.len() >= MAX_LISTINGS
-                    || ids.len() > MAX_LISTING_IDS.saturating_sub(retained_ids)
+                let mut store = self.tasks.write().await;
+                store.expire_listings();
+                let usage = |predicate: &dyn Fn(&Listing) -> bool| {
+                    store
+                        .listings
+                        .iter()
+                        .filter(|entry| predicate(entry))
+                        .fold((0usize, 0usize), |(count, size), entry| {
+                            (count + 1, size + entry.tasks.len())
+                        })
+                };
+                let principal = usage(&|entry| entry.scope == *scope);
+                let tenant = usage(&|entry| entry.scope.tenant == scope.tenant);
+                let global = usage(&|_| true);
+                if principal.0 >= MAX_PRINCIPAL_LISTINGS
+                    || ids.len() > MAX_PRINCIPAL_IDS.saturating_sub(principal.1)
+                    || (scope.tenant.is_some()
+                        && (tenant.0 >= MAX_TENANT_LISTINGS
+                            || ids.len() > MAX_TENANT_IDS.saturating_sub(tenant.1)))
+                    || global.0 >= MAX_LISTINGS
+                    || ids.len() > MAX_LISTING_IDS.saturating_sub(global.1)
                 {
-                    return Err(A2AError::internal(
-                        "task listing capacity reached; retry after existing cursors expire",
+                    return Err(A2AError::invalid_request(
+                        "task listing capacity reached; finish existing traversals or retry after their inactivity expiry",
                     ));
                 }
                 store.listings.push_back(Listing {
                     id: listing_id,
-                    expires: Instant::now() + LISTING_TTL,
+                    expires: Instant::now() + self.listing_ttl,
                     query: listing_query(req),
                     tasks: ids,
+                    scope: scope.clone(),
                 });
             }
             page.last()
@@ -333,7 +397,8 @@ impl TaskStore for InMemoryTaskStore {
         };
         let page = page
             .into_iter()
-            .map(|(_, mut task)| {
+            .map(|(_, task)| {
+                let mut task = (*task).clone();
                 apply_history_length(&mut task, req.history_length);
                 task
             })
@@ -342,7 +407,7 @@ impl TaskStore for InMemoryTaskStore {
             tasks: page,
             next_page_token: next_page_token.unwrap_or_default(),
             page_size: page_size as i32,
-            total_size: total_size as i32,
+            total_size,
         })
     }
 }
@@ -492,10 +557,13 @@ mod tests {
         let store = dated_store().await;
         let mut req = list_request(1);
         req.page_token = Some(store.list(&req).await.unwrap().next_page_token);
-        for _ in 1..MAX_LISTINGS {
+        for _ in 1..MAX_PRINCIPAL_LISTINGS {
             store.list(&list_request(1)).await.unwrap();
         }
-        assert_eq!(store.tasks.read().await.listings.len(), MAX_LISTINGS);
+        assert_eq!(
+            store.tasks.read().await.listings.len(),
+            MAX_PRINCIPAL_LISTINGS
+        );
         assert!(store.list(&list_request(1)).await.is_err());
         assert_eq!(store.list(&req).await.unwrap().tasks[0].id, "b");
 
@@ -514,6 +582,82 @@ mod tests {
         store.list(&list_request(10)).await.unwrap();
         assert!(old_task.upgrade().is_none());
         assert!(store.tasks.read().await.listings.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_quota_and_cursor_ownership_are_isolated_and_activity_renews_ttl() {
+        let store = dated_store().await;
+        let alice = TaskListScope {
+            tenant: Some("tenant".into()),
+            principal: Some((true, "alice".into())),
+        };
+        let bob = TaskListScope {
+            principal: Some((true, "bob".into())),
+            ..alice.clone()
+        };
+        let request = list_request(1);
+        let mut continuation = request.clone();
+        continuation.page_token = Some(
+            store
+                .list_for_scope(&request, &alice, None)
+                .await
+                .unwrap()
+                .next_page_token,
+        );
+        for _ in 1..MAX_PRINCIPAL_LISTINGS {
+            store.list_for_scope(&request, &alice, None).await.unwrap();
+        }
+        assert_eq!(
+            store
+                .list_for_scope(&request, &alice, None)
+                .await
+                .unwrap_err()
+                .code,
+            error_code::INVALID_REQUEST
+        );
+        assert!(store.list_for_scope(&request, &bob, None).await.is_ok());
+        assert!(
+            store
+                .list_for_scope(&continuation, &bob, None)
+                .await
+                .is_err()
+        );
+        tokio::time::advance(Duration::from_secs(240)).await;
+        assert!(
+            store
+                .list_for_scope(&continuation, &alice, None)
+                .await
+                .is_ok()
+        );
+        tokio::time::advance(Duration::from_secs(240)).await;
+        assert!(
+            store
+                .list_for_scope(&continuation, &alice, None)
+                .await
+                .is_ok()
+        );
+        tokio::time::advance(Duration::from_secs(301)).await;
+        assert!(
+            store
+                .list_for_scope(&continuation, &alice, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_predicates_run_without_a_store_lock() {
+        let store = dated_store().await;
+        store
+            .list_scoped(&list_request(1), &|_| {
+                assert!(
+                    store.tasks.try_write().is_ok(),
+                    "listing held a store lock while authorizing"
+                );
+                true
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

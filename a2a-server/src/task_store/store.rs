@@ -14,6 +14,14 @@ pub struct StoredTask {
     pub version: TaskVersion,
 }
 
+/// Trusted caller identity used only for cursor ownership and resource limits.
+/// This does not replace the authorization predicate.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskListScope {
+    pub tenant: Option<String>,
+    pub principal: Option<(bool, String)>,
+}
+
 /// Interface for persisting and retrieving tasks.
 ///
 /// # Concurrency
@@ -60,6 +68,20 @@ pub trait TaskStore: Send + Sync + 'static {
         Err(A2AError::unsupported_operation(
             "store does not support authorized task listing",
         ))
+    }
+
+    /// List with caller-scoped cursor accounting. Existing implementations retain
+    /// their listing behavior; stores with cursor pools should override this.
+    async fn list_for_scope(
+        &self,
+        req: &ListTasksRequest,
+        _scope: &TaskListScope,
+        visible: Option<&(dyn for<'id> Fn(&'id str) -> bool + Send + Sync)>,
+    ) -> Result<ListTasksResponse, A2AError> {
+        match visible {
+            Some(visible) => self.list_scoped(req, visible).await,
+            None => self.list(req).await,
+        }
     }
 
     /// Atomically check that a task is not in a terminal state and transition
