@@ -2640,3 +2640,40 @@ async fn a_cancel_without_a_status_does_not_keep_what_the_agent_said_while_worki
     ));
     release.notify_one();
 }
+
+#[tokio::test]
+async fn send_streaming_message_caps_timeline_without_truncating_storage() {
+    for length in [0, 1] {
+        let handler = quick_handler();
+        let request = with_config(send("complete", None), |config| {
+            config.timeline_length = Some(length)
+        });
+        let events: Vec<_> = handler
+            .send_streaming_message(&ServiceParams::new(), request)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let tasks: Vec<_> = events
+            .iter()
+            .map(|event| event.as_ref().unwrap())
+            .filter_map(|event| match event {
+                StreamResponse::Task(task) => Some(task),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !tasks.is_empty(),
+            "stream must include an opening task: {events:?}"
+        );
+        for task in &tasks {
+            assert_eq!(task.timeline.as_ref().map_or(0, Vec::len), length as usize);
+        }
+        let stored = handler
+            .get_task(&ServiceParams::new(), get(&tasks[0].id))
+            .await
+            .unwrap();
+        assert!(timeline_of(&stored).len() >= 2);
+        assert_eq!(stored.status.state, TaskState::Completed);
+    }
+}
