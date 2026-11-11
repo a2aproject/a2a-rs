@@ -794,7 +794,13 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(events.len(), 2);
-        assert!(matches!(&events[1], Ok(StreamResponse::Task(task)) if task.generation == 42));
+        // ACKs and downlink events are independently ready; preserve both
+        // without requiring one channel to win the select first.
+        assert!(
+            events.iter().any(
+                |event| matches!(event, Ok(StreamResponse::Task(task)) if task.generation == 42)
+            )
+        );
     }
 
     #[tokio::test]
