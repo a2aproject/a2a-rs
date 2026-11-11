@@ -381,13 +381,16 @@ pub fn to_proto_timeline_entry(e: &TimelineEntry) -> proto::TimelineEntry {
 }
 
 /// Entries of a kind this version does not know carry no entry and are
-/// dropped.
+/// retained as a generation-only entry.
 pub fn from_proto_timeline_entry(e: &proto::TimelineEntry) -> Option<TimelineEntry> {
-    let content = match e.entry.as_ref()? {
-        proto::timeline_entry::Entry::Message(m) => TimelineContent::Message(from_proto_message(m)),
-        proto::timeline_entry::Entry::Status(s) => {
+    let content = match e.entry.as_ref() {
+        Some(proto::timeline_entry::Entry::Message(m)) => {
+            TimelineContent::Message(from_proto_message(m))
+        }
+        Some(proto::timeline_entry::Entry::Status(s)) => {
             TimelineContent::Status(from_proto_task_status(s))
         }
+        None => TimelineContent::Unknown,
     };
     Some(TimelineEntry {
         content,

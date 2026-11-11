@@ -112,7 +112,7 @@ fn pre_1_1_task_decodes_with_no_timeline_and_generation_zero() {
 }
 
 #[test]
-fn unknown_timeline_entry_kind_is_dropped() {
+fn unknown_timeline_payload_is_skipped_but_its_generation_is_retained() {
     let json = json!({
         "id": "t1", "contextId": "c1", "status": {"state": "TASK_STATE_WORKING"},
         "timeline": [
@@ -124,8 +124,10 @@ fn unknown_timeline_entry_kind_is_dropped() {
     let task: Task = protojson_conv::from_value(json).unwrap();
 
     let timeline = task.timeline.unwrap();
-    assert_eq!(timeline.len(), 1);
-    assert_eq!(timeline[0].generation, 2);
+    assert_eq!(timeline.len(), 2);
+    assert!(matches!(timeline[0].content, TimelineContent::Unknown));
+    assert_eq!(timeline[0].generation, 1);
+    assert_eq!(timeline[1].generation, 2);
 }
 
 #[test]
@@ -143,7 +145,7 @@ fn timeline_decoding_has_one_empty_representation_across_wire_formats() {
         (Some(json!(null)), vec![]),
         (
             Some(json!([unknown.clone(), later_unknown.clone()])),
-            vec![],
+            vec![5, 9],
         ),
         (Some(json!([])), vec![]),
         (
@@ -152,11 +154,11 @@ fn timeline_decoding_has_one_empty_representation_across_wire_formats() {
                 status.clone(),
                 later_unknown.clone()
             ])),
-            vec![7],
+            vec![5, 7, 9],
         ),
         (
             Some(json!([message, unknown, status, later_unknown])),
-            vec![2, 7],
+            vec![2, 5, 7, 9],
         ),
     ] {
         let mut wire = json!({
@@ -218,7 +220,13 @@ fn unknown_binary_timeline_entries_leave_the_task_generation_intact() {
     task.timeline = vec![unknown];
     task.generation = 9;
     let decoded = pbconv::from_proto_task(&task);
-    assert!(decoded.timeline.is_none());
+    assert!(matches!(
+        decoded.timeline.as_deref(),
+        Some([TimelineEntry {
+            content: TimelineContent::Unknown,
+            generation: 9
+        }])
+    ));
     assert_eq!(decoded.generation, 9);
     assert_eq!(
         serde_json::from_value::<Task>(serde_json::to_value(&decoded).unwrap()).unwrap(),
@@ -545,7 +553,7 @@ fn artifact_only_request_has_no_message_on_the_wire() {
 }
 
 #[test]
-fn native_serde_skips_unknown_timeline_entries_and_null_generations() {
+fn native_serde_retains_unknown_timeline_generations() {
     let json = json!({
         "id": "t1", "contextId": "c1", "status": {"state": "TASK_STATE_WORKING"},
         "generation": null,
@@ -562,10 +570,11 @@ fn native_serde_skips_unknown_timeline_entries_and_null_generations() {
     let timeline = task.timeline.unwrap();
     assert_eq!(
         timeline.len(),
-        2,
-        "the unknown kind is skipped: {timeline:?}"
+        3,
+        "the unknown payload is skipped but its generation remains: {timeline:?}"
     );
-    assert_eq!(timeline[1].generation, 3);
+    assert_eq!(timeline[0].generation, 1);
+    assert_eq!(timeline[2].generation, 3);
 }
 
 #[test]

@@ -447,7 +447,7 @@ pub struct Task {
 
     /// The generation-ordered record of the interaction: agent status
     /// entries and client messages (A2A 1.1, ADR-002).
-    /// Decoding uses `None` when no recognized entries remain, matching protobuf.
+    /// Unknown payloads retain a generation-only entry for gap accounting.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -482,18 +482,51 @@ pub struct TimelineEntry {
 }
 
 /// The content of a [`TimelineEntry`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
-#[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum TimelineContent {
     /// A standalone message, used for client input.
     Message(Message),
     /// An agent status: the state plus the agent's message at that point.
     Status(TaskStatus),
+    /// The payload kind is unknown; only the enclosing generation is retained.
+    Unknown,
 }
 
-/// Reads a timeline, skipping an entry of a kind this version does not know
+impl Serialize for TimelineContent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map =
+            serializer.serialize_map(Some(usize::from(!matches!(self, Self::Unknown))))?;
+        match self {
+            Self::Message(message) => map.serialize_entry("message", message)?,
+            Self::Status(status) => map.serialize_entry("status", status)?,
+            Self::Unknown => {}
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TimelineContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut fields = HashMap::<String, Value>::deserialize(deserializer)?;
+        match (fields.remove("message"), fields.remove("status")) {
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                "timeline entry has multiple payloads",
+            )),
+            (Some(message), None) => serde_json::from_value(message)
+                .map(Self::Message)
+                .map_err(serde::de::Error::custom),
+            (None, Some(status)) => serde_json::from_value(status)
+                .map(Self::Status)
+                .map_err(serde::de::Error::custom),
+            (None, None) => Ok(Self::Unknown),
+        }
+    }
+}
+
+/// Reads a timeline, skipping the payload of a kind this version does not know
 /// (A2A 1.1 §3.2.8: clients MUST skip rather than reject the timeline).
 fn timeline_entries<'de, D: Deserializer<'de>>(
     deserializer: D,
@@ -503,7 +536,6 @@ fn timeline_entries<'de, D: Deserializer<'de>>(
     };
     entries
         .into_iter()
-        .filter(|entry| entry.get("message").is_some() || entry.get("status").is_some())
         .map(|entry| serde_json::from_value(entry).map_err(serde::de::Error::custom))
         .collect::<Result<Vec<_>, _>>()
         .map(|entries| (!entries.is_empty()).then_some(entries))
@@ -1410,7 +1442,10 @@ mod tests {
         unknown["timeline"] = serde_json::json!([{"futureEvent": {"generation": "5"}}]);
         assert_eq!(
             serde_json::from_value::<Task>(unknown).unwrap().timeline,
-            None
+            Some(vec![TimelineEntry {
+                content: TimelineContent::Unknown,
+                generation: 0
+            }])
         );
     }
 
