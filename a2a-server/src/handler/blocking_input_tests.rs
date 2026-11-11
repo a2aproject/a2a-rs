@@ -377,3 +377,45 @@ async fn deadline_does_not_return_an_old_question_as_a_new_answer() {
         handler.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn output_cannot_claim_an_input_the_executor_has_not_read() {
+    struct InvalidTag;
+    impl AgentExecutor for InvalidTag {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::once(async move {
+                let unread = crate::ClientInput::new(Message::new(Role::User, vec![]), i64::MAX);
+                ctx.outputs
+                    .send_for(
+                        &unread,
+                        question(&ctx, TaskState::InputRequired, "not an answer"),
+                    )
+                    .await
+                    .unwrap();
+                futures::future::pending().await
+            })
+            .boxed()
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    let handler = DefaultRequestHandler::new(InvalidTag, InMemoryTaskStore::new());
+    seed_task(&handler, "task", "context").await;
+    let error = timeout(
+        Duration::from_secs(2),
+        handler.send_message(&ServiceParams::new(), request("first")),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+    assert!(error.message.contains("not consumed"));
+    handler.shutdown().await;
+}

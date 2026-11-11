@@ -1109,6 +1109,40 @@ mod subscription_tests {
     use super::*;
 
     #[tokio::test]
+    async fn live_opening_stops_on_a_terminal_snapshot_or_unavailable_task() {
+        use crate::handler::test_support::{make_handler, task_with_history};
+        let handler = make_handler();
+        let params = crate::ServiceParams::new();
+        let settings = ResponsePolicy::subscription(StartMode::Bidi, &params);
+        let task = handler.tasks.task("missing");
+        let mut run = Run::new(handler.clone(), params.clone(), task, settings);
+        let (out, mut received) = mpsc::channel(2);
+        let mut inner = None;
+        let mut generation = 0;
+        assert!(
+            !run.initialize_response(None, &mut inner, &mut generation, &out)
+                .await
+        );
+        assert_eq!(
+            received.recv().await.unwrap().unwrap_err().code,
+            error_code::TASK_NOT_FOUND
+        );
+        assert!(inner.is_none());
+        let mut terminal = task_with_history("missing", "context", 0);
+        terminal.status.state = TaskState::Completed;
+        assert!(
+            !run.initialize_response(Some(terminal.clone()), &mut inner, &mut generation, &out)
+                .await
+        );
+        assert_eq!(
+            received.recv().await.unwrap().unwrap(),
+            StreamResponse::Task(terminal)
+        );
+        assert!(inner.is_none(), "terminal output needs no subscription");
+        handler.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn streaming_lag_resynchronizes_after_a_nonterminal_invocation_ends() {
         use crate::handler::events::ActiveExecution;
         use crate::handler::protocol::EventKind;

@@ -779,6 +779,28 @@ mod tests {
         handler.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn a_cached_task_cannot_acknowledge_a_lost_receipt_after_storage_loss() {
+        let handler = make_handler();
+        let task = handler.tasks.task("task");
+        task.set_snapshot(task_with_history("task", "context", 0));
+        let (input, mut receiver) = routed_input(&handler, 1, None);
+        let (result, ()) = tokio::join!(route(&handler, &input, None), async {
+            drop(
+                receiver
+                    .recv()
+                    .await
+                    .unwrap()
+                    .receipt
+                    .unwrap()
+                    .begin()
+                    .unwrap(),
+            );
+        });
+        assert_eq!(result.unwrap_err().code, error_code::TASK_NOT_FOUND);
+        handler.shutdown().await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_full_http_queue_times_out_without_admitting_another_input() {
         let handler = make_handler().with_http_followup_timeout(Duration::from_secs(1));
