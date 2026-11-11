@@ -35,6 +35,21 @@ fn parse_jsonrpc_error(err: JsonRpcError) -> A2AError {
     a2a::a2a_error_from_details(err.code, err.message, details)
 }
 
+fn decode_jsonrpc_response(body: &str) -> Result<JsonRpcResponse, serde_json::Error> {
+    validate_jsonrpc_response(serde_json::from_str(body)?)
+}
+
+fn validate_jsonrpc_response(
+    response: JsonRpcResponse,
+) -> Result<JsonRpcResponse, serde_json::Error> {
+    if response.jsonrpc != "2.0" {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "jsonrpc must be exactly 2.0",
+        ));
+    }
+    Ok(response)
+}
+
 /// Parses a JSON-RPC envelope. A body that is not one, sent with a non-success
 /// status (an authenticating proxy's 401, a gateway's 429 or 502), is reported
 /// with that status, as the REST transport reports it.
@@ -42,7 +57,7 @@ fn parse_jsonrpc_response(
     status: reqwest::StatusCode,
     body: &str,
 ) -> Result<JsonRpcResponse, A2AError> {
-    serde_json::from_str(body).map_err(|e| {
+    decode_jsonrpc_response(body).map_err(|e| {
         if status.is_success() {
             A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
         } else {
@@ -220,11 +235,12 @@ impl JsonRpcTransport {
             let rpc_response = match parse_jsonrpc_response(status, &body) {
                 Err(_)
                     if method == methods::SEND_LIVE_MESSAGE
-                        && matches!(status.as_u16(), 404 | 405 | 501) =>
+                        && matches!(status.as_u16(), 404 | 405 | 501)
+                        && serde_json::from_str::<Value>(&body).is_err() =>
                 {
-                    return Err(A2AError::unsupported_operation(
-                        "HTTP endpoint does not support live messages",
-                    ));
+                    return Err(A2AError::unsupported_operation(format!(
+                        "HTTP {status} during SendLiveMessage: {body}"
+                    )));
                 }
                 response => response?,
             };
@@ -384,7 +400,7 @@ pub(crate) fn parse_stream_tail(
     }
 
     // A plain JSON-RPC envelope answering the streaming call.
-    if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(text) {
+    if let Ok(response) = decode_jsonrpc_response(text) {
         if let Some(error) = response.error {
             return Some(Err(parse_jsonrpc_error(error)));
         }
@@ -503,24 +519,33 @@ pub(crate) fn parse_jsonrpc_sse_event(
         return None;
     }
 
-    // Try JSON-RPC envelope first
-    match serde_json::from_str::<JsonRpcResponse>(&data) {
-        Ok(rpc_resp) => {
-            if let Some(err) = rpc_resp.error {
-                return Some(Err(parse_jsonrpc_error(err)));
+    let value: Value = match serde_json::from_str(&data) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(A2AError::internal(format!("SSE parse error: {error}")))),
+    };
+    let envelope = value.as_object().is_some_and(|fields| {
+        ["jsonrpc", "id", "result"]
+            .iter()
+            .any(|key| fields.contains_key(*key))
+    });
+    if !envelope {
+        return decode_stream_value(value, "SSE parse error");
+    }
+    match serde_json::from_value::<JsonRpcResponse>(value).and_then(validate_jsonrpc_response) {
+        Ok(response) => {
+            if let Some(error) = response.error {
+                return Some(Err(parse_jsonrpc_error(error)));
             }
-            if let Some(result) = rpc_resp.result {
-                decode_stream_value(result, "SSE parse error")
-            } else {
-                Some(Err(A2AError::internal(
+            match response.result {
+                Some(result) => decode_stream_value(result, "SSE parse error"),
+                None => Some(Err(A2AError::internal(
                     "JSON-RPC stream response missing result",
-                )))
+                ))),
             }
         }
-        Err(_) => {
-            // Fallback: parse directly as StreamResponse
-            decode_stream_text(&data, "SSE parse error")
-        }
+        Err(error) => Some(Err(A2AError::internal(format!(
+            "invalid JSON-RPC stream envelope: {error}"
+        )))),
     }
 }
 
@@ -2552,6 +2577,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jsonrpc_responses_require_exactly_version_two() {
+        for version in ["1.0", "2", "3.0", "2.0 ", ""] {
+            let mut body = json!({"jsonrpc":version,"id":1,"result":{"futureEvent":{}}});
+            // A malformed envelope must not fall back to an unrelated payload.
+            body["message"] =
+                json!({"messageId":"poison", "role":"ROLE_AGENT", "parts":[{"text":"poison"}]});
+            let body = body.to_string();
+            assert!(parse_jsonrpc_response(reqwest::StatusCode::OK, &body).is_err());
+            for data in [body.clone(), format!("data: {body}\n\n")] {
+                let events: Vec<_> = parse_sse_stream(byte_stream(vec![data])).collect().await;
+                assert_eq!(events.len(), 1);
+                assert!(events[0].is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn framed_envelopes_without_a_result_match_unterminated_tail_errors() {
         for body in [
             r#"{"jsonrpc":"2.0","id":1}"#,
@@ -2601,6 +2643,8 @@ mod tests {
                     .unwrap()
                 };
                 assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+                assert!(error.message.contains(status));
+                assert!(error.message.contains("<html>not supported</html>"));
             }
         }
     }

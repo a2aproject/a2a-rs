@@ -42,7 +42,10 @@ pub fn check_framing(data: &[u8]) {
             if let Ok(envelope) = serde_json::from_str::<a2a::JsonRpcResponse>(text) {
                 // An RPC failure, or an absent/null result with no failure,
                 // cannot represent an ignorable future event.
-                if envelope.error.is_some() || envelope.result.is_none() {
+                if envelope.jsonrpc != "2.0"
+                    || envelope.error.is_some()
+                    || envelope.result.is_none()
+                {
                     assert!(
                         tail.as_ref().is_some_and(Result::is_err),
                         "malformed RPC envelope was ignored"
@@ -98,6 +101,9 @@ mod tests {
         for payload in [
             json!({"task":null}),
             json!({"statusUpdate":null}),
+            json!({"messageUpdate":null}),
+            json!({"message_update":null}),
+            json!({"error":null}),
             json!({"task":null,"futureEvent":{}}),
             json!({}),
             json!(null),
@@ -140,17 +146,19 @@ mod tests {
 
     #[test]
     fn framing_oracle_accepts_the_regression_corpus() {
-        for seed in [
-            include_bytes!("../../fuzz/seeds/sse_framing/known-null-task").as_slice(),
-            include_bytes!("../../fuzz/seeds/sse_framing/known-null-status"),
-            include_bytes!("../../fuzz/seeds/sse_framing/known-null-with-unknown"),
-            include_bytes!("../../fuzz/seeds/sse_framing/unknown-result"),
-            include_bytes!("../../fuzz/seeds/sse_framing/unknown-result-null-error"),
-            include_bytes!("../../fuzz/seeds/sse_framing/empty-result"),
-            include_bytes!("../../fuzz/seeds/sse_framing/known-task"),
-            include_bytes!("../../fuzz/seeds/sse_framing/invalid-envelope"),
-        ] {
-            check_framing(seed);
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fuzz/seeds/sse_framing");
+        let mut count = 0;
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                check_framing(&std::fs::read(entry.path()).unwrap());
+                count += 1;
+            }
         }
+        assert!(
+            count >= 16,
+            "the complete framing regression corpus must be present"
+        );
     }
 }
