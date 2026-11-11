@@ -517,6 +517,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_cursors_cannot_invalidate_an_existing_listing() {
+        let store = dated_store().await;
+        let mut request = list_request(1);
+        let cursor = store.list(&request).await.unwrap().next_page_token;
+        let id = cursor.split(':').nth(1).unwrap();
+        for invalid in [
+            "snapshot:missing-position".to_string(),
+            "snapshot:not-a-uuid:1".to_string(),
+            format!("snapshot:{id}:not-a-position"),
+            format!("snapshot:{id}:{}", usize::MAX),
+            URL_SAFE_NO_PAD.encode(b"not a JSON sort key"),
+            "999999999999999999999999999999999999999999".to_string(),
+        ] {
+            request.page_token = Some(invalid);
+            assert_eq!(
+                store.list(&request).await.unwrap_err().code,
+                error_code::INVALID_PARAMS
+            );
+        }
+        request.page_token = Some(cursor);
+        assert_eq!(store.list(&request).await.unwrap().tasks[0].id, "b");
+    }
+
+    #[tokio::test]
     async fn test_create_and_get() {
         let store = InMemoryTaskStore::new();
         let task = make_task("t1", "c1", TaskState::Submitted);
