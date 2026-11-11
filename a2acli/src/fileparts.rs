@@ -65,7 +65,7 @@ impl FilePartSaver {
 
     pub(crate) fn save_message(&mut self, message: &Message) -> Result<(), SaveError> {
         // Live streams also echo client inputs; these are not agent output.
-        if message.role != a2a::Role::Agent {
+        if message.role == a2a::Role::User {
             return Ok(());
         }
         let owner = format!("msg:{}", message.message_id);
@@ -395,6 +395,19 @@ mod tests {
         assert_eq!(scratch.read("a.bin"), b"abc");
         assert_eq!(saver.take_created(), vec![scratch.0.join("a.bin")]);
         assert!(saver.take_created().is_empty());
+    }
+
+    #[test]
+    fn test_unspecified_legacy_sender_file_parts_remain_compatible() {
+        let scratch = Scratch::new();
+        let mut saver = scratch.saver();
+        let mut legacy = message(
+            "legacy",
+            vec![raw(b"legacy output", Some("legacy.bin"), None)],
+        );
+        legacy.role = a2a::Role::Unspecified;
+        legacy.save_to(&mut saver).unwrap();
+        assert_eq!(scratch.read("legacy.bin"), b"legacy output");
     }
 
     #[test]
