@@ -327,7 +327,7 @@ mod tests {
         let params = ServiceParams::new();
         let req = SendMessageRequest {
             artifact_updates: Vec::new(),
-            message: make_message(),
+            message: Some(make_message()),
             configuration: None,
             metadata: None,
             tenant: None,

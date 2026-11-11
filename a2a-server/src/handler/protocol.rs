@@ -77,17 +77,9 @@ pub(super) fn should_interrupt_non_streaming(
     }
 }
 
-/// A request that carries only `artifactUpdates` for an existing task. The
-/// native `message` is not optional, so the wire's absent message arrives as
-/// an empty one with no id (see the protobuf conversion); a message that has
-/// an id, a body or a task of its own is never mistaken for it.
+/// An artifact-only update explicitly omits its message.
 pub(super) fn is_artifact_only(req: &SendMessageRequest) -> bool {
-    !req.artifact_updates.is_empty()
-        && req.message.role == Role::Unspecified
-        && req.message.message_id.is_empty()
-        && req.message.parts.is_empty()
-        && req.message.task_id.is_none()
-        && req.message.context_id.is_none()
+    req.message.is_none() && !req.artifact_updates.is_empty()
 }
 
 /// The task a send request names: the message's, or for an artifact-only
@@ -100,7 +92,9 @@ pub(super) fn request_task_id(req: &SendMessageRequest) -> Option<String> {
             .find(|task_id| !task_id.is_empty())
             .map(str::to_string)
     } else {
-        req.message.task_id.clone()
+        req.message
+            .as_ref()
+            .and_then(|message| message.task_id.clone())
     }
 }
 #[cfg(test)]

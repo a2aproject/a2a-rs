@@ -2,7 +2,6 @@
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 
-use super::protocol::is_artifact_only;
 use a2a::*;
 
 /// Merges an artifact update into the task, advancing the generation. The
@@ -118,12 +117,12 @@ pub(super) fn record_client_input(
     task: &mut Task,
     req: &SendMessageRequest,
 ) -> Result<(), A2AError> {
-    if !is_artifact_only(req) {
+    if let Some(message) = &req.message {
         task.generation += 1;
         task.timeline
             .get_or_insert_with(Vec::new)
             .push(TimelineEntry {
-                content: TimelineContent::Message(req.message.clone()),
+                content: TimelineContent::Message(message.clone()),
                 generation: task.generation,
             });
     }

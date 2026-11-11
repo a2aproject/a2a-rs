@@ -289,7 +289,7 @@ mod tests {
                 &params,
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message,
+                    message: Some(message),
                     configuration: Some(SendMessageConfiguration {
                         if_generation_match: None,
                         timeline_length: None,
@@ -392,7 +392,7 @@ mod tests {
                 &params,
                 SendMessageRequest {
                     artifact_updates: Vec::new(),
-                    message,
+                    message: Some(message),
                     configuration: None,
                     metadata: None,
                     tenant: None,

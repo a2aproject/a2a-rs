@@ -538,7 +538,7 @@ pub(super) fn send_req(task_id: Option<&str>, context_id: Option<&str>) -> SendM
     msg.context_id = context_id.map(Into::into);
     SendMessageRequest {
         artifact_updates: Vec::new(),
-        message: msg,
+        message: Some(msg),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -588,7 +588,7 @@ pub(super) fn caps(streaming: Option<bool>, push: Option<bool>) -> AgentCapabili
 pub(super) fn send_request() -> SendMessageRequest {
     SendMessageRequest {
         artifact_updates: Vec::new(),
-        message: Message::new(Role::User, vec![Part::text("hi")]),
+        message: Some(Message::new(Role::User, vec![Part::text("hi")])),
         configuration: None,
         metadata: None,
         tenant: None,
