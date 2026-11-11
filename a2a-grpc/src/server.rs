@@ -417,6 +417,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_fault_does_not_wait_for_unrelated_executor_work() {
+        let error = open_live_downlink(
+            futures::future::pending(),
+            futures::future::ready(tonic::Status::data_loss("broken input")).boxed(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+        let opening = futures::future::ready(Err(A2AError::invalid_request("empty clean uplink")));
+        let error = open_live_downlink(opening, futures::future::pending().boxed())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn an_opening_ready_after_the_fault_still_drains_its_ready_output() {
+        let mut polled = false;
+        let opening = futures::future::poll_fn(move |_| {
+            if !polled {
+                polled = true;
+                return std::task::Poll::Pending;
+            }
+            let events = futures::stream::iter([Ok(StreamResponse::Message(a2a::Message::new(
+                a2a::Role::Agent,
+                vec![a2a::Part::text("ready reply")],
+            )))])
+            .boxed();
+            std::task::Poll::Ready(Ok(events))
+        });
+        let mut events = open_live_downlink(
+            opening,
+            futures::future::ready(tonic::Status::data_loss("broken input")).boxed(),
+        )
+        .await
+        .unwrap();
+        assert!(events.next().await.unwrap().is_ok());
+        assert_eq!(
+            events.next().await.unwrap().unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn malformed_first_frame_preserves_transport_status_during_opening() {
         let (mut input, fault) = decode_live_uplink(futures::stream::iter([Err(
             tonic::Status::data_loss("bad first frame"),
