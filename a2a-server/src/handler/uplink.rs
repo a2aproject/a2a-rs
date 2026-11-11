@@ -78,7 +78,10 @@ impl IncomingRequest {
             }) => return Some(subscribe.id.clone()),
             _ => return None,
         };
-        Some(message.message.message_id.clone())
+        message
+            .message
+            .as_ref()
+            .map(|message| message.message_id.clone())
             .filter(|id| !id.is_empty())
             .or_else(|| {
                 message

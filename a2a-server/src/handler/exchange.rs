@@ -102,7 +102,9 @@ impl<'a> ExchangeAdapter<'a> {
                     (&bound_task, &mut request.payload)
                     && request_task_id(message).is_none()
                 {
-                    message.message.task_id = Some(task.clone());
+                    if let Some(message) = &mut message.message {
+                        message.task_id = Some(task.clone());
+                    }
                 }
                 let (request, user) = match &request.payload {
                     StreamRequestPayload::SendMessage(_) => {

@@ -144,7 +144,7 @@ fn send(text: &str, task_id: Option<&str>) -> StreamRequest {
     StreamRequest {
         tenant: None,
         payload: StreamRequestPayload::SendMessage(SendMessageRequest {
-            message,
+            message: Some(message),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -247,7 +247,7 @@ async fn unread_input(transport: impl Transport, gate: Arc<tokio::sync::Notify>)
 
     let rejected = send("hello", Some(&opening.id));
     let message_id = match &rejected.payload {
-        StreamRequestPayload::SendMessage(r) => r.message.message_id.clone(),
+        StreamRequestPayload::SendMessage(r) => r.message.as_ref().unwrap().message_id.clone(),
         _ => unreachable!(),
     };
     live.sender

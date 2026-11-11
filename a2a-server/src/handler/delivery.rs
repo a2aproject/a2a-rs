@@ -8,20 +8,9 @@ use super::events::ExecutionReceiver;
 use crate::middleware::ServiceParams;
 use a2a::*;
 
-/// A request that carries only `artifactUpdates` for an existing task. The
-/// native `message` is not optional, so the wire's absent message arrives as
-/// an empty one with no id (see the protobuf conversion); a message that has
-/// an id, a body or a task of its own is never mistaken for it.
+/// An artifact-only update explicitly omits its message.
 pub(super) fn is_artifact_only(req: &SendMessageRequest) -> bool {
-    !req.artifact_updates.is_empty()
-        && req.message.role == Role::Unspecified
-        && req.message.message_id.is_empty()
-        && req.message.parts.is_empty()
-        && req.message.task_id.is_none()
-        && req.message.context_id.is_none()
-        && req.message.metadata.is_none()
-        && req.message.extensions.is_none()
-        && req.message.reference_task_ids.is_none()
+    req.message.is_none() && !req.artifact_updates.is_empty()
 }
 
 /// The task a send request names: the message's, or for an artifact-only
@@ -34,7 +23,9 @@ pub(super) fn request_task_id(req: &SendMessageRequest) -> Option<String> {
             .find(|task_id| !task_id.is_empty())
             .map(str::to_string)
     } else {
-        req.message.task_id.clone()
+        req.message
+            .as_ref()
+            .and_then(|message| message.task_id.clone())
     }
 }
 
@@ -72,7 +63,11 @@ pub(super) fn validate_existing_task(
             ));
         }
     }
-    if let Some(requested) = req.message.context_id.as_deref() {
+    if let Some(requested) = req
+        .message
+        .as_ref()
+        .and_then(|message| message.context_id.as_deref())
+    {
         if requested != task.context_id {
             return Err(A2AError::invalid_params(format!(
                 "contextId {requested} does not match task {}, which belongs to context {}",
@@ -101,7 +96,7 @@ pub(super) fn record_client_input(
 ) -> Result<RecordedInput, A2AError> {
     let mut events = Vec::new();
     let mut message_generation = None;
-    if !is_artifact_only(req) {
+    if let Some(message) = &req.message {
         let asked = task.status.message.clone();
         let history = task.history.get_or_insert_with(Vec::new);
         if !creating
@@ -113,16 +108,16 @@ pub(super) fn record_client_input(
         {
             history.push(asked);
         }
-        history.push(req.message.clone());
+        history.push(message.clone());
         task.generation += 1;
         message_generation = Some(task.generation);
         task.timeline
             .get_or_insert_with(Vec::new)
             .push(TimelineEntry {
-                content: TimelineContent::Message(req.message.clone()),
+                content: TimelineContent::Message(message.clone()),
                 generation: task.generation,
             });
-        events.push(client_message_event(task, &req.message));
+        events.push(client_message_event(task, message));
     }
     events.extend(
         apply_client_artifacts(task, req, creating)?

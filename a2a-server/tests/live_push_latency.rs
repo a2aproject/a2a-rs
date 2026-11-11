@@ -58,7 +58,7 @@ fn send(text: &str, task_id: Option<&str>, push: Option<&str>) -> StreamRequest 
     StreamRequest {
         tenant: None,
         payload: StreamRequestPayload::SendMessage(SendMessageRequest {
-            message,
+            message: Some(message),
             configuration: push.map(|url| SendMessageConfiguration {
                 task_push_notification_config: Some(TaskPushNotificationConfig {
                     url: url.to_string(),

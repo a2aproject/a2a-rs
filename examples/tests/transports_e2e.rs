@@ -914,7 +914,10 @@ async fn rest_transport_push_delivery_end_to_end() {
     let input_generation = match input.event {
         StreamResponse::MessageUpdate(update) => {
             assert_eq!(update.task_id, "task-rest-push");
-            assert_eq!(update.message.message_id, request.message.message_id);
+            assert_eq!(
+                update.message.message_id,
+                request.message.as_ref().unwrap().message_id
+            );
             assert_eq!(update.message.role, Role::User);
             update.generation
         }
@@ -1010,7 +1013,10 @@ async fn jsonrpc_transport_push_delivery_end_to_end() {
     let input_generation = match input.event {
         StreamResponse::MessageUpdate(update) => {
             assert_eq!(update.task_id, "task-rpc-push");
-            assert_eq!(update.message.message_id, request.message.message_id);
+            assert_eq!(
+                update.message.message_id,
+                request.message.as_ref().unwrap().message_id
+            );
             assert_eq!(update.message.role, Role::User);
             update.generation
         }

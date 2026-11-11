@@ -68,7 +68,7 @@ fn request() -> SendMessageRequest {
     let mut message = Message::new(Role::User, vec![Part::text("work")]);
     message.task_id = Some("task".into());
     SendMessageRequest {
-        message,
+        message: Some(message),
         tenant: None,
         configuration: None,
         metadata: None,

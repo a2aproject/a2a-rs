@@ -177,7 +177,10 @@ pub(super) fn records_message(task: &Task, request: &StreamRequest) -> bool {
     let StreamRequestPayload::SendMessage(send) = &request.payload else {
         return true;
     };
-    let id = &send.message.message_id;
+    let Some(message) = &send.message else {
+        return true;
+    };
+    let id = &message.message_id;
     id.is_empty()
         || task.history.iter().flatten().any(|m| &m.message_id == id)
         || task.timeline.iter().flatten().any(

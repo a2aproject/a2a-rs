@@ -99,7 +99,7 @@ fn request(existing: bool) -> SendMessageRequest {
     let mut message = Message::new(Role::User, vec![Part::text("accepted input")]);
     message.task_id = existing.then(|| "task".into());
     SendMessageRequest {
-        message,
+        message: Some(message),
         tenant: None,
         metadata: None,
         configuration: None,

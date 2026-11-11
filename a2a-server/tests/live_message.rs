@@ -175,7 +175,7 @@ fn send(text: &str, task_id: Option<&str>) -> StreamRequest {
     StreamRequest {
         tenant: None,
         payload: StreamRequestPayload::SendMessage(SendMessageRequest {
-            message,
+            message: Some(message),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -360,7 +360,7 @@ async fn an_unread_live_input_is_answered_when_the_turn_ends() {
 
     let rejected = send("hello", Some(&task_id));
     let message_id = match &rejected.payload {
-        StreamRequestPayload::SendMessage(r) => r.message.message_id.clone(),
+        StreamRequestPayload::SendMessage(r) => r.message.as_ref().unwrap().message_id.clone(),
         _ => unreachable!(),
     };
     up.send(rejected).await.unwrap();
@@ -987,9 +987,7 @@ async fn an_artifact_only_request_to_an_idle_task_announces_its_artifact_not_an_
 
     let mut request = send("", None);
     if let StreamRequestPayload::SendMessage(r) = &mut request.payload {
-        r.message.role = Role::Unspecified;
-        r.message.message_id = String::new();
-        r.message.parts.clear();
+        r.message = None;
         r.artifact_updates = vec![artifact_update(&opening.id, "from-client")];
     }
     up.send(request).await.unwrap();
@@ -1242,7 +1240,7 @@ async fn an_artifact_update_without_an_id_is_refused() {
 
 fn text_message_id(request: &StreamRequest) -> String {
     match &request.payload {
-        StreamRequestPayload::SendMessage(r) => r.message.message_id.clone(),
+        StreamRequestPayload::SendMessage(r) => r.message.as_ref().unwrap().message_id.clone(),
         _ => unreachable!(),
     }
 }

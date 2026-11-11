@@ -62,16 +62,16 @@ impl ClientInput {
         user: Option<User>,
         params: &ServiceParams,
         response_id: Option<uuid::Uuid>,
-    ) -> Self {
-        Self {
-            message: request.message.clone(),
+    ) -> Option<Self> {
+        Some(Self {
+            message: request.message.clone()?,
             generation,
             user,
             service_params: params.clone(),
             metadata: request.metadata.clone(),
             tenant: request.tenant.clone(),
             response_id,
-        }
+        })
     }
 }
 

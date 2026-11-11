@@ -610,9 +610,13 @@ impl RequestHandler for TestHandler {
                 // The first request opened the exchange; the rest are answered.
                 .skip(1)
                 .map(|request| match request.payload {
-                    StreamRequestPayload::SendMessage(message) => {
-                        message.message.text().unwrap_or("").to_string()
-                    }
+                    StreamRequestPayload::SendMessage(message) => message
+                        .message
+                        .as_ref()
+                        .unwrap()
+                        .text()
+                        .unwrap_or("")
+                        .to_string(),
                     _ => String::new(),
                 })
                 .take_while(|text| futures::future::ready(text != "finish"))

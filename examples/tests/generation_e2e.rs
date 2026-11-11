@@ -120,7 +120,7 @@ fn send(text: &str, task_id: Option<&str>, if_generation_match: Option<i64>) -> 
     let mut message = Message::new(Role::User, vec![Part::text(text)]);
     message.task_id = task_id.map(Into::into);
     SendMessageRequest {
-        message,
+        message: Some(message),
         configuration: Some(SendMessageConfiguration {
             accepted_output_modes: None,
             task_push_notification_config: None,
@@ -251,9 +251,7 @@ async fn exercise_artifacts(transport: impl Transport) {
 
     // On its own, for the task that exists: no message on the wire.
     let mut alone = send("", None, None);
-    alone.message.role = Role::Unspecified;
-    alone.message.message_id = String::new();
-    alone.message.parts.clear();
+    alone.message = None;
     alone.artifact_updates = vec![client_artifact(&first.id, "on its own")];
     let SendMessageResponse::Task(after) = transport.send_message(&params, &alone).await.unwrap()
     else {

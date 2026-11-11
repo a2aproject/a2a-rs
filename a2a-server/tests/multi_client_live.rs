@@ -151,7 +151,7 @@ fn send(text: &str, task: Option<&str>) -> StreamRequest {
     StreamRequest {
         tenant: None,
         payload: StreamRequestPayload::SendMessage(SendMessageRequest {
-            message,
+            message: Some(message),
             configuration: None,
             metadata: Some([("request".into(), serde_json::json!(text))].into()),
             tenant: Some("workspace".into()),
@@ -336,7 +336,7 @@ async fn shared_credentials_have_independent_rejection_streams_and_bound_task_ro
             task_push_notification_config: None,
             history_length: None,
         });
-        request.message.message_id.clone()
+        request.message.as_ref().unwrap().message_id.clone()
     } else {
         unreachable!()
     };

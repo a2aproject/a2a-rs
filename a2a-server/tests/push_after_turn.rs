@@ -106,7 +106,7 @@ fn req(text: &str, task_id: Option<&str>, push: Option<&str>) -> SendMessageRequ
     let mut message = Message::new(Role::User, vec![Part::text(text)]);
     message.task_id = task_id.map(Into::into);
     SendMessageRequest {
-        message,
+        message: Some(message),
         configuration: config(push),
         metadata: None,
         tenant: None,
