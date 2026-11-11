@@ -289,6 +289,77 @@ mod tests {
     use super::*;
     use crate::handler::test_support::*;
 
+    #[tokio::test]
+    async fn a_closed_publication_queue_reports_failure_for_each_accepted_event() {
+        let handler = make_handler().with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                fail_on_error: true,
+                ..Default::default()
+            })),
+        );
+        let source = handler.tasks.task("task");
+        handler.attach_pushes(&source);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(receiver);
+        let queue = PublicationQueue {
+            sender,
+            regular: Arc::new(tokio::sync::Semaphore::new(1)),
+            terminal: Arc::new(tokio::sync::Semaphore::new(2)),
+        };
+        let mut signals = Vec::new();
+        let events = (0..2)
+            .map(|sequence| {
+                let (failure, receiver) = tokio::sync::watch::channel(None);
+                signals.push(receiver);
+                ExecutionEvent {
+                    sequence,
+                    input_generation: 0,
+                    result: Ok(StreamResponse::Task(task_with_history(
+                        "task", "context", 0,
+                    ))),
+                    kind: EventKind::Normal,
+                    failure: Some(failure),
+                    response_task: None,
+                }
+            })
+            .collect();
+        queue.submit(source.clone(), events, queue.try_reserve().unwrap());
+        for signal in signals {
+            assert!(
+                signal
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .message
+                    .contains("intake unavailable")
+            );
+        }
+        // A closed capacity semaphore is surfaced to direct publishers too.
+        source.publications().regular.close();
+        let (failure, signal) = tokio::sync::watch::channel(None);
+        source
+            .publish(
+                Ok(&StreamResponse::Task(task_with_history(
+                    "task", "context", 0,
+                ))),
+                None,
+                EventKind::Normal,
+                Some(failure),
+                0,
+            )
+            .await;
+        assert!(
+            signal
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("queue closed")
+        );
+        handler.shutdown().await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cancellation_and_subscriptions_bypass_a_full_webhook_queue() {
         install_crypto_provider();

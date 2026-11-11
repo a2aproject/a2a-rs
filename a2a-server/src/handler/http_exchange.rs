@@ -765,6 +765,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn explicit_commit_evidence_survives_a_lost_receipt_and_unavailable_storage() {
+        let handler = DefaultRequestHandler::new(EchoExecutor, PausedReadStore::default())
+            .with_http_followup_timeout(Duration::from_secs(1));
+        let (input, mut receiver) = routed_input(&handler, 1, None);
+        let snapshot = task_with_history("task", "context", 0);
+        let (result, ()) = tokio::join!(route(&handler, &input, None), async {
+            let receipt = receiver.recv().await.unwrap().receipt.unwrap();
+            receipt.state().committed(&snapshot);
+            drop(receipt.begin().unwrap());
+        });
+        assert_eq!(*result.unwrap().unwrap(), snapshot);
+        handler.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_full_http_queue_times_out_without_admitting_another_input() {
         let handler = make_handler().with_http_followup_timeout(Duration::from_secs(1));
         let (input, mut receiver) = routed_input(&handler, 1, None);

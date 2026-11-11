@@ -120,6 +120,12 @@ mod tests {
     #[tokio::test]
     async fn producer_tags_survive_buffering_and_channel_closure() {
         let (outputs, mut receiver) = ExecutorOutputSender::channel(2);
+        let opening =
+            StreamResponse::Message(Message::new(Role::Agent, vec![Part::text("opening")]));
+        outputs.send(opening.clone()).await.unwrap();
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.input_generation, 0);
+        assert_eq!(event.result.unwrap(), opening);
         let input = ClientInput::new(Message::new(Role::User, vec![]), 17);
         outputs
             .send_for(

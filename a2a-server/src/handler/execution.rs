@@ -519,6 +519,25 @@ mod driver_tests {
     }
 
     #[tokio::test]
+    async fn finalization_errors_reach_waiters_unless_shutdown_is_in_progress() {
+        let handler = make_handler();
+        let active = ActiveExecution::new(Some(task_with_history("task", "context", 0)));
+        let mut events = active.subscribe();
+        let error = A2AError::internal("controller disappeared");
+        report_controller_error(&handler, &active, error.clone()).await;
+        let observed = events.recv().await.unwrap().result.unwrap_err();
+        assert_eq!(observed.code, error.code);
+        assert_eq!(observed.message, error.message);
+        assert!(active.inputs.closed.is_cancelled());
+        handler.shutdown().await;
+        report_controller_error(&handler, &active, error).await;
+        assert!(
+            events.try_recv().is_err(),
+            "normal shutdown emits no spurious failure"
+        );
+    }
+
+    #[tokio::test]
     async fn lazy_creation_saves_push_configuration_before_publishing_its_first_event() {
         install_crypto_provider();
         let (url, mut pushes, shutdown, server) = start_push_webhook().await;

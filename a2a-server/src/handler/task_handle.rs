@@ -637,6 +637,105 @@ mod tests {
     use crate::handler::test_support::task_with_history;
 
     #[tokio::test]
+    async fn a_controller_panic_revokes_execution_and_notifies_waiters() {
+        let handler = make_handler();
+        let task = handler.tasks.task("task");
+        // A real execution driver retains this sender between operations.
+        let _lease = task.operations();
+        let active = task
+            .submit(TaskOperation::Input, {
+                let handler = handler.clone();
+                move |state| {
+                    Box::pin(async move { state.reserve(&handler, "task").await.unwrap().0 })
+                }
+            })
+            .await
+            .unwrap();
+        let mut events = active.subscribe();
+        let read_failure = task
+            .submit::<(), _>(TaskOperation::Subscribe, |_| {
+                Box::pin(async { panic!("failed subscription") })
+            })
+            .await
+            .unwrap_err();
+        assert!(read_failure.message.contains("failed unexpectedly"));
+        assert!(
+            task.active().is_some(),
+            "a read panic must not cancel an invocation"
+        );
+        let write_failure = task
+            .submit::<(), _>(TaskOperation::Finished, |_| {
+                Box::pin(async { panic!("failed finalization") })
+            })
+            .await
+            .unwrap_err();
+        assert!(write_failure.message.contains("failed unexpectedly"));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            event
+                .result
+                .unwrap_err()
+                .message
+                .contains("failed unexpectedly")
+        );
+        assert!(active.inputs.closed.is_cancelled());
+        assert!(active.inputs_drained.is_cancelled());
+        assert!(task.active().is_none());
+        // The recovered controller can reserve a new invocation.
+        let next = task
+            .submit(TaskOperation::Input, {
+                let handler = handler.clone();
+                move |state| Box::pin(async move { state.reserve(&handler, "task").await.is_ok() })
+            })
+            .await
+            .unwrap();
+        assert!(next);
+        handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unreserved_webhook_batch_reports_failure_instead_of_disappearing() {
+        let handler = make_handler().with_push_notifications(
+            crate::InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                fail_on_error: true,
+                ..Default::default()
+            })),
+        );
+        let task = handler.tasks.task("task");
+        handler.attach_pushes(&task);
+        let permits: Vec<_> = (0..super::super::EXECUTION_BUFFER_CAPACITY)
+            .map(|_| task.publications().try_reserve().unwrap())
+            .collect();
+        task.inner.state.write().notifications = Some(Vec::new());
+        let (failure, signal) = watch::channel(None);
+        task.publish(
+            Ok(&StreamResponse::Task(task_with_history(
+                "task", "context", 0,
+            ))),
+            None,
+            EventKind::Normal,
+            Some(failure),
+            0,
+        )
+        .await;
+        task.finish_notifications(None);
+        assert!(
+            signal
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("capacity was not reserved")
+        );
+        drop(permits);
+        handler.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn input_batch_exposes_its_complete_snapshot_and_events_before_waking_readers() {
         let task = TaskHandle::new("task".into(), None);
         let mut watch = task.watch();
