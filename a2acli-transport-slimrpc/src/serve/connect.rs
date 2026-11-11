@@ -116,6 +116,11 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
                     result = async { pending.as_mut().unwrap().await }, if pending.is_some() => {
                         pending = None;
                         match result {
+                            Ok(a2a_client::LiveAck::Task(task)) => {
+                                // HTTP-backed transports can acknowledge an
+                                // input with a snapshot outside the downlink.
+                                yield Ok(StreamResponse::Task(*task));
+                            }
                             Ok(a2a_client::LiveAck::Reopened(connection)) => {
                                 events = connection.events;
                                 sender = Some(connection.sender);
@@ -432,6 +437,7 @@ mod tests {
     struct FakeTransport {
         last_params: Mutex<Option<ServiceParams>>,
         live_requests: Arc<Mutex<Vec<StreamRequest>>>,
+        live_task_ack: bool,
     }
 
     impl FakeTransport {
@@ -447,12 +453,18 @@ mod tests {
     struct RecordingUplink {
         requests: Arc<Mutex<Vec<StreamRequest>>>,
         output: tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
+        task_ack: bool,
     }
 
     #[async_trait]
     impl a2a_client::LiveUplink for RecordingUplink {
         async fn send(&self, request: StreamRequest) -> Result<a2a_client::LiveAck, A2AError> {
             self.requests.lock().unwrap().push(request);
+            if self.task_ack {
+                let mut task = fake_task();
+                task.generation = 42;
+                return Ok(a2a_client::LiveAck::Task(Box::new(task)));
+            }
             self.output
                 .send(Ok(StreamResponse::Task(fake_task())))
                 .await
@@ -538,6 +550,7 @@ mod tests {
                 sender: a2a_client::LiveSender::new(Arc::new(RecordingUplink {
                     requests: self.live_requests.clone(),
                     output: sender,
+                    task_ack: self.live_task_ack,
                 })),
                 events: stream::unfold(receiver, |mut receiver| async move {
                     receiver.recv().await.map(|item| (item, receiver))
@@ -753,6 +766,35 @@ mod tests {
                 .unwrap()
                 .contains_key(TOKEN_HEADER)
         );
+    }
+
+    #[tokio::test]
+    async fn live_proxy_preserves_http_task_acknowledgements() {
+        let handler = TransportHandler::new(FakeTransport {
+            live_task_ack: true,
+            ..Default::default()
+        });
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task-1".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        let response = handler
+            .send_live_message(
+                &sample_params(),
+                stream::iter([request.clone(), request]).boxed(),
+            )
+            .await
+            .unwrap();
+        let events: Vec<_> =
+            tokio::time::timeout(std::time::Duration::from_secs(2), response.collect())
+                .await
+                .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[1], Ok(StreamResponse::Task(task)) if task.generation == 42));
     }
 
     #[tokio::test]
