@@ -435,15 +435,27 @@ impl TaskService {
         self.store.begin_cancel(task_id).await
     }
 
+    #[cfg(test)]
     pub(super) async fn list(
         &self,
         request: &ListTasksRequest,
         visible: Option<&(dyn for<'id> Fn(&'id str) -> bool + Send + Sync)>,
     ) -> Result<ListTasksResponse, A2AError> {
-        match visible {
-            Some(visible) => self.store.list_scoped(request, visible).await,
-            None => self.store.list(request).await,
-        }
+        self.list_for_scope(
+            request,
+            &crate::task_store::TaskListScope::default(),
+            visible,
+        )
+        .await
+    }
+
+    pub(super) async fn list_for_scope(
+        &self,
+        request: &ListTasksRequest,
+        scope: &crate::task_store::TaskListScope,
+        visible: Option<&(dyn for<'id> Fn(&'id str) -> bool + Send + Sync)>,
+    ) -> Result<ListTasksResponse, A2AError> {
+        self.store.list_for_scope(request, scope, visible).await
     }
 
     pub(super) async fn commit_input(

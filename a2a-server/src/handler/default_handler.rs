@@ -562,17 +562,23 @@ impl RequestHandler for DefaultRequestHandler {
             page_size: Some(page_size as i32),
             ..req
         };
+        let user = self.authenticated_user(params)?;
+        let scope = crate::task_store::TaskListScope {
+            tenant: req.tenant.clone(),
+            principal: user.map(|user| (user.authenticated, user.name)),
+        };
         let mut response = if let Some(authorizer) = &self.authorizer {
             // Filter before counting and paging; post-filtering leaks counts
             // and creates pages whose continuation reveals inaccessible tasks.
             self.tasks
-                .list(
+                .list_for_scope(
                     &req,
+                    &scope,
                     Some(&|id| authorizer.authorize(params, Some(id)).is_ok()),
                 )
                 .await?
         } else {
-            self.tasks.list(&req, None).await?
+            self.tasks.list_for_scope(&req, &scope, None).await?
         };
         response.tasks.truncate(page_size);
         for task in &mut response.tasks {
