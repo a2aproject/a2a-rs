@@ -741,7 +741,7 @@ mod tests {
         );
         let task = handler.tasks.task("task");
         handler.attach_pushes(&task);
-        let permits: Vec<_> = (0..super::super::EXECUTION_BUFFER_CAPACITY)
+        let permits: Vec<_> = (0..super::super::push_delivery::PUSH_OUTPUT_BATCHES)
             .map(|_| task.publications().try_reserve().unwrap())
             .collect();
         task.inner.state.write().notifications = Some(Vec::new());

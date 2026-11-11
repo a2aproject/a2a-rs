@@ -122,17 +122,19 @@ path is no longer reported as an invalid A2A request.
 In-memory list cursors preserve the initial ordered task IDs for five minutes
 of inactivity. Each continuation reads current contents and rechecks filters
 and permissions. New tasks require a new listing. Concurrent updates may
-change ordering across page boundaries. Cursor ownership and quotas are
-scoped by stable principal and tenant.
+change ordering across page boundaries. Cursor ownership includes the tenant
+and stable principal. Allocation quotas count authenticated principals across
+tenants; anonymous callers share a smaller quota. Global limits still apply.
 Capacity rejects new allocations rather than evicting active traversals;
 active continuations refresh expiry. Custom stores can override the additive
 `list_for_scope` method without changing existing required trait methods.
 
 Webhook work uses bounded per-task queues and a shared HTTP concurrency pool.
 Ordinary output waits for a bounded publication-batch permit outside the
-controller. Input admission rejects before persistence when that queue is
-full; subscriptions and cancellation still proceed. Finalization has reserved
-capacity. Notifications remain ordered, and two slow fan-outs cannot occupy
+controller. The 128 ordinary slots reserve eight for inputs, so
+waiting executor outputs cannot starve follow-up admission. Input admission
+rejects before persistence when its reserved capacity is full; subscriptions
+and cancellation still proceed. Finalization has two additional reserved slots. Notifications remain ordered, and two slow fan-outs cannot occupy
 the whole HTTP pool. Delivery/configuration retries have deadlines. A single task
 cannot occupy every HTTP slot, but many slow tasks can still queue behind the
 finite shared pool. Delivery failure is reported through server diagnostics;

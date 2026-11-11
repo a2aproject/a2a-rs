@@ -16,6 +16,8 @@ use std::{
 use tokio::sync::Mutex;
 
 pub(super) const PUSH_QUEUE_CAPACITY: usize = 1024;
+const PUSH_INPUT_BATCHES: usize = 8;
+pub(super) const PUSH_OUTPUT_BATCHES: usize = super::EXECUTION_BUFFER_CAPACITY - PUSH_INPUT_BATCHES;
 const PUSH_CONFIG_TIMEOUT: Duration = Duration::from_secs(30);
 
 type DeliveryGates = parking_lot::Mutex<HashMap<(TaskId, String), Weak<Mutex<()>>>>;
@@ -98,6 +100,7 @@ impl PushService {
 pub(super) struct PublicationQueue {
     sender: tokio::sync::mpsc::UnboundedSender<PublicationBatch>,
     regular: Arc<tokio::sync::Semaphore>,
+    inputs: Arc<tokio::sync::Semaphore>,
     terminal: Arc<tokio::sync::Semaphore>,
 }
 
@@ -115,9 +118,8 @@ impl PublicationQueue {
         source.background_tasks().spawn(receive_batches(receiver));
         Self {
             sender,
-            regular: Arc::new(tokio::sync::Semaphore::new(
-                super::EXECUTION_BUFFER_CAPACITY,
-            )),
+            regular: Arc::new(tokio::sync::Semaphore::new(PUSH_OUTPUT_BATCHES)),
+            inputs: Arc::new(tokio::sync::Semaphore::new(PUSH_INPUT_BATCHES)),
             terminal: Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
@@ -136,7 +138,7 @@ impl PublicationQueue {
             TaskOperation::Subscribe | TaskOperation::Cancel => return Ok(None),
             TaskOperation::Input => {
                 return self
-                    .regular
+                    .inputs
                     .clone()
                     .try_acquire_owned()
                     .map(Some)
@@ -305,6 +307,7 @@ mod tests {
         let queue = PublicationQueue {
             sender,
             regular: Arc::new(tokio::sync::Semaphore::new(1)),
+            inputs: Arc::new(tokio::sync::Semaphore::new(PUSH_INPUT_BATCHES)),
             terminal: Arc::new(tokio::sync::Semaphore::new(2)),
         };
         let mut signals = Vec::new();
@@ -360,6 +363,50 @@ mod tests {
         handler.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn input_admission_has_capacity_while_output_publication_is_full() {
+        install_crypto_provider();
+        let handler = DefaultRequestHandler::new(
+            ResumableExecutor {
+                release: Arc::new(Notify::new()),
+            },
+            InMemoryTaskStore::new(),
+        )
+        .with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(None),
+        );
+        seed_task(&handler, "task", "context").await;
+        let source = handler.tasks.task("task");
+        handler.attach_pushes(&source);
+        let _outputs: Vec<_> = std::iter::from_fn(|| source.publications().try_reserve()).collect();
+        assert_eq!(_outputs.len(), PUSH_OUTPUT_BATCHES);
+        let mut request = send_req(Some("task"), None);
+        let id = request.message.as_ref().unwrap().message_id.clone();
+        request.configuration =
+            Some(serde_json::from_value(serde_json::json!({"returnImmediately":true})).unwrap());
+        let response = timeout(
+            Duration::from_secs(1),
+            handler.send_message(&ServiceParams::new(), request),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(response, SendMessageResponse::Task(_)));
+        assert!(
+            handler
+                .tasks
+                .load("task")
+                .await
+                .unwrap()
+                .history
+                .unwrap()
+                .iter()
+                .any(|message| message.message_id == id)
+        );
+        handler.shutdown().await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cancellation_and_subscriptions_bypass_a_full_webhook_queue() {
         install_crypto_provider();
@@ -379,7 +426,7 @@ mod tests {
         let task = handler.tasks.load("task").await.unwrap();
         source.set_snapshot(task.clone());
         handler.attach_pushes(&source);
-        for _ in 0..super::super::EXECUTION_BUFFER_CAPACITY {
+        for _ in 0..PUSH_OUTPUT_BATCHES {
             source
                 .publish(
                     Ok(&StreamResponse::Task(task.clone())),
@@ -393,6 +440,16 @@ mod tests {
         entered.notified().await;
         let mut observed = source.sender().subscribe();
         let before = handler.tasks.load("task").await.unwrap();
+        let _input_capacity: Vec<_> = (0..PUSH_INPUT_BATCHES)
+            .map(|_| {
+                source
+                    .publications()
+                    .inputs
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect();
         let error = handler
             .send_message(&ServiceParams::new(), send_req(Some("task"), None))
             .await
