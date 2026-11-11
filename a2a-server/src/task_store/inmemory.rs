@@ -18,14 +18,15 @@ struct StoredEntry {
     version: TaskVersion,
 }
 
-const MAX_LISTINGS: usize = 32;
+const MAX_LISTINGS: usize = 1024;
+const MAX_LISTING_IDS: usize = 1_000_000;
 const LISTING_TTL: Duration = Duration::from_secs(300);
 
 struct Listing {
     id: uuid::Uuid,
     expires: Instant,
     query: ListTasksRequest,
-    tasks: Vec<Arc<Task>>,
+    tasks: Vec<TaskId>,
 }
 
 fn listing_query(req: &ListTasksRequest) -> ListTasksRequest {
@@ -43,9 +44,8 @@ struct Tasks {
     entries: HashMap<TaskId, StoredEntry>,
     /// Terminal task ids, oldest first; tracked only under a limit.
     terminal: VecDeque<TaskId>,
-    /// Bounded, short-lived snapshots: a timestamp update cannot move an
-    /// unread task behind a continuation cursor. Tasks share their allocation
-    /// with the store until a later write replaces them.
+    /// Bounded, short-lived membership snapshots. Only IDs are retained;
+    /// continuation pages always read current task contents.
     listings: VecDeque<Listing>,
 }
 
@@ -74,8 +74,11 @@ impl Tasks {
 ///
 /// Keeps every task for the life of the process unless
 /// [`Self::with_terminal_task_limit`] bounds how many finished ones it holds.
-/// List continuations retain a snapshot for up to five minutes and at most
-/// 32 concurrent lists. Expired or evicted tokens require a fresh list.
+/// List continuations retain ordered IDs for up to five minutes. Each page
+/// reads current contents and permissions, so concurrent updates remain visible
+/// without skipping IDs that moved in the sort order. New tasks require a new
+/// list. At most 1024 lists and one million IDs are retained; exhaustion rejects
+/// new cursors rather than evicting another caller's active traversal.
 pub struct InMemoryTaskStore {
     tasks: RwLock<Tasks>,
     terminal_task_limit: Option<usize>,
@@ -216,7 +219,21 @@ impl TaskStore for InMemoryTaskStore {
         let page_size = resolve_page_size(req.page_size);
         let token = req.page_token.as_deref().filter(|token| !token.is_empty());
         let continuation = token.and_then(|token| token.strip_prefix("snapshot:"));
-        let (tasks, start, listing_id) = if let Some(cursor) = continuation {
+        let matches = |task: &Task| {
+            visible(&task.id)
+                && req
+                    .context_id
+                    .as_ref()
+                    .is_none_or(|id| *id == task.context_id)
+                && req
+                    .status
+                    .as_ref()
+                    .is_none_or(|state| *state == task.status.state)
+                && req
+                    .status_timestamp_after
+                    .is_none_or(|after| task.status.timestamp.is_some_and(|time| time >= after))
+        };
+        let (ids, start, listing_id) = if let Some(cursor) = continuation {
             let (id, position) = cursor
                 .split_once(':')
                 .ok_or_else(|| A2AError::invalid_params("invalid page token"))?;
@@ -235,55 +252,19 @@ impl TaskStore for InMemoryTaskStore {
             }
             (listing.tasks.clone(), position, id)
         } else {
-            let mut tasks: Vec<Arc<Task>> = store
+            let mut tasks: Vec<_> = store
                 .entries
                 .values()
-                .filter(|entry| {
-                    if !visible(&entry.task.id) {
-                        return false;
-                    }
-                    // Filter by context_id if provided
-                    if let Some(ref ctx_id) = req.context_id {
-                        if entry.task.context_id != *ctx_id {
-                            return false;
-                        }
-                    }
-                    // Filter by status if provided
-                    if let Some(ref status) = req.status {
-                        if entry.task.status.state != *status {
-                            return false;
-                        }
-                    }
-                    // A task without a status timestamp cannot satisfy an
-                    // "after" filter, and one stamped at the bound does (the
-                    // proto: "greater than or equal"). Keep this predicate in the
-                    // store so the result count and pagination are based on the
-                    // filtered set.
-                    if let Some(after) = req.status_timestamp_after {
-                        if entry
-                            .task
-                            .status
-                            .timestamp
-                            .is_none_or(|timestamp| timestamp < after)
-                        {
-                            return false;
-                        }
-                    }
-                    true
-                })
-                .map(|e| e.task.clone())
+                .map(|entry| &entry.task)
+                .filter(|task| matches(task))
                 .collect();
-
-            // Pin both ordering and task contents for the rest of this traversal.
             tasks.sort_by_key(|task| (std::cmp::Reverse(task.status.timestamp), task.id.clone()));
             let start = match token {
                 None => 0,
-                // Accept pre-1.1 offsets, but issue snapshot cursors from here on.
                 Some(token) if token.bytes().all(|byte| byte.is_ascii_digit()) => token
                     .parse::<usize>()
                     .map_err(|_| A2AError::invalid_params("invalid page token"))?,
                 Some(token) => {
-                    // Also accept the sort-key tokens issued before snapshots.
                     let bytes = URL_SAFE_NO_PAD
                         .decode(token)
                         .map_err(|_| A2AError::invalid_params("invalid page token"))?;
@@ -296,34 +277,53 @@ impl TaskStore for InMemoryTaskStore {
                     })
                 }
             };
-            (tasks, start, uuid::Uuid::now_v7())
+            (
+                tasks
+                    .into_iter()
+                    .map(|task| task.id.clone())
+                    .collect::<Vec<_>>(),
+                start,
+                uuid::Uuid::now_v7(),
+            )
         };
-
-        // A cursor conveys no authority: deletion and current permissions are
-        // checked even when the contents came from an earlier snapshot.
-        let accessible =
-            |task: &Arc<Task>| store.entries.contains_key(&task.id) && visible(&task.id);
-        let total_size = tasks.iter().filter(|task| accessible(task)).count();
-        let mut page: Vec<_> = tasks
+        // Keep membership/positions stable while reading fresh values and
+        // rechecking filters, deletion and authorization on every page.
+        let current = |id: &TaskId| {
+            store
+                .entries
+                .get(id)
+                .map(|entry| &entry.task)
+                .filter(|task| matches(task))
+        };
+        let total_size = ids.iter().filter(|id| current(id).is_some()).count();
+        let mut page: Vec<_> = ids
             .iter()
             .enumerate()
             .skip(start)
-            .filter(|(_, task)| accessible(task))
+            .filter_map(|(position, id)| current(id).map(|task| (position, (**task).clone())))
             .take(page_size + 1)
-            .map(|(position, task)| (position, (**task).clone()))
             .collect();
         let has_more = page.len() > page_size;
         page.truncate(page_size);
         let next_page_token = if has_more {
             if continuation.is_none() {
-                while store.listings.len() >= MAX_LISTINGS {
-                    store.listings.pop_front();
+                let retained_ids: usize = store
+                    .listings
+                    .iter()
+                    .map(|listing| listing.tasks.len())
+                    .sum();
+                if store.listings.len() >= MAX_LISTINGS
+                    || ids.len() > MAX_LISTING_IDS.saturating_sub(retained_ids)
+                {
+                    return Err(A2AError::internal(
+                        "task listing capacity reached; retry after existing cursors expire",
+                    ));
                 }
                 store.listings.push_back(Listing {
                     id: listing_id,
                     expires: Instant::now() + LISTING_TTL,
                     query: listing_query(req),
-                    tasks,
+                    tasks: ids,
                 });
             }
             page.last()
@@ -331,7 +331,6 @@ impl TaskStore for InMemoryTaskStore {
         } else {
             None
         };
-
         let page = page
             .into_iter()
             .map(|(_, mut task)| {
@@ -339,7 +338,6 @@ impl TaskStore for InMemoryTaskStore {
                 task
             })
             .collect();
-
         Ok(ListTasksResponse {
             tasks: page,
             next_page_token: next_page_token.unwrap_or_default(),
@@ -414,7 +412,7 @@ mod tests {
         req.page_token = Some(first.next_page_token);
         let second = store.list(&req).await.unwrap();
         assert_eq!(second.tasks[0].id, "b");
-        assert_eq!(second.tasks[0].status.state, TaskState::Submitted);
+        assert_eq!(second.tasks[0].status.state, TaskState::Working);
         assert_eq!(second.total_size, 3);
         // Replaying a continuation is stable too.
         assert_eq!(store.list(&req).await.unwrap(), second);
@@ -475,25 +473,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_snapshot_cache_is_bounded_and_expiry_releases_old_versions() {
+    async fn continuation_rechecks_current_filter_values() {
+        let store = dated_store().await;
+        let mut req = list_request(1);
+        req.status = Some(TaskState::Submitted);
+        req.page_token = Some(store.list(&req).await.unwrap().next_page_token);
+        store
+            .update(make_task("b", "ctx", TaskState::Working))
+            .await
+            .unwrap();
+        let page = store.list(&req).await.unwrap();
+        assert_eq!(page.tasks[0].id, "c");
+        assert_eq!(page.total_size, 2);
+    }
+
+    #[tokio::test]
+    async fn list_capacity_preserves_existing_cursors_and_releases_old_versions() {
         let store = dated_store().await;
         let mut req = list_request(1);
         req.page_token = Some(store.list(&req).await.unwrap().next_page_token);
-        for _ in 0..MAX_LISTINGS {
+        for _ in 1..MAX_LISTINGS {
             store.list(&list_request(1)).await.unwrap();
         }
         assert_eq!(store.tasks.read().await.listings.len(), MAX_LISTINGS);
-        assert_eq!(
-            store.list(&req).await.unwrap_err().code,
-            error_code::INVALID_PARAMS
-        );
+        assert!(store.list(&list_request(1)).await.is_err());
+        assert_eq!(store.list(&req).await.unwrap().tasks[0].id, "b");
 
         let old_task = Arc::downgrade(&store.tasks.read().await.entries["a"].task);
         store
             .update(make_task("a", "ctx", TaskState::Working))
             .await
             .unwrap();
-        assert!(old_task.upgrade().is_some());
+        assert!(old_task.upgrade().is_none());
         {
             let mut tasks = store.tasks.write().await;
             for listing in &mut tasks.listings {
