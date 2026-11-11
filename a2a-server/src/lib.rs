@@ -1,6 +1,8 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+// Task mailbox and cancellation futures have a deep Send/Sync type graph.
+#![recursion_limit = "256"]
 //! Server framework for implementing A2A v1 agents.
 //!
 //! Published as `a2a-server-lf` and imported as `a2a_server`. The protocol
