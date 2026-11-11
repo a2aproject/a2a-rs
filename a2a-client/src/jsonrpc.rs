@@ -220,7 +220,15 @@ impl JsonRpcTransport {
             let rpc_response = parse_jsonrpc_response(status, &body)?;
 
             match (rpc_response.error, rpc_response.result) {
-                (Some(err), _) => Err(parse_jsonrpc_error(err)),
+                (Some(err), _) => {
+                    let mut error = parse_jsonrpc_error(err);
+                    if method == methods::SEND_LIVE_MESSAGE
+                        && error.code == error_code::METHOD_NOT_FOUND
+                    {
+                        error.code = error_code::UNSUPPORTED_OPERATION;
+                    }
+                    Err(error)
+                }
                 (None, Some(result)) => Ok(StreamOrResult::Result(result)),
                 (None, None) => Err(A2AError::internal("JSON-RPC response missing result")),
             }
@@ -2525,6 +2533,44 @@ mod tests {
 
         assert_eq!(items.len(), 1, "expected one item, got {items:?}");
         assert!(items.into_iter().next().unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_live_method_is_unsupported_for_opening_and_followups() {
+        use crate::LiveUplink;
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        for opening in [true, false] {
+            let (url, _) = spawn_jsonrpc_server(
+                json!({"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method missing"}})
+                    .to_string(),
+            )
+            .await;
+            let transport = JsonRpcTransport::new(Client::new(), url);
+            let error = if opening {
+                transport
+                    .send_live_message(&ServiceParams::new(), &request)
+                    .await
+                    .err()
+                    .unwrap()
+            } else {
+                JsonRpcLiveUplink {
+                    transport,
+                    params: ServiceParams::new(),
+                }
+                .send(request.clone())
+                .await
+                .err()
+                .unwrap()
+            };
+            assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+        }
     }
 
     #[tokio::test]

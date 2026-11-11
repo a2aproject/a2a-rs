@@ -13,10 +13,10 @@ pub fn a2a_error_to_rpc_error(err: &A2AError) -> slim_rpc::RpcError {
         | error_code::EXTENSION_SUPPORT_REQUIRED
         | error_code::VERSION_NOT_SUPPORTED
         | error_code::PUSH_NOTIFICATION_NOT_SUPPORTED
-        | error_code::UNSUPPORTED_OPERATION
         | error_code::EXTENDED_CARD_NOT_CONFIGURED => {
             slim_rpc::RpcError::failed_precondition(err.message.clone())
         }
+        error_code::UNSUPPORTED_OPERATION => slim_rpc::RpcError::unimplemented(err.message.clone()),
         error_code::TASK_GENERATION_MISMATCH => slim_rpc::RpcError::aborted(err.message.clone()),
         error_code::CONTENT_TYPE_NOT_SUPPORTED
         | error_code::PARSE_ERROR
@@ -67,10 +67,7 @@ mod tests {
                 error_code::PUSH_NOTIFICATION_NOT_SUPPORTED,
                 RpcCode::FailedPrecondition,
             ),
-            (
-                error_code::UNSUPPORTED_OPERATION,
-                RpcCode::FailedPrecondition,
-            ),
+            (error_code::UNSUPPORTED_OPERATION, RpcCode::Unimplemented),
             (
                 error_code::CONTENT_TYPE_NOT_SUPPORTED,
                 RpcCode::InvalidArgument,
@@ -84,6 +81,15 @@ mod tests {
             let error = A2AError::new(code, "test");
             assert_eq!(a2a_error_to_rpc_error(&error).code(), expected);
         }
+    }
+
+    #[test]
+    fn unsupported_live_operation_roundtrips() {
+        let error = A2AError::unsupported_operation("SendLiveMessage is unavailable");
+        assert_eq!(
+            rpc_error_to_a2a_error(&a2a_error_to_rpc_error(&error)).code,
+            error_code::UNSUPPORTED_OPERATION
+        );
     }
 
     #[test]

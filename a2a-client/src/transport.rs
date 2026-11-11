@@ -105,7 +105,7 @@ impl LiveSender {
         self.send(StreamRequest {
             tenant: None,
             payload: StreamRequestPayload::SendMessage(SendMessageRequest {
-                message,
+                message: Some(message),
                 configuration: None,
                 metadata: None,
                 tenant: None,

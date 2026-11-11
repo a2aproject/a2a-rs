@@ -737,6 +737,6 @@ async fn live_rpc_preserves_an_unimplemented_method_error() {
         .await
         .err()
         .expect("handler does not implement live input");
-    assert_eq!(error.code, error_code::METHOD_NOT_FOUND);
+    assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
     server.abort();
 }

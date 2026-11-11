@@ -285,7 +285,8 @@ impl RestTransport {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(Self::into_rest_error(resp).await);
+            let status = resp.status();
+            return Err(live_rest_error(status, Self::into_rest_error(resp).await));
         }
 
         let is_event_stream = resp
@@ -368,6 +369,17 @@ impl crate::LiveUplink for RestLiveUplink {
             }
         }
     }
+}
+
+// Missing live routes are an unsupported operation. Keep typed task errors
+// intact: a live-capable server can legitimately reject an unknown task.
+fn live_rest_error(status: reqwest::StatusCode, mut error: A2AError) -> A2AError {
+    if error.code == error_code::METHOD_NOT_FOUND
+        || (error.code == error_code::INTERNAL_ERROR && matches!(status.as_u16(), 404 | 405 | 501))
+    {
+        error.code = error_code::UNSUPPORTED_OPERATION;
+    }
+    error
 }
 
 fn parse_rest_error(status: reqwest::StatusCode, body: &str) -> A2AError {
@@ -954,6 +966,24 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_live_routes_preserve_typed_task_errors() {
+        for status in [
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            reqwest::StatusCode::NOT_IMPLEMENTED,
+        ] {
+            assert_eq!(
+                live_rest_error(status, A2AError::internal("route missing")).code,
+                error_code::UNSUPPORTED_OPERATION
+            );
+            assert_eq!(
+                live_rest_error(status, A2AError::task_not_found("task")).code,
+                error_code::TASK_NOT_FOUND
+            );
+        }
+    }
+
+    #[test]
     fn test_rest_transport_new_strips_trailing_slash() {
         let t = RestTransport::new(
             crate::default_reqwest_client(None).unwrap(),
@@ -1341,7 +1371,7 @@ mod tests {
                 StreamRequest {
                     tenant: None,
                     payload: StreamRequestPayload::SendMessage(SendMessageRequest {
-                        message: message.clone(),
+                        message: Some(message.clone()),
                         configuration: None,
                         metadata: None,
                         tenant: None,

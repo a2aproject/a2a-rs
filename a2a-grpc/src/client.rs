@@ -124,7 +124,13 @@ impl Transport for GrpcTransport {
             .client()
             .send_live_message(make_request(params, requests))
             .await
-            .map_err(|s| status_to_a2a_error(&s))?;
+            .map_err(|s| {
+                let mut error = status_to_a2a_error(&s);
+                if error.code == error_code::METHOD_NOT_FOUND {
+                    error.code = error_code::UNSUPPORTED_OPERATION;
+                }
+                error
+            })?;
         // Payload kinds this client does not know are skipped, as on any stream.
         let events = response
             .into_inner()

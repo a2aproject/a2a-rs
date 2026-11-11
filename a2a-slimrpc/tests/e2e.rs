@@ -243,7 +243,7 @@ async fn live_inputs_start_and_progress_without_polling_the_downlink() {
         for index in 0..64 {
             let mut next = request.clone();
             if let StreamRequestPayload::SendMessage(send) = &mut next.payload {
-                send.message.message_id = format!("follow-up-{index}");
+                send.message.as_mut().unwrap().message_id = format!("follow-up-{index}");
             }
             assert!(matches!(
                 connection.sender.send(next.clone()).await.unwrap(),
