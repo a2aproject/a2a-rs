@@ -47,8 +47,11 @@ pub(super) async fn open(
     request: StreamRequest,
 ) -> Result<HttpOpening, A2AError> {
     let exchange_id = exchange_id(params)?;
+    let scope_user = handler.authenticated_user(params)?;
     let bound_task = match exchange_id.as_deref() {
-        Some(id) => handler.http_live_responses.task_for_exchange(id),
+        Some(id) => handler
+            .http_live_responses
+            .task_for_exchange(id, &scope_user),
         None => Ok(None),
     };
     let (request, user) = match IncomingRequest::from(request) {
@@ -131,30 +134,64 @@ async fn route(
         handler.authorize(&authorized.params, Some(&bound_task))?;
     }
     let (sender, acknowledged) = oneshot::channel();
-    let sent = session
-        .send(Incoming {
-            request: IncomingRequest::Message(Box::new(MessageInput::Authorized(
-                AuthorizedMessage {
-                    request: authorized.request.clone(),
-                    params: authorized.params.clone(),
-                    user: authorized.user.clone(),
-                    response_id: None,
-                },
-            ))),
-            receipt: Some(Receipt::new(sender)),
-        })
+    let deadline = tokio::time::Instant::now() + handler.http_followup_timeout;
+    let receipt = Receipt::new(sender);
+    let state = receipt.state();
+    let permit = tokio::time::timeout_at(deadline, session.reserve_owned())
         .await
-        .is_ok();
-    drop(session);
+        .map_err(|_| {
+            A2AError::invalid_request("live input queue timed out; input was not admitted")
+        })?;
+    let sent = match permit {
+        Ok(permit) => {
+            permit.send(Incoming {
+                request: IncomingRequest::Message(Box::new(MessageInput::Authorized(
+                    AuthorizedMessage {
+                        request: authorized.request.clone(),
+                        params: authorized.params.clone(),
+                        user: authorized.user.clone(),
+                        response_id: None,
+                    },
+                ))),
+                receipt: Some(receipt),
+            });
+            true
+        }
+        Err(_) => false,
+    };
     if !sent {
         return Ok(None);
     }
-    match acknowledged.await {
-        Ok(task) => Ok(task.map(Box::new)),
+    match tokio::time::timeout_at(deadline, acknowledged).await {
+        Ok(Ok(task)) => Ok(task.map(Box::new)),
         Err(_) => {
+            if state.cancel_pending() {
+                return Err(A2AError::invalid_request(
+                    "live acknowledgement timed out; input was not admitted",
+                ));
+            }
+            // Processing is owned by the live runner. ACK is receipt, not an
+            // acceptance verdict; a later refusal still goes to its downlink.
+            let task = handler
+                .tasks
+                .task(&bound_task)
+                .snapshot()
+                .ok_or_else(|| A2AError::task_not_found(&bound_task))?;
+            Ok(Some(Box::new(task)))
+        }
+        Ok(Err(_)) => {
             // Processing began but its receipt was lost. Recover from
             // storage instead of delivering possibly recorded input twice.
-            let task = handler.tasks.load(&bound_task).await?;
+            let task = match handler.tasks.task(&bound_task).snapshot() {
+                Some(task) => task,
+                None => tokio::time::timeout_at(deadline, handler.tasks.load(&bound_task))
+                    .await
+                    .map_err(|_| {
+                        A2AError::internal(
+                            "live receipt recovery timed out; input outcome is unknown",
+                        )
+                    })??,
+            };
             let raw = StreamRequest {
                 tenant: message.tenant.clone(),
                 payload: StreamRequestPayload::SendMessage(message.clone()),
@@ -178,6 +215,95 @@ mod tests {
     use crate::handler::uplink::Receipt;
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn an_http_deadline_revokes_a_request_that_has_not_started() {
+        let handler = make_handler().with_http_followup_timeout(Duration::from_millis(1));
+        seed_task(&handler, "task", "context").await;
+        let params = ServiceParams::new();
+        let HttpOpening::Attached {
+            registration,
+            mut uplink,
+        } = open(
+            &handler,
+            &params,
+            StreamRequest {
+                tenant: None,
+                payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                    id: "task".into(),
+                    tenant: None,
+                    last_seen_generation: None,
+                }),
+            },
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("opening")
+        };
+        registration.bind("task");
+        uplink.next().await.unwrap();
+        let error = open(
+            &handler,
+            &params,
+            StreamRequest {
+                tenant: None,
+                payload: StreamRequestPayload::SendMessage(send_req(Some("task"), Some("context"))),
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.message.contains("not admitted"));
+        let queued = uplink.next().await.unwrap();
+        assert!(
+            queued.receipt.unwrap().begin().is_none(),
+            "a timed-out pending input cannot later be admitted"
+        );
+        drop(registration);
+    }
+
+    #[tokio::test]
+    async fn an_http_deadline_acknowledges_an_owned_request_without_retrying_it() {
+        let handler = make_handler().with_http_followup_timeout(Duration::from_millis(10));
+        seed_task(&handler, "task", "context").await;
+        let source = handler.tasks.task("task");
+        source.set_snapshot(handler.tasks.load("task").await.unwrap());
+        let params = ServiceParams::new();
+        let HttpOpening::Attached {
+            registration,
+            mut uplink,
+        } = open(
+            &handler,
+            &params,
+            StreamRequest {
+                tenant: None,
+                payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                    id: "task".into(),
+                    tenant: None,
+                    last_seen_generation: None,
+                }),
+            },
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("opening")
+        };
+        registration.bind("task");
+        uplink.next().await.unwrap();
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::SendMessage(send_req(Some("task"), Some("context"))),
+        };
+        let (response, _) = tokio::join!(open(&handler, &params, request), async {
+            let queued = uplink.next().await.unwrap();
+            let _owned = queued.receipt.unwrap().begin().unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        assert!(matches!(response.unwrap(), HttpOpening::Acknowledged(task) if task.id == "task"));
+        drop(registration);
+    }
 
     async fn bound_run(handler: &DefaultRequestHandler) -> Run {
         let params = ServiceParams::new();
@@ -289,7 +415,7 @@ mod tests {
         assert_eq!(
             handler
                 .http_live_responses
-                .task_for_exchange("shared")
+                .task_for_exchange("shared", &None)
                 .unwrap()
                 .as_deref(),
             Some("task")
@@ -330,7 +456,7 @@ mod tests {
         assert!(
             handler
                 .http_live_responses
-                .task_for_exchange("shared")
+                .task_for_exchange("shared", &None)
                 .is_err(),
             "pending exchanges must not infer a task or open another response"
         );

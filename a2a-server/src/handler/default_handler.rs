@@ -50,6 +50,7 @@ pub struct DefaultRequestHandler {
     blocking_response_timeout: Option<Duration>,
     pub(super) cancel_hook_timeout: Duration,
     pub(super) http_live_responses: Arc<HttpLiveResponses>,
+    pub(super) http_followup_timeout: Duration,
 }
 
 impl DefaultRequestHandler {
@@ -72,6 +73,7 @@ impl DefaultRequestHandler {
             blocking_response_timeout: None,
             cancel_hook_timeout: DEFAULT_CANCEL_HOOK_TIMEOUT,
             http_live_responses: Arc::new(HttpLiveResponses::default()),
+            http_followup_timeout: Duration::from_secs(30),
         }
     }
 
@@ -137,6 +139,14 @@ impl DefaultRequestHandler {
     /// responses use their own completion policies and have no such deadline.
     pub fn with_blocking_response_timeout(mut self, timeout: Duration) -> Self {
         self.blocking_response_timeout = Some(timeout);
+        self
+    }
+
+    /// Bounds HTTP live queueing and acknowledgement waits. An input that
+    /// has not started is revoked on expiry; an owned, processing input gets
+    /// a current Task acknowledgement and completes on its downlink.
+    pub fn with_http_followup_timeout(mut self, timeout: Duration) -> Self {
+        self.http_followup_timeout = timeout;
         self
     }
 

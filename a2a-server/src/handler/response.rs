@@ -292,7 +292,11 @@ impl Run {
         let Incoming { request, receipt } = item;
         // Mark processing before delivery: a lost task now leaves an unknown
         // outcome instead of a receipt saying that nothing was handled.
-        let receipt = receipt.map(Receipt::begin);
+        let receipt = match receipt.map(Receipt::begin) {
+            Some(None) => return true, // Its HTTP deadline revoked this queued input.
+            Some(Some(receipt)) => Some(receipt),
+            None => None,
+        };
         let reference_id = request.reference_id();
         let result = self.deliver(request, inner, last_generation, out).await;
         let interrupted = matches!(&result, Err(Rejection::Interrupted(_)));

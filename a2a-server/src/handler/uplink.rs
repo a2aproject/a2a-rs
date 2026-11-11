@@ -7,6 +7,7 @@ use super::protocol::{IncomingRequest, ProtocolError};
 use crate::middleware::{ServiceParams, User};
 use a2a::*;
 use futures::{FutureExt, StreamExt, stream::BoxStream};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 // Live (bidirectional) exchanges: `SendLiveMessage` (A2A 1.1 §3.1.12).
@@ -51,20 +52,48 @@ pub(super) struct Incoming {
 /// These states let the adapter retry safely without involving the runner.
 pub(super) struct Receipt {
     sender: Option<oneshot::Sender<Option<Task>>>,
-    processing: bool,
+    state: ReceiptState,
+}
+
+#[derive(Clone)]
+pub(super) struct ReceiptState(Arc<std::sync::atomic::AtomicU8>);
+
+impl ReceiptState {
+    pub(super) fn cancel_pending(&self) -> bool {
+        self.0
+            .compare_exchange(
+                0,
+                2,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 impl Receipt {
     pub(super) fn new(sender: oneshot::Sender<Option<Task>>) -> Self {
         Self {
             sender: Some(sender),
-            processing: false,
+            state: ReceiptState(Arc::new(std::sync::atomic::AtomicU8::new(0))),
         }
     }
 
-    pub(super) fn begin(mut self) -> Self {
-        self.processing = true;
-        self
+    pub(super) fn state(&self) -> ReceiptState {
+        self.state.clone()
+    }
+
+    pub(super) fn begin(self) -> Option<Self> {
+        self.state
+            .0
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()?;
+        Some(self)
     }
 
     pub(super) fn complete(mut self, task: Result<Task, A2AError>) {
@@ -76,7 +105,7 @@ impl Receipt {
 
 impl Drop for Receipt {
     fn drop(&mut self) {
-        if !self.processing {
+        if self.state.0.load(std::sync::atomic::Ordering::Acquire) == 0 {
             if let Some(sender) = self.sender.take() {
                 let _ = sender.send(None);
             }
@@ -130,7 +159,7 @@ impl Uplink {
     }
 }
 
-/// Reserved HTTP live responses. An exchange ID is unique before task admission;
+/// Reserved HTTP live responses. Exchange IDs are unique per trusted caller;
 /// follow-up calls can route only after the response is bound to its task.
 #[derive(Default)]
 pub(super) struct HttpLiveResponses {
@@ -167,10 +196,16 @@ pub(super) fn exchange_id(params: &ServiceParams) -> Result<Option<String>, A2AE
 
 impl HttpLiveResponses {
     /// Recover the bound task before authorizing an HTTP uplink that omits it.
-    pub(super) fn task_for_exchange(&self, id: &str) -> Result<Option<TaskId>, A2AError> {
+    pub(super) fn task_for_exchange(
+        &self,
+        id: &str,
+        user: &Option<User>,
+    ) -> Result<Option<TaskId>, A2AError> {
         let open = self.open.read();
         let Some(response) = open.iter().find(|response| {
-            !response.sender.is_closed() && response.exchange_id.as_deref() == Some(id)
+            !response.sender.is_closed()
+                && response.exchange_id.as_deref() == Some(id)
+                && &response.user == user
         }) else {
             return Ok(None);
         };
@@ -181,7 +216,7 @@ impl HttpLiveResponses {
             .ok_or_else(|| ProtocolError::ExchangeIdentifierInUse.into())
     }
 
-    /// Claim the optional identifier before admission can create or mutate a task.
+    /// Claim the caller's optional identifier before admission mutates a task.
     pub(super) fn register(
         &self,
         sender: mpsc::Sender<Incoming>,
@@ -193,7 +228,7 @@ impl HttpLiveResponses {
         if exchange_id.is_some()
             && open
                 .iter()
-                .any(|response| response.exchange_id == exchange_id)
+                .any(|response| response.exchange_id == exchange_id && response.user == user)
         {
             return Err(ProtocolError::ExchangeIdentifierInUse.into());
         }
@@ -229,7 +264,9 @@ impl HttpLiveResponses {
         let mut candidates = open.iter().filter(|response| {
             !response.sender.is_closed()
                 && match exchange_id {
-                    Some(id) => response.exchange_id.as_deref() == Some(id),
+                    Some(id) => {
+                        response.exchange_id.as_deref() == Some(id) && &response.user == user
+                    }
                     None => {
                         response.task_id.as_deref() == Some(task_id)
                             && response.exchange_id.is_none()
@@ -265,6 +302,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn different_callers_can_independently_use_the_same_exchange_identifier() {
+        let responses = HttpLiveResponses::default();
+        let alice = Some(User::authenticated("alice"));
+        let bob = Some(User::authenticated("bob"));
+        let (a, _a) = mpsc::channel(1);
+        let (b, _b) = mpsc::channel(1);
+        responses
+            .register(a.clone(), Some("shared".into()), alice.clone())
+            .unwrap();
+        responses.bind(&a, "alice-task");
+        responses
+            .register(b.clone(), Some("shared".into()), bob.clone())
+            .unwrap();
+        responses.bind(&b, "bob-task");
+        assert_eq!(
+            responses
+                .task_for_exchange("shared", &alice)
+                .unwrap()
+                .as_deref(),
+            Some("alice-task")
+        );
+        assert_eq!(
+            responses
+                .task_for_exchange("shared", &bob)
+                .unwrap()
+                .as_deref(),
+            Some("bob-task")
+        );
+        let (_, route) = responses
+            .route("bob-task", Some("shared"), &bob)
+            .unwrap()
+            .unwrap();
+        assert!(route.same_channel(&b));
+        assert!(
+            responses
+                .route("alice-task", Some("shared"), &None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(responses.register(a, Some("shared".into()), alice).is_err());
+    }
+
+    #[test]
     fn duplicate_identifiers_are_rejected_without_displacing_the_owner() {
         let responses = HttpLiveResponses::default();
         let (first, _rx1) = mpsc::channel(1);
@@ -278,7 +358,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, a2a::error_code::INVALID_REQUEST);
         assert_eq!(
-            responses.task_for_exchange("shared").unwrap().as_deref(),
+            responses
+                .task_for_exchange("shared", &None)
+                .unwrap()
+                .as_deref(),
             Some("first")
         );
         responses.unregister(&first);
@@ -287,7 +370,10 @@ mod tests {
             .unwrap();
         responses.bind(&second, "second");
         assert_eq!(
-            responses.task_for_exchange("shared").unwrap().as_deref(),
+            responses
+                .task_for_exchange("shared", &None)
+                .unwrap()
+                .as_deref(),
             Some("second")
         );
     }
