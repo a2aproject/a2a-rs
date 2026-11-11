@@ -94,6 +94,8 @@ impl PushService {
 pub(super) struct SubscriptionState {
     /// Last sequence removed from the broadcast by the webhook receiver.
     cursor: Option<watch::Sender<u64>>,
+    publication: Option<Arc<Mutex<()>>>,
+    lookup_failed: bool,
 }
 
 /// Clear the cursor on every worker exit, including cancellation or unwinding,
@@ -131,9 +133,40 @@ pub(super) async fn broadcast(
     settings: &Arc<PushService>,
     event: ExecutionEvent,
 ) {
+    // Cancellation releases the controller, while the owned publication keeps
+    // draining. A single per-task gate preserves ordering across that handoff.
+    let gate = events
+        .webhook_subscription()
+        .publication
+        .get_or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let cancellation = events.publication_cancellation();
+    let background = events.background_tasks().clone();
+    let source = events.clone();
+    let settings = settings.clone();
+    let mut publication = Box::pin(async move {
+        let _order = gate.lock().await;
+        broadcast_ordered(&source, &settings, event).await;
+    });
+    tokio::select! {
+        biased;
+        () = &mut publication => {},
+        () = cancellation.cancelled() => { background.spawn(publication); },
+    }
+}
+
+async fn broadcast_ordered(
+    events: &TaskHandle,
+    settings: &Arc<PushService>,
+    event: ExecutionEvent,
+) {
     let cursor = {
         let mut state = events.webhook_subscription();
-        if state.cursor.is_none() && needs_notification(&event) {
+        let terminal_after_failure = state.lookup_failed
+            && events
+                .snapshot()
+                .is_some_and(|task| task.status.state.is_terminal());
+        if state.cursor.is_none() && needs_notification(&event) && !terminal_after_failure {
             let receiver = events.sender().subscribe();
             let (cursor, _) = watch::channel(event.sequence - 1);
             state.cursor = Some(cursor.clone());
@@ -212,22 +245,33 @@ async fn receive_events(
             continue;
         }
         let settings = events.pushes().unwrap();
-        // A transient store outage cannot discard an accepted update. Retain
-        // this work and retry; bounded upstream queues apply backpressure.
-        let configs = loop {
-            let lookup =
-                tokio::time::timeout(PUSH_CONFIG_TIMEOUT, settings.store.list(events.id()))
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(A2AError::internal("webhook configuration lookup timed out"))
-                    });
-            match lookup {
+        // Retain across transient failures, but do not retain a finished task's
+        // worker forever when its configuration store remains unavailable.
+        let configs = tokio::time::timeout(PUSH_CONFIG_TIMEOUT, async {
+          loop {
+            match settings.store.list(events.id()).await {
                 Ok(configs) => break configs,
                 Err(error) => {
                     signal_failure(&settings.sender, &event, error.clone());
                     tracing::warn!(task_id = %events.id(), %error, "could not load webhook configurations; retrying");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
+            }
+          }
+        }).await;
+        let configs = match configs {
+            Ok(configs) => {
+                events.webhook_subscription().lookup_failed = false;
+                configs
+            }
+            Err(_) => {
+                events.webhook_subscription().lookup_failed = true;
+                signal_failure(
+                    &settings.sender,
+                    &event,
+                    A2AError::internal("webhook configuration lookup timed out"),
+                );
+                return;
             }
         };
         let event = Arc::new(event);
@@ -261,6 +305,102 @@ async fn receive_events(
 mod tests {
     use super::*;
     use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn cancellation_bypasses_webhook_backpressure_without_reordering_publications() {
+        install_crypto_provider();
+        let handler = make_handler().with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                validate_urls: false,
+                ..Default::default()
+            })),
+        );
+        seed_task(&handler, "task", "context").await;
+        let source = handler.tasks.task("task");
+        let task = handler.tasks.load("task").await.unwrap();
+        source.set_snapshot(task.clone());
+        handler.attach_pushes(&source);
+        let (cursor, _receiver) = watch::channel(0);
+        source.webhook_subscription().cursor = Some(cursor.clone());
+        for _ in 0..super::super::EXECUTION_BUFFER_CAPACITY {
+            source
+                .publish(
+                    Ok(&StreamResponse::Task(task.clone())),
+                    None,
+                    EventKind::Normal,
+                    None,
+                    0,
+                )
+                .await;
+        }
+        let mut observed = source.sender().subscribe();
+        let queue = source.clone();
+        let publisher = source.clone();
+        let blocked = tokio::spawn(async move {
+            queue
+                .submit(
+                    super::super::task_handle::TaskOperation::Output,
+                    move |_| {
+                        Box::pin(async move {
+                            publisher
+                                .publish(
+                                    Ok(&StreamResponse::Task(task)),
+                                    None,
+                                    EventKind::Normal,
+                                    None,
+                                    0,
+                                )
+                                .await;
+                        })
+                    },
+                )
+                .await
+        });
+        timeout(Duration::from_secs(2), async {
+            while source.sequence() <= super::super::EXECUTION_BUFFER_CAPACITY as u64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let canceled = timeout(
+            Duration::from_secs(2),
+            handler.cancel_task(
+                &ServiceParams::new(),
+                CancelTaskRequest {
+                    id: "task".into(),
+                    tenant: None,
+                    metadata: None,
+                },
+            ),
+        )
+        .await
+        .expect("cancel must not wait for a webhook cursor")
+        .unwrap();
+        assert_eq!(canceled.status.state, TaskState::Canceled);
+        blocked.await.unwrap().unwrap();
+        assert!(
+            observed.try_recv().is_err(),
+            "publications remain queued in order"
+        );
+        cursor.send_replace(super::super::EXECUTION_BUFFER_CAPACITY as u64);
+        let first = timeout(Duration::from_secs(2), observed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let last = timeout(Duration::from_secs(2), observed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.sequence + 1, last.sequence);
+        assert!(
+            last.result
+                .as_ref()
+                .is_ok_and(super::super::protocol::is_terminal_event)
+        );
+        handler.shutdown().await;
+    }
 
     struct LookupGuard(Arc<std::sync::atomic::AtomicBool>);
     impl Drop for LookupGuard {

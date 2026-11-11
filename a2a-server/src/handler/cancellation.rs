@@ -188,6 +188,10 @@ pub(super) async fn cancel(
     user: Option<User>,
 ) -> Result<Task, A2AError> {
     let task_id = request.id.clone();
+    // This workflow is owned by TaskService, so caller disconnection cannot
+    // reset the signal while its cancellation is still queued.
+    let handle = handler.tasks.task(&task_id);
+    let _publications = handle.cancel_publications();
     let plan = match handler
         .tasks
         .task(&task_id)

@@ -70,6 +70,8 @@ struct State {
     last_error: Option<(u64, A2AError)>,
     interrupted_input_generation: i64,
     completed_input: Option<(u64, i64)>,
+    publication_cancel: tokio_util::sync::CancellationToken,
+    cancel_requests: usize,
     push_queue: Weak<TaskPushQueue>,
     // Outstanding receivers retain their direct reply or private input rejection.
     // No task-wide reply history survives after those receivers are dropped.
@@ -88,6 +90,23 @@ pub(super) struct ReplyRetention {
 #[derive(Clone)]
 pub(super) struct TaskHandle {
     inner: Arc<TaskInner>,
+}
+
+pub(super) struct CancelPublicationLease(TaskHandle);
+
+impl Drop for CancelPublicationLease {
+    fn drop(&mut self) {
+        let mut state = self.0.inner.state.write();
+        state.cancel_requests -= 1;
+        if state.cancel_requests == 0
+            && state
+                .snapshot
+                .as_ref()
+                .is_none_or(|task| !task.status.state.is_terminal())
+        {
+            state.publication_cancel = tokio_util::sync::CancellationToken::new();
+        }
+    }
 }
 
 /// Weak routing reference that does not retain a task's channels or snapshot.
@@ -120,6 +139,16 @@ struct TaskInner {
 }
 
 impl TaskHandle {
+    pub(super) fn cancel_publications(&self) -> CancelPublicationLease {
+        let mut state = self.inner.state.write();
+        state.cancel_requests += 1;
+        state.publication_cancel.cancel();
+        CancelPublicationLease(self.clone())
+    }
+
+    pub(super) fn publication_cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.inner.state.read().publication_cancel.clone()
+    }
     /// A bounded checkpoint lets blocking senders recover a missed local
     /// invocation-completion event without retaining another task snapshot.
     pub(super) fn completed_input(&self, required: i64, after: u64) -> Option<ExecutionEvent> {

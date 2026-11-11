@@ -34,6 +34,21 @@ impl Notification {
 
     async fn deliver(self) -> Endpoint {
         let endpoint = self.endpoint();
+        let sender = self.sender.clone();
+        let event = self.event.clone();
+        if tokio::time::timeout(sender.delivery_timeout(), self.deliver_inner())
+            .await
+            .is_err()
+        {
+            let error = A2AError::internal("webhook delivery deadline expired");
+            tracing::warn!(task_id = %endpoint.0, %error);
+            signal_failure(&sender, &event, error);
+        }
+        endpoint
+    }
+
+    async fn deliver_inner(self) -> Endpoint {
+        let endpoint = self.endpoint();
         let gate = self.source.pushes().map(|settings| {
             settings.gate(
                 &self.config.task_id,
@@ -231,25 +246,37 @@ async fn dispatch(
     let mut busy = Vec::<Endpoint>::new();
     let mut requests = FuturesUnordered::<BoxFuture<'static, Endpoint>>::new();
     let mut closed = false;
+    // A fan-out on one task cannot occupy the entire handler pool. Keep at
+    // least two URLs concurrent for a task when the pool can support them.
+    let per_task = (concurrency / 2).max(2).min(concurrency);
     loop {
         // Rotate tasks after each opportunity. Within a task, skip busy URLs
         // without letting later work overtake an earlier job for the same URL.
+        let mut scheduled = false;
         for _ in 0..queues.len() {
             if requests.len() >= concurrency {
                 break;
             }
             let mut queue = queues.pop_front().unwrap();
             let index = queue.pending.iter().position(|job| {
-                !busy
-                    .iter()
-                    .any(|(task, url)| task == job.source.id() && url == &job.config.url)
+                busy.iter()
+                    .filter(|(task, _)| task == job.source.id())
+                    .count()
+                    < per_task
+                    && !busy
+                        .iter()
+                        .any(|(task, url)| task == job.source.id() && url == &job.config.url)
             });
             if let Some(index) = index {
                 let job = queue.pending.remove(index).unwrap();
                 busy.push(job.endpoint());
                 requests.push(Box::pin(job.deliver()));
+                scheduled = true;
             }
             queues.push_back(queue);
+        }
+        if scheduled && requests.len() < concurrency {
+            continue;
         }
         queues.retain(|queue| {
             if !queue.pending.is_empty() || busy.iter().any(|(task, _)| task == &queue.id) {
@@ -333,6 +360,117 @@ mod tests {
     use axum::Json;
 
     type Seen = (TaskId, i64, Option<oneshot::Sender<()>>);
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_config_lookup_failure_releases_its_http_slot() {
+        struct FailingGet;
+        #[async_trait::async_trait]
+        impl crate::PushConfigStore for FailingGet {
+            async fn get(&self, _: &str, _: &str) -> Result<TaskPushNotificationConfig, A2AError> {
+                Err(A2AError::internal("store unavailable"))
+            }
+            async fn save(
+                &self,
+                value: TaskPushNotificationConfig,
+            ) -> Result<TaskPushNotificationConfig, A2AError> {
+                Ok(value)
+            }
+            async fn list(&self, _: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
+                Ok(vec![])
+            }
+            async fn delete(&self, _: &str, _: &str) -> Result<(), A2AError> {
+                Ok(())
+            }
+            async fn delete_all(&self, _: &str) -> Result<(), A2AError> {
+                Ok(())
+            }
+        }
+        install_crypto_provider();
+        let sender = Arc::new(crate::HttpPushSender::new(Some(
+            crate::HttpPushSenderConfig {
+                timeout: Duration::from_secs(1),
+                validate_urls: false,
+                ..Default::default()
+            },
+        )));
+        let source = TaskHandle::new("task".into(), None);
+        source
+            .configure_pushes(super::super::push_delivery::PushService::new(
+                FailingGet,
+                crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                    validate_urls: false,
+                    ..Default::default()
+                })),
+            ))
+            .ok()
+            .unwrap();
+        let job = notification("task", 1, "https://example.com/hook", &sender, &source);
+        let done = timeout(Duration::from_secs(2), job.deliver())
+            .await
+            .expect("an unavailable config store cannot hold a delivery slot forever");
+        assert_eq!(done.0, "task");
+    }
+
+    #[tokio::test]
+    async fn one_tasks_slow_fanout_cannot_fill_all_http_slots() {
+        install_crypto_provider();
+        let sender = Arc::new(crate::HttpPushSender::new(Some(
+            crate::HttpPushSenderConfig {
+                timeout: Duration::from_secs(10),
+                validate_urls: false,
+                ..Default::default()
+            },
+        )));
+        let (url, mut seen, server) = endpoint(true).await;
+        let source = TaskHandle::new("a".into(), None);
+        let other = TaskHandle::new("b".into(), None);
+        let (queue, receiver) = PushDispatcher::channel(32);
+        for generation in 1..=16 {
+            queue
+                .submit(notification(
+                    "a",
+                    generation,
+                    &format!("{url}/{generation}"),
+                    &sender,
+                    &source,
+                ))
+                .await;
+        }
+        let delivery = tokio::spawn(dispatch(receiver, queue.released.clone(), 16));
+        let mut releases = Vec::new();
+        for _ in 0..8 {
+            releases.push(
+                timeout(Duration::from_secs(2), seen.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .2,
+            );
+        }
+        queue
+            .submit(notification("b", 1, &format!("{url}/b"), &sender, &other))
+            .await;
+        let (task, _, release) = timeout(Duration::from_secs(2), seen.recv())
+            .await
+            .expect("another task must get a slot before the slow fan-out completes")
+            .unwrap();
+        assert_eq!(task, "b");
+        drop(release);
+        drop(releases);
+        for _ in 0..8 {
+            let (_, _, release) = timeout(Duration::from_secs(2), seen.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            drop(release);
+        }
+        drop(queue);
+        timeout(Duration::from_secs(2), delivery)
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+    }
 
     async fn endpoint(
         gate_all: bool,

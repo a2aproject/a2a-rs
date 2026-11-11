@@ -14,11 +14,13 @@ pub struct HttpPushSender {
     client: reqwest::Client,
     fail_on_error: bool,
     validate_urls: bool,
+    timeout: Duration,
 }
 
 /// Configuration for [`HttpPushSender`].
 pub struct HttpPushSenderConfig {
-    /// HTTP request timeout (default: 30s).
+    /// Notification delivery timeout, including configuration lookup and the
+    /// HTTP request (default: 30s).
     pub timeout: Duration,
     /// If true, a failed delivery asynchronously wakes the active execution's
     /// driver with an error. Delivery does not roll back an already published event.
@@ -77,7 +79,13 @@ impl HttpPushSender {
             client,
             fail_on_error: config.fail_on_error,
             validate_urls: config.validate_urls,
+            timeout: config.timeout,
         }
+    }
+
+    /// Budget for one ordered delivery, including configuration access.
+    pub(crate) fn delivery_timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Send an event to the push notification endpoint.
