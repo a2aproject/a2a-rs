@@ -17,8 +17,8 @@ pub use outputs::{ExecutorOutput, ExecutorOutputSender};
 ///
 /// Non-exhaustive: fields are added as the protocol grows, and only the
 /// handler builds one. Inputs are owned and can move into a worker task.
-/// Once the execution stream ends the old inbox stops yielding messages; unread
-/// inputs remain available to the server for the next invocation.
+/// Inline EOF revokes the old inbox unless an output worker explicitly keeps
+/// the invocation alive. Unread inputs remain available for the next invocation.
 ///
 /// ```no_run
 /// use a2a_server::ExecutorContext;
@@ -166,6 +166,9 @@ pub trait AgentExecutor: Send + Sync + 'static {
     /// `ctx.outputs.send_for(&input, event)` so its buffered output keeps the
     /// producing input's generation. Untagged worker output is conservatively
     /// associated with the opener, never with a newer input read by that worker.
+    /// To continue producing after inline EOF, opt in with
+    /// `ctx.outputs.clone().into_worker()` before returning the stream. Passive
+    /// context/sender clones do not extend the turn; EOF revokes their inbox.
     fn execute(&self, ctx: ExecutorContext)
     -> BoxStream<'static, Result<StreamResponse, A2AError>>;
 

@@ -298,8 +298,13 @@ impl ClientInputSender {
 
     /// End this invocation's right to read, including in detached workers.
     pub(crate) fn revoke(&self) {
-        self.revoked.cancel();
+        self.revoke_reads();
         self.closed.cancel();
+    }
+
+    /// Stop old receivers at inline EOF while the driver drains buffered output.
+    pub(crate) fn revoke_reads(&self) {
+        self.revoked.cancel();
     }
 }
 

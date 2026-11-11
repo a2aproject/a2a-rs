@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 
 /// One locally produced event. Correlation is SDK context, never a wire field.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ExecutorOutput {
     pub result: Result<StreamResponse, A2AError>,
     pub input_generation: i64,
@@ -24,27 +25,56 @@ pub struct ExecutorOutput {
 pub struct ExecutorOutputSender {
     sender: Option<mpsc::Sender<ExecutorOutput>>,
     opening_generation: i64,
+    workers: Option<mpsc::WeakUnboundedSender<()>>,
+    worker_lease: Option<mpsc::UnboundedSender<()>>,
 }
 
 impl ExecutorOutputSender {
     /// Connect a standalone executor to a bounded output receiver in a test or
     /// custom runner. The default generation is zero; `send_for` uses the input.
     pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<ExecutorOutput>) {
-        Self::for_execution(capacity, 0)
+        let (mut sender, receiver, _workers) = Self::for_execution(capacity, 0);
+        // A standalone runner owns channel lifetime itself.
+        sender.workers = None;
+        (sender, receiver)
     }
 
     pub(crate) fn for_execution(
         capacity: usize,
         opening_generation: i64,
-    ) -> (Self, mpsc::Receiver<ExecutorOutput>) {
+    ) -> (Self, mpsc::Receiver<ExecutorOutput>, OutputWorkers) {
         let (sender, receiver) = mpsc::channel(capacity);
+        let (opening, done) = mpsc::unbounded_channel();
         (
             Self {
                 sender: Some(sender),
                 opening_generation,
+                workers: Some(opening.downgrade()),
+                worker_lease: None,
             },
             receiver,
+            OutputWorkers {
+                opening: Some(opening),
+                done,
+            },
         )
+    }
+
+    /// Explicitly keep this invocation alive after its inline stream ends.
+    /// Call before returning/detaching the stream, then move this sender into
+    /// the worker. Merely capturing ExecutorContext does not extend a turn.
+    /// Dropping all opted-in sender clones lets the turn finish.
+    pub fn into_worker(mut self) -> Result<Self, A2AError> {
+        if self.worker_lease.is_none()
+            && let Some(workers) = &self.workers
+        {
+            self.worker_lease = Some(
+                workers
+                    .upgrade()
+                    .ok_or_else(|| A2AError::internal("the inline execution has already ended"))?,
+            );
+        }
+        Ok(self)
     }
 
     /// Emit output for the opening input, including a task or standalone reply.
@@ -82,6 +112,24 @@ impl ExecutorOutputSender {
             })
             .await
             .map_err(|_| A2AError::internal("executor output is closed"))
+    }
+}
+
+/// No messages are sent here. Only opted-in workers retain strong senders;
+/// passive Context/sender clones hold weak references and cannot stall EOF.
+pub(crate) struct OutputWorkers {
+    opening: Option<mpsc::UnboundedSender<()>>,
+    done: mpsc::UnboundedReceiver<()>,
+}
+
+impl OutputWorkers {
+    pub(crate) fn inline_ended(&mut self) -> bool {
+        self.opening.take();
+        self.done.is_closed()
+    }
+
+    pub(crate) async fn ended(&mut self) {
+        let _ = self.done.recv().await;
     }
 }
 
@@ -145,6 +193,23 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn only_explicit_workers_extend_inline_output_lifetime() {
+        let (sender, _receiver, mut workers) = ExecutorOutputSender::for_execution(1, 1);
+        let passive = sender.clone();
+        assert!(workers.inline_ended());
+        assert!(passive.into_worker().is_err());
+        let (sender, _receiver, mut workers) = ExecutorOutputSender::for_execution(1, 1);
+        let active = sender.clone().into_worker().unwrap();
+        assert!(!workers.inline_ended());
+        drop(active);
+        tokio::time::timeout(std::time::Duration::from_secs(1), workers.ended())
+            .await
+            .unwrap();
+        // The passive sender still exists and does not retain the turn.
+        drop(sender);
     }
 
     #[tokio::test]

@@ -83,6 +83,10 @@ capability in the final `with_capabilities` call.
   runner cannot infer the producer of arbitrary custom buffered stream items;
   detached reads no longer advance legacy output correlation. Use the owned
   output sender for prompt per-input blocking replies from detached workers.
+  To keep producing after the inline stream ends, call
+  `ctx.outputs.clone().into_worker()` before returning it. Passive context
+  captures do not extend the turn; inline EOF revokes their input receiver and
+  drains buffered output. Opted-in workers finish by dropping their senders.
 - HTTP live follow-ups have a default 30-second acknowledgement deadline,
   configurable with `with_http_followup_timeout`. Pending requests can be
   revoked before admission. Owned requests are ACKed on timeout only when a

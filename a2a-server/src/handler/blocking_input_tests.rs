@@ -419,3 +419,171 @@ async fn output_cannot_claim_an_input_the_executor_has_not_read() {
     assert!(error.message.contains("not consumed"));
     handler.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_detached_context_cannot_keep_an_ended_turn_or_claim_its_successors_input() {
+    struct DetachedContext {
+        turns: Arc<std::sync::atomic::AtomicUsize>,
+        stopped: Arc<Notify>,
+        read_input: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl AgentExecutor for DetachedContext {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            if self.turns.fetch_add(1, Ordering::SeqCst) == 0 {
+                let stopped = self.stopped.clone();
+                let read_input = self.read_input.clone();
+                tokio::spawn(async move {
+                    // Force ownership of the whole context, including outputs.
+                    let mut ctx = ctx;
+                    read_input.store(ctx.inputs.recv().await.is_some(), Ordering::SeqCst);
+                    drop(ctx);
+                    stopped.notify_one();
+                });
+                stream::empty().boxed()
+            } else {
+                assert_eq!(ctx.message.as_ref().and_then(Message::text), Some("second"));
+                stream::once(async move { Ok(question(&ctx, TaskState::Completed, "successor")) })
+                    .boxed()
+            }
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stopped = Arc::new(Notify::new());
+    let read_input = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handler = DefaultRequestHandler::new(
+        DetachedContext {
+            turns: turns.clone(),
+            stopped: stopped.clone(),
+            read_input: read_input.clone(),
+        },
+        InMemoryTaskStore::new(),
+    );
+    seed_task(&handler, "task", "context").await;
+    timeout(
+        Duration::from_secs(2),
+        handler.send_message(&ServiceParams::new(), request("first")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    timeout(Duration::from_secs(2), stopped.notified())
+        .await
+        .unwrap();
+    let reply = timeout(
+        Duration::from_secs(2),
+        handler.send_message(&ServiceParams::new(), request("second")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(reply, SendMessageResponse::Task(task) if task.status.state == TaskState::Completed)
+    );
+    assert_eq!(turns.load(Ordering::SeqCst), 2);
+    assert!(!read_input.load(Ordering::SeqCst));
+    handler.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_opted_in_output_worker_can_continue_after_inline_eof() {
+    struct OwnedWorker;
+    impl AgentExecutor for OwnedWorker {
+        fn execute(
+            &self,
+            mut ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let outputs = ctx.outputs.clone().into_worker().unwrap();
+            tokio::spawn(async move {
+                outputs
+                    .send(question(&ctx, TaskState::InputRequired, "waiting"))
+                    .await
+                    .unwrap();
+                let input = ctx.inputs.recv().await.unwrap();
+                assert_eq!(input.message.text(), Some("second"));
+                outputs
+                    .send_for(&input, question(&ctx, TaskState::Completed, "done"))
+                    .await
+                    .unwrap();
+            });
+            stream::empty().boxed()
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    let handler = DefaultRequestHandler::new(OwnedWorker, InMemoryTaskStore::new());
+    seed_task(&handler, "task", "context").await;
+    let first = timeout(
+        Duration::from_secs(2),
+        handler.send_message(&ServiceParams::new(), request("first")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(first, SendMessageResponse::Task(task) if task.status.state == TaskState::InputRequired)
+    );
+    let second = timeout(
+        Duration::from_secs(2),
+        handler.send_message(&ServiceParams::new(), request("second")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(second, SendMessageResponse::Task(task) if task.status.state == TaskState::Completed)
+    );
+    handler.shutdown().await;
+}
+
+#[tokio::test]
+async fn buffered_worker_output_precedes_an_inline_terminal_event() {
+    struct Buffered;
+    impl AgentExecutor for Buffered {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            Box::pin(async_stream::stream! {
+                ctx.outputs.send(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    task_id: ctx.task_id.clone(), context_id: ctx.context_id.clone(),
+                    artifact: serde_json::from_value(serde_json::json!({"artifactId":"buffered", "parts":[{"text":"queued"}]})).unwrap(),
+                    append: None, last_chunk: Some(true), metadata: None, generation: 0,
+                })).await.unwrap();
+                yield Ok(question(&ctx, TaskState::Completed, "done"));
+            })
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    let handler = DefaultRequestHandler::new(Buffered, InMemoryTaskStore::new());
+    seed_task(&handler, "task", "context").await;
+    let SendMessageResponse::Task(task) = timeout(
+        Duration::from_secs(2),
+        handler.send_message(&ServiceParams::new(), request("first")),
+    )
+    .await
+    .unwrap()
+    .unwrap() else {
+        panic!("Task expected")
+    };
+    assert_eq!(task.status.state, TaskState::Completed);
+    assert_eq!(task.artifacts.unwrap()[0].parts, vec![Part::text("queued")]);
+    handler.shutdown().await;
+}
