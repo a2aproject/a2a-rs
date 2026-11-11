@@ -46,7 +46,6 @@ pub mod fuzz_support;
 pub mod agent_card;
 pub mod auth;
 pub mod client;
-pub(crate) use a2a::a2a_error_from_details;
 pub mod factory;
 pub mod jsonrpc;
 pub mod middleware;
