@@ -315,9 +315,7 @@ async fn report_controller_error(
     }
     tracing::error!(task_id = %active.task.id(), execution_id = %active.execution_id, %error, "execution finalization failed");
     active.inputs.revoke();
-    active.task.unregister(active);
-    active.publish(Err(&error), None).await;
-    active.task.notify();
+    active.task.execution_failed(active, &error).await;
 }
 
 /// Starts the invocation that takes over `unread` inside the completion
@@ -522,6 +520,7 @@ mod driver_tests {
     async fn finalization_errors_reach_waiters_unless_shutdown_is_in_progress() {
         let handler = make_handler();
         let active = ActiveExecution::new(Some(task_with_history("task", "context", 0)));
+        active.task.register(&active).unwrap();
         let mut events = active.subscribe();
         let error = A2AError::internal("controller disappeared");
         report_controller_error(&handler, &active, error.clone()).await;
@@ -529,6 +528,18 @@ mod driver_tests {
         assert_eq!(observed.code, error.code);
         assert_eq!(observed.message, error.message);
         assert!(active.inputs.closed.is_cancelled());
+        let (next, _inputs, _) = ActiveExecution::with_task(active.task.clone());
+        next.task.register(&next).unwrap();
+        report_controller_error(&handler, &active, error.clone()).await;
+        assert!(
+            events.try_recv().is_err(),
+            "late old errors cannot fail the successor"
+        );
+        assert!(
+            next.task
+                .active()
+                .is_some_and(|current| Arc::ptr_eq(&current, &next))
+        );
         handler.shutdown().await;
         report_controller_error(&handler, &active, error).await;
         assert!(

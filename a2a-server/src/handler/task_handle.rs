@@ -509,8 +509,15 @@ impl TaskHandle {
         let changed = snapshot.is_some()
             || (kind == EventKind::Normal
                 && result.is_ok_and(|event| super::protocol::task_id_for_event(event).is_some()));
-        self.publish_event(result, snapshot, kind, failure, Some(input_generation))
-            .await;
+        self.publish_event(
+            result,
+            snapshot,
+            kind,
+            failure,
+            Some(input_generation),
+            None,
+        )
+        .await;
         if changed {
             self.notify();
         }
@@ -535,10 +542,26 @@ impl TaskHandle {
                     EventKind::Normal,
                     Some(failure.clone()),
                     None,
+                    None,
                 )
                 .await;
             }
         }
+        self.notify();
+    }
+
+    /// Finalization must not publish an old invocation's failure into a newly
+    /// started one. Check identity and allocate the error cursor in one lock.
+    pub(super) async fn execution_failed(&self, active: &Arc<ActiveExecution>, error: &A2AError) {
+        self.publish_event(
+            Err(error),
+            None,
+            EventKind::Normal,
+            None,
+            None,
+            Some(active),
+        )
+        .await;
         self.notify();
     }
 
@@ -549,9 +572,20 @@ impl TaskHandle {
         kind: EventKind,
         failure: Option<FailureSignal>,
         input_generation: Option<i64>,
+        execution: Option<&Arc<ActiveExecution>>,
     ) {
         let event = {
             let mut state = self.inner.state.write();
+            if let Some(execution) = execution {
+                if !state
+                    .execution
+                    .upgrade()
+                    .is_some_and(|current| Arc::ptr_eq(&current, execution))
+                {
+                    return;
+                }
+                state.execution = Weak::new();
+            }
             if let Some(task) = snapshot {
                 state.snapshot = Some(task);
             }
