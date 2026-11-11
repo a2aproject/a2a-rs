@@ -217,7 +217,17 @@ impl JsonRpcTransport {
             let body = wire::response_text(response).await.map_err(|e| {
                 A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
             })?;
-            let rpc_response = parse_jsonrpc_response(status, &body)?;
+            let rpc_response = match parse_jsonrpc_response(status, &body) {
+                Err(_)
+                    if method == methods::SEND_LIVE_MESSAGE
+                        && matches!(status.as_u16(), 404 | 405 | 501) =>
+                {
+                    return Err(A2AError::unsupported_operation(
+                        "HTTP endpoint does not support live messages",
+                    ));
+                }
+                response => response?,
+            };
 
             match (rpc_response.error, rpc_response.result) {
                 (Some(err), _) => {
@@ -465,47 +475,53 @@ where
 }
 
 /// Parse an SSE byte stream into StreamResponse events (JSON-RPC envelope).
-fn parse_sse_stream(
+pub(crate) fn parse_sse_stream(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-    parse_sse_bytes(stream, |event_text| {
-        // Extract `data:` lines from the SSE event
-        let mut data = String::new();
-        for line in event_text.lines() {
-            if let Some(d) = line.strip_prefix("data: ") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(d);
-            } else if let Some(d) = line.strip_prefix("data:") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(d);
-            }
-        }
-        if data.is_empty() {
-            return None;
-        }
+    parse_sse_bytes(stream, parse_jsonrpc_sse_event)
+}
 
-        // Try JSON-RPC envelope first
-        match serde_json::from_str::<JsonRpcResponse>(&data) {
-            Ok(rpc_resp) => {
-                if let Some(err) = rpc_resp.error {
-                    return Some(Err(parse_jsonrpc_error(err)));
-                }
-                if let Some(result) = rpc_resp.result {
-                    decode_stream_value(result, "SSE parse error")
-                } else {
-                    None
-                }
+pub(crate) fn parse_jsonrpc_sse_event(
+    event_text: &str,
+) -> Option<Result<StreamResponse, A2AError>> {
+    // Extract `data:` lines from the SSE event
+    let mut data = String::new();
+    for line in event_text.lines() {
+        if let Some(d) = line.strip_prefix("data: ") {
+            if !data.is_empty() {
+                data.push('\n');
             }
-            Err(_) => {
-                // Fallback: parse directly as StreamResponse
-                decode_stream_text(&data, "SSE parse error")
+            data.push_str(d);
+        } else if let Some(d) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(d);
+        }
+    }
+    if data.is_empty() {
+        return None;
+    }
+
+    // Try JSON-RPC envelope first
+    match serde_json::from_str::<JsonRpcResponse>(&data) {
+        Ok(rpc_resp) => {
+            if let Some(err) = rpc_resp.error {
+                return Some(Err(parse_jsonrpc_error(err)));
+            }
+            if let Some(result) = rpc_resp.result {
+                decode_stream_value(result, "SSE parse error")
+            } else {
+                Some(Err(A2AError::internal(
+                    "JSON-RPC stream response missing result",
+                )))
             }
         }
-    })
+        Err(_) => {
+            // Fallback: parse directly as StreamResponse
+            decode_stream_text(&data, "SSE parse error")
+        }
+    }
 }
 
 /// Parse an SSE byte stream into StreamResponse events (REST binding).
@@ -2533,6 +2549,60 @@ mod tests {
 
         assert_eq!(items.len(), 1, "expected one item, got {items:?}");
         assert!(items.into_iter().next().unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn framed_envelopes_without_a_result_match_unterminated_tail_errors() {
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+        ] {
+            for data in [format!("data: {body}\n\n"), body.into()] {
+                let events: Vec<_> = parse_sse_stream(byte_stream(vec![data])).collect().await;
+                assert_eq!(events.len(), 1);
+                assert!(events[0].is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_json_live_http_unsupported_statuses_are_normalized() {
+        use crate::LiveUplink;
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        for status in [
+            "404 Not Found",
+            "405 Method Not Allowed",
+            "501 Not Implemented",
+        ] {
+            for opening in [true, false] {
+                let endpoint = spawn_http_error_server(status, "<html>not supported</html>").await;
+                let transport = JsonRpcTransport::new(Client::new(), endpoint);
+                let error = if opening {
+                    transport
+                        .send_live_message(&ServiceParams::new(), &request)
+                        .await
+                        .err()
+                        .unwrap()
+                } else {
+                    JsonRpcLiveUplink {
+                        transport,
+                        params: ServiceParams::new(),
+                    }
+                    .send(request.clone())
+                    .await
+                    .err()
+                    .unwrap()
+                };
+                assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+            }
+        }
     }
 
     #[tokio::test]

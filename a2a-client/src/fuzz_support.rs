@@ -16,48 +16,6 @@ pub fn parse_stream_tail(
     crate::jsonrpc::parse_stream_tail(buf, parse_event)
 }
 
-fn skipped_unknown_result(text: &str) -> bool {
-    let Ok(response) = serde_json::from_str::<a2a::JsonRpcResponse>(text.trim()) else {
-        return false;
-    };
-    if response.error.is_some() {
-        return false;
-    }
-    let Some(serde_json::Value::Object(fields)) = response.result else {
-        return false;
-    };
-    // Presence of a known field must never excuse a dropped event, even when
-    // its payload is null. Only entirely unknown payload kinds are skippable.
-    !fields.is_empty()
-        && ![
-            "kind",
-            "jsonrpc",
-            "id",
-            "result",
-            "taskId",
-            "contextId",
-            "messageId",
-            "status",
-            "parts",
-        ]
-        .iter()
-        .any(|field| fields.contains_key(*field))
-        && fields.keys().all(|field| {
-            !matches!(
-                field.as_str(),
-                "task"
-                    | "message"
-                    | "statusUpdate"
-                    | "status_update"
-                    | "artifactUpdate"
-                    | "artifact_update"
-                    | "messageUpdate"
-                    | "message_update"
-                    | "error"
-            )
-        })
-}
-
 pub fn check_framing(data: &[u8]) {
     // Oracle 1: the boundary the caller slices on must be in range and
     // ordered. `parse_sse_bytes` does `buf.drain(..end)` then
@@ -75,20 +33,55 @@ pub fn check_framing(data: &[u8]) {
         let _ = std::str::from_utf8(&data[..start]);
     }
 
-    // Oracle 2: the #198 property — a tail carrying data must never be
-    // silently dropped. Returning None here means the bytes are discarded
-    // and the caller never learns the stream was cut mid-message.
-    let parse_event = |_text: &str| None;
-    let tail = parse_stream_tail(data, &parse_event);
+    // Oracle 2: adding an SSE boundary cannot turn an RPC error into a
+    // successful empty stream. This compares independent framed/tail paths,
+    // without duplicating the implementation's future-payload skip rule.
+    let tail = parse_stream_tail(data, &crate::jsonrpc::parse_jsonrpc_sse_event);
     if let Ok(text) = std::str::from_utf8(data) {
-        // A well-formed JSON-RPC success whose result carries only an event
-        // kind this client does not know is skipped on purpose (stream readers
-        // MUST ignore unrecognised payloads); everything else must surface.
-        if !text.trim().is_empty()
-            && !text.lines().any(|l| l.starts_with("data:"))
-            && !skipped_unknown_result(text)
-        {
-            assert!(tail.is_some(), "non-empty tail silently dropped: {text:?}");
+        if !text.trim().is_empty() && !text.lines().any(|line| line.starts_with("data:")) {
+            if let Ok(envelope) = serde_json::from_str::<a2a::JsonRpcResponse>(text) {
+                // An RPC failure, or an absent/null result with no failure,
+                // cannot represent an ignorable future event.
+                if envelope.error.is_some() || envelope.result.is_none() {
+                    assert!(
+                        tail.as_ref().is_some_and(Result::is_err),
+                        "malformed RPC envelope was ignored"
+                    );
+                }
+                let framed = text
+                    .lines()
+                    .map(|line| format!("data:{line}\n"))
+                    .collect::<String>()
+                    + "\n";
+                let events = futures::executor::block_on(async {
+                    use futures::StreamExt;
+                    crate::jsonrpc::parse_sse_stream(futures::stream::iter([Ok(
+                        bytes::Bytes::from(framed),
+                    )]))
+                    .collect::<Vec<_>>()
+                    .await
+                });
+                match tail {
+                    None => assert!(events.is_empty(), "framing changed an ignored RPC payload"),
+                    Some(Ok(expected)) => {
+                        assert_eq!(events.len(), 1);
+                        assert_eq!(events.into_iter().next().unwrap().unwrap(), expected);
+                    }
+                    Some(Err(_)) => {
+                        assert_eq!(
+                            events.len(),
+                            1,
+                            "framing discarded a malformed RPC envelope"
+                        );
+                        assert!(
+                            events[0].is_err(),
+                            "framing accepted a malformed RPC envelope"
+                        );
+                    }
+                }
+            } else {
+                assert!(tail.is_some(), "nonempty malformed tail silently dropped");
+            }
         }
     }
 }
@@ -99,50 +92,36 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn known_payloads_never_qualify_for_the_unknown_event_exemption() {
-        for field in [
-            "task",
-            "message",
-            "statusUpdate",
-            "status_update",
-            "artifactUpdate",
-            "artifact_update",
-            "messageUpdate",
-            "message_update",
-            "error",
+    fn oracle_preserves_errors_for_known_null_payloads_and_empty_envelopes() {
+        for payload in [
+            json!({"task":null}),
+            json!({"statusUpdate":null}),
+            json!({"task":null,"futureEvent":{}}),
+            json!({}),
+            json!(null),
         ] {
-            for value in [json!(null), json!({}), json!(false)] {
-                for extra_unknown in [false, true] {
-                    let mut result = json!({field: value});
-                    if extra_unknown {
-                        result["futureEvent"] = json!({});
-                    }
-                    let envelope = json!({"jsonrpc":"2.0", "id":1, "result":result}).to_string();
-                    assert!(!skipped_unknown_result(&envelope), "{envelope}");
-                }
-            }
+            let envelope = json!({"jsonrpc":"2.0","id":1,"result":payload}).to_string();
+            check_framing(envelope.as_bytes());
+            assert!(
+                parse_stream_tail(
+                    envelope.as_bytes(),
+                    &crate::jsonrpc::parse_jsonrpc_sse_event
+                )
+                .unwrap()
+                .is_err()
+            );
         }
+        check_framing(br#"{"jsonrpc":"2.0","id":1}"#);
     }
 
     #[test]
-    fn only_well_formed_unknown_result_envelopes_are_exempt() {
-        for value in [json!(null), json!({}), json!(42)] {
-            for null_error in [false, true] {
-                let mut envelope = json!({"jsonrpc":"2.0", "id":1, "result":{"futureEvent":value}});
-                if null_error {
-                    envelope["error"] = json!(null);
-                }
-                assert!(skipped_unknown_result(&envelope.to_string()), "{envelope}");
-            }
-        }
-        for envelope in [
-            json!({"result":{"futureEvent":{}}}),
-            json!({"jsonrpc":"2.0", "id":1, "result":{}}),
-            json!({"jsonrpc":"2.0", "id":1, "result":null}),
-            json!({"jsonrpc":"2.0", "id":1, "result":[]}),
-            json!({"jsonrpc":"2.0", "id":1, "result":{"futureEvent":{}}, "error":{"code":-1,"message":"failed"}}),
-        ] {
-            assert!(!skipped_unknown_result(&envelope.to_string()), "{envelope}");
+    fn oracle_allows_future_payloads_without_a_copy_of_the_decoder_rules() {
+        for payload in [json!({"futureEvent":{}}), json!({"futureOther":null})] {
+            check_framing(
+                json!({"jsonrpc":"2.0","id":1,"result":payload})
+                    .to_string()
+                    .as_bytes(),
+            );
         }
     }
 
