@@ -77,7 +77,6 @@ impl Cancellation {
 
         let cancel_inputs = ClientInputs::closed();
         let exec_ctx = crate::ExecutorContext {
-            outputs: Default::default(),
             execution_id: active_execution.as_ref().map_or_else(
                 || uuid::Uuid::now_v7().to_string(),
                 |active| active.execution_id.clone(),
@@ -91,6 +90,7 @@ impl Cancellation {
             service_params: params.clone(),
             tenant: req.tenant,
             inputs: cancel_inputs,
+            opening_input_generation: 0,
             new_task: false,
             task_snapshot: None,
         };

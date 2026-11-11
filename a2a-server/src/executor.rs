@@ -11,14 +11,14 @@ mod inputs;
 pub(crate) mod outputs;
 pub use inputs::{ClientInput, ClientInputSender, ClientInputs};
 pub(crate) use inputs::{QueuedInput, ReturnedInputs};
-pub use outputs::{ExecutorOutput, ExecutorOutputSender};
+pub use outputs::{ExecutorOutput, ExecutorOutputReceiver, ExecutorOutputSender};
 
 /// Context passed to the [`AgentExecutor`] for each execution.
 ///
 /// Non-exhaustive: fields are added as the protocol grows, and only the
 /// handler builds one. Inputs are owned and can move into a worker task.
-/// Inline EOF revokes the old inbox unless an output worker explicitly keeps
-/// the invocation alive. Unread inputs remain available for the next invocation.
+/// The returned stream defines execution lifetime. EOF revokes its inbox;
+/// unread inputs are rejected, never replayed into another execution.
 ///
 /// ```no_run
 /// use a2a_server::ExecutorContext;
@@ -60,15 +60,15 @@ pub struct ExecutorContext {
     /// alongside its own work. Messages left unread when execution ends are
     /// rejected to their senders, never replayed into another execution.
     pub inputs: ClientInputs,
-    /// Owned output for spawned workers. `send_for` preserves the producing
-    /// input's generation; the ordinary execute stream remains available.
-    pub outputs: ExecutorOutputSender,
     /// Whether this is the task's first invocation. This remains true for a
     /// typed agent's first `execute` call after `start` has created the task.
     pub new_task: bool,
     // The typed adapter refreshes its context after its opening Task is committed.
     // A weak reference keeps this lookup from extending the task's lifetime.
     pub(crate) task_snapshot: Option<crate::handler::WeakTaskHandle>,
+    // Captured before execute/restart can read another input. Channel creation
+    // later in the invocation must not relabel output for the opening request.
+    pub(crate) opening_input_generation: i64,
 }
 
 impl ExecutorContext {
@@ -82,7 +82,6 @@ impl ExecutorContext {
         inputs: ClientInputs,
     ) -> Self {
         ExecutorContext {
-            outputs: Default::default(),
             execution_id: uuid::Uuid::now_v7().to_string(),
             message: None,
             task_id: task_id.into(),
@@ -93,9 +92,23 @@ impl ExecutorContext {
             service_params: ServiceParams::new(),
             tenant: None,
             inputs,
+            opening_input_generation: 0,
             new_task: false,
             task_snapshot: None,
         }
+    }
+
+    /// Create the stream this execution will return and a sender for its workers.
+    /// Move the sender into the worker and return the receiver as a boxed stream.
+    /// `send_for` preserves per-input correlation through this receiver; return
+    /// it directly rather than buffering its untagged items in another stream.
+    /// Perform asynchronous transforms in the worker before `send_for`.
+    /// Dropping all senders ends execution after buffered output is delivered.
+    pub fn output_channel(
+        &self,
+        capacity: usize,
+    ) -> (ExecutorOutputSender, ExecutorOutputReceiver) {
+        ExecutorOutputSender::for_execution(capacity, self.opening_input_generation)
     }
 
     pub fn with_inputs(mut self, inputs: ClientInputs) -> Self {
@@ -161,14 +174,13 @@ impl ExecutorContext {
 /// client or executor edits. Use artifact update events to edit those artifacts.
 #[async_trait::async_trait]
 pub trait AgentExecutor: Send + Sync + 'static {
-    /// Execute a message and return owned output. Inline reads from `ctx.inputs`
-    /// correlate subsequent yielded interruptions. A spawned worker should use
-    /// `ctx.outputs.send_for(&input, event)` so its buffered output keeps the
-    /// producing input's generation. Untagged worker output is conservatively
-    /// associated with the opener, never with a newer input read by that worker.
-    /// To continue producing after inline EOF, opt in with
-    /// `ctx.outputs.clone().into_worker()` before returning the stream. Passive
-    /// context/sender clones do not extend the execution; EOF revokes their inbox.
+    /// Execute a message and return owned output. The returned stream defines
+    /// execution lifetime, including when input is read in a spawned worker.
+    /// For a worker, create `ctx.output_channel(capacity)`, move its sender and
+    /// inputs into the worker, and return the receiver as the output stream.
+    /// `sender.send_for(&input, event)` preserves producer-side correlation.
+    /// Inline input reads correlate subsequent yielded interruptions. Arbitrary
+    /// custom buffering without tags cannot provide exact producer provenance.
     fn execute(&self, ctx: ExecutorContext)
     -> BoxStream<'static, Result<StreamResponse, A2AError>>;
 
@@ -385,7 +397,6 @@ mod tests {
     fn test_executor_context_task_info() {
         let inputs = ClientInputs::closed();
         let ctx = ExecutorContext {
-            outputs: Default::default(),
             execution_id: uuid::Uuid::now_v7().to_string(),
             message: None,
             task_id: "t1".into(),
@@ -396,6 +407,7 @@ mod tests {
             service_params: HashMap::new(),
             tenant: None,
             inputs,
+            opening_input_generation: 0,
             new_task: false,
             task_snapshot: None,
         };
@@ -403,6 +415,23 @@ mod tests {
         assert_eq!(tid, "t1");
         assert_eq!(cid, "c1");
     }
+    #[tokio::test]
+    async fn output_channel_keeps_the_opener_when_created_after_another_input_is_read() {
+        let (sender, inputs) = ClientInputs::channel(1);
+        let mut ctx = ExecutorContext::new("task", "context", inputs);
+        ctx.opening_input_generation = 3;
+        sender
+            .try_send(ClientInput::new(Message::new(Role::User, vec![]), 7))
+            .unwrap();
+        ctx.inputs.recv().await.unwrap();
+        let (outputs, mut receiver) = ctx.output_channel(1);
+        outputs
+            .send(StreamResponse::Message(Message::new(Role::Agent, vec![])))
+            .await
+            .unwrap();
+        assert_eq!(receiver.recv().await.unwrap().input_generation, 3);
+    }
+
     struct StartOnly;
     #[async_trait::async_trait]
     impl Agent for StartOnly {

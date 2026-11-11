@@ -19,62 +19,42 @@ pub struct ExecutorOutput {
     pub input_generation: i64,
 }
 
-/// An owned sender for workers that receive input outside the executor stream.
+/// The sending end of the stream returned by an executor.
 /// Use `send_for` to associate an interruption with the input it answers.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ExecutorOutputSender {
-    sender: Option<mpsc::Sender<ExecutorOutput>>,
+    sender: mpsc::Sender<ExecutorOutput>,
     opening_generation: i64,
-    workers: Option<mpsc::WeakUnboundedSender<()>>,
-    worker_lease: Option<mpsc::UnboundedSender<()>>,
+}
+
+/// An executor's bounded output stream, including producer-side correlation.
+/// Return this receiver directly from `execute`, boxed as its output stream.
+/// Dropping it closes the channel; dropping all senders ends the stream after
+/// buffered events have been read. No separate worker registration is needed.
+pub struct ExecutorOutputReceiver {
+    receiver: mpsc::Receiver<ExecutorOutput>,
 }
 
 impl ExecutorOutputSender {
-    /// Connect a standalone executor to a bounded output receiver in a test or
-    /// custom runner. The default generation is zero; `send_for` uses the input.
-    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<ExecutorOutput>) {
-        let (mut sender, receiver, _workers) = Self::for_execution(capacity, 0);
-        // A standalone runner owns channel lifetime itself.
-        sender.workers = None;
-        (sender, receiver)
+    /// Connect a standalone executor to a bounded output stream. The opening
+    /// generation is zero. In an executor, use `ExecutorContext::output_channel`
+    /// to bind untagged output to the request that started execution.
+    pub fn channel(capacity: usize) -> (Self, ExecutorOutputReceiver) {
+        Self::for_execution(capacity, 0)
     }
 
     pub(crate) fn for_execution(
         capacity: usize,
         opening_generation: i64,
-    ) -> (Self, mpsc::Receiver<ExecutorOutput>, OutputWorkers) {
+    ) -> (Self, ExecutorOutputReceiver) {
         let (sender, receiver) = mpsc::channel(capacity);
-        let (opening, done) = mpsc::unbounded_channel();
         (
             Self {
-                sender: Some(sender),
+                sender,
                 opening_generation,
-                workers: Some(opening.downgrade()),
-                worker_lease: None,
             },
-            receiver,
-            OutputWorkers {
-                opening: Some(opening),
-                done,
-            },
+            ExecutorOutputReceiver { receiver },
         )
-    }
-
-    /// Explicitly keep this invocation alive after its inline stream ends.
-    /// Call before returning/detaching the stream, then move this sender into
-    /// the worker. Merely capturing ExecutorContext does not extend a execution.
-    /// Dropping all opted-in sender clones lets the execution finish.
-    pub fn into_worker(mut self) -> Result<Self, A2AError> {
-        if self.worker_lease.is_none()
-            && let Some(workers) = &self.workers
-        {
-            self.worker_lease = Some(
-                workers
-                    .upgrade()
-                    .ok_or_else(|| A2AError::internal("the inline execution has already ended"))?,
-            );
-        }
-        Ok(self)
     }
 
     /// Emit output for the opening input, including a task or standalone reply.
@@ -83,7 +63,7 @@ impl ExecutorOutputSender {
     }
 
     /// Emit output for this exact consumed input, even if it was buffered while
-    /// another worker consumed a newer input. The server never infers this tag.
+    /// another worker consumed a newer input. The receiver preserves this tag.
     pub async fn send_for(
         &self,
         input: &ClientInput,
@@ -101,11 +81,7 @@ impl ExecutorOutputSender {
         result: Result<StreamResponse, A2AError>,
         input_generation: i64,
     ) -> Result<(), A2AError> {
-        let sender = self
-            .sender
-            .as_ref()
-            .ok_or_else(|| A2AError::internal("executor output is not connected"))?;
-        sender
+        self.sender
             .send(ExecutorOutput {
                 result,
                 input_generation,
@@ -115,27 +91,44 @@ impl ExecutorOutputSender {
     }
 }
 
-/// No messages are sent here. Only opted-in workers retain strong senders;
-/// passive Context/sender clones hold weak references and cannot stall EOF.
-pub(crate) struct OutputWorkers {
-    opening: Option<mpsc::UnboundedSender<()>>,
-    done: mpsc::UnboundedReceiver<()>,
-}
-
-impl OutputWorkers {
-    pub(crate) fn inline_ended(&mut self) -> bool {
-        self.opening.take();
-        self.done.is_closed()
+impl ExecutorOutputReceiver {
+    /// Read a tagged event in a standalone runner. Returning this receiver as
+    /// the executor stream also carries its tag through the default handler.
+    pub async fn recv(&mut self) -> Option<ExecutorOutput> {
+        futures::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
-    pub(crate) async fn ended(&mut self) {
-        let _ = self.done.recv().await;
+    fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<ExecutorOutput>> {
+        let _ = POLLING_EXECUTOR.try_with(|scope| scope.produced.set(None));
+        let output = std::task::ready!(self.receiver.poll_recv(cx));
+        if let Some(output) = &output {
+            let _ = POLLING_EXECUTOR
+                .try_with(|scope| scope.produced.set(Some(output.input_generation)));
+        }
+        std::task::Poll::Ready(output)
+    }
+}
+
+impl futures::Stream for ExecutorOutputReceiver {
+    type Item = Result<StreamResponse, A2AError>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.get_mut()
+            .poll_recv(cx)
+            .map(|output| output.map(|output| output.result))
     }
 }
 
 struct PollScope {
     inputs: Arc<AtomicI64>,
     inline: Arc<AtomicI64>,
+    produced: std::cell::Cell<Option<i64>>,
 }
 
 tokio::task_local! { static POLLING_EXECUTOR: PollScope; }
@@ -148,8 +141,40 @@ pub(crate) async fn scope<F: std::future::Future>(
     future: F,
 ) -> F::Output {
     POLLING_EXECUTOR
-        .scope(PollScope { inputs, inline }, future)
+        .scope(
+            PollScope {
+                inputs,
+                inline,
+                produced: std::cell::Cell::new(None),
+            },
+            future,
+        )
         .await
+}
+
+/// Capture correlation in the same poll that yields the item. A tagged
+/// channel item overrides inline read progress only for this output; it cannot
+/// contaminate a later legacy item or an unrelated pending stream poll.
+pub(crate) async fn next(
+    stream: &mut futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>>,
+    inline: &AtomicI64,
+) -> Option<ExecutorOutput> {
+    futures::future::poll_fn(|cx| {
+        let _ = POLLING_EXECUTOR.try_with(|scope| scope.produced.set(None));
+        let Some(result) = std::task::ready!(stream.as_mut().poll_next(cx)) else {
+            return std::task::Poll::Ready(None);
+        };
+        let generation = POLLING_EXECUTOR
+            .try_with(|scope| scope.produced.take())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| inline.load(Ordering::Acquire));
+        std::task::Poll::Ready(Some(ExecutorOutput {
+            result,
+            input_generation: generation,
+        }))
+    })
+    .await
 }
 
 pub(crate) fn input_read(inputs: &Arc<AtomicI64>, generation: i64) {
@@ -187,29 +212,49 @@ mod tests {
         assert!(receiver.recv().await.unwrap().result.is_err());
         drop(receiver);
         assert!(outputs.fail(A2AError::internal("closed")).await.is_err());
-        assert!(
-            ExecutorOutputSender::default()
-                .fail(A2AError::internal("disconnected"))
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]
-    async fn only_explicit_workers_extend_inline_output_lifetime() {
-        let (sender, _receiver, mut workers) = ExecutorOutputSender::for_execution(1, 1);
-        let passive = sender.clone();
-        assert!(workers.inline_ended());
-        assert!(passive.into_worker().is_err());
-        let (sender, _receiver, mut workers) = ExecutorOutputSender::for_execution(1, 1);
-        let active = sender.clone().into_worker().unwrap();
-        assert!(!workers.inline_ended());
-        drop(active);
-        tokio::time::timeout(std::time::Duration::from_secs(1), workers.ended())
+    async fn tagged_channel_output_does_not_overwrite_later_inline_correlation() {
+        use futures::StreamExt;
+        let inputs = Arc::new(AtomicI64::new(7));
+        let inline = Arc::new(AtomicI64::new(7));
+        let (outputs, receiver) = ExecutorOutputSender::channel(2);
+        let input = ClientInput::new(Message::new(Role::User, vec![]), 3);
+        outputs
+            .send_for(
+                &input,
+                StreamResponse::Message(Message::new(Role::Agent, vec![])),
+            )
             .await
             .unwrap();
-        // The passive sender still exists and does not retain the execution.
-        drop(sender);
+        outputs
+            .send_for(
+                &ClientInput::new(Message::new(Role::User, vec![]), 4),
+                StreamResponse::Message(Message::new(Role::Agent, vec![Part::text("discard")])),
+            )
+            .await
+            .unwrap();
+        drop(outputs);
+        let receiver = receiver.filter(|event| futures::future::ready(
+            !matches!(event, Ok(StreamResponse::Message(message)) if message.text() == Some("discard"))));
+        let legacy = futures::stream::once(async {
+            Ok(StreamResponse::Message(Message::new(Role::Agent, vec![])))
+        });
+        let mut stream = receiver.chain(legacy).boxed();
+        scope(inputs, inline.clone(), async {
+            assert_eq!(
+                next(&mut stream, &inline).await.unwrap().input_generation,
+                3
+            );
+            assert_eq!(inline.load(Ordering::Acquire), 7);
+            assert_eq!(
+                next(&mut stream, &inline).await.unwrap().input_generation,
+                7
+            );
+            assert!(next(&mut stream, &inline).await.is_none());
+        })
+        .await;
     }
 
     #[tokio::test]

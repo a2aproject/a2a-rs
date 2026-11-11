@@ -47,8 +47,8 @@ fn execute(
 Executors may return a standalone agent `Message`, or create/update a task
 through their output stream. Once task output begins, subsequent output must
 belong to that task. A standalone message closes its response stream. A task
-may remain nonterminal after an invocation returns; later input can start a
-new invocation. `execution_id` identifies an invocation, not a client or task.
+may remain nonterminal after its output stream ends; a fresh input can start
+another execution. `execution_id` identifies an invocation, not a client or task.
 The owned input receiver can move into a spawned Tokio worker.
 
 Input queues belong to one execution. If that execution ends before reading
@@ -76,7 +76,7 @@ capability in the final `with_capabilities` call.
 ## Completion, retries and live exchanges
 
 - A blocking send waits for a relevant interrupt or completion. If the
-  invocation that consumed its input returns without changing the task to a
+  execution that consumed its input ends without changing the task to a
   terminal state, the call returns the current task snapshot. This can still
   have a `WORKING` or `INPUT_REQUIRED` state.
 - `with_blocking_response_timeout` can bound waits on an executor that never finishes.
@@ -85,17 +85,15 @@ capability in the final `with_capabilities` call.
   `taskId` and `generation`. Do not resend that input. Other states return
   the stored snapshot. An uncreated task or uncertain storage outcome is an
   error. The timeout does not cancel execution.
-- `AgentExecutor::execute` keeps its signature. An executor can move both
-  `ctx.inputs` and the new `ctx.outputs` into owned workers. Use
-  `outputs.send_for(&input, event)` to tag output at production time. The
-  runner cannot infer the producer of arbitrary custom buffered stream items;
-  detached reads no longer advance legacy output correlation. Use the owned
-  output sender for prompt per-input blocking replies from detached workers.
-  To keep producing after the inline stream ends, call
-  `ctx.outputs.clone().into_worker()` before returning it. `ExecutorOutput`
-  is non-exhaustive; construct outputs through the sender API. Passive context
-  captures do not extend the execution; inline EOF revokes their input receiver and
-  drains buffered output. Opted-in workers finish by dropping their senders.
+- `AgentExecutor::execute` keeps its signature. A worker creates
+  `let (outputs, events) = ctx.output_channel(capacity)`, owns the sender and
+  inputs, and returns `Box::pin(events)` from `execute`. The returned stream
+  alone defines execution lifetime: after all senders drop, buffered events
+  drain and EOF revokes input. Capturing the context does not extend execution.
+  `outputs.send_for(&input, event)` preserves producer-side input correlation
+  through the supplied receiver. Return that receiver directly; arbitrary
+  buffering of its untagged items cannot retain producer provenance implicitly.
+  `ExecutorOutput` is non-exhaustive; construct outputs through the sender API.
 - HTTP live follow-ups have a default 30-second acknowledgement deadline,
   configurable with `with_http_followup_timeout`. Pending requests can be
   revoked before admission. Owned requests are ACKed on timeout only when a

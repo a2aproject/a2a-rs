@@ -12,6 +12,7 @@ use super::protocol::{
 use super::task_handle::{TaskCommand, TaskController, TaskOperation};
 use crate::executor::{ClientInput, ClientInputSender, QueuedInput, ReturnedInputs};
 use a2a::*;
+#[cfg(test)]
 use futures::StreamExt;
 use std::sync::Arc;
 
@@ -162,13 +163,9 @@ async fn poll_executor(
     request: impl Into<ExecutionRequest> + Send,
 ) -> ExecutionEnd {
     let mut request = request.into();
-    let (outputs, mut produced, mut workers) = crate::ExecutorOutputSender::for_execution(
-        super::TASK_INPUT_CAPACITY,
-        active.inputs.received_generation(),
-    );
     match &mut request {
         ExecutionRequest::Message(context) | ExecutionRequest::Restart { context, .. } => {
-            context.outputs = outputs
+            context.opening_input_generation = active.inputs.received_generation();
         }
     }
     let mut stream = match request {
@@ -184,9 +181,6 @@ async fn poll_executor(
     };
     let mut push_failure = active.push_failure.subscribe();
     let mut output_protocol = ExecutionProtocol::default();
-    let (mut stream_ended, mut outputs_ended, mut workers_ended) = (false, false, false);
-    let mut pending_inline = None;
-    let mut preceding_outputs = 0;
     loop {
         // Cancellation and terminal state take precedence over a late delivery error.
         if active.inputs.closed.is_cancelled() {
@@ -199,77 +193,19 @@ async fn poll_executor(
             }
             return ExecutionEnd::Failed(error);
         }
-        // A selected inline item follows the worker items already buffered
-        // when it was polled. Bound the drain to that snapshot so continuous
-        // producers cannot starve an inline terminal event.
-        let ready = if preceding_outputs > 0 {
-            preceding_outputs -= 1;
-            produced
-                .try_recv()
-                .ok()
-                .map(|output| (output.result, output.input_generation))
-        } else {
-            pending_inline.take()
+        let output = tokio::select! {
+            biased;
+            _ = active.inputs.closed.cancelled() => return ExecutionEnd::Stopped,
+            _ = push_failure.changed() => continue,
+            output = crate::executor::outputs::next(&mut stream, &active.inline_input_generation) => output,
         };
-        let (result, generation) = if let Some(output) = ready {
-            output
-        } else if stream_ended && workers_ended {
-            // Passive senders cannot extend the drain with new output.
-            produced.close();
+        let Some(crate::ExecutorOutput {
+            result,
+            input_generation: generation,
+        }) = output
+        else {
             active.inputs.revoke_reads();
-            match produced.try_recv() {
-                Ok(output) => (output.result, output.input_generation),
-                Err(_) => return ExecutionEnd::Finished,
-            }
-        } else {
-            enum Next {
-                Worker(Option<crate::ExecutorOutput>),
-                Inline(Option<Result<StreamResponse, A2AError>>),
-                WorkersEnded,
-            }
-            let next = tokio::select! {
-                biased;
-                _ = active.inputs.closed.cancelled() => return ExecutionEnd::Stopped,
-                _ = push_failure.changed() => continue,
-                output = async {
-                    tokio::select! {
-                        output = produced.recv(), if !outputs_ended => Next::Worker(output),
-                        output = stream.next(), if !stream_ended => Next::Inline(output),
-                        _ = workers.ended(), if stream_ended && !workers_ended => Next::WorkersEnded,
-                    }
-                } => output,
-            };
-            match next {
-                Next::Worker(Some(output)) => (output.result, output.input_generation),
-                Next::Worker(None) => {
-                    outputs_ended = true;
-                    continue;
-                }
-                Next::WorkersEnded => {
-                    workers_ended = true;
-                    produced.close();
-                    active.inputs.revoke_reads();
-                    continue;
-                }
-                Next::Inline(Some(output)) => {
-                    let generation = active
-                        .inline_input_generation
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    pending_inline = Some((output, generation));
-                    preceding_outputs = produced.len();
-                    continue;
-                }
-                Next::Inline(None) => {
-                    stream_ended = true;
-                    stream = Box::pin(futures::stream::empty());
-                    workers_ended = workers.inline_ended();
-                    if workers_ended {
-                        produced.close();
-                        active.inputs.revoke_reads();
-                    }
-                    continue;
-                }
-            }
+            return ExecutionEnd::Finished;
         };
         if generation < 0 || generation > active.inputs.received_generation() {
             return ExecutionEnd::Failed(A2AError::new(

@@ -237,18 +237,18 @@ async fn detached_outputs_keep_the_producing_inputs_generation() {
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let read = self.read.clone();
             let release = self.release.clone();
-            let (sender, mut receiver) = mpsc::channel(2);
+            let (sender, mut receiver) = ctx.output_channel(2);
             let ready = Arc::new(Notify::new());
             let producer_ready = ready.clone();
             tokio::spawn(async move {
                 let first = question(&ctx, TaskState::InputRequired, "first question");
                 // Both reads and buffering happen outside the polled stream.
-                sender.send(Ok(first)).await.unwrap();
+                sender.send(first).await.unwrap();
                 let input = ctx.inputs.recv().await.unwrap();
                 read.notify_one();
                 producer_ready.notify_one();
                 release.notified().await;
-                ctx.outputs
+                sender
                     .send_for(
                         &input,
                         question(&ctx, TaskState::AuthRequired, "second question"),
@@ -258,7 +258,7 @@ async fn detached_outputs_keep_the_producing_inputs_generation() {
             });
             Box::pin(async_stream::stream! {
                 ready.notified().await;
-                while let Some(event) = receiver.recv().await { yield event; }
+                while let Some(event) = receiver.next().await { yield event; }
             })
         }
         fn cancel(
@@ -386,18 +386,18 @@ async fn output_cannot_claim_an_input_the_executor_has_not_read() {
             &self,
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-            stream::once(async move {
+            let (outputs, events) = ctx.output_channel(1);
+            tokio::spawn(async move {
                 let unread = crate::ClientInput::new(Message::new(Role::User, vec![]), i64::MAX);
-                ctx.outputs
+                outputs
                     .send_for(
                         &unread,
                         question(&ctx, TaskState::InputRequired, "not an answer"),
                     )
                     .await
                     .unwrap();
-                futures::future::pending().await
-            })
-            .boxed()
+            });
+            Box::pin(events)
         }
         fn cancel(
             &self,
@@ -436,15 +436,9 @@ async fn a_detached_context_cannot_keep_an_ended_turn_or_claim_its_successors_in
                 let stopped = self.stopped.clone();
                 let read_input = self.read_input.clone();
                 tokio::spawn(async move {
-                    // Force ownership of the whole context, including outputs.
+                    // Force ownership of the whole context, not just its inbox.
                     let mut ctx = ctx;
                     read_input.store(ctx.inputs.recv().await.is_some(), Ordering::SeqCst);
-                    assert!(
-                        ctx.outputs
-                            .send(question(&ctx, TaskState::Working, "late"))
-                            .await
-                            .is_err()
-                    );
                     drop(ctx);
                     stopped.notify_one();
                 });
@@ -500,14 +494,15 @@ async fn a_detached_context_cannot_keep_an_ended_turn_or_claim_its_successors_in
 }
 
 #[tokio::test]
-async fn an_opted_in_output_worker_can_continue_after_inline_eof() {
-    struct OwnedWorker;
+async fn a_workers_returned_output_stream_defines_execution_lifetime() {
+    struct OwnedWorker(TaskState);
     impl AgentExecutor for OwnedWorker {
         fn execute(
             &self,
             mut ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-            let outputs = ctx.outputs.clone().into_worker().unwrap();
+            let final_state = self.0.clone();
+            let (outputs, events) = ctx.output_channel(2);
             tokio::spawn(async move {
                 outputs
                     .send(question(&ctx, TaskState::InputRequired, "waiting"))
@@ -516,11 +511,11 @@ async fn an_opted_in_output_worker_can_continue_after_inline_eof() {
                 let input = ctx.inputs.recv().await.unwrap();
                 assert_eq!(input.message.text(), Some("second"));
                 outputs
-                    .send_for(&input, question(&ctx, TaskState::Completed, "done"))
+                    .send_for(&input, question(&ctx, final_state, "done"))
                     .await
                     .unwrap();
             });
-            stream::empty().boxed()
+            Box::pin(events)
         }
         fn cancel(
             &self,
@@ -529,47 +524,57 @@ async fn an_opted_in_output_worker_can_continue_after_inline_eof() {
             stream::empty().boxed()
         }
     }
-    let handler = DefaultRequestHandler::new(OwnedWorker, InMemoryTaskStore::new());
-    seed_task(&handler, "task", "context").await;
-    let first = timeout(
-        Duration::from_secs(2),
-        handler.send_message(&ServiceParams::new(), request("first")),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(
-        matches!(first, SendMessageResponse::Task(task) if task.status.state == TaskState::InputRequired)
-    );
-    let second = timeout(
-        Duration::from_secs(2),
-        handler.send_message(&ServiceParams::new(), request("second")),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(
-        matches!(second, SendMessageResponse::Task(task) if task.status.state == TaskState::Completed)
-    );
-    handler.shutdown().await;
+    // WORKING completes the blocking response only after channel EOF; a
+    // terminal output also closes normally without a separate worker lease.
+    for final_state in [TaskState::Working, TaskState::Completed] {
+        let handler =
+            DefaultRequestHandler::new(OwnedWorker(final_state.clone()), InMemoryTaskStore::new());
+        seed_task(&handler, "task", "context").await;
+        let first = timeout(
+            Duration::from_secs(2),
+            handler.send_message(&ServiceParams::new(), request("first")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(first, SendMessageResponse::Task(task) if task.status.state == TaskState::InputRequired)
+        );
+        let second = timeout(
+            Duration::from_secs(2),
+            handler.send_message(&ServiceParams::new(), request("second")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(second, SendMessageResponse::Task(task) if task.status.state == final_state)
+        );
+        handler.shutdown().await;
+    }
 }
 
 #[tokio::test]
-async fn buffered_worker_output_precedes_an_inline_terminal_event() {
+async fn worker_channel_preserves_buffered_output_before_a_terminal_event() {
     struct Buffered;
     impl AgentExecutor for Buffered {
         fn execute(
             &self,
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-            Box::pin(async_stream::stream! {
-                ctx.outputs.send(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            let (outputs, events) = ctx.output_channel(2);
+            tokio::spawn(async move {
+                outputs.send(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
                     task_id: ctx.task_id.clone(), context_id: ctx.context_id.clone(),
                     artifact: serde_json::from_value(serde_json::json!({"artifactId":"buffered", "parts":[{"text":"queued"}]})).unwrap(),
                     append: None, last_chunk: Some(true), metadata: None, generation: 0,
                 })).await.unwrap();
-                yield Ok(question(&ctx, TaskState::Completed, "done"));
-            })
+                outputs
+                    .send(question(&ctx, TaskState::Completed, "done"))
+                    .await
+                    .unwrap();
+            });
+            Box::pin(events)
         }
         fn cancel(
             &self,

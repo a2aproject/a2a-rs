@@ -11,7 +11,6 @@ use a2a_server::{
 use futures::{StreamExt, stream::BoxStream};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{Notify, mpsc};
-use tokio_stream::wrappers::ReceiverStream;
 
 fn status(task: &str, context: &str, state: TaskState, text: &str) -> StreamResponse {
     StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
@@ -40,16 +39,16 @@ impl AgentExecutor for WorkerExecutor {
         &self,
         ctx: ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-        let (task, context) = (ctx.task_id, ctx.context_id);
+        let (task, context) = (ctx.task_id.clone(), ctx.context_id.clone());
         let text = ctx
             .message
             .as_ref()
             .and_then(Message::text)
             .unwrap_or("")
             .to_string();
-        let mut inputs = ctx.inputs;
         let processed = self.processed.clone();
         if text == "hold" {
+            let mut inputs = ctx.inputs;
             let read = self.read_old_inbox.clone();
             let result = self.old_result.clone();
             // Deliberately retains ownership beyond the output stream's EOF.
@@ -69,11 +68,12 @@ impl AgentExecutor for WorkerExecutor {
                 Ok(status(&task, &context, TaskState::Completed, "done"))
             }));
         }
-        let (output, events) = mpsc::channel(8);
+        let (output, events) = ctx.output_channel(8);
+        let mut inputs = ctx.inputs;
         // Input processing and event production live in an independent task.
         tokio::spawn(async move {
             if output
-                .send(Ok(status(&task, &context, TaskState::Working, "ready")))
+                .send(status(&task, &context, TaskState::Working, "ready"))
                 .await
                 .is_err()
             {
@@ -93,12 +93,12 @@ impl AgentExecutor for WorkerExecutor {
                     },
                     &text,
                 );
-                if output.send(Ok(event)).await.is_err() || finished {
+                if output.send_for(&input, event).await.is_err() || finished {
                     break;
                 }
             }
         });
-        ReceiverStream::new(events).boxed()
+        Box::pin(events)
     }
 
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
