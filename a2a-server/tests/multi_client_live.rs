@@ -360,23 +360,21 @@ async fn shared_credentials_have_independent_rejection_streams_and_bound_task_ro
 }
 
 #[tokio::test]
-async fn another_principal_cannot_use_an_existing_exchange_identifier() {
+async fn exchange_identifier_is_scoped_to_the_authenticated_principal() {
     let (handler, mut receiver, _) = handler();
-    let (id, _owner) = start(&handler, &params("alice", Some("a")), "start").await;
+    let alice = params("alice", Some("shared-id"));
+    let bob = params("bob", Some("shared-id"));
+    let (alice_task, _alice_output) = start(&handler, &alice, "start").await;
     caller(seen(&mut receiver).await, "alice", "start", true);
-    assert!(
-        handler
-            .send_live_request(&params("bob", Some("a")), send("forbidden", Some(&id)))
-            .await
-            .is_err()
-    );
-    let _bob = open(
-        &handler,
-        &params("bob", Some("b")),
-        send("finish", Some(&id)),
-    )
-    .await;
+    // The same spelling in Bob's scope opens his own exchange and task;
+    // it must not inherit Alice's implicit task binding.
+    let (bob_task, _bob_output) = start(&handler, &bob, "start").await;
+    caller(seen(&mut receiver).await, "bob", "start", true);
+    assert_ne!(alice_task, bob_task);
+    ack(&handler, &bob, send("finish", None)).await;
     caller(seen(&mut receiver).await, "bob", "finish", false);
+    ack(&handler, &alice, send("finish", None)).await;
+    caller(seen(&mut receiver).await, "alice", "finish", false);
 }
 
 #[tokio::test]
