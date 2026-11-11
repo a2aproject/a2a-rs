@@ -586,7 +586,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn caller_quota_and_cursor_ownership_are_isolated_and_activity_renews_ttl() {
-        let store = dated_store().await;
+        let store = dated_store()
+            .await
+            .with_listing_ttl(Duration::from_secs(120));
         let alice = TaskListScope {
             tenant: Some("tenant".into()),
             principal: Some((true, "alice".into())),
@@ -622,21 +624,21 @@ mod tests {
                 .await
                 .is_err()
         );
-        tokio::time::advance(Duration::from_secs(240)).await;
+        tokio::time::advance(Duration::from_secs(90)).await;
         assert!(
             store
                 .list_for_scope(&continuation, &alice, None)
                 .await
                 .is_ok()
         );
-        tokio::time::advance(Duration::from_secs(240)).await;
+        tokio::time::advance(Duration::from_secs(90)).await;
         assert!(
             store
                 .list_for_scope(&continuation, &alice, None)
                 .await
                 .is_ok()
         );
-        tokio::time::advance(Duration::from_secs(301)).await;
+        tokio::time::advance(Duration::from_secs(121)).await;
         assert!(
             store
                 .list_for_scope(&continuation, &alice, None)

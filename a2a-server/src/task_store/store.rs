@@ -140,13 +140,35 @@ mod tests {
             tenant: None,
             principal: Some((true, "alice".into())),
         };
-        assert!(
+        let task = Task {
+            id: "legacy".into(),
+            context_id: "context".into(),
+            generation: 0,
+            timeline: None,
+            status: TaskStatus {
+                state: TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        };
+        store.create(task.clone()).await.unwrap();
+        store.update(task.clone()).await.unwrap();
+        assert_eq!(store.get("legacy").await.unwrap(), Some(task));
+        assert_eq!(
             store
                 .list_for_scope(&request, &scope, None)
                 .await
                 .unwrap()
-                .tasks
-                .is_empty()
+                .tasks[0]
+                .id,
+            "legacy"
+        );
+        assert_eq!(
+            store.begin_cancel("legacy").await.unwrap().status.state,
+            TaskState::Canceled
         );
         assert_eq!(
             store
