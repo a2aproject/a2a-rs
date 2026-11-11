@@ -1139,6 +1139,28 @@ mod subscription_tests {
             StreamResponse::Task(terminal)
         );
         assert!(inner.is_none(), "terminal output needs no subscription");
+        let mut stored = task_with_history("missing", "context", 0);
+        stored.status.state = TaskState::Working;
+        handler.tasks.store().create(stored.clone()).await.unwrap();
+        assert!(
+            run.initialize_response(None, &mut inner, &mut generation, &out)
+                .await
+        );
+        assert_eq!(
+            received.recv().await.unwrap().unwrap(),
+            StreamResponse::Task(stored)
+        );
+        assert!(inner.is_some());
+        drop(received);
+        inner = None;
+        assert!(
+            !run.initialize_response(None, &mut inner, &mut generation, &out)
+                .await
+        );
+        assert!(
+            inner.is_none(),
+            "a disconnected opening must not attach a subscription"
+        );
         handler.shutdown().await;
     }
 

@@ -1962,6 +1962,34 @@ mod policy_tests {
     }
 
     #[test]
+    fn applying_client_artifacts_requires_an_id_and_content() {
+        for (id, parts) in [("", vec![Part::text("payload")]), ("artifact", vec![])] {
+            let mut task = task_with_history("task", "context", 0);
+            let before = task.clone();
+            let mut request = crate::handler::test_support::send_req(Some("task"), Some("context"));
+            let artifact =
+                serde_json::from_value(serde_json::json!({ "artifactId": id, "parts": parts }))
+                    .unwrap();
+            request.artifact_updates = vec![TaskArtifactUpdateEvent {
+                task_id: "task".into(),
+                context_id: "context".into(),
+                artifact,
+                append: None,
+                last_chunk: None,
+                metadata: None,
+                generation: 0,
+            }];
+            assert_eq!(
+                apply_client_artifacts(&mut task, &request, false)
+                    .unwrap_err()
+                    .code,
+                error_code::INVALID_PARAMS
+            );
+            assert_eq!(task, before);
+        }
+    }
+
+    #[test]
     fn executor_output_sequences_allow_one_reply_or_a_task_lifecycle() {
         for (events, valid) in [
             (vec![reply()], true),

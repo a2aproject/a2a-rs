@@ -771,31 +771,53 @@ mod tests {
 
     #[tokio::test]
     async fn input_batch_exposes_its_complete_snapshot_and_events_before_waking_readers() {
-        let task = TaskHandle::new("task".into(), None);
-        let mut watch = task.watch();
-        let mut events = task.sender().subscribe();
-        let snapshot = task_with_history("task", "context", 0);
-        let updates = vec![StreamResponse::Task(snapshot.clone()); 3];
-        task.publish_input(
-            snapshot.clone(),
-            &updates,
-            tokio::sync::watch::channel(None).0,
+        for count in [0, 3] {
+            let task = TaskHandle::new("task".into(), None);
+            let mut watch = task.watch();
+            let mut events = task.sender().subscribe();
+            let snapshot = task_with_history("task", "context", 0);
+            let updates = vec![StreamResponse::Task(snapshot.clone()); count];
+            task.publish_input(
+                snapshot.clone(),
+                &updates,
+                tokio::sync::watch::channel(None).0,
+            )
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), watch.changed())
+                .await
+                .unwrap();
+            let (_, cached, cursor) = task.resubscribe();
+            assert_eq!(cached, Some(snapshot));
+            assert_eq!(cursor, updates.len() as u64);
+            for (index, expected) in updates.into_iter().enumerate() {
+                let event = events.try_recv().unwrap();
+                assert_eq!(event.sequence, index as u64 + 1);
+                assert_eq!(event.result.unwrap(), expected);
+            }
+            assert!(events.try_recv().is_err());
+            // A batch is one state change even when it broadcasts several events.
+            assert_eq!(*watch.changes.borrow(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_checkpoints_cannot_answer_newer_inputs_or_older_cursors() {
+        let mut snapshot = task_with_history("task", "context", 0);
+        snapshot.generation = 7;
+        let task = TaskHandle::new("task".into(), Some(snapshot.clone()));
+        task.publish(
+            Ok(&StreamResponse::Task(snapshot.clone())),
+            None,
+            EventKind::InvocationEnded,
+            None,
+            7,
         )
         .await;
-        tokio::time::timeout(std::time::Duration::from_secs(1), watch.changed())
-            .await
-            .unwrap();
-        let (_, cached, cursor) = task.resubscribe();
-        assert_eq!(cached, Some(snapshot));
-        assert_eq!(cursor, updates.len() as u64);
-        for (index, expected) in updates.into_iter().enumerate() {
-            let event = events.try_recv().unwrap();
-            assert_eq!(event.sequence, index as u64 + 1);
-            assert_eq!(event.result.unwrap(), expected);
-        }
-        assert!(events.try_recv().is_err());
-        // A batch is one state change even when it broadcasts several events.
-        assert_eq!(*watch.changes.borrow(), 1);
+        assert!(task.completed_input(8, 0).is_none());
+        assert!(task.completed_input(7, task.sequence()).is_none());
+        let recovered = task.completed_input(7, 0).unwrap();
+        assert_eq!(recovered.input_generation, 7);
+        assert_eq!(recovered.result.unwrap(), StreamResponse::Task(snapshot));
     }
 
     #[tokio::test]
