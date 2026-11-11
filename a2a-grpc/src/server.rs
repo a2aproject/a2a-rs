@@ -54,12 +54,25 @@ fn live_downlink(
     events: futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>>,
     fault: futures::future::BoxFuture<'static, tonic::Status>,
 ) -> BoxStreamResult<proto::StreamResponse> {
-    futures::stream::unfold(Some((events, fault)), |state| async move {
-        let (mut events, mut fault) = state?;
-        tokio::select! {
-            biased;
-            error = &mut fault => Some((Err(error), None)),
-            event = events.next() => event.map(|event| (map_proto_stream_item(event), Some((events, fault)))),
+    // A transport failure must follow output already ready for earlier valid
+    // inputs. Bound the drain so an always-ready executor cannot hide the error.
+    futures::stream::unfold(Some((events, fault, None, 128usize)), |state| async move {
+        let (mut events, mut fault, mut failed, mut remaining) = state?;
+        loop {
+            if let Some(error) = failed {
+                if remaining > 0 {
+                    if let Some(Some(event)) = events.next().now_or_never() {
+                        remaining -= 1;
+                        return Some((map_proto_stream_item(event), Some((events, fault, Some(error), remaining))));
+                    }
+                }
+                return Some((Err(error), None));
+            }
+            tokio::select! {
+                biased;
+                error = &mut fault => failed = Some(error),
+                event = events.next() => return event.map(|event| (map_proto_stream_item(event), Some((events, fault, None, remaining)))),
+            }
         }
     }).boxed()
 }
@@ -231,15 +244,23 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
         validate_protocol_version(&params)?;
         let (uplink, mut fault) = decode_live_uplink(request.into_inner());
         let opening = self.handler.send_live_message(&params, uplink);
+        tokio::pin!(opening);
         let events = tokio::select! {
             biased;
-            error = &mut fault => return Err(error),
-            events = opening => events.map_err(|error| a2a_error_to_status(&error))?,
+            // Prefer an already-open response so its ready events can drain.
+            events = &mut opening => match events {
+                Ok(events) => events,
+                Err(error) => return Err((&mut fault).now_or_never().unwrap_or_else(|| a2a_error_to_status(&error))),
+            },
+            error = &mut fault => {
+                // Poll once after the malformed frame closed the input. Never
+                // wait for unrelated executor work just to report bad framing.
+                if let Some(Ok(events)) = opening.now_or_never() {
+                    return Ok(tonic::Response::new(live_downlink(events, futures::future::ready(error).boxed())));
+                }
+                return Err(error);
+            },
         };
-        // Opening the handler may itself have polled the malformed frame.
-        if let Some(error) = (&mut fault).now_or_never() {
-            return Err(error);
-        }
         Ok(tonic::Response::new(live_downlink(events, fault)))
     }
 
@@ -349,6 +370,37 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::DataLoss);
         assert_eq!(error.message(), "bad protobuf frame");
         assert!(output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_frame_drains_ready_output_before_original_transport_error() {
+        let event = StreamResponse::Message(a2a::Message::new(
+            a2a::Role::Agent,
+            vec![a2a::Part::text("earlier output")],
+        ));
+        for infinite in [false, true] {
+            let events = if infinite {
+                futures::stream::repeat(Ok(event.clone())).boxed()
+            } else {
+                futures::stream::iter([Ok(event.clone())]).boxed()
+            };
+            let fault =
+                futures::future::ready(tonic::Status::data_loss("bad protobuf frame")).boxed();
+            let mut output = live_downlink(events, fault);
+            let mut received = 0;
+            loop {
+                match output.next().await.unwrap() {
+                    Ok(_) => received += 1,
+                    Err(error) => {
+                        assert_eq!(error.code(), tonic::Code::DataLoss);
+                        assert_eq!(error.message(), "bad protobuf frame");
+                        break;
+                    }
+                }
+            }
+            assert_eq!(received, if infinite { 128 } else { 1 });
+            assert!(output.next().await.is_none());
+        }
     }
 
     #[tokio::test]
