@@ -9,12 +9,60 @@ use a2a_pb::pbconv;
 use a2a_pb::proto;
 use a2a_pb::proto::a2a_service_server::A2aService;
 use a2a_server::RequestHandler;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio_stream::Stream;
 
 use crate::errors::a2a_error_to_status;
 
 type BoxStreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
+
+/// Tonic decoding failures are fatal transport errors, not a normal half-close.
+/// Keep the error alongside the normalized input so it can reach the downlink
+/// even when the handler is still waiting for its first request.
+fn decode_live_uplink(
+    input: impl Stream<Item = Result<proto::StreamRequest, tonic::Status>> + Send + 'static,
+) -> (
+    futures::stream::BoxStream<'static, a2a::StreamRequest>,
+    futures::future::BoxFuture<'static, tonic::Status>,
+) {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let input = input
+        .scan(Some(sender), |sender, item| {
+            futures::future::ready(match item {
+                Ok(request) => Some(pbconv::from_proto_stream_request(&request)),
+                Err(error) => {
+                    if let Some(sender) = sender.take() {
+                        let _ = sender.send(error);
+                    }
+                    None
+                }
+            })
+        })
+        .fuse()
+        .boxed();
+    let fault = async move {
+        match receiver.await {
+            Ok(error) => error,
+            Err(_) => futures::future::pending().await,
+        }
+    }
+    .boxed();
+    (input, fault)
+}
+
+fn live_downlink(
+    events: futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>>,
+    fault: futures::future::BoxFuture<'static, tonic::Status>,
+) -> BoxStreamResult<proto::StreamResponse> {
+    futures::stream::unfold(Some((events, fault)), |state| async move {
+        let (mut events, mut fault) = state?;
+        tokio::select! {
+            biased;
+            error = &mut fault => Some((Err(error), None)),
+            event = events.next() => event.map(|event| (map_proto_stream_item(event), Some((events, fault)))),
+        }
+    }).boxed()
+}
 
 /// gRPC server handler — wraps a `RequestHandler` as a tonic gRPC service.
 ///
@@ -181,21 +229,18 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
     ) -> Result<tonic::Response<Self::SendLiveMessageStream>, tonic::Status> {
         let params = extract_service_params(request.metadata());
         validate_protocol_version(&params)?;
-        // A request that cannot be read ends the uplink, and with it what the
-        // client can still say; the downlink goes on until the task does.
-        let uplink = request
-            .into_inner()
-            .take_while(|item| futures::future::ready(item.is_ok()))
-            .filter_map(|item| futures::future::ready(item.ok()))
-            .map(|request| pbconv::from_proto_stream_request(&request))
-            .boxed();
-        let stream = self
-            .handler
-            .send_live_message(&params, uplink)
-            .await
-            .map_err(|e| a2a_error_to_status(&e))?;
-        let proto_stream = stream.map(map_proto_stream_item);
-        Ok(tonic::Response::new(Box::pin(proto_stream)))
+        let (uplink, mut fault) = decode_live_uplink(request.into_inner());
+        let opening = self.handler.send_live_message(&params, uplink);
+        let events = tokio::select! {
+            biased;
+            error = &mut fault => return Err(error),
+            events = opening => events.map_err(|error| a2a_error_to_status(&error))?,
+        };
+        // Opening the handler may itself have polled the malformed frame.
+        if let Some(error) = (&mut fault).now_or_never() {
+            return Err(error);
+        }
+        Ok(tonic::Response::new(live_downlink(events, fault)))
     }
 
     async fn create_task_push_notification_config(
@@ -287,6 +332,38 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_live_uplink_stops_input_and_reports_original_status() {
+        let frame = proto::StreamRequest::default();
+        let (mut input, fault) = decode_live_uplink(futures::stream::iter([
+            Ok(frame.clone()),
+            Err(tonic::Status::data_loss("bad protobuf frame")),
+            Ok(frame),
+        ]));
+        assert!(input.next().await.is_some());
+        assert!(input.next().await.is_none());
+        assert!(input.next().await.is_none());
+        let mut output = live_downlink(futures::stream::pending().boxed(), fault);
+        let error = output.next().await.unwrap().unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+        assert_eq!(error.message(), "bad protobuf frame");
+        assert!(output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn normal_live_half_close_keeps_downlink_available() {
+        let (mut input, fault) = decode_live_uplink(futures::stream::empty());
+        assert!(input.next().await.is_none());
+        let events = futures::stream::iter([Ok(StreamResponse::Message(a2a::Message::new(
+            a2a::Role::Agent,
+            vec![a2a::Part::text("done")],
+        )))])
+        .boxed();
+        let mut output = live_downlink(events, fault);
+        assert!(output.next().await.unwrap().is_ok());
+        assert!(output.next().await.is_none());
+    }
 
     #[test]
     fn test_extract_service_params_empty() {
