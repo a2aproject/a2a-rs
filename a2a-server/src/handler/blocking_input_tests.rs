@@ -856,12 +856,26 @@ async fn deferred_answers_keep_fifo_generations_when_status_resumes_working() {
             received,
         },
         InMemoryTaskStore::new(),
-    );
+    )
+    .with_capabilities(caps(Some(true), None));
     seed_task(&handler, "task", "context").await;
-    handler
-        .send_message(&ServiceParams::new(), request("first"))
-        .await
-        .unwrap();
+    let (uplink, incoming) = tokio::sync::mpsc::unbounded_channel();
+    let live = |message| StreamRequest {
+        tenant: None,
+        payload: StreamRequestPayload::SendMessage(message),
+    };
+    uplink.send(live(request("first"))).unwrap();
+    let incoming = stream::unfold(incoming, |mut receiver| async move {
+        receiver.recv().await.map(|request| (request, receiver))
+    })
+    .boxed();
+    let params = ServiceParams::from([(a2a::SVC_PARAM_VERSION.into(), vec!["1.1".into()])]);
+    let mut downlink = handler.send_live_message(&params, incoming).await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        while let Some(event) = downlink.next().await {
+            if matches!(event.unwrap(), StreamResponse::StatusUpdate(event) if event.status.state == TaskState::InputRequired) { break; }
+        }
+    }).await.unwrap();
     let active = handler.tasks.task("task").active().unwrap();
     let capacity = active.inputs.sender.capacity();
     let send = |text| {
@@ -872,7 +886,7 @@ async fn deferred_answers_keep_fifo_generations_when_status_resumes_working() {
                 .await
         })
     };
-    let second = send("second");
+    uplink.send(live(request("second"))).unwrap();
     timeout(Duration::from_secs(2), async {
         while active.inputs.sender.capacity() == capacity {
             tokio::task::yield_now().await;
@@ -882,12 +896,11 @@ async fn deferred_answers_keep_fifo_generations_when_status_resumes_working() {
     .unwrap();
     working.notify_one();
     timeout(Duration::from_secs(2), async {
-        while handler.tasks.load("task").await.unwrap().status.state != TaskState::Working {
-            tokio::task::yield_now().await;
+        loop {
+            let event = downlink.next().await.unwrap().unwrap();
+            if matches!(event, StreamResponse::StatusUpdate(event) if event.status.state == TaskState::Working) { break; }
         }
-    })
-    .await
-    .unwrap();
+    }).await.expect("a deferred uplink must not stall the live downlink");
     let third = send("third");
     timeout(Duration::from_secs(2), async {
         while active.inputs.sender.capacity() != capacity - 2 {
@@ -905,11 +918,15 @@ async fn deferred_answers_keep_fifo_generations_when_status_resumes_working() {
             .any(|message| matches!(message.text(), Some("second" | "third")))
     );
     read.notify_one();
-    for reply in [second, third] {
-        assert!(
-            matches!(timeout(Duration::from_secs(2), reply).await.unwrap().unwrap().unwrap(), SendMessageResponse::Task(task) if task.status.state==TaskState::Completed)
-        );
-    }
+    assert!(
+        matches!(timeout(Duration::from_secs(2), third).await.unwrap().unwrap().unwrap(), SendMessageResponse::Task(task) if task.status.state==TaskState::Completed)
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let event = downlink.next().await.unwrap().unwrap();
+            if matches!(event, StreamResponse::StatusUpdate(event) if event.status.state == TaskState::Completed) { break; }
+        }
+    }).await.unwrap();
     let a = inputs.recv().await.unwrap();
     let b = inputs.recv().await.unwrap();
     assert_eq!((&*a.0, &*b.0), ("second", "third"));
@@ -958,4 +975,101 @@ async fn an_unclaimed_answer_times_out_without_persistence_and_releases_its_requ
     assert_eq!(handler.tasks.load("task").await.unwrap(), before);
     handler.shutdown().await;
     assert_eq!(handler.tasks.background_tasks.count(), 0);
+}
+
+#[tokio::test]
+async fn a_terminal_downlink_cannot_ack_an_answer_that_was_never_committed() {
+    struct Completes(Arc<Notify>);
+    impl AgentExecutor for Completes {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let finish = self.0.clone();
+            Box::pin(async_stream::stream! {
+                yield Ok(question(&ctx, TaskState::InputRequired, "question"));
+                finish.notified().await;
+                yield Ok(question(&ctx, TaskState::Completed, "done without reading"));
+            })
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    crate::test_util::install_crypto_provider();
+    let finish = Arc::new(Notify::new());
+    let handler = DefaultRequestHandler::new(Completes(finish.clone()), InMemoryTaskStore::new())
+        .with_capabilities(caps(Some(true), None));
+    seed_task(&handler, "task", "context").await;
+    handler
+        .send_message(&ServiceParams::new(), request("first"))
+        .await
+        .unwrap();
+    let active = handler.tasks.task("task").active().unwrap();
+    let capacity = active.inputs.sender.capacity();
+    let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
+    let receipt = super::uplink::Receipt::new(acknowledge);
+    let state = receipt.state();
+    let (uplink, incoming) = tokio::sync::mpsc::channel(1);
+    let params = ServiceParams::from([(a2a::SVC_PARAM_VERSION.into(), vec!["1.1".into()])]);
+    let mut events = super::response::Run::new(
+        handler.clone(),
+        params.clone(),
+        active.task.clone(),
+        super::protocol::ResponsePolicy::new(super::protocol::StartMode::Bidi, true),
+    )
+    .with_uplink(Some(super::uplink::Uplink::Http(incoming)), None)
+    .start(None, None, 0);
+    uplink
+        .send(super::uplink::Incoming {
+            request: super::protocol::IncomingRequest::Message(Box::new(
+                super::delivery::MessageInput::Authorized(super::delivery::AuthorizedMessage {
+                    request: request("unclaimed"),
+                    params,
+                    user: None,
+                    response_id: None,
+                    receipt: Some(state.clone()),
+                }),
+            )),
+            receipt: Some(receipt),
+        })
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        while active.inputs.sender.capacity() == capacity {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    finish.notify_one();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.next().await.unwrap().unwrap();
+            if matches!(event, StreamResponse::StatusUpdate(event) if event.status.state==TaskState::Completed) { break; }
+        }
+    }).await.unwrap();
+    assert!(
+        timeout(Duration::from_secs(2), acknowledged)
+            .await
+            .unwrap()
+            .is_err(),
+        "an uncommitted input must not receive a Task acknowledgement"
+    );
+    assert!(state.committed_task().is_none());
+    assert!(
+        !handler
+            .tasks
+            .load("task")
+            .await
+            .unwrap()
+            .history
+            .iter()
+            .flatten()
+            .any(|message| message.text() == Some("unclaimed"))
+    );
+    handler.shutdown().await;
 }

@@ -297,18 +297,28 @@ impl Run {
             None => None,
         };
         let reference_id = request.reference_id();
-        let result = self.deliver(request, inner, last_generation, out).await;
+        let mut output_open = true;
+        let result = self
+            .deliver(request, inner, last_generation, out, &mut output_open)
+            .await;
         let interrupted = matches!(&result, Err(Rejection::Interrupted(_)));
-        let mut downlink_open = *result.as_ref().unwrap_or(&true);
+        let mut downlink_open = output_open && *result.as_ref().unwrap_or(&true);
         if let Err(rejection) = result {
-            // Ordering is by arrival: what the exchange has already published
-            // for earlier requests goes out before this one's rejection.
-            downlink_open = self.flush(inner, last_generation, out).await;
+            // Earlier output precedes this input's rejection. Once a terminal
+            // event was forwarded, no further event belongs to this response.
             if downlink_open {
-                let event = rejection.into_stream_error(self.task.id(), reference_id);
-                downlink_open = self.forward(Ok(event), last_generation, out).await;
+                downlink_open = self.flush(inner, last_generation, out).await;
+                if downlink_open {
+                    let event = rejection.into_stream_error(self.task.id(), reference_id);
+                    downlink_open = self.forward(Ok(event), last_generation, out).await;
+                }
             }
         }
+        let interrupted = interrupted
+            || (!downlink_open
+                && receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.state().committed_task().is_none()));
         if let Some(receipt) = receipt.filter(|_| !interrupted) {
             // §3.1.12 requires a Task ACK even for an individually rejected
             // input; its StreamError was sent on the downlink above.
@@ -346,8 +356,9 @@ impl Run {
         &mut self,
         request: IncomingRequest,
         inner: &mut Option<ResponseStream>,
-        _last_generation: &mut i64,
+        last_generation: &mut i64,
         out: &mpsc::Sender<Result<StreamResponse, A2AError>>,
+        output_open: &mut bool,
     ) -> Result<bool, Rejection> {
         // The response is already subscribed to the task before admitting input.
         // Even a formerly idle task publishes into this same receiver.
@@ -358,16 +369,32 @@ impl Run {
             );
             *inner = Some(event_stream(self.settings, receiver, None, sequence));
         }
-        self.handler
-            .receive_message(
-                &self.params,
-                request.into_message()?,
-                self.settings.mode(),
-                Some(self.task.id()),
-                self.settings.response_id(),
-            )
-            .await?;
-        Ok(!out.is_closed())
+        let handler = self.handler.clone();
+        let params = self.params.clone();
+        let task_id = self.task.id().clone();
+        let message = request.into_message()?;
+        let admission = handler.receive_message(
+            &params,
+            message,
+            self.settings.mode(),
+            Some(&task_id),
+            self.settings.response_id(),
+        );
+        tokio::pin!(admission);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut admission => { result?; return Ok(*output_open && !out.is_closed()); },
+                () = out.closed(), if *output_open => { *output_open = false; },
+                event = async { match inner.as_mut() { Some(events) => events.next().await, None => std::future::pending().await } }, if *output_open => {
+                    // Input can await an executor read without obstructing the
+                    // same exchange's downlink. No separate admission task is needed.
+                    if !self.handle_output(event, inner, last_generation, out, true).await {
+                        *output_open = false;
+                    }
+                },
+            }
+        }
     }
 }
 
@@ -926,6 +953,7 @@ mod delivery_tests {
                         &mut inner,
                         &mut generation,
                         &out,
+                        &mut true,
                     )
                     .await
                     .unwrap_or_else(|error| {
