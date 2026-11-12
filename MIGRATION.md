@@ -120,16 +120,16 @@ capability in the final `with_capabilities` call.
   with refreshed parameters to change credentials; creating another clone of
   the existing sender does not refresh them.
 - Unsupported live operations consistently report `UNSUPPORTED_OPERATION`.
-  SLIM RPC establishes the call asynchronously, so an unsupported operation
-  is reported on `connection.events`, rather than by `send_live_message`.
-  Any malformed gRPC frame reports its original transport status. If an
-  earlier request was received, admission and its first response share a
-  recovery deadline, defaulting to 30 seconds. Set it with
+  SLIM RPC establishes the call asynchronously, so an unsupported operation is
+  reported on `connection.events`, rather than by `send_live_message`. Any
+  malformed gRPC frame reports its original transport status. If an earlier
+  request was received, admission and its first response share a recovery
+  deadline, defaulting to 30 seconds. Set it with
   `GrpcHandler::with_live_recovery_timeout`; it applies to recovery after
-  malformed input. Healthy exchanges have no such deadline. Available
-  output is preserved, with a bounded ready-event drain before the fault. If a custom handler remains
-  pending beyond the deadline, the fault is returned without waiting longer.
-  A normal input half-close still permits output.
+  malformed input. Healthy exchanges have no such deadline. Available output
+  is preserved, with a bounded ready-event drain before the fault. If a custom
+  handler remains pending beyond the deadline, the fault is returned without
+  waiting longer. A normal input half-close still permits output.
 - An HTTP live fallback classified as unsupported retains its HTTP status
   and response body in the error message. A 404 can mean a wrong endpoint or
   a lost route; it is not proof of the agent's advertised capabilities.
