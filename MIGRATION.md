@@ -52,15 +52,23 @@ may remain nonterminal after its output stream ends; a fresh input can start
 another execution. `execution_id` identifies an invocation, not a client or task.
 The owned input receiver can move into a spawned Tokio worker.
 
-Input queues belong to one execution. If that execution ends before reading
-an accepted input, a waiting sending call receives an explicit rejection (a private
-`StreamError` on a live exchange). The input remains in persisted task history
-but is never automatically replayed into another `execute` call. A fresh
-request after completion may start another execution. An immediately exhausted
-stream is finalized before admitting a fresh answer to its final interrupt, so
-that answer starts the next execution and is persisted once. Task history does not
-implicitly become its inbox. An already returned `returnImmediately` response
-acknowledges persistence, not executor consumption.
+Input queues belong to one execution. If that execution ends before reading an
+accepted input, a waiting sending call receives an explicit rejection (a
+private `StreamError` on a live exchange). The input remains in persisted task
+history but is never automatically replayed into another `execute` call. A
+fresh request after completion may start another execution. An answer to an
+outstanding interrupt waits uncommitted until the current executor claims it.
+If the stream ends first, the original request starts a fresh execution and is
+persisted once; no accepted inbox message is handed off. Deferred requests
+retain bounded queue capacity and publication reservations. The read-admission
+deadline defaults to 30 seconds and is configured with
+`with_input_admission_timeout`; expiry reports that input was not committed. A
+read claim binds accepted input to that execution; cancellation after the
+claim does not replay it. `try_recv` can initiate a claim and return `None`
+while persistence finishes; keep polling or await `recv` to obtain the
+committed message. Task history does not implicitly become its inbox. An
+already returned `returnImmediately` response acknowledges persistence, not
+executor consumption.
 
 The default handler validates each client input, persists it, and delivers it
 through the task's execution input queue. Custom `TaskStore` implementations
@@ -88,24 +96,26 @@ capability in the final `with_capabilities` call.
   `taskId` and `generation`. Do not resend that input. Other states return
   the stored snapshot. An uncreated task or uncertain storage outcome is an
   error. The timeout does not cancel execution.
-- `AgentExecutor::execute` keeps its signature. A worker creates
-  `let (outputs, events) = ctx.output_channel(capacity)`, owns the sender and
+- `AgentExecutor::execute` keeps its signature. A worker creates `let
+  (outputs, events) = ctx.output_channel(capacity)`, owns the sender and
   inputs, and returns `Box::pin(events)` from `execute`. The returned stream
   alone defines execution lifetime: after all senders drop, buffered events
-  drain and EOF revokes input. Capturing the context does not extend execution.
-  `outputs.send_for(&input, event)` preserves producer-side input correlation
-  through the supplied receiver. Return that receiver directly; arbitrary
-  buffering of its untagged items cannot retain producer provenance implicitly.
-  Async/prefetching adapters that erase receiver tags are rejected with
-  `INVALID_AGENT_RESPONSE`; transform events before `send_for`. A synchronous
-  adapter that discards a tagged item produces a diagnostic. Untagged custom
-  buffers still need explicit producer correlation.
-  Prefer `ctx.spawn_worker(capacity, |ctx, outputs| async move { ...; Ok(()) })`
-  and return its receiver, or attach a manually spawned worker using
+  drain and EOF revokes input. Capturing the context does not extend
+  execution. `outputs.send_for(&input, event)` preserves producer-side input
+  correlation through the supplied receiver. Return that receiver directly;
+  arbitrary buffering of its untagged items cannot retain producer provenance
+  implicitly. Synchronous filtering is supported, including filtering followed
+  by a pending read. Ambiguous buffering/prefetching produces a diagnostic and
+  conservative correlation; it does not fail an otherwise valid execution.
+  Transform before `send_for` when exact producer correlation matters.
+  Arbitrary untagged buffers cannot preserve that provenance implicitly.
+  Prefer `ctx.spawn_worker(capacity, |ctx, outputs| async move { ...; Ok(())
+  })` and return its receiver, or attach a manually spawned worker using
   `events.with_worker(handle)`. The monitored worker's panic, cancellation or
-  returned error becomes a stream error after its buffered output. Dropping the
-  stream aborts that worker. Arbitrary detached application tasks are not monitored.
-  `ExecutorOutput` is non-exhaustive; construct outputs through the sender API.
+  returned error becomes a stream error after its buffered output. Dropping
+  the stream aborts that worker. Arbitrary detached application tasks are not
+  monitored. `ExecutorOutput` is non-exhaustive; construct outputs through the
+  sender API.
 - HTTP live follow-ups have a default 30-second acknowledgement deadline,
   configurable with `with_http_followup_timeout`. Pending requests can be
   revoked before admission. Owned requests are ACKed on timeout only when a
@@ -155,14 +165,21 @@ fixed; newly created tasks require a new listing. Cursor ownership includes
 the tenant and stable principal, while cache budgets count a principal across
 tenants to prevent request-supplied tenants from multiplying allocations.
 
-Anonymous listings always use authenticated stateless keyset cursors, retaining
-no per-list state. Authenticated listings also use these cursors when any cache
-budget is full, so exhausting the cache cannot deny another caller's listing
-or evict active traversals. These live cursors are bound to the store, query,
-tenant and principal. They re-sort current contents on every page: concurrent
-status timestamp changes can move tasks across page boundaries, so they do not
-provide frozen membership. Custom stores can override the additive
-`list_for_scope` method without changing existing required trait methods.
+Anonymous listings always use authenticated stateless keyset cursors,
+retaining no per-list state. Authenticated listings also use these cursors
+when any cache budget is full, so exhausting the cache cannot deny another
+caller's listing or evict active traversals. These live cursors are bound to
+the store, query, tenant and principal. They re-sort current contents on every
+page: concurrent status timestamp changes can move tasks across page
+boundaries, so they do not provide frozen membership: a task moving ahead of
+the cursor can be omitted, and a task moving behind it can be returned again.
+Start a new traversal for a fresh view. Newly issued stateless tokens are
+authenticated and scope-bound; legacy numeric/unsigned sort-key positions
+remain readable for compatibility and have no scope binding. Every page still
+checks current filters and authorization. Stateless continuation scans are
+O(N), with selection followed by sorting only the next page. Custom stores can
+override the additive `list_for_scope` method without changing existing
+required trait methods.
 
 Webhook work uses bounded per-task queues and a shared HTTP concurrency pool.
 Ordinary output waits for a bounded publication-batch permit outside the
