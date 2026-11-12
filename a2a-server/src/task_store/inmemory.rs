@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use a2a::*;
 use async_trait::async_trait;
+#[cfg(test)]
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 
 use super::apply_history_length;
+use super::cursor::{KeysetCursors, Position, listing_query};
 use super::store::{TaskListScope, TaskStore, TaskVersion};
 use crate::pagination::resolve_page_size;
 
@@ -23,11 +25,28 @@ const MAX_LISTINGS: usize = 1024;
 const MAX_LISTING_IDS: usize = 1_000_000;
 const MAX_PRINCIPAL_LISTINGS: usize = 32;
 const MAX_PRINCIPAL_IDS: usize = 250_000;
-const MAX_ANONYMOUS_LISTINGS: usize = 8;
-const MAX_ANONYMOUS_IDS: usize = 64_000;
 const MAX_TENANT_LISTINGS: usize = 256;
 const MAX_TENANT_IDS: usize = 500_000;
 const LISTING_TTL: Duration = Duration::from_secs(300);
+
+fn matches_task(
+    task: &Task,
+    req: &ListTasksRequest,
+    visible: Option<&(dyn for<'id> Fn(&'id str) -> bool + Send + Sync)>,
+) -> bool {
+    visible.is_none_or(|visible| visible(&task.id))
+        && req
+            .context_id
+            .as_ref()
+            .is_none_or(|id| *id == task.context_id)
+        && req
+            .status
+            .as_ref()
+            .is_none_or(|state| *state == task.status.state)
+        && req
+            .status_timestamp_after
+            .is_none_or(|after| task.status.timestamp.is_some_and(|time| time >= after))
+}
 
 fn principal(scope: &TaskListScope) -> Option<&str> {
     scope
@@ -42,16 +61,6 @@ struct Listing {
     query: ListTasksRequest,
     tasks: Arc<Vec<TaskId>>,
     scope: TaskListScope,
-}
-
-fn listing_query(req: &ListTasksRequest) -> ListTasksRequest {
-    let mut query = req.clone();
-    query.page_token = None;
-    query.page_size = None;
-    query.history_length = None;
-    query.timeline_length = None;
-    query.include_artifacts = None;
-    query
 }
 
 #[derive(Default)]
@@ -89,15 +98,15 @@ impl Tasks {
 ///
 /// Keeps every task for the life of the process unless
 /// [`Self::with_terminal_task_limit`] bounds how many finished ones it holds.
-/// List continuations retain ordered IDs for five minutes of inactivity. Each page
-/// reads current contents and permissions, so concurrent updates remain visible
-/// without skipping IDs that moved in the sort order. New tasks require a new
-/// list. At most 1024 lists and one million IDs are retained; exhaustion rejects
-/// new cursors rather than evicting another caller's active traversal.
+/// Authenticated lists can cache ordered IDs for five minutes of inactivity.
+/// Anonymous lists and cache overflow use stateless, scope-bound live cursors.
+/// Every page rechecks current contents, filters and visibility. Snapshot-cache
+/// limits never prevent another caller from listing tasks.
 pub struct InMemoryTaskStore {
     tasks: RwLock<Tasks>,
     terminal_task_limit: Option<usize>,
     listing_ttl: Duration,
+    cursors: KeysetCursors,
 }
 
 impl InMemoryTaskStore {
@@ -106,7 +115,64 @@ impl InMemoryTaskStore {
             tasks: RwLock::new(Tasks::default()),
             terminal_task_limit: None,
             listing_ttl: LISTING_TTL,
+            cursors: KeysetCursors::default(),
         }
+    }
+
+    // Live cursor positions retain no per-caller state. This is the default
+    // for anonymous access and the fallback when snapshot caching is full.
+    async fn list_stateless(
+        &self,
+        req: &ListTasksRequest,
+        scope: &TaskListScope,
+        visible: Option<&(dyn for<'id> Fn(&'id str) -> bool + Send + Sync)>,
+    ) -> Result<ListTasksResponse, A2AError> {
+        let position = self
+            .cursors
+            .position(req.page_token.as_deref(), req, scope)?;
+        let mut tasks: Vec<_> = self
+            .tasks
+            .read()
+            .await
+            .entries
+            .values()
+            .map(|entry| entry.task.clone())
+            .collect();
+        tasks.retain(|task| matches_task(task, req, visible));
+        tasks.sort_by_key(|task| (std::cmp::Reverse(task.status.timestamp), task.id.clone()));
+        let total_size = tasks.len().min(i32::MAX as usize) as i32;
+        let start = match position {
+            Position::Offset(position) => position,
+            Position::After((timestamp, id)) => tasks.partition_point(|task| {
+                (std::cmp::Reverse(task.status.timestamp), &task.id)
+                    <= (std::cmp::Reverse(timestamp), &id)
+            }),
+        };
+        let page_size = resolve_page_size(req.page_size);
+        let has_more = start.saturating_add(page_size) < tasks.len();
+        let page: Vec<_> = tasks.into_iter().skip(start).take(page_size).collect();
+        let next_page_token = if has_more {
+            page.last()
+                .map(|task| self.cursors.encode(task, req, scope))
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let tasks = page
+            .into_iter()
+            .map(|task| {
+                let mut task = (*task).clone();
+                apply_history_length(&mut task, req.history_length);
+                task
+            })
+            .collect();
+        Ok(ListTasksResponse {
+            tasks,
+            next_page_token,
+            page_size: page_size as i32,
+            total_size,
+        })
     }
 
     /// Expire a list after this much inactivity. Successful continuations renew it.
@@ -254,24 +320,19 @@ impl TaskStore for InMemoryTaskStore {
         scope: &TaskListScope,
         visible: Option<&(dyn for<'id> Fn(&'id str) -> bool + Send + Sync)>,
     ) -> Result<ListTasksResponse, A2AError> {
+        if principal(scope).is_none()
+            || req
+                .page_token
+                .as_deref()
+                .is_some_and(|token| token.starts_with("keyset:"))
+        {
+            return self.list_stateless(req, scope, visible).await;
+        }
         self.tasks.write().await.expire_listings();
         let page_size = resolve_page_size(req.page_size);
         let token = req.page_token.as_deref().filter(|token| !token.is_empty());
         let continuation = token.and_then(|token| token.strip_prefix("snapshot:"));
-        let matches = |task: &Task| {
-            visible.is_none_or(|visible| visible(&task.id))
-                && req
-                    .context_id
-                    .as_ref()
-                    .is_none_or(|id| *id == task.context_id)
-                && req
-                    .status
-                    .as_ref()
-                    .is_none_or(|state| *state == task.status.state)
-                && req
-                    .status_timestamp_after
-                    .is_none_or(|after| task.status.timestamp.is_some_and(|time| time >= after))
-        };
+        let matches = |task: &Task| matches_task(task, req, visible);
         let (ids, start, listing_id) = if let Some(cursor) = continuation {
             let (id, position) = cursor
                 .split_once(':')
@@ -309,23 +370,12 @@ impl TaskStore for InMemoryTaskStore {
             };
             tasks.retain(|task| matches(task));
             tasks.sort_by_key(|task| (std::cmp::Reverse(task.status.timestamp), task.id.clone()));
-            let start = match token {
-                None => 0,
-                Some(token) if token.bytes().all(|byte| byte.is_ascii_digit()) => token
-                    .parse::<usize>()
-                    .map_err(|_| A2AError::invalid_params("invalid page token"))?,
-                Some(token) => {
-                    let bytes = URL_SAFE_NO_PAD
-                        .decode(token)
-                        .map_err(|_| A2AError::invalid_params("invalid page token"))?;
-                    let (timestamp, id): (Option<chrono::DateTime<chrono::Utc>>, String) =
-                        serde_json::from_slice(&bytes)
-                            .map_err(|_| A2AError::invalid_params("invalid page token"))?;
-                    tasks.partition_point(|task| {
-                        (std::cmp::Reverse(task.status.timestamp), &task.id)
-                            <= (std::cmp::Reverse(timestamp), &id)
-                    })
-                }
+            let start = match self.cursors.position(token, req, scope)? {
+                Position::Offset(position) => position,
+                Position::After((timestamp, id)) => tasks.partition_point(|task| {
+                    (std::cmp::Reverse(task.status.timestamp), &task.id)
+                        <= (std::cmp::Reverse(timestamp), &id)
+                }),
             };
             (
                 Arc::new(
@@ -376,27 +426,21 @@ impl TaskStore for InMemoryTaskStore {
                             (count + 1, size + entry.tasks.len())
                         })
                 };
-                // The request's tenant cannot create a new caller budget.
-                // Unauthenticated names share one smaller anonymous budget.
+                // A request-supplied tenant cannot mint cache budgets. Cache
+                // exhaustion changes cursor mode, never listing availability.
                 let principal_usage = usage(&|entry| principal(&entry.scope) == principal(scope));
-                let (list_limit, id_limit) = if principal(scope).is_some() {
-                    (MAX_PRINCIPAL_LISTINGS, MAX_PRINCIPAL_IDS)
-                } else {
-                    (MAX_ANONYMOUS_LISTINGS, MAX_ANONYMOUS_IDS)
-                };
                 let tenant = usage(&|entry| entry.scope.tenant == scope.tenant);
                 let global = usage(&|_| true);
-                if principal_usage.0 >= list_limit
-                    || ids.len() > id_limit.saturating_sub(principal_usage.1)
+                if principal_usage.0 >= MAX_PRINCIPAL_LISTINGS
+                    || ids.len() > MAX_PRINCIPAL_IDS.saturating_sub(principal_usage.1)
                     || (scope.tenant.is_some()
                         && (tenant.0 >= MAX_TENANT_LISTINGS
                             || ids.len() > MAX_TENANT_IDS.saturating_sub(tenant.1)))
                     || global.0 >= MAX_LISTINGS
                     || ids.len() > MAX_LISTING_IDS.saturating_sub(global.1)
                 {
-                    return Err(A2AError::invalid_request(
-                        "task listing capacity reached; finish existing traversals or retry after their inactivity expiry",
-                    ));
+                    drop(store);
+                    return self.list_stateless(req, scope, visible).await;
                 }
                 store.listings.push_back(Listing {
                     id: listing_id,
@@ -473,11 +517,25 @@ mod tests {
         store
     }
 
+    fn cached_scope() -> TaskListScope {
+        TaskListScope {
+            tenant: None,
+            principal: Some((true, "snapshot-reader".into())),
+        }
+    }
+
+    async fn cached_list(
+        store: &InMemoryTaskStore,
+        req: &ListTasksRequest,
+    ) -> Result<ListTasksResponse, A2AError> {
+        store.list_for_scope(req, &cached_scope(), None).await
+    }
+
     #[tokio::test]
     async fn list_snapshot_does_not_skip_updated_tasks_or_repeat_moved_tasks() {
         let store = dated_store().await;
         let mut req = list_request(1);
-        let first = store.list(&req).await.unwrap();
+        let first = cached_list(&store, &req).await.unwrap();
         assert_eq!(first.tasks[0].id, "a");
 
         for (id, seconds) in [("a", 0), ("b", 40), ("d", 50)] {
@@ -491,14 +549,14 @@ mod tests {
         }
 
         req.page_token = Some(first.next_page_token);
-        let second = store.list(&req).await.unwrap();
+        let second = cached_list(&store, &req).await.unwrap();
         assert_eq!(second.tasks[0].id, "b");
         assert_eq!(second.tasks[0].status.state, TaskState::Working);
         assert_eq!(second.total_size, 3);
         // Replaying a continuation is stable too.
-        assert_eq!(store.list(&req).await.unwrap(), second);
+        assert_eq!(cached_list(&store, &req).await.unwrap(), second);
         req.page_token = Some(second.next_page_token);
-        let third = store.list(&req).await.unwrap();
+        let third = cached_list(&store, &req).await.unwrap();
         assert_eq!(third.tasks[0].id, "c");
         assert!(third.next_page_token.is_empty());
         let fresh = store.list(&list_request(10)).await.unwrap();
@@ -525,7 +583,7 @@ mod tests {
             req.page_token = Some(token);
             let page = store.list(&req).await.unwrap();
             assert_eq!(page.tasks[0].id, "b");
-            assert!(page.next_page_token.starts_with("snapshot:"));
+            assert!(page.next_page_token.starts_with("keyset:"));
             req.page_token = Some(page.next_page_token);
             assert_eq!(store.list(&req).await.unwrap().tasks[0].id, "c");
         }
@@ -538,17 +596,20 @@ mod tests {
     async fn list_snapshot_rechecks_visibility_deletion_and_query_filters() {
         let store = dated_store().await;
         let mut req = list_request(1);
-        req.page_token = Some(store.list(&req).await.unwrap().next_page_token);
-        let scoped = store.list_scoped(&req, &|id| id == "c").await.unwrap();
+        req.page_token = Some(cached_list(&store, &req).await.unwrap().next_page_token);
+        let scoped = store
+            .list_for_scope(&req, &cached_scope(), Some(&|id| id == "c"))
+            .await
+            .unwrap();
         assert_eq!(scoped.tasks[0].id, "c");
         assert_eq!(scoped.total_size, 1);
         assert!(scoped.next_page_token.is_empty());
 
         store.tasks.write().await.entries.remove("b");
-        assert_eq!(store.list(&req).await.unwrap().tasks[0].id, "c");
+        assert_eq!(cached_list(&store, &req).await.unwrap().tasks[0].id, "c");
         req.context_id = Some("different-context".into());
         assert_eq!(
-            store.list(&req).await.unwrap_err().code,
+            cached_list(&store, &req).await.unwrap_err().code,
             error_code::INVALID_PARAMS
         );
     }
@@ -569,34 +630,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_capacity_preserves_existing_cursors_and_releases_old_versions() {
+    async fn cache_capacity_preserves_existing_cursors_and_falls_back_without_retaining_tasks() {
         let store = dated_store().await;
         let mut req = list_request(1);
-        req.page_token = Some(store.list(&req).await.unwrap().next_page_token);
-        for _ in 1..MAX_ANONYMOUS_LISTINGS {
-            store.list(&list_request(1)).await.unwrap();
+        req.page_token = Some(cached_list(&store, &req).await.unwrap().next_page_token);
+        for _ in 1..MAX_PRINCIPAL_LISTINGS {
+            cached_list(&store, &list_request(1)).await.unwrap();
         }
         assert_eq!(
             store.tasks.read().await.listings.len(),
-            MAX_ANONYMOUS_LISTINGS
+            MAX_PRINCIPAL_LISTINGS
         );
-        assert!(store.list(&list_request(1)).await.is_err());
-        assert_eq!(store.list(&req).await.unwrap().tasks[0].id, "b");
-
+        assert!(
+            cached_list(&store, &list_request(1))
+                .await
+                .unwrap()
+                .next_page_token
+                .starts_with("keyset:")
+        );
+        assert_eq!(cached_list(&store, &req).await.unwrap().tasks[0].id, "b");
         let old_task = Arc::downgrade(&store.tasks.read().await.entries["a"].task);
         store
             .update(make_task("a", "ctx", TaskState::Working))
             .await
             .unwrap();
         assert!(old_task.upgrade().is_none());
-        {
-            let mut tasks = store.tasks.write().await;
-            for listing in &mut tasks.listings {
-                listing.expires = Instant::now() - Duration::from_secs(1);
-            }
+        for listing in &mut store.tasks.write().await.listings {
+            listing.expires = Instant::now() - Duration::from_secs(1);
         }
-        store.list(&list_request(10)).await.unwrap();
-        assert!(old_task.upgrade().is_none());
+        cached_list(&store, &list_request(10)).await.unwrap();
         assert!(store.tasks.read().await.listings.is_empty());
     }
 
@@ -625,13 +687,13 @@ mod tests {
         for _ in 1..MAX_PRINCIPAL_LISTINGS {
             store.list_for_scope(&request, &alice, None).await.unwrap();
         }
-        assert_eq!(
+        assert!(
             store
                 .list_for_scope(&request, &alice, None)
                 .await
-                .unwrap_err()
-                .code,
-            error_code::INVALID_REQUEST
+                .unwrap()
+                .next_page_token
+                .starts_with("keyset:")
         );
         assert!(store.list_for_scope(&request, &bob, None).await.is_ok());
         assert!(
@@ -664,55 +726,132 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn principal_budget_spans_tenants_and_anonymous_names_share_a_smaller_budget() {
+    async fn anonymous_lists_and_cross_tenant_cache_overflow_never_exhaust_other_callers() {
         let store = dated_store().await;
-        for index in 0..MAX_PRINCIPAL_LISTINGS {
-            let tenant = Some(format!("tenant-{index}"));
-            let scope = TaskListScope {
-                tenant: tenant.clone(),
-                principal: Some((true, "alice".into())),
-            };
-            let mut request = list_request(1);
-            request.tenant = tenant;
-            store.list_for_scope(&request, &scope, None).await.unwrap();
+        for _ in 0..64 {
+            assert!(
+                store
+                    .list(&list_request(1))
+                    .await
+                    .unwrap()
+                    .next_page_token
+                    .starts_with("keyset:")
+            );
         }
-        let extra = TaskListScope {
-            tenant: Some("another-tenant".into()),
-            principal: Some((true, "alice".into())),
-        };
-        assert_eq!(
-            store
-                .list_for_scope(&list_request(1), &extra, None)
-                .await
-                .unwrap_err()
-                .code,
-            error_code::INVALID_REQUEST
-        );
-        for index in 0..MAX_ANONYMOUS_LISTINGS {
+        for index in 0..64 {
             let scope = TaskListScope {
-                tenant: Some(format!("anonymous-{index}")),
-                principal: Some((false, format!("untrusted-name-{index}"))),
+                tenant: Some(format!("public-{index}")),
+                principal: Some((false, format!("untrusted-{index}"))),
+            };
+            let page = store
+                .list_for_scope(&list_request(1), &scope, None)
+                .await
+                .unwrap();
+            assert!(page.next_page_token.starts_with("keyset:"));
+        }
+        assert!(store.tasks.read().await.listings.is_empty());
+        for index in 0..MAX_PRINCIPAL_LISTINGS {
+            let scope = TaskListScope {
+                tenant: Some(format!("tenant-{index}")),
+                principal: Some((true, "alice".into())),
             };
             store
                 .list_for_scope(&list_request(1), &scope, None)
                 .await
                 .unwrap();
         }
-        assert!(store.list(&list_request(1)).await.is_err());
-        let bob = TaskListScope {
-            tenant: None,
-            principal: Some((true, "bob".into())),
+        let scope = TaskListScope {
+            tenant: Some("another-tenant".into()),
+            principal: Some((true, "alice".into())),
         };
         assert!(
             store
-                .list_for_scope(&list_request(1), &bob, None)
+                .list_for_scope(&list_request(1), &scope, None)
                 .await
-                .is_ok()
+                .unwrap()
+                .next_page_token
+                .starts_with("keyset:")
+        );
+        assert!(
+            store
+                .list(&list_request(1))
+                .await
+                .unwrap()
+                .next_page_token
+                .starts_with("keyset:")
         );
         assert_eq!(
             store.tasks.read().await.listings.len(),
-            MAX_PRINCIPAL_LISTINGS + MAX_ANONYMOUS_LISTINGS + 1
+            MAX_PRINCIPAL_LISTINGS
         );
+    }
+
+    #[tokio::test]
+    async fn global_snapshot_capacity_never_denies_new_principals_or_anonymous_lists() {
+        let store = dated_store().await;
+        for principal in 0..MAX_LISTINGS / MAX_PRINCIPAL_LISTINGS {
+            let scope = TaskListScope {
+                tenant: None,
+                principal: Some((true, format!("reader-{principal}"))),
+            };
+            for _ in 0..MAX_PRINCIPAL_LISTINGS {
+                store
+                    .list_for_scope(&list_request(1), &scope, None)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(store.tasks.read().await.listings.len(), MAX_LISTINGS);
+        let scope = TaskListScope {
+            tenant: None,
+            principal: Some((true, "new-reader".into())),
+        };
+        let first = store
+            .list_for_scope(&list_request(1), &scope, None)
+            .await
+            .unwrap();
+        assert!(first.next_page_token.starts_with("keyset:"));
+        let mut next = list_request(1);
+        next.page_token = Some(first.next_page_token);
+        assert_eq!(
+            store
+                .list_for_scope(&next, &scope, None)
+                .await
+                .unwrap()
+                .tasks[0]
+                .id,
+            "b"
+        );
+        assert!(store.list(&list_request(1)).await.is_ok());
+        assert_eq!(store.tasks.read().await.listings.len(), MAX_LISTINGS);
+    }
+
+    #[tokio::test]
+    async fn anonymous_live_cursors_recheck_authorization_and_bind_query_and_scope() {
+        let store = dated_store().await;
+        let scope = TaskListScope::default();
+        let mut req = list_request(1);
+        req.page_token = Some(store.list(&req).await.unwrap().next_page_token);
+        let page = store
+            .list_for_scope(&req, &scope, Some(&|id| id == "c"))
+            .await
+            .unwrap();
+        assert_eq!(page.tasks[0].id, "c");
+        assert_eq!(page.total_size, 1);
+        let mut other = req.clone();
+        other.context_id = Some("other".into());
+        assert!(store.list(&other).await.is_err());
+        let other_scope = TaskListScope {
+            tenant: Some("other".into()),
+            ..scope
+        };
+        assert!(
+            store
+                .list_for_scope(&req, &other_scope, None)
+                .await
+                .is_err()
+        );
+        assert!(store.tasks.read().await.listings.is_empty());
     }
 
     #[tokio::test]
@@ -734,7 +873,7 @@ mod tests {
     async fn malformed_cursors_cannot_invalidate_an_existing_listing() {
         let store = dated_store().await;
         let mut request = list_request(1);
-        let cursor = store.list(&request).await.unwrap().next_page_token;
+        let cursor = cached_list(&store, &request).await.unwrap().next_page_token;
         let id = cursor.split(':').nth(1).unwrap();
         for invalid in [
             "snapshot:missing-position".to_string(),
@@ -746,12 +885,15 @@ mod tests {
         ] {
             request.page_token = Some(invalid);
             assert_eq!(
-                store.list(&request).await.unwrap_err().code,
+                cached_list(&store, &request).await.unwrap_err().code,
                 error_code::INVALID_PARAMS
             );
         }
         request.page_token = Some(cursor);
-        assert_eq!(store.list(&request).await.unwrap().tasks[0].id, "b");
+        assert_eq!(
+            cached_list(&store, &request).await.unwrap().tasks[0].id,
+            "b"
+        );
     }
 
     #[tokio::test]
