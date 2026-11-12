@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use a2a::{A2AError, StreamResponse};
 use a2a_pb::pbconv;
@@ -16,6 +17,8 @@ use crate::errors::a2a_error_to_status;
 
 type BoxStreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
 
+const DEFAULT_LIVE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct UplinkFailure {
     status: tonic::Status,
     had_input: bool,
@@ -23,13 +26,13 @@ struct UplinkFailure {
 }
 
 impl UplinkFailure {
-    fn new(status: tonic::Status, had_input: bool) -> Self {
+    fn new(status: tonic::Status, had_input: bool, recovery_timeout: Duration) -> Self {
         Self {
             status,
             had_input,
             // Share one grace period between finishing admission and obtaining
             // its first output, even for custom handlers that never complete.
-            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            deadline: tokio::time::Instant::now() + recovery_timeout,
         }
     }
 }
@@ -39,13 +42,14 @@ impl UplinkFailure {
 /// even when the handler is still waiting for its first request.
 fn decode_live_uplink(
     input: impl Stream<Item = Result<proto::StreamRequest, tonic::Status>> + Send + 'static,
+    recovery_timeout: Duration,
 ) -> (
     futures::stream::BoxStream<'static, a2a::StreamRequest>,
     futures::future::BoxFuture<'static, UplinkFailure>,
 ) {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let input = input
-        .scan((Some(sender), false), |(sender, had_input), item| {
+        .scan((Some(sender), false), move |(sender, had_input), item| {
             futures::future::ready(match item {
                 Ok(request) => {
                     *had_input = true;
@@ -53,7 +57,8 @@ fn decode_live_uplink(
                 }
                 Err(status) => {
                     if let Some(sender) = sender.take() {
-                        let _ = sender.send(UplinkFailure::new(status, *had_input));
+                        let _ =
+                            sender.send(UplinkFailure::new(status, *had_input, recovery_timeout));
                     }
                     None
                 }
@@ -166,11 +171,23 @@ async fn open_live_downlink(
 /// are handled through `a2a_pb::pbconv`.
 pub struct GrpcHandler<H: RequestHandler> {
     handler: Arc<H>,
+    live_recovery_timeout: Duration,
 }
 
 impl<H: RequestHandler> GrpcHandler<H> {
     pub fn new(handler: Arc<H>) -> Self {
-        GrpcHandler { handler }
+        GrpcHandler {
+            handler,
+            live_recovery_timeout: DEFAULT_LIVE_RECOVERY_TIMEOUT,
+        }
+    }
+
+    /// Bound recovery after malformed live input (30 seconds by default).
+    /// Admission and its first response share this grace period. Expiry returns
+    /// the original transport fault; healthy exchanges have no such deadline.
+    pub fn with_live_recovery_timeout(mut self, timeout: Duration) -> Self {
+        self.live_recovery_timeout = timeout;
+        self
     }
 }
 
@@ -324,7 +341,7 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
     ) -> Result<tonic::Response<Self::SendLiveMessageStream>, tonic::Status> {
         let params = extract_service_params(request.metadata());
         validate_protocol_version(&params)?;
-        let (uplink, fault) = decode_live_uplink(request.into_inner());
+        let (uplink, fault) = decode_live_uplink(request.into_inner(), self.live_recovery_timeout);
         let events =
             open_live_downlink(self.handler.send_live_message(&params, uplink), fault).await?;
         Ok(tonic::Response::new(events))
@@ -423,11 +440,14 @@ mod tests {
     #[tokio::test]
     async fn malformed_live_uplink_stops_input_and_reports_original_status() {
         let frame = proto::StreamRequest::default();
-        let (mut input, fault) = decode_live_uplink(futures::stream::iter([
-            Ok(frame.clone()),
-            Err(tonic::Status::data_loss("bad protobuf frame")),
-            Ok(frame),
-        ]));
+        let (mut input, fault) = decode_live_uplink(
+            futures::stream::iter([
+                Ok(frame.clone()),
+                Err(tonic::Status::data_loss("bad protobuf frame")),
+                Ok(frame),
+            ]),
+            DEFAULT_LIVE_RECOVERY_TIMEOUT,
+        );
         assert!(input.next().await.is_some());
         assert!(input.next().await.is_none());
         assert!(input.next().await.is_none());
@@ -453,6 +473,7 @@ mod tests {
             let fault = futures::future::ready(UplinkFailure::new(
                 tonic::Status::data_loss("bad protobuf frame"),
                 false,
+                DEFAULT_LIVE_RECOVERY_TIMEOUT,
             ))
             .boxed();
             let mut output = live_downlink(events, fault);
@@ -479,6 +500,7 @@ mod tests {
             futures::future::ready(UplinkFailure::new(
                 tonic::Status::data_loss("broken input"),
                 false,
+                DEFAULT_LIVE_RECOVERY_TIMEOUT,
             ))
             .boxed(),
         )
@@ -514,6 +536,7 @@ mod tests {
             futures::future::ready(UplinkFailure::new(
                 tonic::Status::data_loss("broken input"),
                 true,
+                DEFAULT_LIVE_RECOVERY_TIMEOUT,
             ))
             .boxed(),
         )
@@ -530,10 +553,10 @@ mod tests {
     #[tokio::test]
     async fn a_later_malformed_frame_preserves_a_pending_admitted_opening() {
         let frame = proto::StreamRequest::default();
-        let (mut input, fault) = decode_live_uplink(futures::stream::iter([
-            Ok(frame),
-            Err(tonic::Status::data_loss("bad later frame")),
-        ]));
+        let (mut input, fault) = decode_live_uplink(
+            futures::stream::iter([Ok(frame), Err(tonic::Status::data_loss("bad later frame"))]),
+            DEFAULT_LIVE_RECOVERY_TIMEOUT,
+        );
         let opening = async move {
             assert!(input.next().await.is_some());
             assert!(input.next().await.is_none());
@@ -570,7 +593,11 @@ mod tests {
     #[tokio::test]
     async fn malformed_input_bounds_pending_opening_and_first_output() {
         fn expired_failure() -> UplinkFailure {
-            let mut failure = UplinkFailure::new(tonic::Status::data_loss("bad later frame"), true);
+            let mut failure = UplinkFailure::new(
+                tonic::Status::data_loss("bad later frame"),
+                true,
+                DEFAULT_LIVE_RECOVERY_TIMEOUT,
+            );
             failure.deadline = tokio::time::Instant::now();
             failure
         }
@@ -604,9 +631,10 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_first_frame_preserves_transport_status_during_opening() {
-        let (mut input, fault) = decode_live_uplink(futures::stream::iter([Err(
-            tonic::Status::data_loss("bad first frame"),
-        )]));
+        let (mut input, fault) = decode_live_uplink(
+            futures::stream::iter([Err(tonic::Status::data_loss("bad first frame"))]),
+            DEFAULT_LIVE_RECOVERY_TIMEOUT,
+        );
         let opening = async move {
             assert!(input.next().await.is_none());
             Err(A2AError::invalid_request(
@@ -620,7 +648,8 @@ mod tests {
 
     #[tokio::test]
     async fn normal_live_half_close_keeps_downlink_available() {
-        let (mut input, fault) = decode_live_uplink(futures::stream::empty());
+        let (mut input, fault) =
+            decode_live_uplink(futures::stream::empty(), DEFAULT_LIVE_RECOVERY_TIMEOUT);
         assert!(input.next().await.is_none());
         let events = futures::stream::iter([Ok(StreamResponse::Message(a2a::Message::new(
             a2a::Role::Agent,
@@ -683,8 +712,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_grpc_handler_new() {
+    #[tokio::test]
+    async fn configured_recovery_timeout_bounds_an_admitted_opening() {
         use a2a::*;
         use a2a_server::handler::DefaultRequestHandler;
         use a2a_server::task_store::InMemoryTaskStore;
@@ -715,8 +744,26 @@ mod tests {
                 },
             ),
         );
-        let grpc_handler = GrpcHandler::new(handler);
-        // Just verify construction
-        let _ = grpc_handler;
+        let grpc_handler = GrpcHandler::new(handler).with_live_recovery_timeout(Duration::ZERO);
+        let (mut input, fault) = decode_live_uplink(
+            futures::stream::iter([
+                Ok(proto::StreamRequest::default()),
+                Err(tonic::Status::data_loss("bad input after admission")),
+            ]),
+            grpc_handler.live_recovery_timeout,
+        );
+        let opening = async move {
+            assert!(input.next().await.is_some());
+            assert!(input.next().await.is_none());
+            futures::future::pending().await
+        };
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), open_live_downlink(opening, fault))
+                .await
+                .unwrap()
+                .err()
+                .unwrap();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+        assert_eq!(error.message(), "bad input after admission");
     }
 }
