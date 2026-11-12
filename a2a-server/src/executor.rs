@@ -10,7 +10,7 @@ use std::{collections::HashMap, sync::Arc};
 mod inputs;
 pub(crate) mod outputs;
 pub use inputs::{ClientInput, ClientInputSender, ClientInputs};
-pub(crate) use inputs::{QueuedInput, ReturnedInputs};
+pub(crate) use inputs::{InputOffer, QueuedInput, ReturnedInputs};
 pub use outputs::{ExecutorOutput, ExecutorOutputReceiver, ExecutorOutputSender};
 
 /// Context passed to the [`AgentExecutor`] for each execution.

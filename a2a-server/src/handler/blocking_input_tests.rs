@@ -674,3 +674,288 @@ async fn a_panicking_monitored_worker_fails_the_task_and_notifies_the_blocking_c
     );
     handler.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interrupted_answers_commit_only_after_a_read_claim_or_in_a_fresh_execution() {
+    struct Worker {
+        count: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<Notify>,
+        read: bool,
+    }
+    impl AgentExecutor for Worker {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            if self.count.fetch_add(1, Ordering::SeqCst) > 0 {
+                assert_eq!(ctx.message.as_ref().and_then(Message::text), Some("second"));
+                return stream::once(
+                    async move { Ok(question(&ctx, TaskState::Completed, "fresh")) },
+                )
+                .boxed();
+            }
+            let release = self.release.clone();
+            let read = self.read;
+            Box::pin(ctx.spawn_worker(2, move |mut ctx, output| async move {
+                output
+                    .send(question(&ctx, TaskState::InputRequired, "question"))
+                    .await?;
+                release.notified().await;
+                if read {
+                    let input = ctx
+                        .inputs
+                        .recv()
+                        .await
+                        .expect("claimed input commits before delivery");
+                    assert_eq!(input.message.text(), Some("second"));
+                    output
+                        .send_for(&input, question(&ctx, TaskState::Completed, "read"))
+                        .await?;
+                }
+                Ok(())
+            }))
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    for scenario in 0..3 {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        crate::test_util::install_crypto_provider();
+        let handler = DefaultRequestHandler::new(
+            Worker {
+                count: count.clone(),
+                release: release.clone(),
+                read: scenario == 1,
+            },
+            InMemoryTaskStore::new(),
+        );
+        seed_task(&handler, "task", "context").await;
+        handler
+            .send_message(&ServiceParams::new(), request("first"))
+            .await
+            .unwrap();
+        let active = handler.tasks.task("task").active().unwrap();
+        let capacity = active.inputs.sender.capacity();
+        let before = handler.tasks.load("task").await.unwrap();
+        let mut observers = active.task.sender().subscribe();
+        let second = request("second");
+        let id = second.message.as_ref().unwrap().message_id.clone();
+        let response = tokio::spawn({
+            let handler = handler.clone();
+            async move { handler.send_message(&ServiceParams::new(), second).await }
+        });
+        timeout(Duration::from_secs(2), async {
+            while active.inputs.sender.capacity() == capacity {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the answer was offered to the interrupted inbox");
+        assert_eq!(
+            handler.tasks.load("task").await.unwrap(),
+            before,
+            "an unclaimed offer must not persist anything"
+        );
+        assert!(
+            observers.try_recv().is_err(),
+            "an unclaimed answer must not be broadcast"
+        );
+        assert!(!response.is_finished());
+        if scenario == 2 {
+            active
+                .push_failure
+                .send_replace(Some(A2AError::internal("end-of-stream webhook failed")));
+            active.mark_stream_ended();
+        }
+        release.notify_one();
+        let reply = timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = handler.tasks.load("task").await.unwrap();
+        let recorded = stored
+            .history
+            .iter()
+            .flatten()
+            .filter(|message| message.message_id == id)
+            .count();
+        if scenario == 2 {
+            assert!(reply.is_err());
+            assert_eq!(stored.status.state, TaskState::Failed);
+            assert_eq!(recorded, 0);
+        } else {
+            assert!(
+                matches!(reply.unwrap(), SendMessageResponse::Task(task) if task.status.state==TaskState::Completed)
+            );
+            assert_eq!(recorded, 1);
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                if scenario == 1 { 1 } else { 2 }
+            );
+        }
+        handler.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_answers_keep_fifo_generations_when_status_resumes_working() {
+    struct Ordered {
+        working: Arc<Notify>,
+        read: Arc<Notify>,
+        received: tokio::sync::mpsc::UnboundedSender<(String, i64)>,
+    }
+    impl AgentExecutor for Ordered {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let working = self.working.clone();
+            let read = self.read.clone();
+            let received = self.received.clone();
+            Box::pin(ctx.spawn_worker(2, move |mut ctx, output| async move {
+                output
+                    .send(question(&ctx, TaskState::InputRequired, "question"))
+                    .await?;
+                working.notified().await;
+                output
+                    .send(question(&ctx, TaskState::Working, "resumed"))
+                    .await?;
+                read.notified().await;
+                for _ in 0..2 {
+                    let input = ctx.inputs.recv().await.unwrap();
+                    received
+                        .send((input.message.text().unwrap().into(), input.generation))
+                        .unwrap();
+                }
+                output
+                    .send(question(&ctx, TaskState::Completed, "done"))
+                    .await?;
+                Ok(())
+            }))
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    let working = Arc::new(Notify::new());
+    let read = Arc::new(Notify::new());
+    let (received, mut inputs) = tokio::sync::mpsc::unbounded_channel();
+    crate::test_util::install_crypto_provider();
+    let handler = DefaultRequestHandler::new(
+        Ordered {
+            working: working.clone(),
+            read: read.clone(),
+            received,
+        },
+        InMemoryTaskStore::new(),
+    );
+    seed_task(&handler, "task", "context").await;
+    handler
+        .send_message(&ServiceParams::new(), request("first"))
+        .await
+        .unwrap();
+    let active = handler.tasks.task("task").active().unwrap();
+    let capacity = active.inputs.sender.capacity();
+    let send = |text| {
+        let handler = handler.clone();
+        tokio::spawn(async move {
+            handler
+                .send_message(&ServiceParams::new(), request(text))
+                .await
+        })
+    };
+    let second = send("second");
+    timeout(Duration::from_secs(2), async {
+        while active.inputs.sender.capacity() == capacity {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    working.notify_one();
+    timeout(Duration::from_secs(2), async {
+        while handler.tasks.load("task").await.unwrap().status.state != TaskState::Working {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let third = send("third");
+    timeout(Duration::from_secs(2), async {
+        while active.inputs.sender.capacity() != capacity - 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let stored = handler.tasks.load("task").await.unwrap();
+    assert!(
+        !stored
+            .history
+            .iter()
+            .flatten()
+            .any(|message| matches!(message.text(), Some("second" | "third")))
+    );
+    read.notify_one();
+    for reply in [second, third] {
+        assert!(
+            matches!(timeout(Duration::from_secs(2), reply).await.unwrap().unwrap().unwrap(), SendMessageResponse::Task(task) if task.status.state==TaskState::Completed)
+        );
+    }
+    let a = inputs.recv().await.unwrap();
+    let b = inputs.recv().await.unwrap();
+    assert_eq!((&*a.0, &*b.0), ("second", "third"));
+    assert!(a.1 < b.1);
+    handler.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unclaimed_answer_times_out_without_persistence_and_releases_its_request() {
+    struct NeverReads;
+    impl AgentExecutor for NeverReads {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::once(async move { Ok(question(&ctx, TaskState::InputRequired, "question")) })
+                .chain(stream::pending())
+                .boxed()
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    crate::test_util::install_crypto_provider();
+    let handler = DefaultRequestHandler::new(NeverReads, InMemoryTaskStore::new());
+    seed_task(&handler, "task", "context").await;
+    handler
+        .send_message(&ServiceParams::new(), request("first"))
+        .await
+        .unwrap();
+    let before = handler.tasks.load("task").await.unwrap();
+    let bounded = handler
+        .clone()
+        .with_input_admission_timeout(Duration::from_millis(10));
+    let error = timeout(
+        Duration::from_secs(2),
+        bounded.send_message(&ServiceParams::new(), request("answer")),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.message.contains("input was not committed"));
+    assert_eq!(handler.tasks.load("task").await.unwrap(), before);
+    handler.shutdown().await;
+    assert_eq!(handler.tasks.background_tasks.count(), 0);
+}

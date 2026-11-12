@@ -222,6 +222,7 @@ impl ActiveExecution {
         self.stream_ended
             .store(true, std::sync::atomic::Ordering::Release);
         self.inputs.revoke_reads();
+        self.task.wake_inputs();
     }
 
     #[cfg(test)]
@@ -375,10 +376,7 @@ impl ActiveExecution {
     }
 
     pub(super) fn snapshot_is_terminal(&self) -> bool {
-        self.task
-            .snapshot()
-            .as_ref()
-            .is_some_and(|task| task.status.state.is_terminal())
+        self.task.is_terminal()
     }
 }
 

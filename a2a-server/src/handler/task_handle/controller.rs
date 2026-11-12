@@ -366,6 +366,15 @@ impl TaskController {
         active: &Arc<ActiveExecution>,
         task_id: &TaskId,
     ) {
+        // A queued admission may finalize EOF before the driver's Failed
+        // command arrives. Preserve an already signaled notification failure.
+        let failure = active.push_failure.borrow().clone();
+        if let Some(error) = failure {
+            reject_unread_inputs(active, task_id, self).await;
+            execution::publish_failure(handler, active, task_id, &error).await;
+            self.release(active);
+            return;
+        }
         if let Err(error) = self.persist_deferred_task(handler, active).await {
             reject_unread_inputs(active, task_id, self).await;
             execution::publish_failure(handler, active, task_id, &error).await;
@@ -467,6 +476,15 @@ pub(in crate::handler) enum TaskCommand {
         id: TaskId,
         reply: super::CommandReply<Result<Delivery, Rejection>>,
     },
+    AdmitClaimed {
+        handler: DefaultRequestHandler,
+        message: Box<AuthorizedMessage>,
+        mode: StartMode,
+        id: TaskId,
+        active: Arc<ActiveExecution>,
+        offer: crate::executor::InputOffer,
+        reply: super::CommandReply<Result<Delivery, Rejection>>,
+    },
     Subscribe {
         handler: DefaultRequestHandler,
         task: super::TaskHandle,
@@ -537,6 +555,28 @@ impl TaskCommand {
                 id,
                 reply,
             } => reply.complete(state.admit(&handler, *message, mode, id).await),
+            Self::AdmitClaimed {
+                handler,
+                message,
+                mode,
+                id,
+                active,
+                offer,
+                reply,
+            } => {
+                let outcome = if state.execution.is_current(&active)
+                    && !active
+                        .stream_ended
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    && !active.inputs.is_revoked()
+                {
+                    admission::commit_claimed(&handler, &message, &id, &active, offer).await
+                } else {
+                    drop(offer);
+                    state.admit(&handler, *message, mode, id).await
+                };
+                reply.complete(outcome);
+            }
             Self::Subscribe {
                 handler,
                 task,

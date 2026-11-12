@@ -88,9 +88,50 @@ pub(super) async fn inject_input(
     Ok(delivery)
 }
 
-type InputPermit = mpsc::OwnedPermit<QueuedInput>;
+/// The reader has claimed this offer. Commit and publish the real input before
+/// releasing it to executor code; a failed write releases the reader as well.
+pub(super) async fn commit_claimed(
+    handler: &DefaultRequestHandler,
+    message: &AuthorizedMessage,
+    task_id: &str,
+    active: &Arc<ActiveExecution>,
+    offer: crate::executor::InputOffer,
+) -> Result<Delivery, Rejection> {
+    let task = active
+        .snapshot()
+        .ok_or_else(|| A2AError::internal("a running execution has no task"))?;
+    validate_existing_task(&task, &message.request)?;
+    let (task, recorded) = persist_input(handler, message, task_id, task).await?;
+    let input = recorded
+        .message_generation
+        .and_then(|generation| {
+            ClientInput::received(
+                &message.request,
+                generation,
+                message.user.clone(),
+                &message.params,
+                message.response_id,
+            )
+        })
+        .ok_or_else(|| A2AError::internal("claimed input has no message generation"))?;
+    // Receipt ownership is fixed before publication. Cancellation after a read
+    // claim has the same semantics as cancellation after any consumed input.
+    active.inputs.received(input.generation);
+    let delivery = publish_input(
+        active,
+        task,
+        &recorded.events,
+        recorded.message_generation,
+        message.response_id,
+    )
+    .await;
+    offer.complete(input);
+    Ok(delivery)
+}
 
-fn validate_and_reserve_input(
+pub(super) type InputPermit = mpsc::OwnedPermit<QueuedInput>;
+
+pub(super) fn validate_and_reserve_input(
     active: &Arc<ActiveExecution>,
     request: &SendMessageRequest,
     task_id: &str,

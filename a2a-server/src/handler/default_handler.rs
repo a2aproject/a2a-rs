@@ -48,6 +48,7 @@ pub struct DefaultRequestHandler {
     extended_agent_card: Option<Arc<dyn ExtendedAgentCardResolver>>,
     long_poll_timeout: Duration,
     blocking_response_timeout: Option<Duration>,
+    input_admission_timeout: Duration,
     pub(super) cancel_hook_timeout: Duration,
     pub(super) http_live_responses: Arc<HttpLiveResponses>,
     pub(super) http_followup_timeout: Duration,
@@ -71,6 +72,7 @@ impl DefaultRequestHandler {
             extended_agent_card: None,
             long_poll_timeout: DEFAULT_LONG_POLL_TIMEOUT,
             blocking_response_timeout: None,
+            input_admission_timeout: Duration::from_secs(30),
             cancel_hook_timeout: DEFAULT_CANCEL_HOOK_TIMEOUT,
             http_live_responses: Arc::new(HttpLiveResponses::default()),
             http_followup_timeout: Duration::from_secs(30),
@@ -142,6 +144,18 @@ impl DefaultRequestHandler {
     pub fn with_blocking_response_timeout(mut self, timeout: Duration) -> Self {
         self.blocking_response_timeout = Some(timeout);
         self
+    }
+
+    /// Bound an answer's wait for an interrupted executor to claim it.
+    /// Defaults to 30 seconds in every send mode. Expiry rejects the request
+    /// before persistence, so the caller can retry without duplicating input.
+    pub fn with_input_admission_timeout(mut self, timeout: Duration) -> Self {
+        self.input_admission_timeout = timeout;
+        self
+    }
+
+    pub(super) fn input_admission_timeout(&self) -> Duration {
+        self.input_admission_timeout
     }
 
     /// Bounds HTTP live queueing and acknowledgement waits. An input that

@@ -272,7 +272,9 @@ async fn unread_sends_are_rejected_without_starting_another_execution() {
             streaming: Some(true),
             ..Default::default()
         });
-        old_question(&handler).await;
+        // Unread input to a non-interrupted execution is still committed and
+        // rejected at EOF; answers to interrupts have separate claim tests.
+        seed_task(&handler, "task", "context").await;
         let first = tokio::spawn({
             let handler = handler.clone();
             async move {
@@ -372,7 +374,9 @@ async fn live_unread_input_is_rejected_and_only_a_fresh_input_starts_execute() {
         streaming: Some(true),
         ..Default::default()
     });
-    old_question(&handler).await;
+    // Unread input to a non-interrupted execution is still committed and
+    // rejected at EOF; answers to interrupts have separate claim tests.
+    seed_task(&handler, "task", "context").await;
     let live = |request| StreamRequest {
         tenant: None,
         payload: StreamRequestPayload::SendMessage(request),

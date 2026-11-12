@@ -49,6 +49,20 @@ impl AgentExecutor for LiveAgent {
             .as_ref()
             .and_then(|m| m.text())
             .map(str::to_owned);
+        if first.as_deref() == Some("ask-worker") {
+            return Box::pin(ctx.spawn_worker(2, |ctx, output| async move {
+                output
+                    .send(status(
+                        &ctx.task_id,
+                        &ctx.context_id,
+                        TaskState::InputRequired,
+                        "need input",
+                    ))
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok(())
+            }));
+        }
         Box::pin(async_stream::stream! {
             let (task, context) = (ctx.task_id.clone(), ctx.context_id.clone());
             match first.as_deref() {
@@ -2154,55 +2168,59 @@ async fn messages_racing_an_executor_that_fails_are_never_refused_for_a_closed_q
 /// execution, even before the old driver's completion command is processed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_immediate_answer_to_an_exhausted_interrupt_starts_fresh_without_retry() {
-    for round in 0..30 {
-        let (handler, _) = handler(true);
-        let p = params("1.1");
-        let mut stream = match send("ask", None).payload {
-            StreamRequestPayload::SendMessage(request) => {
-                handler.send_streaming_message(&p, request).await.unwrap()
+    for opening in ["ask", "ask-slow", "ask-worker"] {
+        for round in 0..30 {
+            let (handler, _) = handler(true);
+            let p = params("1.1");
+            let mut stream = match send(opening, None).payload {
+                StreamRequestPayload::SendMessage(request) => {
+                    handler.send_streaming_message(&p, request).await.unwrap()
+                }
+                _ => unreachable!(),
+            };
+            let task_id = task_of(next(&mut stream).await).id;
+            loop {
+                if let StreamResponse::StatusUpdate(update) = next(&mut stream).await
+                    && update.status.state == TaskState::InputRequired
+                {
+                    break;
+                }
             }
-            _ => unreachable!(),
-        };
-        let task_id = task_of(next(&mut stream).await).id;
-        loop {
-            if let StreamResponse::StatusUpdate(update) = next(&mut stream).await
-                && update.status.state == TaskState::InputRequired
-            {
-                break;
-            }
+            let request = message_request("quick", &task_id);
+            let reference = request.message.as_ref().unwrap().message_id.clone();
+            let reply =
+                tokio::time::timeout(Duration::from_secs(5), handler.send_message(&p, request))
+                    .await
+                    .expect("no hang");
+            let get = || GetTaskRequest {
+                id: task_id.clone(),
+                history_length: None,
+                tenant: None,
+                timeline_length: None,
+                current_generation: None,
+            };
+            let reply = reply.unwrap_or_else(|error| {
+                panic!("round {round}: fresh input was rejected: {error:?}")
+            });
+            assert!(
+                matches!(reply, SendMessageResponse::Task(task) if task.status.state == TaskState::Completed)
+            );
+            let stored = handler.get_task(&p, get()).await.unwrap();
+            assert_eq!(
+                stored
+                    .history
+                    .iter()
+                    .flatten()
+                    .filter(|message| message.message_id == reference)
+                    .count(),
+                1
+            );
+            assert_eq!(stored.timeline.iter().flatten().filter(|entry| matches!(&entry.content, TimelineContent::Message(message) if message.message_id == reference)).count(), 1);
+            assert_eq!(
+                handler.get_task(&p, get()).await.unwrap().status.state,
+                TaskState::Completed
+            );
+            handler.shutdown().await;
         }
-        let request = message_request("quick", &task_id);
-        let reference = request.message.as_ref().unwrap().message_id.clone();
-        let reply = tokio::time::timeout(Duration::from_secs(5), handler.send_message(&p, request))
-            .await
-            .expect("no hang");
-        let get = || GetTaskRequest {
-            id: task_id.clone(),
-            history_length: None,
-            tenant: None,
-            timeline_length: None,
-            current_generation: None,
-        };
-        let reply = reply
-            .unwrap_or_else(|error| panic!("round {round}: fresh input was rejected: {error:?}"));
-        assert!(
-            matches!(reply, SendMessageResponse::Task(task) if task.status.state == TaskState::Completed)
-        );
-        let stored = handler.get_task(&p, get()).await.unwrap();
-        assert_eq!(
-            stored
-                .history
-                .iter()
-                .flatten()
-                .filter(|message| message.message_id == reference)
-                .count(),
-            1
-        );
-        assert_eq!(stored.timeline.iter().flatten().filter(|entry| matches!(&entry.content, TimelineContent::Message(message) if message.message_id == reference)).count(), 1);
-        assert_eq!(
-            handler.get_task(&p, get()).await.unwrap().status.state,
-            TaskState::Completed
-        );
-        handler.shutdown().await;
     }
 }

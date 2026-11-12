@@ -11,6 +11,7 @@ use parking_lot::RwLock;
 use std::sync::{Arc, Weak};
 use tokio::sync::{broadcast, watch};
 
+mod admission_queue;
 mod controller;
 
 pub(super) use controller::{OutputAction, TaskCommand, TaskController};
@@ -122,6 +123,7 @@ struct TaskInner {
     id: TaskId,
     background_tasks: Arc<super::background_tasks::BackgroundTasks>,
     changes: watch::Sender<u64>,
+    input_activity: Arc<tokio::sync::Notify>,
     sender: broadcast::Sender<ExecutionEvent>,
     state: RwLock<State>,
     notifications: std::sync::OnceLock<Arc<super::push_delivery::PushService>>,
@@ -217,6 +219,7 @@ impl TaskHandle {
                 id,
                 background_tasks,
                 changes: watch::channel(0).0,
+                input_activity: Arc::default(),
                 sender: broadcast::channel(super::EXECUTION_BUFFER_CAPACITY).0,
                 state: RwLock::new(State {
                     snapshot,
@@ -308,7 +311,12 @@ impl TaskHandle {
         background_tasks.spawn(CONTROLLER.scope(task.clone(), async move {
             use futures::FutureExt;
             let mut state = TaskController::default();
-            while let Some(work) = commands.recv().await {
+            let mut pending =
+                admission_queue::PendingAdmissions::new(task.inner.input_activity.clone());
+            while let Some(work) = pending.next(&mut commands, &state).await {
+                let Some(work) = pending.stage(work, &state) else {
+                    continue;
+                };
                 tracing::trace!(task_id = %task.id(), "processing task operation");
                 task.inner.state.write().notifications = Some(Vec::new());
                 if std::panic::AssertUnwindSafe(work.command.run(&mut state))
@@ -442,6 +450,10 @@ impl TaskHandle {
         }
     }
 
+    pub(super) fn wake_inputs(&self) {
+        self.inner.input_activity.notify_one();
+    }
+
     pub(super) fn notify(&self) {
         self.inner.changes.send_modify(|version| *version += 1);
     }
@@ -449,6 +461,15 @@ impl TaskHandle {
     #[cfg(test)]
     pub(super) fn is_watched(&self) -> bool {
         self.inner.changes.receiver_count() > 0 || self.inner.sender.receiver_count() > 0
+    }
+
+    pub(super) fn is_terminal(&self) -> bool {
+        self.inner
+            .state
+            .read()
+            .snapshot
+            .as_ref()
+            .is_some_and(|task| task.status.state.is_terminal())
     }
 
     pub(super) fn snapshot(&self) -> Option<Task> {
@@ -689,7 +710,12 @@ impl TaskHandle {
                 }
                 state.execution = Weak::new();
             }
-            if let Some(task) = snapshot {
+            if let Some(task) = snapshot
+                && state
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|cached| task.generation >= cached.generation)
+            {
                 state.snapshot = Some(task);
             }
             if result.is_ok_and(|event| {
@@ -885,6 +911,29 @@ mod tests {
                 .unwrap();
             handler.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn failed_direct_publication_does_not_roll_back_a_newer_snapshot() {
+        let handler = make_handler().with_push_notifications(
+            crate::InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(None),
+        );
+        let task = handler.tasks.task("task");
+        handler.attach_pushes(&task);
+        let mut newer = task_with_history("task", "context", 0);
+        newer.generation = 7;
+        task.set_snapshot(newer.clone());
+        let mut events = task.sender().subscribe();
+        handler.shutdown().await;
+        let mut older = newer.clone();
+        older.generation = 3;
+        let event = StreamResponse::Task(older.clone());
+        task.publish(Ok(&event), Some(older), EventKind::Normal, None, 0)
+            .await;
+        assert_eq!(task.snapshot(), Some(newer));
+        assert_eq!(events.recv().await.unwrap().result.unwrap(), event);
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]

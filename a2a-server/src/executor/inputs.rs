@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Owned task inputs and cancellation-safe receipt tracking.
 
+mod offer;
+pub(crate) use offer::InputOffer;
+
 use crate::middleware::{ServiceParams, User};
 use a2a::*;
 use serde_json::Value;
@@ -90,6 +93,7 @@ pub struct ClientInputs {
     revoked: CancellationToken,
     returned: Option<oneshot::Sender<mpsc::Receiver<QueuedInput>>>,
     received_generation: Arc<AtomicI64>,
+    pending_offer: Option<Arc<offer::OfferedInput>>,
 }
 
 impl ClientInputs {
@@ -112,6 +116,7 @@ impl ClientInputs {
                 revoked,
                 returned: None,
                 received_generation,
+                pending_offer: None,
             },
         )
     }
@@ -138,6 +143,23 @@ impl ClientInputs {
             if self.revoked.is_cancelled() {
                 return None;
             }
+            if let Some(offer) = self.pending_offer.take() {
+                if let Some(input) = offer.value() {
+                    self.received_generation
+                        .fetch_max(input.generation, Ordering::AcqRel);
+                    super::outputs::input_read(&self.received_generation, input.generation);
+                    return Some(input);
+                }
+                if offer.ready.is_cancelled() {
+                    continue;
+                }
+                self.pending_offer = Some(offer.clone());
+                tokio::select! {
+                    biased;
+                    _ = self.revoked.cancelled() => return None,
+                    _ = offer.ready.cancelled() => continue,
+                }
+            }
             let receiver = self.receiver.as_mut().expect("receiver exists until drop");
             let input = tokio::select! {
                 biased;
@@ -151,6 +173,12 @@ impl ClientInputs {
             if self.revoked.is_cancelled() {
                 return None;
             }
+            if let QueuedInput::Offered(offer) = input {
+                if offer.claim() {
+                    self.pending_offer = Some(offer);
+                }
+                continue;
+            }
             if let Some(input) = input.claim() {
                 self.received_generation
                     .fetch_max(input.generation, Ordering::AcqRel);
@@ -160,24 +188,48 @@ impl ClientInputs {
         }
     }
 
-    /// A message that is already queued, without waiting.
+    /// A committed message that is already available, without waiting.
+    /// After an interruption, this may claim an offered answer and return None
+    /// while its persistence finishes. Keep polling, or use `recv` to await it.
     pub fn try_recv(&mut self) -> Option<ClientInput> {
-        if self.revoked.is_cancelled() {
-            return None;
+        loop {
+            if self.revoked.is_cancelled() {
+                return None;
+            }
+            if let Some(offer) = self.pending_offer.take() {
+                if let Some(input) = offer.value() {
+                    self.received_generation
+                        .fetch_max(input.generation, Ordering::AcqRel);
+                    super::outputs::input_read(&self.received_generation, input.generation);
+                    return Some(input);
+                }
+                if offer.ready.is_cancelled() {
+                    continue;
+                }
+                self.pending_offer = Some(offer);
+                return None;
+            }
+            let receiver = self.receiver.as_mut().expect("receiver exists until drop");
+            if self.closed.is_cancelled() {
+                receiver.close();
+            }
+            let input = receiver.try_recv().ok()?;
+            if self.revoked.is_cancelled() {
+                return None;
+            }
+            if let QueuedInput::Offered(offer) = input {
+                if offer.claim() {
+                    self.pending_offer = Some(offer);
+                }
+                continue;
+            }
+            if let Some(input) = input.claim() {
+                self.received_generation
+                    .fetch_max(input.generation, Ordering::AcqRel);
+                super::outputs::input_read(&self.received_generation, input.generation);
+                return Some(input);
+            }
         }
-        let receiver = self.receiver.as_mut().expect("receiver exists until drop");
-        if self.closed.is_cancelled() {
-            receiver.close();
-        }
-        let input = receiver.try_recv().ok()?;
-        if self.revoked.is_cancelled() {
-            return None;
-        }
-        let input = input.claim()?;
-        self.received_generation
-            .fetch_max(input.generation, Ordering::AcqRel);
-        super::outputs::input_read(&self.received_generation, input.generation);
-        Some(input)
     }
 
     #[cfg(test)]
@@ -209,36 +261,38 @@ const RECLAIMED: u8 = 2;
 /// Reading and reclaiming race through one atomic receipt. This lets a worker
 /// own the receiver without letting it read messages already rejected at EOF.
 #[derive(Clone)]
-pub(crate) struct QueuedInput {
-    input: Arc<ClientInput>,
-    state: Arc<AtomicU8>,
+pub(crate) enum QueuedInput {
+    Ready {
+        input: Arc<ClientInput>,
+        state: Arc<AtomicU8>,
+    },
+    Offered(Arc<offer::OfferedInput>),
 }
 
 impl QueuedInput {
     pub(crate) fn new(input: ClientInput) -> Self {
-        Self {
+        Self::Ready {
             input: Arc::new(input),
             state: Arc::new(AtomicU8::new(UNREAD)),
         }
     }
-
     pub(crate) fn pending(&self) -> bool {
-        self.state.load(Ordering::Acquire) == UNREAD
+        matches!(self, Self::Ready { state, .. } if state.load(Ordering::Acquire) == UNREAD)
     }
-
     fn claim(self) -> Option<ClientInput> {
         self.take(RECEIVED)
     }
-
     pub(crate) fn reclaim(self) -> Option<ClientInput> {
         self.take(RECLAIMED)
     }
-
-    fn take(self, state: u8) -> Option<ClientInput> {
-        self.state
-            .compare_exchange(UNREAD, state, Ordering::AcqRel, Ordering::Acquire)
+    fn take(self, target: u8) -> Option<ClientInput> {
+        let Self::Ready { input, state } = self else {
+            return None;
+        };
+        state
+            .compare_exchange(UNREAD, target, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
-        Some(Arc::try_unwrap(self.input).unwrap_or_else(|input| (*input).clone()))
+        Some(Arc::try_unwrap(input).unwrap_or_else(|input| (*input).clone()))
     }
 }
 
