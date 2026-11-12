@@ -99,7 +99,7 @@ impl Tasks {
 /// Keeps every task for the life of the process unless
 /// [`Self::with_terminal_task_limit`] bounds how many finished ones it holds.
 /// Authenticated lists can cache ordered IDs for five minutes of inactivity.
-/// Anonymous lists and cache overflow use stateless, scope-bound live cursors.
+/// Anonymous lists and cache overflow issue signed, scope-bound live cursors.
 /// Every page rechecks current contents, filters and visibility. Snapshot-cache
 /// limits never prevent another caller from listing tasks.
 pub struct InMemoryTaskStore {
