@@ -1,7 +1,8 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! Stateless, caller-bound positions for listings that retain no server cursor.
+//! Newly issued stateless cursors are caller-bound. Legacy unsigned positions
+//! remain readable for compatibility; visibility is rechecked on every page.
 
 use super::store::TaskListScope;
 use a2a::*;
@@ -97,6 +98,7 @@ impl KeysetCursors {
         if token.len() > MAX_TOKEN_BYTES {
             return Err(A2AError::invalid_params("invalid page token"));
         }
+        // Legacy tokens are positions, not authentication or scope proofs.
         if token.bytes().all(|byte| byte.is_ascii_digit()) {
             return token
                 .parse()

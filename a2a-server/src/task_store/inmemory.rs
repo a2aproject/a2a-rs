@@ -139,17 +139,33 @@ impl InMemoryTaskStore {
             .map(|entry| entry.task.clone())
             .collect();
         tasks.retain(|task| matches_task(task, req, visible));
-        tasks.sort_by_key(|task| (std::cmp::Reverse(task.status.timestamp), task.id.clone()));
         let total_size = tasks.len().min(i32::MAX as usize) as i32;
         let start = match position {
             Position::Offset(position) => position,
-            Position::After((timestamp, id)) => tasks.partition_point(|task| {
-                (std::cmp::Reverse(task.status.timestamp), &task.id)
-                    <= (std::cmp::Reverse(timestamp), &id)
-            }),
+            Position::After((timestamp, id)) => {
+                tasks.retain(|task| {
+                    (std::cmp::Reverse(task.status.timestamp), &task.id)
+                        > (std::cmp::Reverse(timestamp), &id)
+                });
+                0
+            }
         };
         let page_size = resolve_page_size(req.page_size);
         let has_more = start.saturating_add(page_size) < tasks.len();
+        // Issued cursors need only the next page, not an ordering of all N
+        // tasks. Selection is O(N), followed by O(page_size log page_size).
+        let compare = |a: &Arc<Task>, b: &Arc<Task>| {
+            (std::cmp::Reverse(a.status.timestamp), &a.id)
+                .cmp(&(std::cmp::Reverse(b.status.timestamp), &b.id))
+        };
+        if start < tasks.len() {
+            let keep = start.saturating_add(page_size).min(tasks.len());
+            if keep < tasks.len() {
+                tasks.select_nth_unstable_by(keep, compare);
+                tasks.truncate(keep);
+            }
+            tasks.sort_unstable_by(compare);
+        }
         let page: Vec<_> = tasks.into_iter().skip(start).take(page_size).collect();
         let next_page_token = if has_more {
             page.last()
@@ -529,6 +545,32 @@ mod tests {
         req: &ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
         store.list_for_scope(req, &cached_scope(), None).await
+    }
+
+    #[tokio::test]
+    async fn stateless_paging_explicitly_uses_live_positions_and_rechecks_legacy_visibility() {
+        let store = dated_store().await;
+        let mut request = list_request(1);
+        let first = store.list(&request).await.unwrap();
+        assert_eq!(first.tasks[0].id, "a");
+        request.page_token = Some(first.next_page_token);
+        let mut moved = store.get("b").await.unwrap().unwrap();
+        moved.status.timestamp = chrono::DateTime::from_timestamp(40, 0);
+        store.update(moved).await.unwrap();
+        let next = store.list(&request).await.unwrap();
+        assert_eq!(
+            next.tasks[0].id, "c",
+            "an updated task can move before a live cursor and be omitted"
+        );
+        assert!(next.next_page_token.is_empty());
+        assert_eq!(store.list(&list_request(1)).await.unwrap().tasks[0].id, "b");
+        request.page_token = Some("0".into());
+        let visible = store.list_scoped(&request, &|id| id == "c").await.unwrap();
+        assert_eq!(visible.total_size, 1);
+        assert_eq!(
+            visible.tasks[0].id, "c",
+            "legacy positions do not bypass current visibility"
+        );
     }
 
     #[tokio::test]
