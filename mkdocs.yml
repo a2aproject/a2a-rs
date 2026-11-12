@@ -21,6 +21,8 @@ copyright: Copyright A2A Contributors. Licensed under the Apache License, Versio
 # Navigation
 nav:
   - Home: index.md
+  - Reference:
+      - a2acli: reference/a2acli.md
 
 # With `mkdocs build --strict`, a link or anchor that does not resolve fails the
 # build. The defaults only log a dead anchor, and an unrecognized link, at info.

@@ -77,6 +77,7 @@ the provenance do that.
 - `card get --validate` against the A2A JSON schema, reporting every
   violation with its JSON pointer path
 
+<!-- --8<-- [start:reference] -->
 ## Run
 
 Commands are namespaced by the resource they act on (`card get`, `task get`,
@@ -96,6 +97,8 @@ cargo run --bin a2acli -- task cancel task-123
 cargo run --bin a2acli -- task subscribe task-123
 cargo run --bin a2acli -- task push-config list task-123
 cargo run --bin a2acli -- task push-config create task-123 https://example.com/callback --auth-scheme Bearer --auth-credentials secret
+cargo run --bin a2acli -- task push-config get task-123 config-1
+cargo run --bin a2acli -- task push-config delete task-123 config-1
 cargo run --bin a2acli -- completion zsh
 ```
 
@@ -104,6 +107,24 @@ or `--transport rest` (repeatable and ordered, highest preference first) to pin
 the transport when the agent card exposes more than one compatible interface.
 The global `--tenant`, `--bearer`, `--api-key`, and repeated
 `--svc-param Name:Value` options also apply to `task push-config` commands.
+
+### Command options
+
+Besides the global options, some commands take options of their own:
+
+| Command | Option | Effect |
+| --- | --- | --- |
+| `send` | `--task-id <id>` | Continue an existing task (`A2ACLI_TASK_ID`). |
+| `send` | `--history-length <n>` | Ask the server to include up to `n` history items in task responses. |
+| `send` | `--accept-output <mode>` | Accepted output mode, for example `text/plain` or `application/json`. |
+| `send` | `--return-immediately` | Ask the agent to return early when it supports queued work. This is a request to the agent; `--async` is the client-side "do not wait" (see [Blocking and polling](#blocking-and-polling)). |
+| `task get` | `--history-length <n>` | Ask the server to include up to `n` history items. |
+| `task list` | `--status <state>` | Filter by task state: `unspecified`, `submitted`, `working`, `completed`, `failed`, `canceled`, `input-required`, `rejected` or `auth-required`. |
+| `task list` | `--history-length <n>` | Ask the server to include up to `n` history items per task. |
+| `task list` | `--include-artifacts` | Ask the server to include artifacts in the listed tasks. |
+| `task list`, `task push-config list` | `--page-size <n>`, `--page-token <token>` | Request a page size, and continue from the token of a previous response. |
+| `task push-config create` | `--config-id <id>` | An identifier for the push config (its `id` field). |
+| `task push-config create` | `--token <token>` | An optional token for validating push notifications (the config's `token` field). |
 
 ### Capability pre-flight
 
@@ -450,6 +471,7 @@ a2acli completion powershell | Out-String | Invoke-Expression
 
 Naming an unsupported shell is a usage error (exit 2) listing the accepted
 values.
+<!-- --8<-- [end:reference] -->
 
 ## Conformance
 
