@@ -470,12 +470,11 @@ impl RequestHandler for DefaultRequestHandler {
         }
         let admission = handler.admit_message(params, MessageInput::Raw(req), policy);
         let (task, events) = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, admission).await
-                .map_err(|_| A2AError::internal("response deadline expired during admission; input outcome is unknown; inspect the task before retrying")
-                    .with_details(vec![TypedDetail::error_info("RESPONSE_DEADLINE_EXCEEDED", "a2a-rs", Some(std::collections::HashMap::from([
-                        ("inputCommitted".into(), "unknown".into()),
-                        ("taskId".into(), requested_task.unwrap_or_default()),
-                    ])))]))??,
+            Some(deadline) => tokio::time::timeout_at(deadline, admission)
+                .await
+                .map_err(|_| {
+                    protocol::response_deadline_error(requested_task.as_deref(), None, false)
+                })??,
             None => admission.await?,
         };
         let events = self.response_stream(params, (task.clone(), events), policy, None, None);
@@ -492,21 +491,18 @@ impl RequestHandler for DefaultRequestHandler {
                     }
                     // A deadline must never turn a provisional cache entry or
                     // an older question into this input's successful answer.
-                    let stored = self.tasks.load(task.id()).now_or_never()
-                            .ok_or_else(|| A2AError::internal("blocking response timed out after admission; input was committed; inspect the task before retrying"))??;
+                    let stored = self.tasks.load(task.id()).now_or_never().ok_or_else(|| {
+                        protocol::response_deadline_error(Some(task.id()), None, true)
+                    })??;
                     if matches!(
                         stored.status.state,
                         TaskState::InputRequired | TaskState::AuthRequired
                     ) {
-                        return Err(A2AError::internal("blocking response timed out after input committed; execution continues; do not resend this input")
-                                .with_details(vec![TypedDetail::error_info(
-                                    "RESPONSE_DEADLINE_EXCEEDED", "a2a-rs",
-                                    Some(std::collections::HashMap::from([
-                                        ("inputCommitted".into(), "true".into()),
-                                        ("taskId".into(), stored.id.clone()),
-                                        ("generation".into(), stored.generation.to_string()),
-                                    ])),
-                                )]));
+                        return Err(protocol::response_deadline_error(
+                            Some(&stored.id),
+                            Some(stored.generation),
+                            true,
+                        ));
                     }
                     SendMessageResponse::Task(stored)
                 }

@@ -248,6 +248,54 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn a_late_offer_rejects_ended_revoked_or_lost_readers_before_writing() {
+        let handler = make_handler();
+        seed_task(&handler, "task", "context").await;
+        let stored = handler.tasks.load("task").await.unwrap();
+        let mut request = send_request();
+        request.message.as_mut().unwrap().task_id = Some("task".into());
+        for lost in 0..3 {
+            let (active, inputs, invocation) =
+                ActiveExecution::with_task(handler.tasks.task("task"));
+            active.set_snapshot(stored.clone());
+            match lost {
+                0 => active.mark_stream_ended(),
+                1 => active.inputs.revoke_reads(),
+                _ => {}
+            }
+            drop(invocation);
+            if lost == 2 {
+                drop(inputs);
+            }
+            let rejection = validate_and_reserve_input(&active, &request, "task")
+                .expect_err("a late offer cannot enter an unavailable inbox");
+            let StreamResponse::Error(error) =
+                rejection.into_stream_error("task", Some("input".into()))
+            else {
+                panic!("input rejection must be a stream error");
+            };
+            assert_eq!(
+                error.code,
+                if lost == 2 {
+                    "INTERNAL_ERROR"
+                } else {
+                    "UNAVAILABLE"
+                }
+            );
+            assert_eq!(error.reference_id.as_deref(), Some("input"));
+            if lost == 0 {
+                let unary = validate_and_reserve_input(&active, &request, "task")
+                    .err()
+                    .unwrap()
+                    .into_error();
+                assert_eq!(unary.code, error_code::INVALID_REQUEST);
+            }
+            assert_eq!(handler.tasks.load("task").await.unwrap(), stored);
+        }
+        handler.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_missing_snapshot_or_closed_inbox_rejects_input_before_persistence() {
         let handler = make_handler();
         seed_task(&handler, "task", "context").await;

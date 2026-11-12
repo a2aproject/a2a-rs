@@ -707,6 +707,34 @@ pub(super) fn should_interrupt_non_streaming(
     }
 }
 
+/// Preserve retry information when the one unary deadline expires.
+pub(super) fn response_deadline_error(
+    task_id: Option<&str>,
+    generation: Option<i64>,
+    known_committed: bool,
+) -> A2AError {
+    let mut metadata = std::collections::HashMap::from([(
+        "inputCommitted".into(),
+        if known_committed { "true" } else { "unknown" }.into(),
+    )]);
+    if let Some(task_id) = task_id {
+        metadata.insert("taskId".into(), task_id.into());
+    }
+    if let Some(generation) = generation {
+        metadata.insert("generation".into(), generation.to_string());
+    }
+    let message = if known_committed {
+        "blocking response deadline expired after input committed; execution continues; do not resend this input"
+    } else {
+        "response deadline expired during admission; input outcome is unknown; inspect the task before retrying"
+    };
+    A2AError::internal(message).with_details(vec![TypedDetail::error_info(
+        "RESPONSE_DEADLINE_EXCEEDED",
+        "a2a-rs",
+        Some(metadata),
+    )])
+}
+
 /// Why a live request was not carried out.
 pub(super) enum Rejection {
     /// The stream ended before admission; this input has no committed effects.
@@ -2163,6 +2191,35 @@ mod policy_tests {
     }
 
     #[test]
+    fn replies_require_agent_role_and_cannot_expose_a_provisional_task() {
+        let mut task = task_with_history("task", "context", 0);
+        task.status.state = TaskState::Working;
+        for created in [false, true] {
+            let mut message = Message::new(Role::Agent, vec![Part::text("reply")]);
+            message.task_id = Some(task.id.clone());
+            let mut event = StreamResponse::Message(message);
+            prepare_agent_reply(&task, &mut event, created).unwrap();
+            let StreamResponse::Message(message) = event else {
+                panic!("expected direct reply");
+            };
+            assert_eq!(message.context_id.as_deref(), Some("context"));
+            assert_eq!(message.task_id.as_deref(), created.then_some("task"));
+            for role in [Role::User, Role::Unspecified] {
+                let mut event = StreamResponse::Message(Message::new(
+                    role,
+                    vec![Part::text("untrusted reply")],
+                ));
+                assert_eq!(
+                    prepare_agent_reply(&task, &mut event, created)
+                        .unwrap_err()
+                        .code,
+                    error_code::INVALID_AGENT_RESPONSE
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cancellation_acknowledgements_preserve_the_committed_snapshot() {
         let mut task = task_with_history("task", "context", 0);
         task.status.state = TaskState::Canceled;
@@ -2173,6 +2230,18 @@ mod policy_tests {
             announced: false,
         };
         let original = task.clone();
+        let mut working = task.clone();
+        working.status.state = TaskState::Working;
+        assert_eq!(
+            validate_cancel_acknowledgement(&working, &mut status(TaskState::Canceled))
+                .unwrap_err()
+                .code,
+            error_code::INVALID_AGENT_RESPONSE
+        );
+        assert!(matches!(
+            entry.notification(None),
+            CancellationNotification::None
+        ));
         let mut event = status(TaskState::Canceled);
         validate_cancel_acknowledgement(&task, &mut event).unwrap();
         assert_eq!(task, original);

@@ -1122,6 +1122,379 @@ async fn a_reader_canceled_during_persistence_cannot_silently_consume_the_answer
     }
 }
 
+#[tokio::test]
+async fn successive_interrupts_preserve_the_order_of_uncommitted_requests() {
+    struct Successive {
+        first: Arc<Notify>,
+        second: Arc<Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl AgentExecutor for Successive {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let first = ctx
+                .message
+                .as_ref()
+                .and_then(Message::text)
+                .unwrap()
+                .to_owned();
+            let wait = if first == "first" {
+                self.first.clone()
+            } else {
+                self.second.clone()
+            };
+            Box::pin(async_stream::stream! {
+                if first == "third" { yield Ok(question(&ctx, TaskState::Completed, "done")); }
+                else {
+                    yield Ok(question(&ctx, TaskState::InputRequired, &format!("question for {first}")));
+                    wait.notified().await;
+                }
+            })
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    crate::test_util::install_crypto_provider();
+    let (first, second) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler = DefaultRequestHandler::new(
+        Successive {
+            first: first.clone(),
+            second: second.clone(),
+            calls: calls.clone(),
+        },
+        InMemoryTaskStore::new(),
+    );
+    seed_task(&handler, "task", "context").await;
+    handler
+        .send_message(&ServiceParams::new(), request("first"))
+        .await
+        .unwrap();
+    let active = handler.tasks.task("task").active().unwrap();
+    let capacity = active.inputs.sender.capacity();
+    let send = |text: &'static str| {
+        let handler = handler.clone();
+        tokio::spawn(async move {
+            handler
+                .send_message(&ServiceParams::new(), request(text))
+                .await
+        })
+    };
+    let second_response = send("second");
+    timeout(Duration::from_secs(1), async {
+        while active.inputs.sender.capacity() != capacity - 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let third_response = send("third");
+    timeout(Duration::from_secs(1), async {
+        while active.inputs.sender.capacity() != capacity - 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    first.notify_one();
+    let second_task = timeout(Duration::from_secs(1), second_response)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(second_task, SendMessageResponse::Task(task) if task.status.message.as_ref().and_then(Message::text) == Some("question for second"))
+    );
+    assert!(!third_response.is_finished());
+    assert!(
+        !handler
+            .tasks
+            .load("task")
+            .await
+            .unwrap()
+            .history
+            .iter()
+            .flatten()
+            .any(|m| m.text() == Some("third"))
+    );
+    second.notify_one();
+    assert!(
+        matches!(timeout(Duration::from_secs(1), third_response).await.unwrap().unwrap().unwrap(), SendMessageResponse::Task(task) if task.status.state == TaskState::Completed)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    let task = handler.tasks.load("task").await.unwrap();
+    for text in ["first", "second", "third"] {
+        assert_eq!(
+            task.history
+                .iter()
+                .flatten()
+                .filter(|m| m.role == Role::User && m.text() == Some(text))
+                .count(),
+            1
+        );
+    }
+    handler.shutdown().await;
+}
+
+#[tokio::test]
+async fn canceling_a_recv_claim_can_be_followed_by_a_real_read_in_the_same_execution() {
+    use futures::FutureExt;
+    struct Reader {
+        withdraw: Arc<Notify>,
+        withdrawn: Arc<Notify>,
+        read: Arc<Notify>,
+    }
+    impl AgentExecutor for Reader {
+        fn execute(
+            &self,
+            mut ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let (withdraw, withdrawn, read) = (
+                self.withdraw.clone(),
+                self.withdrawn.clone(),
+                self.read.clone(),
+            );
+            Box::pin(async_stream::stream! {
+                yield Ok(question(&ctx, TaskState::InputRequired, "question"));
+                withdraw.notified().await;
+                assert!(ctx.inputs.recv().now_or_never().is_none());
+                withdrawn.notify_one();
+                yield Ok(question(&ctx, TaskState::Working, "still preparing"));
+                read.notified().await;
+                assert_eq!(ctx.inputs.recv().await.unwrap().message.text(), Some("second"));
+                yield Ok(question(&ctx, TaskState::Completed, "read"));
+            })
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    crate::test_util::install_crypto_provider();
+    let (withdraw, withdrawn, read) = (
+        Arc::new(Notify::new()),
+        Arc::new(Notify::new()),
+        Arc::new(Notify::new()),
+    );
+    let handler = DefaultRequestHandler::new(
+        Reader {
+            withdraw: withdraw.clone(),
+            withdrawn: withdrawn.clone(),
+            read: read.clone(),
+        },
+        InMemoryTaskStore::new(),
+    );
+    seed_task(&handler, "task", "context").await;
+    handler
+        .send_message(&ServiceParams::new(), request("first"))
+        .await
+        .unwrap();
+    let task = handler.tasks.task("task");
+    let active = task.active().unwrap();
+    let capacity = active.inputs.sender.capacity();
+    let response = tokio::spawn({
+        let handler = handler.clone();
+        async move {
+            handler
+                .send_message(&ServiceParams::new(), request("second"))
+                .await
+        }
+    });
+    timeout(Duration::from_secs(1), async {
+        while active.inputs.sender.capacity() == capacity {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    withdraw.notify_one();
+    timeout(Duration::from_secs(1), withdrawn.notified())
+        .await
+        .unwrap();
+    task.submit(super::task_handle::TaskOperation::Subscribe, |_| {
+        Box::pin(async {})
+    })
+    .await
+    .unwrap();
+    assert!(
+        !handler
+            .tasks
+            .load("task")
+            .await
+            .unwrap()
+            .history
+            .iter()
+            .flatten()
+            .any(|m| m.text() == Some("second"))
+    );
+    assert!(!response.is_finished());
+    read.notify_one();
+    assert!(
+        matches!(timeout(Duration::from_secs(1), response).await.unwrap().unwrap().unwrap(), SendMessageResponse::Task(task) if task.status.state == TaskState::Completed)
+    );
+    handler.shutdown().await;
+}
+
+#[tokio::test]
+async fn deferred_admission_is_bounded_and_disconnected_callers_return_all_reservations() {
+    crate::test_util::install_crypto_provider();
+    let handler = DefaultRequestHandler::new(NeverReads, InMemoryTaskStore::new());
+    seed_task(&handler, "task", "context").await;
+    handler
+        .send_message(&ServiceParams::new(), request("first"))
+        .await
+        .unwrap();
+    let active = handler.tasks.task("task").active().unwrap();
+    let before = handler.tasks.load("task").await.unwrap();
+    let capacity = active.inputs.sender.capacity();
+    let mut waiting = Vec::new();
+    for _ in 0..capacity {
+        let handler = handler.clone();
+        waiting.push(tokio::spawn(async move {
+            handler
+                .send_message(&ServiceParams::new(), request("uncommitted"))
+                .await
+        }));
+    }
+    timeout(Duration::from_secs(1), async {
+        while active.inputs.sender.capacity() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let busy = timeout(
+        Duration::from_secs(1),
+        handler.send_message(&ServiceParams::new(), request("overflow")),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(busy.message.contains("busy"), "{busy:?}");
+    assert_eq!(handler.tasks.load("task").await.unwrap(), before);
+    for caller in waiting {
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+    }
+    timeout(Duration::from_secs(1), async {
+        while active.inputs.sender.capacity() != capacity {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every disconnected reservation must be released promptly");
+    assert_eq!(handler.tasks.load("task").await.unwrap(), before);
+    handler
+        .cancel_task(
+            &ServiceParams::new(),
+            CancelTaskRequest {
+                id: "task".into(),
+                metadata: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    handler.shutdown().await;
+    assert_eq!(handler.tasks.background_tasks.count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn deadline_recovery_cannot_add_a_second_wait_for_an_unresponsive_store() {
+    #[derive(Clone)]
+    struct SlowRead {
+        inner: Arc<InMemoryTaskStore>,
+        blocked: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait]
+    impl TaskStore for SlowRead {
+        async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.create(task).await
+        }
+        async fn update(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.update(task).await
+        }
+        async fn get(&self, id: &str) -> Result<Option<Task>, A2AError> {
+            if self.blocked.load(Ordering::SeqCst) {
+                std::future::pending().await
+            } else {
+                self.inner.get(id).await
+            }
+        }
+        async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+            self.inner.list(req).await
+        }
+        async fn begin_cancel(&self, id: &str) -> Result<Task, A2AError> {
+            self.inner.begin_cancel(id).await
+        }
+    }
+    struct Working(Arc<std::sync::atomic::AtomicBool>);
+    impl AgentExecutor for Working {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let blocked = self.0.clone();
+            Box::pin(async_stream::stream! {
+                yield Ok(question(&ctx, TaskState::Working, "working"));
+                blocked.store(true, Ordering::SeqCst);
+                futures::future::pending::<()>().await;
+            })
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    crate::test_util::install_crypto_provider();
+    let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let store = SlowRead {
+        inner: Arc::default(),
+        blocked: blocked.clone(),
+    };
+    let handler = DefaultRequestHandler::new(Working(blocked.clone()), store.clone())
+        .with_blocking_response_timeout(Duration::from_secs(5));
+    seed_task(&handler, "task", "context").await;
+    let start = tokio::time::Instant::now();
+    let error = handler
+        .send_message(&ServiceParams::new(), request("first"))
+        .await
+        .unwrap_err();
+    assert_eq!(start.elapsed(), Duration::from_secs(5));
+    let detail = &error.details.as_ref().unwrap()[0].value;
+    assert_eq!(detail["reason"], "RESPONSE_DEADLINE_EXCEEDED");
+    assert_eq!(detail["metadata"]["inputCommitted"], "true");
+    assert_eq!(detail["metadata"]["taskId"], "task");
+    blocked.store(false, Ordering::SeqCst);
+    assert_eq!(
+        store.inner.get("task").await.unwrap().unwrap().status.state,
+        TaskState::Working
+    );
+    handler
+        .cancel_task(
+            &ServiceParams::new(),
+            CancelTaskRequest {
+                id: "task".into(),
+                metadata: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    handler.shutdown().await;
+}
+
 struct NeverReads;
 impl AgentExecutor for NeverReads {
     fn execute(
