@@ -165,21 +165,18 @@ fixed; newly created tasks require a new listing. Cursor ownership includes
 the tenant and stable principal, while cache budgets count a principal across
 tenants to prevent request-supplied tenants from multiplying allocations.
 
-Anonymous listings always use authenticated stateless keyset cursors,
-retaining no per-list state. Authenticated listings also use these cursors
-when any cache budget is full, so exhausting the cache cannot deny another
-caller's listing or evict active traversals. These live cursors are bound to
-the store, query, tenant and principal. They re-sort current contents on every
-page: concurrent status timestamp changes can move tasks across page
-boundaries, so they do not provide frozen membership: a task moving ahead of
-the cursor can be omitted, and a task moving behind it can be returned again.
-Start a new traversal for a fresh view. Newly issued stateless tokens are
-authenticated and scope-bound; legacy numeric/unsigned sort-key positions
-remain readable for compatibility and have no scope binding. Every page still
-checks current filters and authorization. Stateless continuation scans are
-O(N), with selection followed by sorting only the next page. Custom stores can
-override the additive `list_for_scope` method without changing existing
-required trait methods.
+Anonymous listings retain no per-list state. Authenticated listings also use
+stateless positions when a cache budget is full, so exhausting the cache
+cannot deny another caller's listing or evict active traversals. Newly issued
+keyset tokens are authenticated and bind the store, query, tenant and
+principal. Each page uses current timestamp order: a task moving ahead of the
+cursor can be omitted, and a task moving behind it can repeat. Start a new
+traversal for a fresh view. Legacy numeric/unsigned sort-key positions remain
+readable for compatibility and have no scope binding. Every page still checks
+current filters and authorization. For issued keyset cursors, continuation
+pages scan O(N) Arc references, select the next page and sort only that page.
+Custom stores can override the additive `list_for_scope` method without
+changing existing required trait methods.
 
 Webhook work uses bounded per-task queues and a shared HTTP concurrency pool.
 Ordinary output waits for a bounded publication-batch permit outside the
