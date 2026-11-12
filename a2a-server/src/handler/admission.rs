@@ -96,6 +96,8 @@ pub(super) async fn commit_claimed(
     task_id: &str,
     active: &Arc<ActiveExecution>,
     offer: crate::executor::InputOffer,
+    permit: InputPermit,
+    invocation: &mut InvocationState,
 ) -> Result<Delivery, Rejection> {
     let task = active
         .snapshot()
@@ -114,9 +116,9 @@ pub(super) async fn commit_claimed(
             )
         })
         .ok_or_else(|| A2AError::internal("claimed input has no message generation"))?;
-    // Receipt ownership is fixed before publication. Cancellation after a read
-    // claim has the same semantics as cancellation after any consumed input.
-    active.inputs.received(input.generation);
+    // Persistence is not consumption. Track the normal unread receipt before
+    // publication so EOF can reject even a reader lost during this write.
+    let input = invocation.track_input(input);
     let delivery = publish_input(
         active,
         task,
@@ -125,7 +127,8 @@ pub(super) async fn commit_claimed(
         message.response_id,
     )
     .await;
-    offer.complete(input);
+    permit.send(input);
+    offer.complete();
     Ok(delivery)
 }
 

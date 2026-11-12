@@ -314,9 +314,6 @@ impl TaskHandle {
             let mut pending =
                 admission_queue::PendingAdmissions::new(task.inner.input_activity.clone());
             while let Some(work) = pending.next(&mut commands, &state).await {
-                let Some(work) = pending.stage(work, &state) else {
-                    continue;
-                };
                 tracing::trace!(task_id = %task.id(), "processing task operation");
                 task.inner.state.write().notifications = Some(Vec::new());
                 if std::panic::AssertUnwindSafe(work.command.run(&mut state))

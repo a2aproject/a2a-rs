@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicI64, AtomicU8, Ordering},
     },
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 /// A client message that reached a running execution: sent on a live stream
@@ -93,13 +93,14 @@ pub struct ClientInputs {
     revoked: CancellationToken,
     returned: Option<oneshot::Sender<mpsc::Receiver<QueuedInput>>>,
     received_generation: Arc<AtomicI64>,
-    pending_offer: Option<Arc<offer::OfferedInput>>,
+    offers: watch::Receiver<Option<Arc<offer::OfferedInput>>>,
 }
 
 impl ClientInputs {
     /// A bounded channel for exercising an executor on its own.
     pub fn channel(capacity: usize) -> (ClientInputSender, ClientInputs) {
         let (sender, receiver) = mpsc::channel(capacity);
+        let (offers, offered) = watch::channel(None);
         let closed = CancellationToken::new();
         let revoked = CancellationToken::new();
         let received_generation = Arc::new(AtomicI64::new(0));
@@ -109,6 +110,7 @@ impl ClientInputs {
                 closed: closed.clone(),
                 revoked: revoked.clone(),
                 received_generation: received_generation.clone(),
+                offers,
             },
             ClientInputs {
                 receiver: Some(receiver),
@@ -116,7 +118,7 @@ impl ClientInputs {
                 revoked,
                 returned: None,
                 received_generation,
-                pending_offer: None,
+                offers: offered,
             },
         )
     }
@@ -138,28 +140,20 @@ impl ClientInputs {
 
     /// The next message, waiting for one if none is queued. Closing the
     /// sending end preserves buffered messages; after those, returns `None`.
+    /// Canceling this future withdraws its uncommitted read claim. If a write
+    /// has already started, its input can still commit, but stays queued with
+    /// an unread receipt until actually received or rejected at execution end.
     pub async fn recv(&mut self) -> Option<ClientInput> {
+        let mut claim = None::<offer::ReadClaim>;
         loop {
             if self.revoked.is_cancelled() {
                 return None;
             }
-            if let Some(offer) = self.pending_offer.take() {
-                if let Some(input) = offer.value() {
-                    self.received_generation
-                        .fetch_max(input.generation, Ordering::AcqRel);
-                    super::outputs::input_read(&self.received_generation, input.generation);
-                    return Some(input);
-                }
-                if offer.ready.is_cancelled() {
-                    continue;
-                }
-                self.pending_offer = Some(offer.clone());
-                tokio::select! {
-                    biased;
-                    _ = self.revoked.cancelled() => return None,
-                    _ = offer.ready.cancelled() => continue,
-                }
+            if claim.is_none() {
+                let offered = self.offers.borrow_and_update().clone();
+                claim = offered.and_then(|offer| offer.claim());
             }
+            let released = claim.as_ref().map(offer::ReadClaim::ready);
             let receiver = self.receiver.as_mut().expect("receiver exists until drop");
             let input = tokio::select! {
                 biased;
@@ -169,15 +163,11 @@ impl ClientInputs {
                     receiver.recv().await
                 }
                 input = receiver.recv() => input,
+                _ = async { match released { Some(ready) => ready.cancelled().await, None => std::future::pending().await } } => { claim = None; continue; },
+                _ = self.offers.changed() => continue,
             }?;
             if self.revoked.is_cancelled() {
                 return None;
-            }
-            if let QueuedInput::Offered(offer) = input {
-                if offer.claim() {
-                    self.pending_offer = Some(offer);
-                }
-                continue;
             }
             if let Some(input) = input.claim() {
                 self.received_generation
@@ -189,24 +179,11 @@ impl ClientInputs {
     }
 
     /// A committed message that is already available, without waiting.
-    /// After an interruption, this may claim an offered answer and return None
-    /// while its persistence finishes. Keep polling, or use `recv` to await it.
+    /// It never claims an uncommitted answer. Use `recv` to accept an answer
+    /// offered to an interrupted execution and await its committed value.
     pub fn try_recv(&mut self) -> Option<ClientInput> {
         loop {
             if self.revoked.is_cancelled() {
-                return None;
-            }
-            if let Some(offer) = self.pending_offer.take() {
-                if let Some(input) = offer.value() {
-                    self.received_generation
-                        .fetch_max(input.generation, Ordering::AcqRel);
-                    super::outputs::input_read(&self.received_generation, input.generation);
-                    return Some(input);
-                }
-                if offer.ready.is_cancelled() {
-                    continue;
-                }
-                self.pending_offer = Some(offer);
                 return None;
             }
             let receiver = self.receiver.as_mut().expect("receiver exists until drop");
@@ -216,12 +193,6 @@ impl ClientInputs {
             let input = receiver.try_recv().ok()?;
             if self.revoked.is_cancelled() {
                 return None;
-            }
-            if let QueuedInput::Offered(offer) = input {
-                if offer.claim() {
-                    self.pending_offer = Some(offer);
-                }
-                continue;
             }
             if let Some(input) = input.claim() {
                 self.received_generation
@@ -261,23 +232,20 @@ const RECLAIMED: u8 = 2;
 /// Reading and reclaiming race through one atomic receipt. This lets a worker
 /// own the receiver without letting it read messages already rejected at EOF.
 #[derive(Clone)]
-pub(crate) enum QueuedInput {
-    Ready {
-        input: Arc<ClientInput>,
-        state: Arc<AtomicU8>,
-    },
-    Offered(Arc<offer::OfferedInput>),
+pub(crate) struct QueuedInput {
+    input: Arc<ClientInput>,
+    state: Arc<AtomicU8>,
 }
 
 impl QueuedInput {
     pub(crate) fn new(input: ClientInput) -> Self {
-        Self::Ready {
+        Self {
             input: Arc::new(input),
             state: Arc::new(AtomicU8::new(UNREAD)),
         }
     }
     pub(crate) fn pending(&self) -> bool {
-        matches!(self, Self::Ready { state, .. } if state.load(Ordering::Acquire) == UNREAD)
+        self.state.load(Ordering::Acquire) == UNREAD
     }
     fn claim(self) -> Option<ClientInput> {
         self.take(RECEIVED)
@@ -286,9 +254,7 @@ impl QueuedInput {
         self.take(RECLAIMED)
     }
     fn take(self, target: u8) -> Option<ClientInput> {
-        let Self::Ready { input, state } = self else {
-            return None;
-        };
+        let Self { input, state } = self;
         state
             .compare_exchange(UNREAD, target, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
@@ -311,9 +277,37 @@ pub struct ClientInputSender {
     pub(crate) closed: CancellationToken,
     revoked: CancellationToken,
     received_generation: Arc<AtomicI64>,
+    offers: watch::Sender<Option<Arc<offer::OfferedInput>>>,
 }
 
 impl ClientInputSender {
+    pub(crate) fn offer(&self, offer: Option<Arc<offer::OfferedInput>>) {
+        self.offers.send_if_modified(|current| {
+            let same = match (&*current, &offer) {
+                (Some(current), Some(offer)) => Arc::ptr_eq(current, offer),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                *current = offer;
+            }
+            !same
+        });
+    }
+
+    pub(crate) fn clear_offer(&self, offer: &Arc<offer::OfferedInput>) {
+        self.offers.send_if_modified(|current| {
+            if current
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, offer))
+            {
+                *current = None;
+                true
+            } else {
+                false
+            }
+        });
+    }
     /// The opening message is delivered through ExecutorContext, outside the inbox.
     pub(crate) fn received(&self, generation: i64) {
         self.received_generation

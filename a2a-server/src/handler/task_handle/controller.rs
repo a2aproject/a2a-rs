@@ -483,6 +483,7 @@ pub(in crate::handler) enum TaskCommand {
         id: TaskId,
         active: Arc<ActiveExecution>,
         offer: crate::executor::InputOffer,
+        permit: admission::InputPermit,
         reply: super::CommandReply<Result<Delivery, Rejection>>,
     },
     Subscribe {
@@ -562,6 +563,7 @@ impl TaskCommand {
                 id,
                 active,
                 offer,
+                permit,
                 reply,
             } => {
                 let outcome = if state.execution.is_current(&active)
@@ -570,9 +572,17 @@ impl TaskCommand {
                         .load(std::sync::atomic::Ordering::Acquire)
                     && !active.inputs.is_revoked()
                 {
-                    admission::commit_claimed(&handler, &message, &id, &active, offer).await
+                    let invocation = state
+                        .execution
+                        .bookkeeping(&active)
+                        .expect("current invocation");
+                    admission::commit_claimed(
+                        &handler, &message, &id, &active, offer, permit, invocation,
+                    )
+                    .await
                 } else {
                     drop(offer);
+                    drop(permit);
                     state.admit(&handler, *message, mode, id).await
                 };
                 reply.complete(outcome);

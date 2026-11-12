@@ -60,15 +60,23 @@ fresh request after completion may start another execution. An answer to an
 outstanding interrupt waits uncommitted until the current executor claims it.
 If the stream ends first, the original request starts a fresh execution and is
 persisted once; no accepted inbox message is handed off. Deferred requests
-retain bounded queue capacity and publication reservations. The read-admission
-deadline defaults to 30 seconds and is configured with
-`with_input_admission_timeout`; expiry reports that input was not committed. A
-read claim binds accepted input to that execution; cancellation after the
-claim does not replay it. `try_recv` can initiate a claim and return `None`
-while persistence finishes; keep polling or await `recv` to obtain the
-committed message. Task history does not implicitly become its inbox. An
-already returned `returnImmediately` response acknowledges persistence, not
-executor consumption.
+retain bounded inbox reservations and publication capacity. Uncommitted offers
+use one replaceable notification slot, so expiry or caller disconnect releases
+capacity even if the executor never reads. The read-admission deadline defaults
+to 30 seconds and is configured with `with_input_admission_timeout`; expiry
+reports that input was not committed. Artifact-only input and cancellation stay
+behind earlier deferred requests; a cancellation may wait for their remaining
+read-admission budget.
+
+A pending `recv` owns its read claim. Canceling that future withdraws the claim
+before persistence starts. If persistence has started, the committed input goes
+through the normal tracked inbox: only actually returning it advances consumed
+input progress. Ending execution without reading it gives its sender an explicit
+unread-input rejection. Committed input is never replayed. `try_recv` only reads
+committed messages and never claims an offered answer; use `recv` to accept one.
+Task history does not implicitly become its inbox. `returnImmediately` bypasses
+the read handshake once earlier admissions are resolved; its response acknowledges
+persistence, not executor consumption.
 
 The default handler validates each client input, persists it, and delivers it
 through the task's execution input queue. Custom `TaskStore` implementations
@@ -90,7 +98,11 @@ capability in the final `with_capabilities` call.
   execution that consumed its input ends without changing the task to a
   terminal state, the call returns the current task snapshot. This can still
   have a `WORKING` or `INPUT_REQUIRED` state.
-- `with_blocking_response_timeout` can bound waits on an executor that never finishes.
+- `with_blocking_response_timeout` uses one deadline across admission and the
+  blocking response. Time spent waiting for a reader reduces the response budget.
+  It also bounds `returnImmediately` admission. Expiry during a storage operation
+  can leave an unknown input outcome; inspect the task before retrying. Deadline
+  recovery never waits for another full timeout to reload storage.
   Expiry re-reads storage. A stored interrupt is not presented as a new
   answer: a deadline error includes SDK `ErrorInfo` with `inputCommitted`,
   `taskId` and `generation`. Do not resend that input. Other states return

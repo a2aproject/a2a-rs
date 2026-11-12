@@ -21,7 +21,7 @@ use crate::middleware::{ServiceParams, User};
 use crate::pagination::resolve_page_size;
 use a2a::*;
 use async_trait::async_trait;
-use futures::{StreamExt, stream::BoxStream};
+use futures::{FutureExt, StreamExt, stream::BoxStream};
 use std::{sync::Arc, time::Duration};
 
 use super::{ExtendedAgentCardResolver, LiveResponse, RequestAuthorizer, RequestHandler};
@@ -131,16 +131,19 @@ impl DefaultRequestHandler {
         self
     }
 
-    /// Bounds a blocking `SendMessage` response after input admission.
+    /// Bounds a unary `SendMessage` request, including input admission.
     ///
     /// The default has no deadline: A2A requires waiting for completion or
     /// interruption. Expiry re-reads the committed Task. An interrupted task
     /// returns an explicit deadline error with inputCommitted/taskId details,
     /// rather than presenting an older question as the answer. Other states
-    /// return the stored snapshot. Execution continues; do not repeat committed
+    /// return the stored snapshot when it is immediately available. A pending
+    /// store read returns an explicit error without extending the deadline.
+    /// Execution continues; do not repeat committed
     /// input. Before lazy creation commits a Task, expiry remains an error.
-    /// Streaming, live, and `returnImmediately`
-    /// responses use their own completion policies and have no such deadline.
+    /// Expiry during an in-flight admission reports an unknown outcome. Inspect
+    /// the Task before retrying. `returnImmediately` still bounds admission,
+    /// while streaming and live responses use their own completion policies.
     pub fn with_blocking_response_timeout(mut self, timeout: Duration) -> Self {
         self.blocking_response_timeout = Some(timeout);
         self
@@ -159,8 +162,8 @@ impl DefaultRequestHandler {
     }
 
     /// Bounds HTTP live queueing and acknowledgement waits. An input that
-    /// has not started is revoked on expiry; an owned, processing input gets
-    /// a current Task acknowledgement and completes on its downlink.
+    /// has not started is revoked on expiry. A processing input receives a Task
+    /// acknowledgement only with commit evidence; otherwise its outcome is unknown.
     pub fn with_http_followup_timeout(mut self, timeout: Duration) -> Self {
         self.http_followup_timeout = timeout;
         self
@@ -455,17 +458,30 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
+        let started = tokio::time::Instant::now();
+        let deadline = self
+            .blocking_response_timeout
+            .map(|timeout| started + timeout);
         let policy = ResponsePolicy::message(StartMode::Blocking, params, &req);
-        let (task, events) = self
-            .admit_message(params, MessageInput::Raw(req), policy)
-            .await?;
+        let requested_task = request_task_id(&req);
+        let mut handler = self.clone();
+        if let Some(timeout) = self.blocking_response_timeout {
+            handler.input_admission_timeout = handler.input_admission_timeout.min(timeout);
+        }
+        let admission = handler.admit_message(params, MessageInput::Raw(req), policy);
+        let (task, events) = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, admission).await
+                .map_err(|_| A2AError::internal("response deadline expired during admission; input outcome is unknown; inspect the task before retrying")
+                    .with_details(vec![TypedDetail::error_info("RESPONSE_DEADLINE_EXCEEDED", "a2a-rs", Some(std::collections::HashMap::from([
+                        ("inputCommitted".into(), "unknown".into()),
+                        ("taskId".into(), requested_task.unwrap_or_default()),
+                    ])))]))??,
+            None => admission.await?,
+        };
         let events = self.response_stream(params, (task.clone(), events), policy, None, None);
         let response = unary_response(self.tasks.clone(), task.clone(), events);
-        let mut response = match self
-            .blocking_response_timeout
-            .filter(|_| !policy.return_immediately())
-        {
-            Some(timeout) => match tokio::time::timeout(timeout, response).await {
+        let mut response = match deadline.filter(|_| !policy.return_immediately()) {
+            Some(deadline) => match tokio::time::timeout_at(deadline, response).await {
                 Ok(response) => response?,
                 Err(_) => {
                     let uncreated = task.active().is_some_and(|active| {
@@ -476,9 +492,8 @@ impl RequestHandler for DefaultRequestHandler {
                     }
                     // A deadline must never turn a provisional cache entry or
                     // an older question into this input's successful answer.
-                    let stored = tokio::time::timeout(timeout, self.tasks.load(task.id()))
-                            .await
-                            .map_err(|_| A2AError::internal("blocking response timed out; input outcome is unknown; inspect the task before retrying"))??;
+                    let stored = self.tasks.load(task.id()).now_or_never()
+                            .ok_or_else(|| A2AError::internal("blocking response timed out after admission; input was committed; inspect the task before retrying"))??;
                     if matches!(
                         stored.status.state,
                         TaskState::InputRequired | TaskState::AuthRequired

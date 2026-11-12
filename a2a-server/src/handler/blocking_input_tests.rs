@@ -680,7 +680,7 @@ async fn interrupted_answers_commit_only_after_a_read_claim_or_in_a_fresh_execut
     struct Worker {
         count: Arc<std::sync::atomic::AtomicUsize>,
         release: Arc<Notify>,
-        read: bool,
+        behavior: u8,
     }
     impl AgentExecutor for Worker {
         fn execute(
@@ -695,13 +695,13 @@ async fn interrupted_answers_commit_only_after_a_read_claim_or_in_a_fresh_execut
                 .boxed();
             }
             let release = self.release.clone();
-            let read = self.read;
+            let behavior = self.behavior;
             Box::pin(ctx.spawn_worker(2, move |mut ctx, output| async move {
                 output
                     .send(question(&ctx, TaskState::InputRequired, "question"))
                     .await?;
                 release.notified().await;
-                if read {
+                if behavior == 1 {
                     let input = ctx
                         .inputs
                         .recv()
@@ -711,6 +711,11 @@ async fn interrupted_answers_commit_only_after_a_read_claim_or_in_a_fresh_execut
                     output
                         .send_for(&input, question(&ctx, TaskState::Completed, "read"))
                         .await?;
+                } else if behavior == 3 {
+                    assert!(
+                        ctx.inputs.try_recv().is_none(),
+                        "try_recv must not claim an uncommitted answer"
+                    );
                 }
                 Ok(())
             }))
@@ -722,7 +727,7 @@ async fn interrupted_answers_commit_only_after_a_read_claim_or_in_a_fresh_execut
             stream::empty().boxed()
         }
     }
-    for scenario in 0..3 {
+    for scenario in 0..4 {
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let release = Arc::new(Notify::new());
         crate::test_util::install_crypto_provider();
@@ -730,7 +735,7 @@ async fn interrupted_answers_commit_only_after_a_read_claim_or_in_a_fresh_execut
             Worker {
                 count: count.clone(),
                 release: release.clone(),
-                read: scenario == 1,
+                behavior: scenario,
             },
             InMemoryTaskStore::new(),
         );
@@ -935,16 +940,75 @@ async fn deferred_answers_keep_fifo_generations_when_status_resumes_working() {
 }
 
 #[tokio::test]
-async fn an_unclaimed_answer_times_out_without_persistence_and_releases_its_request() {
-    struct NeverReads;
-    impl AgentExecutor for NeverReads {
+async fn a_reader_canceled_during_persistence_cannot_silently_consume_the_answer() {
+    #[derive(Clone)]
+    struct SavingAnswer {
+        inner: Arc<InMemoryTaskStore>,
+        entered: Arc<Notify>,
+        save: Arc<Notify>,
+        block: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait]
+    impl TaskStore for SavingAnswer {
+        async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.inner.create(task).await
+        }
+        async fn update(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            if task
+                .history
+                .iter()
+                .flatten()
+                .any(|m| m.text() == Some("second"))
+                && self.block.swap(false, Ordering::SeqCst)
+            {
+                self.entered.notify_one();
+                self.save.notified().await;
+            }
+            self.inner.update(task).await
+        }
+        async fn get(&self, id: &str) -> Result<Option<Task>, A2AError> {
+            self.inner.get(id).await
+        }
+        async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+            self.inner.list(req).await
+        }
+        async fn begin_cancel(&self, id: &str) -> Result<Task, A2AError> {
+            self.inner.begin_cancel(id).await
+        }
+    }
+    struct Worker {
+        read: Arc<Notify>,
+        abandon: Arc<Notify>,
+        output: Arc<Notify>,
+        finish: Arc<Notify>,
+        drop_inputs: bool,
+    }
+    impl AgentExecutor for Worker {
         fn execute(
             &self,
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-            stream::once(async move { Ok(question(&ctx, TaskState::InputRequired, "question")) })
-                .chain(stream::pending())
-                .boxed()
+            let (read, abandon, sent, finish, drop_inputs) = (
+                self.read.clone(),
+                self.abandon.clone(),
+                self.output.clone(),
+                self.finish.clone(),
+                self.drop_inputs,
+            );
+            Box::pin(ctx.spawn_worker(2, move |mut ctx, output| async move {
+                output.send(question(&ctx, TaskState::InputRequired, "question")).await?;
+                let old_question = question(&ctx, TaskState::InputRequired, "old worker question");
+                read.notified().await;
+                tokio::select! {
+                    input = ctx.inputs.recv() => panic!("the store is gated, so no input may arrive: {input:?}"),
+                    _ = abandon.notified() => {},
+                }
+                if drop_inputs { drop(ctx.inputs); }
+                output.send(old_question).await?;
+                sent.notify_one();
+                finish.notified().await;
+                Ok(())
+            }))
         }
         fn cancel(
             &self,
@@ -953,6 +1017,400 @@ async fn an_unclaimed_answer_times_out_without_persistence_and_releases_its_requ
             stream::empty().boxed()
         }
     }
+    for drop_inputs in [false, true] {
+        crate::test_util::install_crypto_provider();
+        let store = SavingAnswer {
+            inner: Arc::default(),
+            entered: Arc::default(),
+            save: Arc::default(),
+            block: Arc::new(true.into()),
+        };
+        let (read, abandon, output, finish) = (
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+        );
+        let handler = DefaultRequestHandler::new(
+            Worker {
+                read: read.clone(),
+                abandon: abandon.clone(),
+                output: output.clone(),
+                finish: finish.clone(),
+                drop_inputs,
+            },
+            store.clone(),
+        );
+        seed_task(&handler, "task", "context").await;
+        handler
+            .send_message(&ServiceParams::new(), request("first"))
+            .await
+            .unwrap();
+        let active = handler.tasks.task("task").active().unwrap();
+        let progress = active.inputs.received_generation();
+        let reply = tokio::spawn({
+            let handler = handler.clone();
+            async move {
+                handler
+                    .send_message(&ServiceParams::new(), request("second"))
+                    .await
+            }
+        });
+        read.notify_one();
+        timeout(Duration::from_secs(1), store.entered.notified())
+            .await
+            .unwrap();
+        abandon.notify_one();
+        timeout(Duration::from_secs(1), output.notified())
+            .await
+            .unwrap();
+        store.save.notify_one();
+        wait_for_input(&handler, "second").await;
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let task = handler.tasks.load("task").await.unwrap();
+                if task.status.message.as_ref().and_then(Message::text)
+                    == Some("old worker question")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            active.inputs.received_generation(),
+            progress,
+            "committing an abandoned claim is not consumption"
+        );
+        assert!(
+            !reply.is_finished(),
+            "unrelated output cannot complete the unread answer"
+        );
+        finish.notify_one();
+        let error = timeout(Duration::from_secs(1), reply)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.message.contains("before reading"), "{error:?}");
+        let stored = handler.tasks.load("task").await.unwrap();
+        assert_eq!(
+            stored
+                .history
+                .iter()
+                .flatten()
+                .filter(|m| m.text() == Some("second"))
+                .count(),
+            1
+        );
+        let canceled = handler
+            .cancel_task(
+                &ServiceParams::new(),
+                CancelTaskRequest {
+                    id: "task".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(canceled.status.state, TaskState::Canceled);
+        handler.shutdown().await;
+        assert_eq!(handler.tasks.background_tasks.count(), 0);
+    }
+}
+
+struct NeverReads;
+impl AgentExecutor for NeverReads {
+    fn execute(
+        &self,
+        ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        stream::once(async move { Ok(question(&ctx, TaskState::InputRequired, "question")) })
+            .chain(stream::pending())
+            .boxed()
+    }
+    fn cancel(&self, _: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        stream::empty().boxed()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_admission_wait_uses_the_configured_response_deadline() {
+    crate::test_util::install_crypto_provider();
+    let handler = DefaultRequestHandler::new(NeverReads, InMemoryTaskStore::new())
+        .with_blocking_response_timeout(Duration::from_secs(5));
+    seed_task(&handler, "task", "context").await;
+    handler
+        .send_message(&ServiceParams::new(), request("first"))
+        .await
+        .unwrap();
+    let before = handler.tasks.load("task").await.unwrap();
+    let start = tokio::time::Instant::now();
+    let error = handler
+        .send_message(&ServiceParams::new(), request("second"))
+        .await
+        .unwrap_err();
+    assert_eq!(start.elapsed(), Duration::from_secs(5));
+    assert!(error.message.contains("deadline"));
+    tokio::task::yield_now().await;
+    assert_eq!(handler.tasks.load("task").await.unwrap(), before);
+    handler.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_cannot_overtake_an_earlier_uncommitted_answer() {
+    crate::test_util::install_crypto_provider();
+    let handler = DefaultRequestHandler::new(NeverReads, InMemoryTaskStore::new())
+        .with_input_admission_timeout(Duration::from_secs(10));
+    seed_task(&handler, "task", "context").await;
+    handler
+        .send_message(&ServiceParams::new(), request("first"))
+        .await
+        .unwrap();
+    let active = handler.tasks.task("task").active().unwrap();
+    let capacity = active.inputs.sender.capacity();
+    let answer = tokio::spawn({
+        let handler = handler.clone();
+        async move {
+            handler
+                .send_message(&ServiceParams::new(), request("answer"))
+                .await
+        }
+    });
+    while active.inputs.sender.capacity() == capacity {
+        tokio::task::yield_now().await;
+    }
+    let start = tokio::time::Instant::now();
+    let canceled = handler
+        .cancel_task(
+            &ServiceParams::new(),
+            CancelTaskRequest {
+                id: "task".into(),
+                metadata: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(start.elapsed(), Duration::from_secs(10));
+    assert_eq!(canceled.status.state, TaskState::Canceled);
+    let error = answer.await.unwrap().unwrap_err();
+    assert!(
+        error.message.contains("input was not committed"),
+        "{error:?}"
+    );
+    assert!(
+        !canceled
+            .history
+            .iter()
+            .flatten()
+            .any(|message| message.text() == Some("answer"))
+    );
+    handler.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn artifact_only_updates_cannot_overtake_an_earlier_uncommitted_answer() {
+    use futures::FutureExt;
+    crate::test_util::install_crypto_provider();
+    let handler = DefaultRequestHandler::new(NeverReads, InMemoryTaskStore::new())
+        .with_input_admission_timeout(Duration::from_secs(10))
+        .with_capabilities(AgentCapabilities {
+            user_artifacts: Some(true),
+            ..Default::default()
+        });
+    seed_task(&handler, "task", "context").await;
+    let params = ServiceParams::new();
+    handler
+        .send_message(&params, request("first"))
+        .await
+        .unwrap();
+    let task = handler.tasks.task("task");
+    let active = task.active().unwrap();
+    let capacity = active.inputs.sender.capacity();
+    let answer = tokio::spawn({
+        let handler = handler.clone();
+        async move {
+            handler
+                .send_message(&ServiceParams::new(), request("answer"))
+                .await
+        }
+    });
+    while active.inputs.sender.capacity() == capacity {
+        tokio::task::yield_now().await;
+    }
+    let update = serde_json::from_value(serde_json::json!({
+        "artifactUpdates": [{"taskId":"task", "contextId":"context", "artifact":{"artifactId":"client", "parts":[{"text":"data"}]}, "lastChunk":true}],
+        "configuration":{"returnImmediately":true}
+    })).unwrap();
+    let mut artifact = Box::pin(handler.send_message(&params, update));
+    assert!(artifact.as_mut().now_or_never().is_none());
+    let mut immediate = request("immediate after artifact");
+    immediate.configuration =
+        Some(serde_json::from_value(serde_json::json!({"returnImmediately":true})).unwrap());
+    let mut immediate = Box::pin(handler.send_message(&params, immediate));
+    assert!(immediate.as_mut().now_or_never().is_none());
+    task.submit(super::task_handle::TaskOperation::Subscribe, |_| {
+        Box::pin(async {})
+    })
+    .await
+    .unwrap();
+    assert!(
+        handler
+            .tasks
+            .load("task")
+            .await
+            .unwrap()
+            .artifacts
+            .is_none(),
+        "the artifact cannot persist before the earlier answer is resolved"
+    );
+    let start = tokio::time::Instant::now();
+    let result = artifact.await.unwrap();
+    assert_eq!(start.elapsed(), Duration::from_secs(10));
+    let SendMessageResponse::Task(artifact_task) = result else {
+        panic!("artifact update must return the task");
+    };
+    assert!(
+        artifact_task
+            .artifacts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|a| a.artifact_id == "client")
+    );
+    let SendMessageResponse::Task(immediate_task) = immediate.await.unwrap() else {
+        panic!("immediate input must return the task");
+    };
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_secs(10),
+        "an ordered returnImmediately input must not start another read wait"
+    );
+    assert!(immediate_task.generation > artifact_task.generation);
+    assert!(
+        immediate_task
+            .history
+            .iter()
+            .flatten()
+            .any(|m| m.text() == Some("immediate after artifact"))
+    );
+    assert!(
+        answer
+            .await
+            .unwrap()
+            .unwrap_err()
+            .message
+            .contains("input was not committed")
+    );
+    handler.shutdown().await;
+}
+
+#[tokio::test]
+async fn return_immediately_persists_an_interrupted_answer_without_waiting_for_a_reader() {
+    crate::test_util::install_crypto_provider();
+    let handler = DefaultRequestHandler::new(NeverReads, InMemoryTaskStore::new());
+    seed_task(&handler, "task", "context").await;
+    handler
+        .send_message(&ServiceParams::new(), request("first"))
+        .await
+        .unwrap();
+    let active = handler.tasks.task("task").active().unwrap();
+    let read_generation = active.inputs.received_generation();
+    let mut answer = request("immediate");
+    let id = answer.message.as_ref().unwrap().message_id.clone();
+    answer.configuration = Some(SendMessageConfiguration {
+        return_immediately: Some(true),
+        accepted_output_modes: None,
+        task_push_notification_config: None,
+        history_length: None,
+        timeline_length: None,
+        if_generation_match: None,
+    });
+    let result = timeout(
+        Duration::from_secs(1),
+        handler.send_message(&ServiceParams::new(), answer),
+    )
+    .await
+    .expect("returnImmediately cannot wait for the execution to read input")
+    .unwrap();
+    assert!(
+        matches!(result, SendMessageResponse::Task(task) if task.history.iter().flatten().any(|message| message.message_id == id))
+    );
+    assert_eq!(
+        active.inputs.received_generation(),
+        read_generation,
+        "persistence must not advance consumption progress"
+    );
+    handler
+        .cancel_task(
+            &ServiceParams::new(),
+            CancelTaskRequest {
+                id: "task".into(),
+                metadata: None,
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    handler.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn time_spent_admitting_input_reduces_the_remaining_response_wait() {
+    struct Reader(Arc<Notify>);
+    impl AgentExecutor for Reader {
+        fn execute(
+            &self,
+            mut ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let read = self.0.clone();
+            Box::pin(async_stream::stream! {
+                yield Ok(question(&ctx, TaskState::InputRequired, "question"));
+                read.notified().await;
+                ctx.inputs.recv().await.unwrap();
+                yield Ok(question(&ctx, TaskState::Working, "processing"));
+                futures::future::pending::<()>().await;
+            })
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    crate::test_util::install_crypto_provider();
+    let read = Arc::new(Notify::new());
+    let handler = DefaultRequestHandler::new(Reader(read.clone()), InMemoryTaskStore::new())
+        .with_blocking_response_timeout(Duration::from_secs(5));
+    seed_task(&handler, "task", "context").await;
+    handler
+        .send_message(&ServiceParams::new(), request("first"))
+        .await
+        .unwrap();
+    let start = tokio::time::Instant::now();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        read.notify_one();
+    });
+    let response = handler
+        .send_message(&ServiceParams::new(), request("second"))
+        .await
+        .unwrap();
+    assert_eq!(start.elapsed(), Duration::from_secs(5));
+    assert!(
+        matches!(response, SendMessageResponse::Task(task) if task.status.state == TaskState::Working)
+    );
+    release.await.unwrap();
+    handler.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unclaimed_answer_times_out_without_persistence_and_releases_its_request() {
     crate::test_util::install_crypto_provider();
     let handler = DefaultRequestHandler::new(NeverReads, InMemoryTaskStore::new());
     seed_task(&handler, "task", "context").await;
@@ -964,14 +1422,47 @@ async fn an_unclaimed_answer_times_out_without_persistence_and_releases_its_requ
     let bounded = handler
         .clone()
         .with_input_admission_timeout(Duration::from_millis(10));
-    let error = timeout(
-        Duration::from_secs(2),
-        bounded.send_message(&ServiceParams::new(), request("answer")),
-    )
+    let active = handler.tasks.task("task").active().unwrap();
+    let capacity = active.inputs.sender.capacity();
+    for _ in 0..20 {
+        let error = timeout(
+            Duration::from_secs(2),
+            bounded.send_message(&ServiceParams::new(), request("answer")),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.message.contains("input was not committed"));
+        assert_eq!(
+            active.inputs.sender.capacity(),
+            capacity,
+            "expired reservations must release every inbox slot"
+        );
+    }
+    let abandoned = tokio::spawn({
+        let handler = handler.clone();
+        async move {
+            handler
+                .send_message(&ServiceParams::new(), request("abandoned"))
+                .await
+        }
+    });
+    timeout(Duration::from_secs(1), async {
+        while active.inputs.sender.capacity() == capacity {
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .unwrap()
-    .unwrap_err();
-    assert!(error.message.contains("input was not committed"));
+    .unwrap();
+    abandoned.abort();
+    assert!(abandoned.await.unwrap_err().is_cancelled());
+    timeout(Duration::from_secs(1), async {
+        while active.inputs.sender.capacity() != capacity {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("caller disconnect must release the offer without waiting for its 30s deadline");
     assert_eq!(handler.tasks.load("task").await.unwrap(), before);
     handler.shutdown().await;
     assert_eq!(handler.tasks.background_tasks.count(), 0);

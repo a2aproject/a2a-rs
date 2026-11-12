@@ -3,9 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! An uncommitted request offered to an interrupted execution's reader.
 
-use super::{ClientInput, QueuedInput};
 use std::sync::{
-    Arc, OnceLock,
+    Arc,
     atomic::{AtomicU8, Ordering},
 };
 use tokio::sync::Notify;
@@ -15,31 +14,51 @@ const WAITING: u8 = 0;
 const CLAIMED: u8 = 1;
 const CANCELED: u8 = 2;
 const COMMITTING: u8 = 3;
+const COMPLETED: u8 = 4;
 
 pub(crate) struct OfferedInput {
     state: AtomicU8,
-    value: OnceLock<ClientInput>,
     pub(super) ready: CancellationToken,
     changed: Arc<Notify>,
 }
 
 impl OfferedInput {
-    pub(super) fn claim(&self) -> bool {
+    pub(super) fn claim(self: &Arc<Self>) -> Option<ReadClaim> {
         if self
             .state
             .compare_exchange(WAITING, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return false;
+            return None;
         }
         // The task's retiring mailbox may still have a waiter. A read claim
         // must also wake its replacement rather than letting that waiter steal it.
         self.changed.notify_waiters();
-        true
+        Some(ReadClaim(self.clone()))
     }
+}
 
-    pub(super) fn value(&self) -> Option<ClientInput> {
-        self.value.get().cloned()
+/// A pending recv owns its claim. Canceling that future withdraws the claim
+/// unless persistence has already started; committed input has a normal receipt.
+pub(super) struct ReadClaim(Arc<OfferedInput>);
+
+impl ReadClaim {
+    pub(super) fn ready(&self) -> CancellationToken {
+        self.0.ready.clone()
+    }
+}
+
+impl Drop for ReadClaim {
+    fn drop(&mut self) {
+        if self
+            .0
+            .state
+            .compare_exchange(CLAIMED, CANCELED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.0.ready.cancel();
+            self.0.changed.notify_waiters();
+        }
     }
 }
 
@@ -50,14 +69,21 @@ pub(crate) struct InputOffer {
 }
 
 impl InputOffer {
-    pub(crate) fn new(changed: Arc<Notify>) -> (QueuedInput, Self) {
+    pub(crate) fn new(changed: Arc<Notify>) -> Self {
         let inner = Arc::new(OfferedInput {
             state: AtomicU8::new(WAITING),
-            value: OnceLock::new(),
             ready: CancellationToken::new(),
             changed,
         });
-        (QueuedInput::Offered(inner.clone()), Self { inner })
+        Self { inner }
+    }
+
+    pub(crate) fn reader(&self) -> Arc<OfferedInput> {
+        self.inner.clone()
+    }
+
+    pub(crate) fn canceled(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) == CANCELED
     }
 
     pub(crate) fn claimed(&self) -> bool {
@@ -71,15 +97,15 @@ impl InputOffer {
             .is_ok()
     }
 
-    pub(crate) fn complete(self, input: ClientInput) {
-        let _ = self.inner.value.set(input);
+    pub(crate) fn complete(self) {
+        self.inner.state.store(COMPLETED, Ordering::Release);
         self.inner.ready.cancel();
     }
 }
 
 impl Drop for InputOffer {
     fn drop(&mut self) {
-        if self.inner.value.get().is_none() {
+        if self.inner.state.load(Ordering::Acquire) != COMPLETED {
             self.inner.state.store(CANCELED, Ordering::Release);
             self.inner.ready.cancel();
         }
@@ -89,7 +115,7 @@ impl Drop for InputOffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ClientInputs;
+    use crate::{ClientInput, ClientInputs, executor::QueuedInput};
     use a2a::{Message, Part, Role};
     use futures::FutureExt;
 
@@ -101,14 +127,15 @@ mod tests {
     async fn read_claim_waits_for_commit_and_canceled_offers_do_not_close_the_inbox() {
         let (sender, mut inputs) = ClientInputs::channel(1);
         for commit in [false, true] {
-            let (queued, lease) = InputOffer::new(Arc::default());
-            sender.sender.try_send(queued).ok().unwrap();
+            let lease = InputOffer::new(Arc::default());
+            sender.offer(Some(lease.reader()));
             let mut read = Box::pin(inputs.recv());
             assert!(read.as_mut().now_or_never().is_none());
             assert!(lease.claimed());
             assert!(lease.begin_commit());
             if commit {
-                lease.complete(input());
+                sender.try_send(input()).unwrap();
+                lease.complete();
             } else {
                 drop(lease);
                 sender.try_send(input()).unwrap();
@@ -122,14 +149,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_recv_claims_an_offer_and_returns_only_the_committed_input() {
+    async fn try_recv_never_claims_an_uncommitted_offer() {
         let (sender, mut inputs) = ClientInputs::channel(1);
-        let (queued, lease) = InputOffer::new(Arc::default());
-        sender.sender.try_send(queued).ok().unwrap();
+        let lease = InputOffer::new(Arc::default());
+        sender.offer(Some(lease.reader()));
         assert!(inputs.try_recv().is_none());
-        assert!(lease.claimed());
-        assert!(lease.begin_commit());
-        lease.complete(input());
+        assert!(!lease.claimed());
+        assert!(!lease.begin_commit());
+        sender.try_send(input()).unwrap();
         assert_eq!(inputs.try_recv().unwrap().generation, 7);
         assert!(inputs.try_recv().is_none());
     }
@@ -137,10 +164,41 @@ mod tests {
     #[tokio::test]
     async fn a_canceled_unclaimed_offer_never_reaches_executor_code() {
         let (sender, mut inputs) = ClientInputs::channel(1);
-        let (queued, lease) = InputOffer::new(Arc::default());
-        sender.sender.try_send(queued).ok().unwrap();
+        let lease = InputOffer::new(Arc::default());
+        sender.offer(Some(lease.reader()));
         drop(lease);
         drop(sender);
         assert!(inputs.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn canceling_recv_withdraws_a_claim_before_commit_starts() {
+        let (sender, mut inputs) = ClientInputs::channel(1);
+        let lease = InputOffer::new(Arc::default());
+        sender.offer(Some(lease.reader()));
+        let mut read = Box::pin(inputs.recv());
+        assert!(read.as_mut().now_or_never().is_none());
+        assert!(lease.claimed());
+        drop(read);
+        assert!(lease.canceled());
+        assert!(!lease.begin_commit());
+        assert_eq!(sender.received_generation(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reader_lost_during_commit_leaves_a_reclaimable_unread_receipt() {
+        let (sender, mut inputs) = ClientInputs::channel(1);
+        let lease = InputOffer::new(Arc::default());
+        sender.offer(Some(lease.reader()));
+        let mut read = Box::pin(inputs.recv());
+        assert!(read.as_mut().now_or_never().is_none());
+        assert!(lease.begin_commit());
+        drop(read);
+        let tracked = QueuedInput::new(input());
+        sender.sender.try_send(tracked.clone()).unwrap();
+        lease.complete();
+        drop(inputs);
+        assert_eq!(sender.received_generation(), 0);
+        assert_eq!(tracked.reclaim().unwrap().generation, 7);
     }
 }
