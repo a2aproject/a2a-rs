@@ -41,16 +41,15 @@ The live client runs the same conversation over all three bindings:
    the task ID; the executor emits `Working` and waits on `ctx.inputs.recv()`.
 2. `live.sender.send_message` sends `hello` to that task while the executor is
    running. The downlink announces the client message and the echoed response.
-3. `pause` produces `InputRequired`, then the executor returns. The task and live
-   exchange remain open.
-4. `resumed` invokes the executor again for the same task. The message that
-   starts this invocation is in `ctx.message`; further input is in `ctx.inputs`.
+3. `pause` produces `InputRequired`; the executor keeps waiting on its inbox.
+   The task and live exchange remain open.
+4. `resumed` reaches that same execution through `ctx.inputs`. The opening
+   message was supplied in `ctx.message`.
 5. `finish` produces `Completed`, closing the downlink.
 
 The server prints `task_id`, `execution_id`, and `state` for each status update.
-The execution ID stays the same through `start`, `hello`, and `pause`, then
-changes for `resumed` and stays the same through `finish`. The task ID stays
-the same throughout the conversation.
+The execution ID and task ID stay the same throughout the conversation,
+including while the executor waits for input after `pause`.
 
 `live.events` carries task updates for every binding. HTTP sends subsequent input
 as individual requests and returns task receipts; gRPC writes input on the duplex
@@ -58,7 +57,8 @@ stream. The executor and conversation code are shared across these bindings.
 The executor uses the same owned `ExecutorContext` and `'static` output stream
 as `main`. Its input receiver can also move into a spawned Tokio worker. When
 the execution stream ends, the old receiver is revoked and unread messages are
-handed to the next invocation; workers cannot consume that handed-off input.
+rejected to their waiting senders, never replayed into another invocation.
+A fresh request after execution ends can start a new invocation.
 The client reports errors with a nonzero exit status and bounds each conversation
 to 30 seconds.
 

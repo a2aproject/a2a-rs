@@ -2,15 +2,15 @@
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 
-//! A live conversation that spans multiple executor invocations.
+//! A live conversation that receives input throughout one execution.
 
 use a2a::*;
 use a2a_client::{A2AClient, LiveAck, LiveConnection, Transport};
 use a2a_server::{AgentExecutor, ExecutorContext};
 use futures::{StreamExt, stream::BoxStream};
 
-/// Echoes input while running. `pause` returns from execute with InputRequired;
-/// later input starts another invocation for the same task. `finish` completes it.
+/// Echoes input while running. `pause` emits InputRequired and keeps reading
+/// the same inbox; `finish` completes the task and ends execution.
 pub struct LiveEchoExecutor;
 
 impl AgentExecutor for LiveEchoExecutor {
@@ -28,7 +28,7 @@ impl AgentExecutor for LiveEchoExecutor {
                     "finish" => (TaskState::Completed, "Conversation complete".to_string()),
                     _ => (TaskState::Working, format!("Echo: {text}")),
                 };
-                let keep_running = state == TaskState::Working;
+                let keep_running = !state.is_terminal();
                 eprintln!(
                     "task_id={} execution_id={} state={state:?}",
                     ctx.task_id, ctx.execution_id,

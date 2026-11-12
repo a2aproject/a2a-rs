@@ -658,3 +658,42 @@ async fn the_client_opens_an_exchange_through_its_interceptors_and_applies_the_t
     ));
     assert_eq!(text_of(&next(&mut live).await), "done");
 }
+
+mod input_required_keeps_execution_open {
+    use super::*;
+    use futures::FutureExt;
+
+    #[tokio::test]
+    async fn pause_waits_for_resumed_input_on_the_same_stream() {
+        let (sender, inputs) = a2a_server::ClientInputs::channel(2);
+        let context = ExecutorContext::new("task", "context", inputs)
+            .with_message(Message::new(Role::User, vec![Part::text("pause")]));
+        let mut events = examples_lib::live::LiveEchoExecutor.execute(context);
+        assert!(matches!(events.next().await.unwrap().unwrap(),
+            StreamResponse::StatusUpdate(event) if event.status.state == TaskState::InputRequired));
+        assert!(
+            events.next().now_or_never().is_none(),
+            "input-required keeps the inbox open"
+        );
+        for (text, expected) in [
+            ("resumed", TaskState::Working),
+            ("finish", TaskState::Completed),
+        ] {
+            sender
+                .try_send(a2a_server::ClientInput::new(
+                    Message::new(Role::User, vec![Part::text(text)]),
+                    1,
+                ))
+                .unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(event, StreamResponse::StatusUpdate(event) if event.status.state == expected)
+            );
+        }
+        assert!(events.next().await.is_none());
+    }
+}
