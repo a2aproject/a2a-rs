@@ -66,6 +66,18 @@ fn parse_jsonrpc_response(
     })
 }
 
+// Classify routing failures by envelope shape, independently of strict decoding.
+// A missing/invalid ID or malformed error is a protocol failure, not evidence
+// that this endpoint does not support SendLiveMessage.
+fn looks_like_jsonrpc_response(body: &str) -> bool {
+    serde_json::from_str::<Value>(body).is_ok_and(|value| {
+        value.as_object().is_some_and(|object| {
+            object.contains_key("jsonrpc")
+                && (object.contains_key("error") || object.contains_key("result"))
+        })
+    })
+}
+
 /// JSON-RPC transport implementation.
 ///
 /// Sends all requests as JSON-RPC 2.0 POSTs to a single endpoint.
@@ -236,7 +248,7 @@ impl JsonRpcTransport {
                 Err(_)
                     if method == methods::SEND_LIVE_MESSAGE
                         && matches!(status.as_u16(), 404 | 405 | 501)
-                        && serde_json::from_str::<JsonRpcResponse>(&body).is_err() =>
+                        && !looks_like_jsonrpc_response(&body) =>
                 {
                     return Err(A2AError::unsupported_operation(format!(
                         "HTTP {status} during SendLiveMessage: {body}"
@@ -2667,6 +2679,22 @@ mod tests {
             }),
         };
         for (body, code) in [
+            (
+                r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"agent refused"}}"#,
+                error_code::INTERNAL_ERROR, // Missing IDs remain malformed RPC.
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32602,"message":"agent refused"}}"#,
+                error_code::INVALID_PARAMS,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":{},"error":{"code":-32602,"message":"agent refused"}}"#,
+                error_code::INTERNAL_ERROR,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","result":"agent refused"}"#,
+                error_code::INTERNAL_ERROR,
+            ),
             (
                 r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"agent refused"}}"#,
                 error_code::INVALID_PARAMS,
