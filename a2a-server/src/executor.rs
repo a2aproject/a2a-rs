@@ -111,6 +111,18 @@ impl ExecutorContext {
         ExecutorOutputSender::for_execution(capacity, self.opening_input_generation)
     }
 
+    /// Run an owned worker and return its monitored output stream.
+    /// Panics and returned errors fail execution; dropping the returned stream
+    /// aborts the worker. Read inputs and use `send_for` inside the closure.
+    pub fn spawn_worker<F, Fut>(self, capacity: usize, worker: F) -> ExecutorOutputReceiver
+    where
+        F: FnOnce(Self, ExecutorOutputSender) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), A2AError>> + Send + 'static,
+    {
+        let (outputs, events) = self.output_channel(capacity);
+        events.with_worker(tokio::spawn(async move { worker(self, outputs).await }))
+    }
+
     pub fn with_inputs(mut self, inputs: ClientInputs) -> Self {
         self.inputs = inputs;
         self
@@ -176,8 +188,10 @@ impl ExecutorContext {
 pub trait AgentExecutor: Send + Sync + 'static {
     /// Execute a message and return owned output. The returned stream defines
     /// execution lifetime, including when input is read in a spawned worker.
-    /// For a worker, create `ctx.output_channel(capacity)`, move its sender and
-    /// inputs into the worker, and return the receiver as the output stream.
+    /// Use `ctx.spawn_worker(capacity, |ctx, outputs| async move { ... })` and
+    /// return its receiver as the output stream to monitor worker failures.
+    /// `ctx.output_channel` also supports manually managed producers; attach
+    /// their JoinHandle with `receiver.with_worker(handle)` to monitor them.
     /// `sender.send_for(&input, event)` preserves producer-side correlation.
     /// Inline input reads correlate subsequent yielded interruptions. Arbitrary
     /// custom buffering without tags cannot provide exact producer provenance.

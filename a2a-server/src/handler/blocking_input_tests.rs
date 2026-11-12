@@ -533,11 +533,10 @@ async fn a_workers_returned_output_stream_defines_execution_lifetime() {
     impl AgentExecutor for OwnedWorker {
         fn execute(
             &self,
-            mut ctx: ExecutorContext,
+            ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let final_state = self.0.clone();
-            let (outputs, events) = ctx.output_channel(2);
-            tokio::spawn(async move {
+            let events = ctx.spawn_worker(2, move |mut ctx, outputs| async move {
                 outputs
                     .send(question(&ctx, TaskState::InputRequired, "waiting"))
                     .await
@@ -546,8 +545,8 @@ async fn a_workers_returned_output_stream_defines_execution_lifetime() {
                 assert_eq!(input.message.text(), Some("second"));
                 outputs
                     .send_for(&input, question(&ctx, final_state, "done"))
-                    .await
-                    .unwrap();
+                    .await?;
+                Ok(())
             });
             Box::pin(events)
         }
@@ -630,5 +629,48 @@ async fn worker_channel_preserves_buffered_output_before_a_terminal_event() {
     };
     assert_eq!(task.status.state, TaskState::Completed);
     assert_eq!(task.artifacts.unwrap()[0].parts, vec![Part::text("queued")]);
+    handler.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_panicking_monitored_worker_fails_the_task_and_notifies_the_blocking_caller() {
+    struct Panics;
+    impl AgentExecutor for Panics {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            async fn worker(
+                ctx: ExecutorContext,
+                outputs: crate::ExecutorOutputSender,
+            ) -> Result<(), A2AError> {
+                outputs
+                    .send(question(&ctx, TaskState::Working, "working"))
+                    .await?;
+                panic!("worker panicked");
+            }
+            Box::pin(ctx.spawn_worker(2, worker))
+        }
+        fn cancel(
+            &self,
+            _: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            stream::empty().boxed()
+        }
+    }
+    let handler = DefaultRequestHandler::new(Panics, InMemoryTaskStore::new());
+    seed_task(&handler, "task", "context").await;
+    let error = timeout(
+        Duration::from_secs(2),
+        handler.send_message(&ServiceParams::new(), request("first")),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.message.contains("panicked"));
+    assert_eq!(
+        handler.tasks.load("task").await.unwrap().status.state,
+        TaskState::Failed
+    );
     handler.shutdown().await;
 }

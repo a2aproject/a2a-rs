@@ -4,7 +4,7 @@
 //! Owned executor output with producer-side input correlation.
 
 use super::ClientInput;
-use a2a::{A2AError, StreamResponse};
+use a2a::{A2AError, StreamResponse, error_code};
 use std::sync::{
     Arc,
     atomic::{AtomicI64, Ordering},
@@ -30,9 +30,14 @@ pub struct ExecutorOutputSender {
 /// An executor's bounded output stream, including producer-side correlation.
 /// Return this receiver directly from `execute`, boxed as its output stream.
 /// Dropping it closes the channel; dropping all senders ends the stream after
-/// buffered events have been read. No separate worker registration is needed.
+/// buffered events have been read. Attach an owned worker with `with_worker`
+/// to report its errors and abort it when the stream is dropped.
 pub struct ExecutorOutputReceiver {
     receiver: mpsc::Receiver<ExecutorOutput>,
+    opening_generation: i64,
+    worker: Option<tokio::task::JoinHandle<Result<(), A2AError>>>,
+    failure: Option<A2AError>,
+    ended: bool,
 }
 
 impl ExecutorOutputSender {
@@ -53,7 +58,13 @@ impl ExecutorOutputSender {
                 sender,
                 opening_generation,
             },
-            ExecutorOutputReceiver { receiver },
+            ExecutorOutputReceiver {
+                receiver,
+                opening_generation,
+                worker: None,
+                failure: None,
+                ended: false,
+            },
         )
     }
 
@@ -92,6 +103,43 @@ impl ExecutorOutputSender {
 }
 
 impl ExecutorOutputReceiver {
+    /// Monitor the worker that owns this output stream. A panic, cancellation,
+    /// or returned error becomes a stream error after buffered output. Dropping
+    /// the stream aborts the worker, so shutdown cannot leave it detached.
+    pub fn with_worker(mut self, worker: tokio::task::JoinHandle<Result<(), A2AError>>) -> Self {
+        if let Some(previous) = self.worker.replace(worker) {
+            previous.abort();
+        }
+        self
+    }
+
+    fn poll_worker(&mut self, cx: &mut std::task::Context<'_>) {
+        use std::future::Future;
+        let Some(worker) = self.worker.as_mut() else {
+            return;
+        };
+        let std::task::Poll::Ready(result) = std::pin::Pin::new(worker).poll(cx) else {
+            return;
+        };
+        self.worker = None;
+        let failure = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => {
+                tracing::error!(%error, "agent output worker failed");
+                Some(A2AError::internal(if error.is_panic() {
+                    "agent output worker panicked"
+                } else {
+                    "agent output worker was canceled"
+                }))
+            }
+        };
+        if let Some(error) = failure {
+            self.receiver.close();
+            self.failure = Some(error);
+        }
+    }
+
     /// Read a tagged event in a standalone runner. Returning this receiver as
     /// the executor stream also carries its tag through the default handler.
     pub async fn recv(&mut self) -> Option<ExecutorOutput> {
@@ -102,13 +150,42 @@ impl ExecutorOutputReceiver {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<ExecutorOutput>> {
-        let _ = POLLING_EXECUTOR.try_with(|scope| scope.produced.set(None));
-        let output = std::task::ready!(self.receiver.poll_recv(cx));
-        if let Some(output) = &output {
-            let _ = POLLING_EXECUTOR
-                .try_with(|scope| scope.produced.set(Some(output.input_generation)));
+        use std::task::Poll;
+        if self.ended {
+            return Poll::Ready(None);
         }
-        std::task::Poll::Ready(output)
+        self.poll_worker(cx);
+        let _ = POLLING_EXECUTOR.try_with(|scope| scope.produced.set(None));
+        let output = match self.receiver.poll_recv(cx) {
+            Poll::Ready(Some(output)) => Some(output),
+            Poll::Ready(None) | Poll::Pending if self.failure.is_some() => {
+                self.ended = true;
+                self.failure.take().map(|error| ExecutorOutput {
+                    result: Err(error),
+                    input_generation: self.opening_generation,
+                })
+            }
+            Poll::Ready(None) if self.worker.is_none() => {
+                self.ended = true;
+                None
+            }
+            Poll::Ready(None) | Poll::Pending => return Poll::Pending,
+        };
+        if let Some(output) = &output {
+            let _ = POLLING_EXECUTOR.try_with(|scope| {
+                scope.reads.set(scope.reads.get() + 1);
+                scope.produced.set(Some(output.input_generation));
+            });
+        }
+        Poll::Ready(output)
+    }
+}
+
+impl Drop for ExecutorOutputReceiver {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
+        }
     }
 }
 
@@ -129,6 +206,8 @@ struct PollScope {
     inputs: Arc<AtomicI64>,
     inline: Arc<AtomicI64>,
     produced: std::cell::Cell<Option<i64>>,
+    reads: std::cell::Cell<usize>,
+    warned: std::cell::Cell<bool>,
 }
 
 tokio::task_local! { static POLLING_EXECUTOR: PollScope; }
@@ -146,6 +225,8 @@ pub(crate) async fn scope<F: std::future::Future>(
                 inputs,
                 inline,
                 produced: std::cell::Cell::new(None),
+                reads: std::cell::Cell::new(0),
+                warned: std::cell::Cell::new(false),
             },
             future,
         )
@@ -160,15 +241,28 @@ pub(crate) async fn next(
     inline: &AtomicI64,
 ) -> Option<ExecutorOutput> {
     futures::future::poll_fn(|cx| {
-        let _ = POLLING_EXECUTOR.try_with(|scope| scope.produced.set(None));
-        let Some(result) = std::task::ready!(stream.as_mut().poll_next(cx)) else {
+        let _ = POLLING_EXECUTOR.try_with(|scope| { scope.produced.set(None); scope.reads.set(0); });
+        let polled = stream.as_mut().poll_next(cx);
+        let (tag, unusable) = POLLING_EXECUTOR.try_with(|scope| {
+            let tag = scope.produced.take();
+            let reads = scope.reads.get();
+            let ambiguous = reads > 1 || (reads > 0 && (polled.is_pending() || tag.is_none()));
+            if ambiguous && !scope.warned.replace(true) {
+                tracing::warn!(reads, "executor output adapter discarded input correlation; return the supplied receiver directly and transform before send_for");
+            }
+            (tag, reads > 1 || (reads > 0 && polled.is_pending()))
+        }).unwrap_or((None, false));
+        let generation = tag.unwrap_or_else(|| inline.load(Ordering::Acquire));
+        if unusable {
+            return std::task::Poll::Ready(Some(ExecutorOutput {
+                result: Err(A2AError::new(error_code::INVALID_AGENT_RESPONSE,
+                    "executor output lost input correlation through a buffering adapter; return the supplied receiver directly")),
+                input_generation: generation,
+            }));
+        }
+        let Some(result) = std::task::ready!(polled) else {
             return std::task::Poll::Ready(None);
         };
-        let generation = POLLING_EXECUTOR
-            .try_with(|scope| scope.produced.take())
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| inline.load(Ordering::Acquire));
         std::task::Poll::Ready(Some(ExecutorOutput {
             result,
             input_generation: generation,
@@ -255,6 +349,142 @@ mod tests {
             assert!(next(&mut stream, &inline).await.is_none());
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn worker_errors_follow_buffered_output_even_with_another_sender_alive() {
+        use futures::StreamExt;
+        let (outputs, receiver) = ExecutorOutputSender::channel(2);
+        let outside_sender = outputs.clone();
+        let worker = tokio::spawn(async move {
+            outputs
+                .send(StreamResponse::Message(Message::new(Role::Agent, vec![])))
+                .await?;
+            Err(A2AError::internal("worker returned an error"))
+        });
+        let mut events = receiver.with_worker(worker);
+        assert!(events.next().await.unwrap().is_ok());
+        assert_eq!(
+            events.next().await.unwrap().unwrap_err().message,
+            "worker returned an error"
+        );
+        assert!(events.next().await.is_none());
+        assert!(
+            outside_sender
+                .fail(A2AError::internal("late"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_monitored_stream_aborts_its_worker() {
+        let (outputs, receiver) = ExecutorOutputSender::channel(1);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        struct Stopped(Arc<tokio::sync::Notify>);
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let ready = started.clone();
+        let done = stopped.clone();
+        let worker = tokio::spawn(async move {
+            let _stopped = Stopped(done);
+            let _outputs = outputs;
+            ready.notify_one();
+            std::future::pending::<Result<(), A2AError>>().await
+        });
+        let stream = receiver.with_worker(worker);
+        started.notified().await;
+        // Replacing the monitored worker must abort the former owner too.
+        let replacement = tokio::spawn(std::future::pending::<Result<(), A2AError>>());
+        let replacement_abort = replacement.abort_handle();
+        let stream = stream.with_worker(replacement);
+        tokio::time::timeout(std::time::Duration::from_secs(1), stopped.notified())
+            .await
+            .unwrap();
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !replacement_abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_aborted_worker_is_an_error_instead_of_silent_eof() {
+        use futures::StreamExt;
+        let (outputs, receiver) = ExecutorOutputSender::channel(1);
+        let worker = tokio::spawn(async move {
+            let _outputs = outputs;
+            std::future::pending::<Result<(), A2AError>>().await
+        });
+        worker.abort();
+        let mut events = receiver.with_worker(worker);
+        assert!(
+            events
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .message
+                .contains("canceled")
+        );
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn asynchronous_or_prefetching_adapters_cannot_silently_relabel_tagged_output() {
+        use futures::StreamExt;
+        for adapter in 0..3 {
+            let (outputs, mut receiver) = ExecutorOutputSender::channel(2);
+            for generation in [7, 9] {
+                outputs
+                    .send_for(
+                        &ClientInput::new(Message::new(Role::User, vec![]), generation),
+                        StreamResponse::Message(Message::new(Role::Agent, vec![])),
+                    )
+                    .await
+                    .unwrap();
+            }
+            drop(outputs);
+            let mut stream: futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>> =
+                match adapter {
+                    0 => receiver
+                        .then(|event| async move {
+                            std::future::pending::<()>().await;
+                            event
+                        })
+                        .boxed(),
+                    1 => receiver.map(futures::future::ready).buffered(2).boxed(),
+                    _ => Box::pin(async_stream::stream! {
+                        let event = receiver.next().await.unwrap();
+                        std::future::pending::<()>().await;
+                        yield event;
+                    }),
+                };
+            let inputs = Arc::new(AtomicI64::new(9));
+            let inline = Arc::new(AtomicI64::new(1));
+            scope(inputs, inline.clone(), async {
+                let output = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    next(&mut stream, &inline),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    output.result.unwrap_err().code,
+                    error_code::INVALID_AGENT_RESPONSE
+                );
+                assert!(POLLING_EXECUTOR.with(|scope| scope.warned.get()));
+            })
+            .await;
+        }
     }
 
     #[tokio::test]

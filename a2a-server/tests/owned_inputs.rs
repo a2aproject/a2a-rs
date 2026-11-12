@@ -68,18 +68,11 @@ impl AgentExecutor for WorkerExecutor {
                 Ok(status(&task, &context, TaskState::Completed, "done"))
             }));
         }
-        let (output, events) = ctx.output_channel(8);
-        let mut inputs = ctx.inputs;
-        // Input processing and event production live in an independent task.
-        tokio::spawn(async move {
-            if output
+        let events = ctx.spawn_worker(8, move |mut ctx, output| async move {
+            output
                 .send(status(&task, &context, TaskState::Working, "ready"))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            while let Some(input) = inputs.recv().await {
+                .await?;
+            while let Some(input) = ctx.inputs.recv().await {
                 let text = input.message.text().unwrap_or("").to_string();
                 let finished = text == "finish";
                 processed.send(text.clone()).unwrap();
@@ -93,10 +86,12 @@ impl AgentExecutor for WorkerExecutor {
                     },
                     &text,
                 );
-                if output.send_for(&input, event).await.is_err() || finished {
+                output.send_for(&input, event).await?;
+                if finished {
                     break;
                 }
             }
+            Ok(())
         });
         Box::pin(events)
     }
