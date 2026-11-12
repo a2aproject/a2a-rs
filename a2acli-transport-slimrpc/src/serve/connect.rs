@@ -507,6 +507,7 @@ mod tests {
         last_params: Mutex<Option<ServiceParams>>,
         live_requests: Arc<Mutex<Vec<StreamRequest>>>,
         live_task_ack: bool,
+        opening_generation: Option<i64>,
         ack_generation: Option<i64>,
         reopen: bool,
         ack_release: Option<Arc<tokio::sync::Notify>>,
@@ -650,6 +651,9 @@ mod tests {
             self.live_requests.lock().unwrap().push(first.clone());
             let (sender, receiver) = tokio::sync::mpsc::channel(1);
             let mut opening = fake_task();
+            if let Some(generation) = self.opening_generation {
+                opening.generation = generation;
+            }
             if self.reopen {
                 opening.generation = 43;
             }
@@ -1102,44 +1106,46 @@ mod tests {
 
     #[tokio::test]
     async fn live_proxy_preserves_http_task_acknowledgements() {
-        let handler = TransportHandler::new(FakeTransport {
-            live_task_ack: true,
-            ..Default::default()
-        });
-        let request = StreamRequest {
-            tenant: None,
-            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
-                id: "task-1".into(),
+        for _ in 0..64 {
+            let handler = TransportHandler::new(FakeTransport {
+                live_task_ack: true,
+                opening_generation: Some(41), // Ordering requires reported generations.
+                ..Default::default()
+            });
+            let request = StreamRequest {
                 tenant: None,
-                last_seen_generation: None,
-            }),
-        };
-        let response = handler
-            .send_live_message(
-                &sample_params(),
-                stream::iter([request.clone(), request]).boxed(),
-            )
-            .await
-            .unwrap();
-        let events: Vec<_> =
-            tokio::time::timeout(std::time::Duration::from_secs(2), response.collect())
+                payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                    id: "task-1".into(),
+                    tenant: None,
+                    last_seen_generation: None,
+                }),
+            };
+            let response = handler
+                .send_live_message(
+                    &sample_params(),
+                    stream::iter([request.clone(), request]).boxed(),
+                )
                 .await
                 .unwrap();
-        // The newer ACK may supersede an opening still buffered on the other
-        // channel. In either ordering, clients see monotonically fresh state.
-        let generations: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                Ok(StreamResponse::Task(task)) => Some(task.generation),
-                _ => None,
-            })
-            .collect();
-        assert!(generations.windows(2).all(|pair| pair[0] <= pair[1]));
-        assert!(
-            events.iter().any(
+            let events: Vec<_> =
+                tokio::time::timeout(std::time::Duration::from_secs(2), response.collect())
+                    .await
+                    .unwrap();
+            assert!(events.iter().all(|event| matches!(event, Ok(StreamResponse::Task(task)) if matches!(task.generation, 41 | 42))));
+            // The newer ACK may supersede an opening still buffered on the other
+            // channel. In either ordering, clients see monotonically fresh state.
+            let generations: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Ok(StreamResponse::Task(task)) => Some(task.generation),
+                    _ => None,
+                })
+                .collect();
+            assert!(generations.windows(2).all(|pair| pair[0] <= pair[1]));
+            assert!(events.iter().any(
                 |event| matches!(event, Ok(StreamResponse::Task(task)) if task.generation == 42)
-            )
-        );
+            ));
+        }
     }
 
     #[tokio::test]
