@@ -17,6 +17,10 @@ name = "helloworld-client"
 path = "src/helloworld/client.rs"
 
 [[bin]]
+name = "quickstart-server"
+path = "src/quickstart/server.rs"
+
+[[bin]]
 name = "helloworld-tls-server"
 path = "src/helloworld_tls/server.rs"
 
