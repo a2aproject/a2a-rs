@@ -236,7 +236,7 @@ impl JsonRpcTransport {
                 Err(_)
                     if method == methods::SEND_LIVE_MESSAGE
                         && matches!(status.as_u16(), 404 | 405 | 501)
-                        && serde_json::from_str::<Value>(&body).is_err() =>
+                        && serde_json::from_str::<JsonRpcResponse>(&body).is_err() =>
                 {
                     return Err(A2AError::unsupported_operation(format!(
                         "HTTP {status} during SendLiveMessage: {body}"
@@ -2608,7 +2608,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_json_live_http_unsupported_statuses_are_normalized() {
+    async fn non_rpc_live_http_unsupported_statuses_are_normalized() {
         use crate::LiveUplink;
         let request = StreamRequest {
             tenant: None,
@@ -2623,29 +2623,68 @@ mod tests {
             "405 Method Not Allowed",
             "501 Not Implemented",
         ] {
-            for opening in [true, false] {
-                let endpoint = spawn_http_error_server(status, "<html>not supported</html>").await;
-                let transport = JsonRpcTransport::new(Client::new(), endpoint);
-                let error = if opening {
-                    transport
-                        .send_live_message(&ServiceParams::new(), &request)
+            for body in [
+                "<html>not supported</html>",
+                r#"{"detail":"Not Found"}"#,
+                r#"{"status":404,"error":"Not Found"}"#,
+                "null",
+            ] {
+                for opening in [true, false] {
+                    let endpoint = spawn_http_error_server(status, body).await;
+                    let transport = JsonRpcTransport::new(Client::new(), endpoint);
+                    let error = if opening {
+                        transport
+                            .send_live_message(&ServiceParams::new(), &request)
+                            .await
+                            .err()
+                            .unwrap()
+                    } else {
+                        JsonRpcLiveUplink {
+                            transport,
+                            params: ServiceParams::new(),
+                        }
+                        .send(request.clone())
                         .await
                         .err()
                         .unwrap()
-                } else {
-                    JsonRpcLiveUplink {
-                        transport,
-                        params: ServiceParams::new(),
-                    }
-                    .send(request.clone())
-                    .await
-                    .err()
-                    .unwrap()
-                };
-                assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
-                assert!(error.message.contains(status));
-                assert!(error.message.contains("<html>not supported</html>"));
+                    };
+                    assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+                    assert!(error.message.contains(status));
+                    assert!(error.message.contains(body));
+                }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_error_envelopes_on_http_404_keep_their_protocol_error() {
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        for (body, code) in [
+            (
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"agent refused"}}"#,
+                error_code::INVALID_PARAMS,
+            ),
+            (
+                r#"{"jsonrpc":"1.0","id":1,"error":{"code":-32602,"message":"agent refused"}}"#,
+                error_code::INTERNAL_ERROR,
+            ),
+        ] {
+            let endpoint = spawn_http_error_server("404 Not Found", body).await;
+            let transport = JsonRpcTransport::new(Client::new(), endpoint);
+            let error = transport
+                .send_live_message(&ServiceParams::new(), &request)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.code, code);
+            assert!(error.message.contains("agent refused"));
         }
     }
 
