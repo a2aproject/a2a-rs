@@ -4,7 +4,7 @@
 //! Owned executor output with producer-side input correlation.
 
 use super::ClientInput;
-use a2a::{A2AError, StreamResponse, error_code};
+use a2a::{A2AError, StreamResponse};
 use std::sync::{
     Arc,
     atomic::{AtomicI64, Ordering},
@@ -243,23 +243,19 @@ pub(crate) async fn next(
     futures::future::poll_fn(|cx| {
         let _ = POLLING_EXECUTOR.try_with(|scope| { scope.produced.set(None); scope.reads.set(0); });
         let polled = stream.as_mut().poll_next(cx);
-        let (tag, unusable) = POLLING_EXECUTOR.try_with(|scope| {
+        let tag = POLLING_EXECUTOR.try_with(|scope| {
             let tag = scope.produced.take();
             let reads = scope.reads.get();
             let ambiguous = reads > 1 || (reads > 0 && (polled.is_pending() || tag.is_none()));
             if ambiguous && !scope.warned.replace(true) {
                 tracing::warn!(reads, "executor output adapter discarded input correlation; return the supplied receiver directly and transform before send_for");
             }
-            (tag, reads > 1 || (reads > 0 && polled.is_pending()))
-        }).unwrap_or((None, false));
+            // Multiple reads can be a valid synchronous filter. Without a
+            // typed outer item we cannot distinguish it from prefetching; use
+            // conservative legacy correlation and diagnose, never fail it.
+            if reads > 1 { None } else { tag }
+        }).unwrap_or(None);
         let generation = tag.unwrap_or_else(|| inline.load(Ordering::Acquire));
-        if unusable {
-            return std::task::Poll::Ready(Some(ExecutorOutput {
-                result: Err(A2AError::new(error_code::INVALID_AGENT_RESPONSE,
-                    "executor output lost input correlation through a buffering adapter; return the supplied receiver directly")),
-                input_generation: generation,
-            }));
-        }
         let Some(result) = std::task::ready!(polled) else {
             return std::task::Poll::Ready(None);
         };
@@ -438,8 +434,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asynchronous_or_prefetching_adapters_cannot_silently_relabel_tagged_output() {
+    async fn filtering_then_pending_does_not_fail_execution_or_poison_the_next_tag() {
         use futures::StreamExt;
+        for adapter in 0..3 {
+            let (outputs, receiver) = ExecutorOutputSender::channel(3);
+            for _ in 0..2 {
+                outputs
+                    .send(StreamResponse::Message(Message::new(
+                        Role::Agent,
+                        vec![Part::text("heartbeat")],
+                    )))
+                    .await
+                    .unwrap();
+            }
+            let keep = |event: &Result<StreamResponse, A2AError>| !matches!(event, Ok(StreamResponse::Message(message)) if message.text()==Some("heartbeat"));
+            let mut stream = match adapter {
+                0 => receiver
+                    .filter(move |event| futures::future::ready(keep(event)))
+                    .boxed(),
+                1 => receiver
+                    .filter_map(move |event| futures::future::ready(keep(&event).then_some(event)))
+                    .boxed(),
+                _ => receiver
+                    .skip_while(move |event| futures::future::ready(!keep(event)))
+                    .boxed(),
+            };
+            let inputs = Arc::new(AtomicI64::new(7));
+            let inline = Arc::new(AtomicI64::new(1));
+            scope(inputs, inline.clone(), async {
+                use futures::FutureExt;
+                assert!(next(&mut stream, &inline).now_or_never().is_none());
+                outputs.send_for(&ClientInput::new(Message::new(Role::User, vec![]), 7),
+                    StreamResponse::Message(Message::new(Role::Agent, vec![Part::text("answer")]))).await.unwrap();
+                let output = next(&mut stream, &inline).await.unwrap();
+                assert_eq!(output.input_generation, 7);
+                assert!(matches!(output.result, Ok(StreamResponse::Message(message)) if message.text()==Some("answer")));
+                drop(outputs);
+                assert!(next(&mut stream, &inline).await.is_none());
+            }).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn asynchronous_or_prefetching_adapters_diagnose_ambiguous_correlation() {
+        use futures::{FutureExt, StreamExt};
         for adapter in 0..3 {
             let (outputs, mut receiver) = ExecutorOutputSender::channel(2);
             for generation in [7, 9] {
@@ -452,35 +490,35 @@ mod tests {
                     .unwrap();
             }
             drop(outputs);
-            let mut stream: futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>> =
-                match adapter {
-                    0 => receiver
-                        .then(|event| async move {
-                            std::future::pending::<()>().await;
-                            event
-                        })
-                        .boxed(),
-                    1 => receiver.map(futures::future::ready).buffered(2).boxed(),
-                    _ => Box::pin(async_stream::stream! {
-                        let event = receiver.next().await.unwrap();
+            let mut stream = match adapter {
+                0 => receiver
+                    .then(|event| async move {
                         std::future::pending::<()>().await;
-                        yield event;
-                    }),
-                };
+                        event
+                    })
+                    .boxed(),
+                1 => receiver.map(futures::future::ready).buffered(2).boxed(),
+                _ => Box::pin(async_stream::stream! {
+                    let event = receiver.next().await.unwrap();
+                    std::future::pending::<()>().await;
+                    yield event;
+                })
+                    as futures::stream::BoxStream<'static, Result<StreamResponse, A2AError>>,
+            };
             let inputs = Arc::new(AtomicI64::new(9));
             let inline = Arc::new(AtomicI64::new(1));
             scope(inputs, inline.clone(), async {
-                let output = tokio::time::timeout(
-                    std::time::Duration::from_secs(1),
-                    next(&mut stream, &inline),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-                assert_eq!(
-                    output.result.unwrap_err().code,
-                    error_code::INVALID_AGENT_RESPONSE
-                );
+                let result = next(&mut stream, &inline).now_or_never();
+                if adapter == 1 {
+                    let output = result.unwrap().unwrap();
+                    assert!(output.result.is_ok());
+                    assert_eq!(
+                        output.input_generation, 1,
+                        "ambiguous prefetch must not borrow another input's tag"
+                    );
+                } else {
+                    assert!(result.is_none());
+                }
                 assert!(POLLING_EXECUTOR.with(|scope| scope.warned.get()));
             })
             .await;
