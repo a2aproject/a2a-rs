@@ -94,6 +94,12 @@ impl LiveTaskCursor {
             && ((cursor.acknowledged > 0 && generation <= cursor.acknowledged)
                 || generation < cursor.observed)
         {
+            tracing::debug!(
+                task_id = %id, event_generation = generation,
+                observed_generation = cursor.observed,
+                acknowledged_generation = cursor.acknowledged,
+                "discarding a superseded live event; task generations must remain monotonic across reopens"
+            );
             return false;
         }
         cursor.observed = cursor.observed.max(generation);
@@ -106,6 +112,11 @@ impl LiveTaskCursor {
         }
         let cursor = self.tasks.entry(task.id.clone()).or_default();
         if task.generation <= cursor.observed {
+            tracing::debug!(
+                task_id = %task.id, ack_generation = task.generation,
+                observed_generation = cursor.observed,
+                "discarding a superseded live acknowledgement"
+            );
             return false;
         }
         cursor.acknowledged = task.generation;

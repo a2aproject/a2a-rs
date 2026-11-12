@@ -28,7 +28,8 @@ Update custom transports, handlers and struct literals together.
   Every wire binding requires a single `A2A-Version` value selecting `1.0`
   or `1.1`; a numeric patch component is tolerated and ignored. Bare `1`,
   `1.2` and later versions, and duplicate version headers are rejected.
-  A missing header means legacy `0.3`, which every binding rejects. This also applies to custom SLIM RPC callers.
+  A missing header means legacy `0.3`, which every binding rejects.
+  This also applies to custom SLIM RPC callers.
   Bindings use the 1.1 protobuf/ProtoJSON envelope and enum names;
   legacy 0.3 stream events are rejected rather than silently skipped.
   JSON-RPC response envelopes must declare `"jsonrpc": "2.0"`.
@@ -123,8 +124,10 @@ capability in the final `with_capabilities` call.
   is reported on `connection.events`, rather than by `send_live_message`.
   Any malformed gRPC frame reports its original transport status. If an
   earlier request was received, admission and its first response share a
-  30-second recovery deadline. Available earlier output is preserved, with
-  a bounded ready-event drain before the fault. If a custom handler remains
+  recovery deadline, defaulting to 30 seconds. Set it with
+  `GrpcHandler::with_live_recovery_timeout`; it applies to recovery after
+  malformed input. Healthy exchanges have no such deadline. Available
+  output is preserved, with a bounded ready-event drain before the fault. If a custom handler remains
   pending beyond the deadline, the fault is returned without waiting longer.
   A normal input half-close still permits output.
 - An HTTP live fallback classified as unsupported retains its HTTP status
@@ -133,7 +136,9 @@ capability in the final `with_capabilities` call.
 - The SLIM proxy merges Task ACKs with the downlink using task generations.
   Only positive, reported generations are compared; generation zero is
   forwarded as unknown. Progress is retained per task across reopened
-  connections. Stale ACKs and covered non-message events are omitted.
+  connections. Stale ACKs and covered non-message events are omitted and
+  logged at debug level. Reconnected backends must preserve task generations;
+  a lower-generation snapshot does not reset the cursor.
   `MessageUpdate` events are always forwarded because an ACK snapshot can
   have its history and timeline trimmed. Consumers can deduplicate message IDs.
 
@@ -161,13 +166,14 @@ provide frozen membership. Custom stores can override the additive
 
 Webhook work uses bounded per-task queues and a shared HTTP concurrency pool.
 Ordinary output waits for a bounded publication-batch permit outside the
-controller. The 128 ordinary slots reserve eight for inputs, so
-waiting executor outputs cannot starve follow-up admission. Input admission
-rejects before persistence when its reserved capacity is full; subscriptions
-and cancellation still proceed. Finalization has two additional reserved slots. Notifications remain ordered, and two slow fan-outs cannot occupy
-the whole HTTP pool. Delivery/configuration retries have deadlines. A single task
-cannot occupy every HTTP slot, but many slow tasks can still queue behind the
-finite shared pool. If direct webhook publication cannot be admitted, the committed event still
-reaches client subscribers once and notification failure is signaled.
-Delivery failure is reported through server diagnostics;
-webhook delivery is not a durable, exactly-once outbox.
+controller. The 128 ordinary slots reserve eight for inputs, so waiting
+executor outputs cannot starve follow-up admission. Input admission rejects
+before persistence when its reserved capacity is full; subscriptions and
+cancellation still proceed. Finalization has two additional reserved slots.
+Notifications remain ordered, and two slow fan-outs cannot occupy the whole
+HTTP pool. Delivery/configuration retries have deadlines. A single task cannot
+occupy every HTTP slot, but many slow tasks can still queue behind the finite
+shared pool. If direct webhook publication cannot be admitted, the committed
+event still reaches client subscribers once and notification failure is
+signaled. Delivery failure is reported through server diagnostics; webhook
+delivery is not a durable, exactly-once outbox.
