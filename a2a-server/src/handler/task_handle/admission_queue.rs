@@ -163,14 +163,21 @@ impl PendingAdmissions {
         commands: &mut mpsc::Receiver<QueuedCommand>,
         state: &TaskController,
     ) -> Option<QueuedCommand> {
+        let changed = self.changed.clone();
         loop {
+            // A retiring controller can still be waiting on the task's Notify.
+            // Register before checking readiness so broadcast wakeups cannot
+            // be lost between that check and the select below.
+            let notified = changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(work) = self.ready(state) {
                 return Some(work);
             }
             let deadline = self.waiting.iter().map(|pending| pending.deadline).min();
             tokio::select! {
                 biased;
-                _ = self.changed.notified() => {},
+                _ = &mut notified => {},
                 _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {},
                 work = commands.recv() => return work,
             }

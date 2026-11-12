@@ -32,7 +32,9 @@ impl OfferedInput {
         {
             return false;
         }
-        self.changed.notify_one();
+        // The task's retiring mailbox may still have a waiter. A read claim
+        // must also wake its replacement rather than letting that waiter steal it.
+        self.changed.notify_waiters();
         true
     }
 

@@ -451,7 +451,7 @@ impl TaskHandle {
     }
 
     pub(super) fn wake_inputs(&self) {
-        self.inner.input_activity.notify_one();
+        self.inner.input_activity.notify_waiters();
     }
 
     pub(super) fn notify(&self) {
@@ -797,6 +797,118 @@ mod tests {
     use super::*;
     use crate::handler::test_support::make_handler;
     use crate::handler::test_support::task_with_history;
+
+    #[tokio::test]
+    async fn a_retiring_controller_cannot_steal_an_answer_read_claim() {
+        use crate::handler::test_support::{seed_task, send_req};
+        use crate::{
+            AgentExecutor, ExecutorContext, InMemoryTaskStore, RequestHandler, ServiceParams,
+        };
+        use futures::{FutureExt, stream::BoxStream};
+        use tokio::{
+            sync::Notify,
+            time::{Duration, timeout},
+        };
+
+        struct WaitingWorker(Arc<Notify>);
+        impl AgentExecutor for WaitingWorker {
+            fn execute(
+                &self,
+                ctx: ExecutorContext,
+            ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+                let release = self.0.clone();
+                Box::pin(ctx.spawn_worker(1, move |mut ctx, output| async move {
+                    let event = |state| {
+                        StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                            task_id: ctx.task_id.clone(),
+                            context_id: ctx.context_id.clone(),
+                            generation: 0,
+                            status: TaskStatus {
+                                state,
+                                message: None,
+                                timestamp: None,
+                            },
+                            metadata: None,
+                        })
+                    };
+                    output.send(event(TaskState::InputRequired)).await?;
+                    release.notified().await;
+                    let input = ctx
+                        .inputs
+                        .recv()
+                        .await
+                        .expect("the answer must reach the reader");
+                    output.send_for(&input, event(TaskState::Completed)).await?;
+                    Ok(())
+                }))
+            }
+
+            fn cancel(
+                &self,
+                _: ExecutorContext,
+            ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        crate::test_util::install_crypto_provider();
+        let release = Arc::new(Notify::new());
+        let handler = super::super::DefaultRequestHandler::new(
+            WaitingWorker(release.clone()),
+            InMemoryTaskStore::new(),
+        );
+        seed_task(&handler, "task", "context").await;
+        let task = handler.tasks.task("task");
+        // Retiring mailboxes can outlive their last sender long enough for a
+        // replacement to start. Keep their earlier notification waiter registered.
+        let retired = task.inner.input_activity.notified();
+        tokio::pin!(retired);
+        retired.as_mut().enable();
+        let params = ServiceParams::new();
+        handler
+            .send_message(&params, send_req(Some("task"), Some("context")))
+            .await
+            .unwrap();
+        let active = task.active().unwrap();
+        let capacity = active.inputs.sender.capacity();
+        let before = handler.tasks.load("task").await.unwrap();
+        let answer = send_req(Some("task"), Some("context"));
+        let message_id = answer.message.as_ref().unwrap().message_id.clone();
+        let waiting = tokio::spawn({
+            let handler = handler.clone();
+            async move { handler.send_message(&params, answer).await }
+        });
+        timeout(Duration::from_secs(1), async {
+            while active.inputs.sender.capacity() == capacity {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the answer must be offered before the reader is released");
+        assert_eq!(handler.tasks.load("task").await.unwrap(), before);
+        release.notify_one();
+        let result = timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the current mailbox must receive the read-claim wakeup")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, SendMessageResponse::Task(task) if task.status.state == TaskState::Completed)
+        );
+        assert!(retired.as_mut().now_or_never().is_some());
+        let stored = handler.tasks.load("task").await.unwrap();
+        assert_eq!(
+            stored
+                .history
+                .iter()
+                .flatten()
+                .filter(|message| message.message_id == message_id)
+                .count(),
+            1
+        );
+        handler.shutdown().await;
+        assert_eq!(handler.tasks.background_tasks.count(), 0);
+    }
 
     #[tokio::test]
     async fn a_controller_panic_revokes_execution_and_notifies_waiters() {

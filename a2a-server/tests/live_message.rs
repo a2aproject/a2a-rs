@@ -1851,9 +1851,15 @@ async fn a_panic_while_handling_a_call_never_loses_or_hangs_the_calls_queued_beh
             ));
         }
         for (marker, caller) in callers {
-            let reply = tokio::time::timeout(Duration::from_secs(5), caller)
-                .await
-                .unwrap_or_else(|_| panic!("round {round}: {marker} hung"));
+            let reply = match tokio::time::timeout(Duration::from_secs(5), caller).await {
+                Ok(reply) => reply,
+                Err(_) => {
+                    let task = a2a_server::TaskStore::get(store.inner.as_ref(), &task_id)
+                        .await
+                        .unwrap();
+                    panic!("round {round}: {marker} hung; stored task: {task:?}");
+                }
+            };
             // The call that hit the panic itself may fail; the others may not
             // be acknowledged unless they were carried out.
             if let Ok(Ok(LiveResponse::Ack(task))) = reply {
