@@ -276,7 +276,7 @@ impl ClientInputSender {
 
     /// Queues `input`. `Err` gives it back when the channel is full or closed.
     pub fn try_send(&self, input: ClientInput) -> Result<(), Box<ClientInput>> {
-        if self.closed.is_cancelled() {
+        if self.closed.is_cancelled() || self.revoked.is_cancelled() {
             return Err(Box::new(input));
         }
         self.sender
@@ -294,6 +294,10 @@ impl ClientInputSender {
     /// Signals closure; buffered messages remain readable by the executor.
     pub fn close(&self) {
         self.closed.cancel();
+    }
+
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.revoked.is_cancelled()
     }
 
     /// End this invocation's right to read, including in detached workers.

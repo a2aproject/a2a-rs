@@ -200,6 +200,8 @@ pub(super) struct ActiveExecution {
     pub(super) execution_id: String,
     pub(super) task: TaskHandle,
     pub(super) finished: tokio_util::sync::CancellationToken,
+    /// EOF observed and preceding output applied; completion may still be queued.
+    pub(super) stream_ended: std::sync::atomic::AtomicBool,
     prepared: std::sync::atomic::AtomicBool,
     /// Where messages sent to this task go while the executor runs. The queue
     /// belongs only to this execution; unread input is rejected when it ends.
@@ -216,6 +218,12 @@ pub(super) struct ActiveExecution {
 }
 
 impl ActiveExecution {
+    pub(super) fn mark_stream_ended(&self) {
+        self.stream_ended
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.inputs.revoke_reads();
+    }
+
     #[cfg(test)]
     pub(super) fn new(task: Option<Task>) -> Arc<Self> {
         let prepared = task.is_some();
@@ -238,6 +246,7 @@ impl ActiveExecution {
                 execution_id: uuid::Uuid::now_v7().to_string(),
                 task,
                 finished: tokio_util::sync::CancellationToken::new(),
+                stream_ended: std::sync::atomic::AtomicBool::new(false),
                 prepared: std::sync::atomic::AtomicBool::new(false),
                 inputs,
                 inputs_drained: tokio_util::sync::CancellationToken::new(),

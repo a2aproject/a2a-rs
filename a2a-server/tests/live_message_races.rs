@@ -498,7 +498,10 @@ async fn p5_run() -> (usize, usize) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p5_messages_at_execution_end_get_an_explicit_outcome() {
     let (declined, rounds) = p5_run().await;
-    assert!(declined <= rounds);
+    assert_eq!(
+        declined, 0,
+        "an immediate answer must start fresh, never be rejected"
+    );
     assert_eq!(rounds, 50);
 }
 
@@ -530,17 +533,12 @@ async fn an_exchange_that_fell_behind_carries_on_from_the_task() {
         up.send(send("ask", Some(&task.id)))
             .await
             .unwrap_or_else(|_| panic!("round {round}: the exchange ended"));
-        // If this input joins the ending execution it is rejected explicitly;
-        // a fresh input after that rejection can start another execution.
-        let mut retried = false;
+        // EOF was observed before the interrupted status became visible.
         let reached = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match down.next().await {
                     Some(Ok(StreamResponse::Error(error))) => {
-                        assert_eq!(error.code, "UNAVAILABLE");
-                        assert!(!retried, "a fresh request must start execution");
-                        retried = true;
-                        up.send(send("ask", Some(&task.id))).await.unwrap();
+                        panic!("round {round}: an immediate answer was rejected: {error:?}")
                     }
                     Some(Ok(event)) => {
                         if text(&event).as_deref() == Some("need input") {

@@ -709,6 +709,8 @@ pub(super) fn should_interrupt_non_streaming(
 
 /// Why a live request was not carried out.
 pub(super) enum Rejection {
+    /// The stream ended before admission; this input has no committed effects.
+    ExecutionEnded,
     /// The bounded queue is full, so the request cannot be accepted now. The
     /// client may retry; this is not an error in the request.
     Declined(String),
@@ -742,6 +744,9 @@ impl Rejection {
     /// The error to give a caller that is not on a stream yet.
     pub(super) fn into_error(self) -> A2AError {
         match self {
+            Rejection::ExecutionEnded => {
+                A2AError::invalid_request("execution ended before input admission")
+            }
             Rejection::Declined(reason) => A2AError::unsupported_operation(reason),
             Rejection::Failed(error) | Rejection::Interrupted(error) => error,
         }
@@ -755,6 +760,10 @@ impl Rejection {
         reference_id: Option<String>,
     ) -> StreamResponse {
         let (code, message) = match self {
+            Rejection::ExecutionEnded => (
+                "UNAVAILABLE".to_string(),
+                "execution ended before input admission".to_string(),
+            ),
             Rejection::Declined(reason) => ("UNAVAILABLE".to_string(), reason),
             Rejection::Failed(error) | Rejection::Interrupted(error) => {
                 (stream_error_code(&error), error.message)
@@ -776,6 +785,9 @@ impl Rejection {
 /// running turn.
 fn unary_refusal(rejection: Rejection, task_id: Option<&str>) -> A2AError {
     match rejection {
+        Rejection::ExecutionEnded => {
+            A2AError::invalid_request("execution ended before input admission")
+        }
         Rejection::Declined(reason) => A2AError::invalid_request(format!(
             "task execution is already in progress: {} ({reason})",
             task_id.unwrap_or_default()

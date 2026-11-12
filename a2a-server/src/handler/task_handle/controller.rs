@@ -36,14 +36,27 @@ impl TaskController {
         if let (Some(task_id), ExecutionState::Running(invocation)) =
             (request_task_id(&message.request), &mut self.execution)
         {
-            return admission::inject_input(
-                handler,
-                &message,
-                &task_id,
-                &invocation.active,
-                &mut invocation.bookkeeping,
-            )
-            .await;
+            let active = invocation.active.clone();
+            if !active
+                .stream_ended
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                match admission::inject_input(
+                    handler,
+                    &message,
+                    &task_id,
+                    &active,
+                    &mut invocation.bookkeeping,
+                )
+                .await
+                {
+                    Err(Rejection::ExecutionEnded) => {} // No input was persisted.
+                    delivery => return delivery,
+                }
+            }
+            // EOF may precede the driver's queued Finished command. Complete
+            // it here, then admit this fresh request exactly once.
+            self.finish_execution(handler, &active, &task_id).await;
         }
         if matches!(self.execution, ExecutionState::Canceling { .. }) {
             return Err(ProtocolError::TaskTerminated(&reserved_id).into());
@@ -486,6 +499,7 @@ pub(in crate::handler) enum TaskCommand {
         handler: DefaultRequestHandler,
         active: Arc<ActiveExecution>,
         event: Box<StreamResponse>,
+        last_output: bool,
         reply: super::CommandReply<Result<OutputAction, A2AError>>,
     },
     Publish {
@@ -554,8 +568,17 @@ impl TaskCommand {
                 handler,
                 active,
                 event,
+                last_output,
                 reply,
-            } => reply.complete(state.output(&handler, active, *event).await),
+            } => {
+                let outcome = state.output(&handler, active.clone(), *event).await;
+                // Admission runs in this mailbox too: mark EOF only once its
+                // final output was applied, before the next request can run.
+                if last_output && outcome.is_ok() {
+                    active.mark_stream_ended();
+                }
+                reply.complete(outcome);
+            }
             Self::Publish {
                 source,
                 event,

@@ -95,6 +95,20 @@ fn validate_and_reserve_input(
     request: &SendMessageRequest,
     task_id: &str,
 ) -> Result<(Task, Option<InputPermit>), Rejection> {
+    if active
+        .stream_ended
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(Rejection::ExecutionEnded);
+    }
+    if active.inputs.is_revoked() {
+        if !active.inputs.closed.is_cancelled() {
+            return Err(Rejection::input_busy()); // Last output has not committed yet.
+        }
+        return Err(Rejection::Failed(A2AError::internal(
+            "the input queue of a registered execution is closed",
+        )));
+    }
     if active.uncreated.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(ProtocolError::TaskNotFound(task_id).into());
     }

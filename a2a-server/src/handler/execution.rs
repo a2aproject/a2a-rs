@@ -12,6 +12,7 @@ use super::protocol::{
 use super::task_handle::{TaskCommand, TaskController, TaskOperation};
 use crate::executor::{ClientInput, ClientInputSender, QueuedInput, ReturnedInputs};
 use a2a::*;
+use futures::FutureExt;
 #[cfg(test)]
 use futures::StreamExt;
 use std::sync::Arc;
@@ -175,12 +176,17 @@ async fn poll_executor(
             let _ = accepted.send(stream.is_some());
             match stream {
                 Some(stream) => stream,
-                None => return ExecutionEnd::Finished,
+                None => {
+                    active.mark_stream_ended();
+                    return ExecutionEnd::Finished;
+                }
             }
         }
     };
     let mut push_failure = active.push_failure.subscribe();
     let mut output_protocol = ExecutionProtocol::default();
+    let mut prefetched = None;
+    let mut stream_exhausted = false;
     loop {
         // Cancellation and terminal state take precedence over a late delivery error.
         if active.inputs.closed.is_cancelled() {
@@ -193,18 +199,29 @@ async fn poll_executor(
             }
             return ExecutionEnd::Failed(error);
         }
-        let output = tokio::select! {
-            biased;
-            _ = active.inputs.closed.cancelled() => return ExecutionEnd::Stopped,
-            _ = push_failure.changed() => continue,
-            output = crate::executor::outputs::next(&mut stream, &active.inline_input_generation) => output,
+        if stream_exhausted
+            || active
+                .stream_ended
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return ExecutionEnd::Finished;
+        }
+        let output = if let Some(output) = prefetched.take() {
+            Some(output)
+        } else {
+            tokio::select! {
+                biased;
+                _ = active.inputs.closed.cancelled() => return ExecutionEnd::Stopped,
+                _ = push_failure.changed() => continue,
+                output = crate::executor::outputs::next(&mut stream, &active.inline_input_generation) => output,
+            }
         };
         let Some(crate::ExecutorOutput {
             result,
             input_generation: generation,
         }) = output
         else {
-            active.inputs.revoke_reads();
+            active.mark_stream_ended();
             return ExecutionEnd::Finished;
         };
         if generation < 0 || generation > active.inputs.received_generation() {
@@ -224,12 +241,30 @@ async fn poll_executor(
                     Err(error) => return ExecutionEnd::Failed(error),
                     _ => {}
                 }
+                // Observe an immediately following EOF before making an interrupt
+                // visible. An immediate answer must not join an exhausted inbox.
+                if protocol::should_interrupt_non_streaming(false, &event).is_some() {
+                    match crate::executor::outputs::next(
+                        &mut stream,
+                        &active.inline_input_generation,
+                    )
+                    .now_or_never()
+                    {
+                        Some(None) => {
+                            active.inputs.revoke_reads();
+                            stream_exhausted = true;
+                        }
+                        Some(Some(output)) => prefetched = Some(output),
+                        None => {} // A live executor can still receive this answer.
+                    }
+                }
                 let action = active
                     .task
                     .request(TaskOperation::Output, |reply| TaskCommand::Output {
                         handler: handler.clone(),
                         active: active.clone(),
                         event: Box::new(event),
+                        last_output: stream_exhausted,
                         reply,
                     })
                     .await

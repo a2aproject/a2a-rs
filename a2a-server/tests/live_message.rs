@@ -2150,14 +2150,14 @@ async fn messages_racing_an_executor_that_fails_are_never_refused_for_a_closed_q
     }
 }
 
-/// Input arriving at EOF either belongs to the finishing execution and is
-/// explicitly rejected unread, or starts a fresh execution. It is never replayed.
+/// An immediate answer to a final INPUT_REQUIRED is admitted once into a new
+/// execution, even before the old driver's completion command is processed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn an_answer_racing_execution_end_is_rejected_or_starts_a_fresh_execution() {
+async fn an_immediate_answer_to_an_exhausted_interrupt_starts_fresh_without_retry() {
     for round in 0..30 {
         let (handler, _) = handler(true);
         let p = params("1.1");
-        let mut stream = match send("ask-slow", None).payload {
+        let mut stream = match send("ask", None).payload {
             StreamRequestPayload::SendMessage(request) => {
                 handler.send_streaming_message(&p, request).await.unwrap()
             }
@@ -2183,35 +2183,22 @@ async fn an_answer_racing_execution_end_is_rejected_or_starts_a_fresh_execution(
             timeline_length: None,
             current_generation: None,
         };
-        match reply {
-            Ok(SendMessageResponse::Task(task)) => {
-                assert_eq!(task.status.state, TaskState::Completed)
-            }
-            Ok(_) => panic!("a task response is required"),
-            Err(error) => {
-                assert!(
-                    error.message.contains("before reading this message"),
-                    "round {round}: {error:?}"
-                );
-                let task = handler.get_task(&p, get()).await.unwrap();
-                assert_eq!(task.status.state, TaskState::InputRequired);
-                assert_eq!(
-                    task.history
-                        .iter()
-                        .flatten()
-                        .filter(|message| message.message_id == reference)
-                        .count(),
-                    1
-                );
-                let reply = handler
-                    .send_message(&p, message_request("quick", &task_id))
-                    .await
-                    .unwrap();
-                assert!(
-                    matches!(reply, SendMessageResponse::Task(task) if task.status.state == TaskState::Completed)
-                );
-            }
-        }
+        let reply = reply
+            .unwrap_or_else(|error| panic!("round {round}: fresh input was rejected: {error:?}"));
+        assert!(
+            matches!(reply, SendMessageResponse::Task(task) if task.status.state == TaskState::Completed)
+        );
+        let stored = handler.get_task(&p, get()).await.unwrap();
+        assert_eq!(
+            stored
+                .history
+                .iter()
+                .flatten()
+                .filter(|message| message.message_id == reference)
+                .count(),
+            1
+        );
+        assert_eq!(stored.timeline.iter().flatten().filter(|entry| matches!(&entry.content, TimelineContent::Message(message) if message.message_id == reference)).count(), 1);
         assert_eq!(
             handler.get_task(&p, get()).await.unwrap().status.state,
             TaskState::Completed

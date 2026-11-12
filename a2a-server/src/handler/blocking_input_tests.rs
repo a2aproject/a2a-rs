@@ -424,6 +424,7 @@ async fn output_cannot_claim_an_input_the_executor_has_not_read() {
 async fn a_detached_context_cannot_keep_an_ended_turn_or_claim_its_successors_input() {
     struct DetachedContext {
         turns: Arc<std::sync::atomic::AtomicUsize>,
+        read_gate: Arc<Notify>,
         stopped: Arc<Notify>,
         read_input: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -433,20 +434,25 @@ async fn a_detached_context_cannot_keep_an_ended_turn_or_claim_its_successors_in
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             if self.turns.fetch_add(1, Ordering::SeqCst) == 0 {
+                let read_gate = self.read_gate.clone();
                 let stopped = self.stopped.clone();
                 let read_input = self.read_input.clone();
+                let opening = question(&ctx, TaskState::InputRequired, "first question");
                 tokio::spawn(async move {
                     // Force ownership of the whole context, not just its inbox.
                     let mut ctx = ctx;
+                    read_gate.notified().await;
                     read_input.store(ctx.inputs.recv().await.is_some(), Ordering::SeqCst);
                     drop(ctx);
                     stopped.notify_one();
                 });
-                stream::empty().boxed()
+                stream::once(async move { Ok(opening) }).boxed()
             } else {
                 assert_eq!(ctx.message.as_ref().and_then(Message::text), Some("second"));
-                stream::once(async move { Ok(question(&ctx, TaskState::Completed, "successor")) })
-                    .boxed()
+                stream::once(async move {
+                    Ok(question(&ctx, TaskState::InputRequired, "second question"))
+                })
+                .boxed()
             }
         }
         fn cancel(
@@ -457,17 +463,39 @@ async fn a_detached_context_cannot_keep_an_ended_turn_or_claim_its_successors_in
         }
     }
     let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    crate::test_util::install_crypto_provider();
+    let read_gate = Arc::new(Notify::new());
     let stopped = Arc::new(Notify::new());
     let read_input = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handler = DefaultRequestHandler::new(
         DetachedContext {
             turns: turns.clone(),
+            read_gate: read_gate.clone(),
             stopped: stopped.clone(),
             read_input: read_input.clone(),
         },
         InMemoryTaskStore::new(),
+    )
+    .with_push_notifications(
+        crate::InMemoryPushConfigStore::new(),
+        crate::HttpPushSender::new(None),
     );
     seed_task(&handler, "task", "context").await;
+    let source = handler.tasks.task("task");
+    handler.attach_pushes(&source);
+    // Hold the old driver's Finished command outside the mailbox. Admission
+    // must detect EOF itself while the old worker still owns the whole context.
+    let mut finalization = Vec::new();
+    for _ in 0..2 {
+        finalization.push(
+            source
+                .publications()
+                .reserve(&source, super::task_handle::TaskOperation::Finished)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
     timeout(
         Duration::from_secs(2),
         handler.send_message(&ServiceParams::new(), request("first")),
@@ -475,9 +503,6 @@ async fn a_detached_context_cannot_keep_an_ended_turn_or_claim_its_successors_in
     .await
     .unwrap()
     .unwrap();
-    timeout(Duration::from_secs(2), stopped.notified())
-        .await
-        .unwrap();
     let reply = timeout(
         Duration::from_secs(2),
         handler.send_message(&ServiceParams::new(), request("second")),
@@ -485,9 +510,18 @@ async fn a_detached_context_cannot_keep_an_ended_turn_or_claim_its_successors_in
     .await
     .unwrap()
     .unwrap();
-    assert!(
-        matches!(reply, SendMessageResponse::Task(task) if task.status.state == TaskState::Completed)
+    assert!(matches!(reply, SendMessageResponse::Task(task)
+        if task.status.message.as_ref().and_then(Message::text) == Some("second question")));
+    assert_eq!(
+        turns.load(Ordering::SeqCst),
+        2,
+        "fresh execution began while the old receiver was still owned"
     );
+    read_gate.notify_one();
+    timeout(Duration::from_secs(2), stopped.notified())
+        .await
+        .unwrap();
+    drop(finalization);
     assert_eq!(turns.load(Ordering::SeqCst), 2);
     assert!(!read_input.load(Ordering::SeqCst));
     handler.shutdown().await;
