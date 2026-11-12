@@ -509,6 +509,7 @@ pub(in crate::handler) enum TaskCommand {
         kind: protocol::EventKind,
         failure: Option<super::FailureSignal>,
         input_generation: Option<i64>,
+        published: Arc<std::sync::atomic::AtomicU64>,
         reply: super::CommandReply<()>,
     },
     Finished {
@@ -586,9 +587,10 @@ impl TaskCommand {
                 kind,
                 failure,
                 input_generation,
+                published,
                 reply,
             } => {
-                source
+                let sequence = source
                     .publish_event_inner(
                         event.as_ref().as_ref(),
                         snapshot.map(|task| *task),
@@ -597,7 +599,8 @@ impl TaskCommand {
                         input_generation,
                         None,
                     )
-                    .await;
+                    .unwrap_or(0);
+                published.store(sequence, std::sync::atomic::Ordering::Release);
                 reply.complete(());
             }
             Self::Finished {

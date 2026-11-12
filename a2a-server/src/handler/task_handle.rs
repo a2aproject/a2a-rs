@@ -247,6 +247,7 @@ impl TaskHandle {
         &self.inner.background_tasks
     }
 
+    #[cfg(test)]
     pub(super) fn sender(&self) -> &broadcast::Sender<ExecutionEvent> {
         &self.inner.sender
     }
@@ -597,6 +598,8 @@ impl TaskHandle {
             && kind == EventKind::Normal
             && result.is_ok_and(|event| super::protocol::task_id_for_event(event).is_some())
         {
+            let fallback_snapshot = snapshot.clone();
+            let published = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let publication = self
                 .request(TaskOperation::Publication, |reply| TaskCommand::Publish {
                     source: self.clone(),
@@ -605,27 +608,49 @@ impl TaskHandle {
                     kind,
                     failure: failure.clone(),
                     input_generation,
+                    published: published.clone(),
                     reply,
                 })
                 .await;
             if let Err(error) = publication {
-                let event = ExecutionEvent {
-                    sequence: 0,
-                    input_generation: input_generation.unwrap_or(0),
-                    result: result.cloned().map_err(Clone::clone),
-                    kind,
-                    failure,
-                    response_task: None,
+                let sequence = published.load(std::sync::atomic::Ordering::Acquire);
+                let event = if sequence == 0 {
+                    // A failed webhook admission must not erase the committed
+                    // client update. No unordered webhook fallback is queued.
+                    self.record_event(
+                        result,
+                        fallback_snapshot,
+                        kind,
+                        failure,
+                        input_generation,
+                        None,
+                    )
+                } else {
+                    Some(ExecutionEvent {
+                        sequence,
+                        input_generation: input_generation.unwrap_or(0),
+                        result: result.cloned().map_err(Clone::clone),
+                        kind,
+                        failure,
+                        response_task: None,
+                    })
                 };
-                super::push_worker::signal_failure(self.pushes().unwrap().sender(), &event, error);
+                if let Some(event) = event {
+                    super::push_worker::signal_failure(
+                        self.pushes().unwrap().sender(),
+                        &event,
+                        error,
+                    );
+                }
+                self.notify();
             }
             return;
         }
-        self.publish_event_inner(result, snapshot, kind, failure, input_generation, execution)
-            .await;
+        let _ =
+            self.publish_event_inner(result, snapshot, kind, failure, input_generation, execution);
     }
 
-    async fn publish_event_inner(
+    fn publish_event_inner(
         &self,
         result: Result<&StreamResponse, &A2AError>,
         snapshot: Option<Task>,
@@ -633,7 +658,25 @@ impl TaskHandle {
         failure: Option<FailureSignal>,
         input_generation: Option<i64>,
         execution: Option<&Arc<ActiveExecution>>,
-    ) {
+    ) -> Option<u64> {
+        let event =
+            self.record_event(result, snapshot, kind, failure, input_generation, execution)?;
+        let sequence = event.sequence;
+        if let Some(pushes) = self.pushes() {
+            super::push_delivery::notify(self, pushes, event);
+        }
+        Some(sequence)
+    }
+
+    fn record_event(
+        &self,
+        result: Result<&StreamResponse, &A2AError>,
+        snapshot: Option<Task>,
+        kind: EventKind,
+        failure: Option<FailureSignal>,
+        input_generation: Option<i64>,
+        execution: Option<&Arc<ActiveExecution>>,
+    ) -> Option<ExecutionEvent> {
         let event = {
             let mut state = self.inner.state.write();
             if let Some(execution) = execution {
@@ -642,7 +685,7 @@ impl TaskHandle {
                     .upgrade()
                     .is_some_and(|current| Arc::ptr_eq(&current, execution))
                 {
-                    return;
+                    return None;
                 }
                 state.execution = Weak::new();
             }
@@ -702,13 +745,12 @@ impl TaskHandle {
                 }
                 true
             });
+            // Cursor allocation and client delivery share this short lock,
+            // including failure fallback outside the controller.
+            let _ = self.inner.sender.send(event.clone());
             event
         };
-        if let Some(pushes) = self.pushes() {
-            super::push_delivery::broadcast(self, pushes, event);
-        } else {
-            let _ = self.inner.sender.send(event);
-        }
+        Some(event)
     }
 }
 
@@ -788,6 +830,61 @@ mod tests {
             .unwrap();
         assert!(next);
         handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_direct_publication_still_delivers_the_client_event_exactly_once() {
+        for shutdown in [false, true] {
+            let handler = make_handler().with_push_notifications(
+                crate::InMemoryPushConfigStore::new(),
+                crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                    fail_on_error: true,
+                    ..Default::default()
+                })),
+            );
+            let task = handler.tasks.task("task");
+            handler.attach_pushes(&task);
+            let mut client = task.sender().subscribe();
+            let mut changed = task.watch();
+            let _closed_queue = if shutdown {
+                handler.shutdown().await;
+                None
+            } else {
+                let (queue, receiver) = tokio::sync::mpsc::channel::<QueuedCommand>(1);
+                drop(receiver);
+                let queue = Arc::new(queue);
+                task.inner.state.write().operations = Arc::downgrade(&queue);
+                Some(queue)
+            };
+            let mut snapshot = task_with_history("task", "context", 0);
+            snapshot.generation = 1;
+            let output = StreamResponse::Task(snapshot.clone());
+            let (failure, signal) = watch::channel(None);
+            task.publish(
+                Ok(&output),
+                Some(snapshot.clone()),
+                EventKind::Normal,
+                Some(failure),
+                1,
+            )
+            .await;
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.sequence, 1);
+            assert_eq!(event.result.unwrap(), output);
+            assert!(client.try_recv().is_err());
+            assert_eq!(task.snapshot(), Some(snapshot));
+            assert!(
+                signal.borrow().is_some(),
+                "webhook failure remains observable"
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(1), changed.changed())
+                .await
+                .unwrap();
+            handler.shutdown().await;
+        }
     }
 
     #[tokio::test]

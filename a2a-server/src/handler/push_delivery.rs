@@ -197,8 +197,7 @@ pub(super) fn needs_notification(event: &ExecutionEvent) -> bool {
 
 /// Clients observe committed events immediately. Webhooks own reserved queue
 /// capacity and never await configuration or HTTP inside the task controller.
-pub(super) fn broadcast(source: &TaskHandle, settings: &Arc<PushService>, event: ExecutionEvent) {
-    let _ = source.sender().send(event.clone());
+pub(super) fn notify(source: &TaskHandle, settings: &Arc<PushService>, event: ExecutionEvent) {
     if !needs_notification(&event) {
         return;
     }
@@ -284,8 +283,7 @@ mod tests {
     async fn a_publication_bypassing_the_controller_reports_failure() {
         let (source, mut notifications) = captured_source(8, true).await;
         let (failure, signal) = tokio::sync::watch::channel(None);
-        let mut events = source.sender().subscribe();
-        broadcast(
+        notify(
             &source,
             source.pushes().unwrap(),
             ExecutionEvent {
@@ -307,7 +305,6 @@ mod tests {
                 .message
                 .contains("bypassed the task controller")
         );
-        assert_eq!(events.recv().await.unwrap().sequence, 1);
         assert!(notifications.try_recv().is_err());
         source.background_tasks().shutdown().await;
     }
