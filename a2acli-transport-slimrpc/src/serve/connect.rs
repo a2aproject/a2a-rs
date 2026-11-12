@@ -13,6 +13,7 @@
 //! serve loop -- has no fake-able seam and is instead exercised end-to-end
 //! via the itk/csit integration suites.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -60,12 +61,17 @@ impl<T: Transport + 'static> TransportHandler<T> {
     }
 }
 
-/// A Task ACK is a snapshot, so it supersedes older events from the other
-/// HTTP channel. Retain one task cursor per live exchange, without a registry.
+/// Compare only reported generations. A trimmed ACK cannot replace message
+/// events, and reopening the transport does not reset per-task progress.
 #[derive(Default)]
 struct LiveTaskCursor {
-    observed: Option<(TaskId, i64)>,
-    acknowledged: Option<(TaskId, i64)>,
+    tasks: HashMap<TaskId, TaskProgress>,
+}
+
+#[derive(Default)]
+struct TaskProgress {
+    observed: i64,
+    acknowledged: i64,
 }
 
 impl LiveTaskCursor {
@@ -77,31 +83,33 @@ impl LiveTaskCursor {
             StreamResponse::MessageUpdate(event) => (&event.task_id, event.generation),
             _ => return true,
         };
-        if self
-            .acknowledged
-            .as_ref()
-            .is_some_and(|(task, snapshot)| task == id && generation <= *snapshot)
-            || self
-                .observed
-                .as_ref()
-                .is_some_and(|(task, seen)| task == id && generation < *seen)
+        // Zero is an omitted generation, not a cursor or a duplicate.
+        if generation <= 0 {
+            return true;
+        }
+        let cursor = self.tasks.entry(id.clone()).or_default();
+        // History/timeline may be trimmed to zero. Keep messages even below
+        // the ACK generation; their IDs let consumers identify duplicates.
+        if !matches!(event, StreamResponse::MessageUpdate(_))
+            && ((cursor.acknowledged > 0 && generation <= cursor.acknowledged)
+                || generation < cursor.observed)
         {
             return false;
         }
-        self.observed = Some((id.clone(), generation));
+        cursor.observed = cursor.observed.max(generation);
         true
     }
 
     fn acknowledge(&mut self, task: &Task) -> bool {
-        if self
-            .observed
-            .as_ref()
-            .is_some_and(|(id, generation)| id == &task.id && task.generation <= *generation)
-        {
+        if task.generation <= 0 {
+            return true;
+        }
+        let cursor = self.tasks.entry(task.id.clone()).or_default();
+        if task.generation <= cursor.observed {
             return false;
         }
-        self.acknowledged = Some((task.id.clone(), task.generation));
-        self.observed = self.acknowledged.clone();
+        cursor.acknowledged = task.generation;
+        cursor.observed = task.generation;
         true
     }
 }
@@ -173,7 +181,6 @@ impl<T: Transport + 'static> RequestHandler for TransportHandler<T> {
                             }
                             Ok(a2a_client::LiveAck::Reopened(connection)) => {
                                 events = connection.events;
-                                progress = LiveTaskCursor::default();
                                 sender = Some(connection.sender);
                             }
                             Ok(_) => {}
@@ -489,6 +496,8 @@ mod tests {
         last_params: Mutex<Option<ServiceParams>>,
         live_requests: Arc<Mutex<Vec<StreamRequest>>>,
         live_task_ack: bool,
+        ack_generation: Option<i64>,
+        reopen: bool,
         ack_release: Option<Arc<tokio::sync::Notify>>,
     }
 
@@ -506,6 +515,8 @@ mod tests {
         requests: Arc<Mutex<Vec<StreamRequest>>>,
         output: tokio::sync::mpsc::Sender<Result<StreamResponse, A2AError>>,
         task_ack: bool,
+        ack_generation: Option<i64>,
+        reopen: bool,
         ack_release: Option<Arc<tokio::sync::Notify>>,
     }
 
@@ -513,6 +524,28 @@ mod tests {
     impl a2a_client::LiveUplink for RecordingUplink {
         async fn send(&self, request: StreamRequest) -> Result<a2a_client::LiveAck, A2AError> {
             self.requests.lock().unwrap().push(request);
+            if self.reopen {
+                let (output, receiver) = tokio::sync::mpsc::channel(1);
+                let mut stale = fake_task();
+                stale.generation = 42;
+                output.try_send(Ok(StreamResponse::Task(stale))).unwrap();
+                return Ok(a2a_client::LiveAck::Reopened(Box::new(
+                    a2a_client::LiveConnection {
+                        sender: a2a_client::LiveSender::new(Arc::new(RecordingUplink {
+                            requests: self.requests.clone(),
+                            output,
+                            task_ack: true,
+                            ack_generation: Some(42),
+                            reopen: false,
+                            ack_release: None,
+                        })),
+                        events: stream::unfold(receiver, |mut receiver| async move {
+                            receiver.recv().await.map(|event| (event, receiver))
+                        })
+                        .boxed(),
+                    },
+                )));
+            }
             if self.task_ack {
                 if let Some(release) = &self.ack_release {
                     let mut newer = fake_task();
@@ -524,7 +557,7 @@ mod tests {
                     release.notified().await;
                 }
                 let mut task = fake_task();
-                task.generation = 42;
+                task.generation = self.ack_generation.unwrap_or(42);
                 return Ok(a2a_client::LiveAck::Task(Box::new(task)));
             }
             self.output
@@ -605,14 +638,18 @@ mod tests {
             self.record(params);
             self.live_requests.lock().unwrap().push(first.clone());
             let (sender, receiver) = tokio::sync::mpsc::channel(1);
-            sender
-                .try_send(Ok(StreamResponse::Task(fake_task())))
-                .unwrap();
+            let mut opening = fake_task();
+            if self.reopen {
+                opening.generation = 43;
+            }
+            sender.try_send(Ok(StreamResponse::Task(opening))).unwrap();
             Ok(a2a_client::LiveConnection {
                 sender: a2a_client::LiveSender::new(Arc::new(RecordingUplink {
                     requests: self.live_requests.clone(),
                     output: sender,
                     task_ack: self.live_task_ack,
+                    ack_generation: self.ack_generation,
+                    reopen: self.reopen,
                     ack_release: self.ack_release.clone(),
                 })),
                 events: stream::unfold(receiver, |mut receiver| async move {
@@ -875,13 +912,181 @@ mod tests {
         assert!(progress.acknowledge(&task));
         assert!(!progress.acknowledge(&task));
         for event in &events {
-            assert!(!progress.observe(event));
+            assert_eq!(
+                progress.observe(event),
+                matches!(event, StreamResponse::MessageUpdate(_))
+            );
         }
         task.generation = 7;
         assert!(progress.observe(&StreamResponse::Task(task.clone())));
         task.generation = 6;
         assert!(!progress.acknowledge(&task));
         assert!(progress.observe(&StreamResponse::Message(fake_message())));
+    }
+
+    #[test]
+    fn unknown_generations_never_suppress_acknowledgements_or_downlink_events() {
+        let task = fake_task();
+        assert_eq!(task.generation, 0);
+        let events = [
+            StreamResponse::Task(task.clone()),
+            StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: task.id.clone(),
+                context_id: task.context_id.clone(),
+                status: task.status.clone(),
+                metadata: None,
+                generation: 0,
+            }),
+            StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                task_id: task.id.clone(),
+                context_id: task.context_id.clone(),
+                artifact: serde_json::from_value(
+                    serde_json::json!({"artifactId":"a","parts":[{"text":"part"}]}),
+                )
+                .unwrap(),
+                append: None,
+                last_chunk: None,
+                metadata: None,
+                generation: 0,
+            }),
+            StreamResponse::MessageUpdate(TaskMessageUpdateEvent {
+                task_id: task.id.clone(),
+                context_id: task.context_id.clone(),
+                message: fake_message(),
+                metadata: None,
+                generation: 0,
+            }),
+        ];
+        let mut progress = LiveTaskCursor::default();
+        for _ in 0..3 {
+            assert!(progress.acknowledge(&task));
+            for event in &events {
+                assert!(progress.observe(event));
+            }
+            assert!(progress.acknowledge(&task));
+        }
+        assert!(
+            progress.tasks.is_empty(),
+            "unknown generations retain no cursor"
+        );
+        let mut known = task.clone();
+        known.generation = 9;
+        assert!(progress.observe(&StreamResponse::Task(known.clone())));
+        assert!(progress.acknowledge(&task));
+        for event in &events {
+            assert!(progress.observe(event));
+        }
+        known.generation = 8;
+        assert!(
+            !progress.acknowledge(&known),
+            "unknown values must not reset known progress"
+        );
+    }
+
+    #[test]
+    fn trimmed_acknowledgements_preserve_messages_and_track_each_task_independently() {
+        let mut first = fake_task();
+        first.generation = 7;
+        first.history = None;
+        first.timeline = None;
+        let mut second = first.clone();
+        second.id = "second".into();
+        second.generation = 12;
+        let mut progress = LiveTaskCursor::default();
+        assert!(progress.acknowledge(&first));
+        assert!(progress.observe(&StreamResponse::Task(second.clone())));
+        assert!(
+            progress.observe(&StreamResponse::MessageUpdate(TaskMessageUpdateEvent {
+                task_id: first.id.clone(),
+                context_id: first.context_id.clone(),
+                message: fake_message(),
+                generation: 6,
+                metadata: None,
+            }))
+        );
+        first.generation = 6;
+        second.generation = 11;
+        assert!(!progress.acknowledge(&first));
+        assert!(!progress.acknowledge(&second));
+        assert_eq!(progress.tasks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn live_proxy_forwards_task_acknowledgements_without_generations() {
+        let handler = TransportHandler::new(FakeTransport {
+            live_task_ack: true,
+            ack_generation: Some(0),
+            ..Default::default()
+        });
+        let requests: Vec<_> = (0..4)
+            .map(|_| StreamRequest {
+                tenant: None,
+                payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                    id: "task".into(),
+                    tenant: None,
+                    last_seen_generation: None,
+                }),
+            })
+            .collect();
+        let events = handler
+            .send_live_message(&ServiceParams::new(), stream::iter(requests).boxed())
+            .await
+            .unwrap();
+        let events: Vec<_> =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.collect())
+                .await
+                .unwrap();
+        assert_eq!(
+            events.len(),
+            4,
+            "opening and every zero-generation ACK must be delivered"
+        );
+        assert!(
+            events.iter().all(
+                |event| matches!(event, Ok(StreamResponse::Task(task)) if task.generation == 0)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn reopening_live_transport_preserves_previous_task_progress() {
+        let handler = TransportHandler::new(FakeTransport {
+            reopen: true,
+            ..Default::default()
+        });
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        let (input, receiver) = tokio::sync::mpsc::channel(3);
+        input.send(request.clone()).await.unwrap();
+        let uplink = stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|event| (event, receiver))
+        })
+        .boxed();
+        let mut events = handler
+            .send_live_message(&ServiceParams::new(), uplink)
+            .await
+            .unwrap();
+        assert!(
+            matches!(events.next().await.unwrap().unwrap(), StreamResponse::Task(task) if task.generation == 43)
+        );
+        input.send(request.clone()).await.unwrap(); // Reopens with an older snapshot.
+        input.send(request).await.unwrap(); // Receives an older ACK on the new uplink.
+        drop(input);
+        let remaining: Vec<_> =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.collect())
+                .await
+                .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "reopening must not allow snapshots or ACKs to regress"
+        );
+        assert_eq!(handler.transport.live_requests.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

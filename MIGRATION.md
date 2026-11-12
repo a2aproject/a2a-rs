@@ -27,8 +27,8 @@ Update custom transports, handlers and struct literals together.
 - `a2a::VERSION` is now `"1.1"`. Send `A2A-Version: 1.1` for 1.1 features.
   Every wire binding requires a single `A2A-Version` value selecting `1.0`
   or `1.1`; a numeric patch component is tolerated and ignored. Bare `1`,
-  `1.2` and later versions, and duplicate version headers are rejected. A missing header means legacy `0.3`, which every
-  binding rejects. This also applies to custom SLIM RPC callers.
+  `1.2` and later versions, and duplicate version headers are rejected.
+  A missing header means legacy `0.3`, which every binding rejects. This also applies to custom SLIM RPC callers.
   Bindings use the 1.1 protobuf/ProtoJSON envelope and enum names;
   legacy 0.3 stream events are rejected rather than silently skipped.
   JSON-RPC response envelopes must declare `"jsonrpc": "2.0"`.
@@ -121,15 +121,21 @@ capability in the final `with_capabilities` call.
 - Unsupported live operations consistently report `UNSUPPORTED_OPERATION`.
   SLIM RPC establishes the call asynchronously, so an unsupported operation
   is reported on `connection.events`, rather than by `send_live_message`.
-  A malformed first gRPC frame reports its original transport status. If an
-  earlier request was received, its opening admission finishes and its first
-  response is preserved before that status. Remaining ready output has a
-  bounded drain. A normal input half-close still permits output.
+  Any malformed gRPC frame reports its original transport status. If an
+  earlier request was received, admission and its first response share a
+  30-second recovery deadline. Available earlier output is preserved, with
+  a bounded ready-event drain before the fault. If a custom handler remains
+  pending beyond the deadline, the fault is returned without waiting longer.
+  A normal input half-close still permits output.
 - An HTTP live fallback classified as unsupported retains its HTTP status
   and response body in the error message. A 404 can mean a wrong endpoint or
   a lost route; it is not proof of the agent's advertised capabilities.
 - The SLIM proxy merges Task ACKs with the downlink using task generations.
-  Stale ACKs and events already superseded by an ACK snapshot are omitted.
+  Only positive, reported generations are compared; generation zero is
+  forwarded as unknown. Progress is retained per task across reopened
+  connections. Stale ACKs and covered non-message events are omitted.
+  `MessageUpdate` events are always forwarded because an ACK snapshot can
+  have its history and timeline trimmed. Consumers can deduplicate message IDs.
 
 For versioned REST requests, an unknown task-action path returns HTTP 404.
 Malformed requests to recognized operations still return HTTP 400; an unknown
