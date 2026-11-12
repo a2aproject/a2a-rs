@@ -101,6 +101,10 @@ mod tests {
         for payload in [
             json!({"task":null}),
             json!({"statusUpdate":null}),
+            json!({"status_update":null}),
+            json!({"message":null}),
+            json!({"artifactUpdate":null}),
+            json!({"artifact_update":null}),
             json!({"messageUpdate":null}),
             json!({"message_update":null}),
             json!({"error":null}),
