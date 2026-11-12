@@ -55,7 +55,9 @@ Input queues belong to one execution. If that execution ends before reading
 an accepted input, a waiting sending call receives an explicit rejection (a private
 `StreamError` on a live exchange). The input remains in persisted task history
 but is never automatically replayed into another `execute` call. A fresh
-request after completion may start another execution; task history does not
+request after completion may start another execution. An immediately exhausted
+stream is finalized before admitting a fresh answer to its final interrupt, so
+that answer starts the next execution and is persisted once. Task history does not
 implicitly become its inbox. An already returned `returnImmediately` response
 acknowledges persistence, not executor consumption.
 
@@ -93,6 +95,15 @@ capability in the final `with_capabilities` call.
   `outputs.send_for(&input, event)` preserves producer-side input correlation
   through the supplied receiver. Return that receiver directly; arbitrary
   buffering of its untagged items cannot retain producer provenance implicitly.
+  Async/prefetching adapters that erase receiver tags are rejected with
+  `INVALID_AGENT_RESPONSE`; transform events before `send_for`. A synchronous
+  adapter that discards a tagged item produces a diagnostic. Untagged custom
+  buffers still need explicit producer correlation.
+  Prefer `ctx.spawn_worker(capacity, |ctx, outputs| async move { ...; Ok(()) })`
+  and return its receiver, or attach a manually spawned worker using
+  `events.with_worker(handle)`. The monitored worker's panic, cancellation or
+  returned error becomes a stream error after its buffered output. Dropping the
+  stream aborts that worker. Arbitrary detached application tasks are not monitored.
   `ExecutorOutput` is non-exhaustive; construct outputs through the sender API.
 - HTTP live follow-ups have a default 30-second acknowledgement deadline,
   configurable with `with_http_followup_timeout`. Pending requests can be
@@ -126,14 +137,20 @@ path is no longer reported as an invalid A2A request.
 
 ## Listing and webhook bounds
 
-In-memory list cursors preserve the initial ordered task IDs for five minutes
-of inactivity. Each continuation reads current contents and rechecks filters
-and permissions. New tasks require a new listing. Concurrent updates may
-change ordering across page boundaries. Cursor ownership includes the tenant
-and stable principal. Allocation quotas count authenticated principals across
-tenants; anonymous callers share a smaller quota. Global limits still apply.
-Capacity rejects new allocations rather than evicting active traversals;
-active continuations refresh expiry. Custom stores can override the additive
+Authenticated in-memory listings normally cache their initial ordered task IDs
+for five minutes of inactivity. Continuations renew expiry, read current
+contents and recheck filters and permissions. Their membership order stays
+fixed; newly created tasks require a new listing. Cursor ownership includes
+the tenant and stable principal, while cache budgets count a principal across
+tenants to prevent request-supplied tenants from multiplying allocations.
+
+Anonymous listings always use authenticated stateless keyset cursors, retaining
+no per-list state. Authenticated listings also use these cursors when any cache
+budget is full, so exhausting the cache cannot deny another caller's listing
+or evict active traversals. These live cursors are bound to the store, query,
+tenant and principal. They re-sort current contents on every page: concurrent
+status timestamp changes can move tasks across page boundaries, so they do not
+provide frozen membership. Custom stores can override the additive
 `list_for_scope` method without changing existing required trait methods.
 
 Webhook work uses bounded per-task queues and a shared HTTP concurrency pool.
@@ -144,5 +161,7 @@ rejects before persistence when its reserved capacity is full; subscriptions
 and cancellation still proceed. Finalization has two additional reserved slots. Notifications remain ordered, and two slow fan-outs cannot occupy
 the whole HTTP pool. Delivery/configuration retries have deadlines. A single task
 cannot occupy every HTTP slot, but many slow tasks can still queue behind the
-finite shared pool. Delivery failure is reported through server diagnostics;
+finite shared pool. If direct webhook publication cannot be admitted, the committed event still
+reaches client subscribers once and notification failure is signaled.
+Delivery failure is reported through server diagnostics;
 webhook delivery is not a durable, exactly-once outbox.
