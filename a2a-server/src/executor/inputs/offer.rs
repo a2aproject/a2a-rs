@@ -124,6 +124,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_offer_cleanup_cannot_erase_the_next_callers_notification() {
+        let (sender, mut inputs) = ClientInputs::channel(1);
+        sender.offer(None);
+        let stale = InputOffer::new(Arc::default());
+        let next = InputOffer::new(Arc::default());
+        sender.offer(Some(stale.reader()));
+        sender.offer(Some(next.reader()));
+        sender.clear_offer(&stale.reader());
+        drop(stale);
+        let mut read = Box::pin(inputs.recv());
+        assert!(read.as_mut().now_or_never().is_none());
+        assert!(next.claimed());
+        assert!(next.begin_commit());
+        assert_eq!(sender.received_generation(), 0);
+        sender.try_send(input()).unwrap();
+        next.complete();
+        assert_eq!(read.await.unwrap().generation, 7);
+        assert_eq!(sender.received_generation(), 7);
+    }
+
+    #[tokio::test]
+    async fn try_recv_skips_rejected_receipts_without_advancing_input_progress() {
+        let (sender, mut inputs) = ClientInputs::channel(2);
+        let rejected = QueuedInput::new(input());
+        sender.sender.try_send(rejected.clone()).unwrap();
+        assert!(rejected.reclaim().is_some());
+        assert!(inputs.try_recv().is_none());
+        assert_eq!(sender.received_generation(), 0);
+        sender.try_send(input()).unwrap();
+        assert_eq!(inputs.try_recv().unwrap().generation, 7);
+        assert_eq!(sender.received_generation(), 7);
+    }
+
+    #[tokio::test]
     async fn read_claim_waits_for_commit_and_canceled_offers_do_not_close_the_inbox() {
         let (sender, mut inputs) = ClientInputs::channel(1);
         for commit in [false, true] {

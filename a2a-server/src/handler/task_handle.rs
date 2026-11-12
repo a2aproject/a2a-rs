@@ -903,6 +903,28 @@ mod tests {
                 .count(),
             1
         );
+        // The shared executor must also release an idle worker's offer watch
+        // when another task is canceled after the first task completes.
+        seed_task(&handler, "cancel", "context").await;
+        handler
+            .send_message(
+                &ServiceParams::new(),
+                send_req(Some("cancel"), Some("context")),
+            )
+            .await
+            .unwrap();
+        let canceled = handler
+            .cancel_task(
+                &ServiceParams::new(),
+                CancelTaskRequest {
+                    id: "cancel".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(canceled.status.state, TaskState::Canceled);
         handler.shutdown().await;
         assert_eq!(handler.tasks.background_tasks.count(), 0);
     }
