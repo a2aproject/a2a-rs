@@ -19,6 +19,19 @@ type BoxStreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + 
 struct UplinkFailure {
     status: tonic::Status,
     had_input: bool,
+    deadline: tokio::time::Instant,
+}
+
+impl UplinkFailure {
+    fn new(status: tonic::Status, had_input: bool) -> Self {
+        Self {
+            status,
+            had_input,
+            // Share one grace period between finishing admission and obtaining
+            // its first output, even for custom handlers that never complete.
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        }
+    }
 }
 
 /// Tonic decoding failures are fatal transport errors, not a normal half-close.
@@ -40,10 +53,7 @@ fn decode_live_uplink(
                 }
                 Err(status) => {
                     if let Some(sender) = sender.take() {
-                        let _ = sender.send(UplinkFailure {
-                            status,
-                            had_input: *had_input,
-                        });
+                        let _ = sender.send(UplinkFailure::new(status, *had_input));
                     }
                     None
                 }
@@ -89,7 +99,10 @@ fn live_downlink(
                 let event = if state.remaining == 0 {
                     None
                 } else if failure.had_input && !state.delivered {
-                    state.events.next().await
+                    tokio::time::timeout_at(failure.deadline, state.events.next())
+                        .await
+                        .ok()
+                        .flatten()
                 } else {
                     state.events.next().now_or_never().flatten()
                 };
@@ -136,9 +149,9 @@ async fn open_live_downlink(
             if !failure.had_input { return Err(failure.status); }
             // Admission owns the first request. A later malformed frame must
             // not drop its opening while persistence is still completing.
-            match opening.await {
-                Ok(events) => return Ok(live_downlink(events, futures::future::ready(failure).boxed())),
-                Err(_) => return Err(failure.status),
+            match tokio::time::timeout_at(failure.deadline, opening).await {
+                Ok(Ok(events)) => return Ok(live_downlink(events, futures::future::ready(failure).boxed())),
+                Ok(Err(_)) | Err(_) => return Err(failure.status),
             }
 
         },
@@ -437,10 +450,10 @@ mod tests {
             } else {
                 futures::stream::iter([Ok(event.clone())]).boxed()
             };
-            let fault = futures::future::ready(UplinkFailure {
-                status: tonic::Status::data_loss("bad protobuf frame"),
-                had_input: false,
-            })
+            let fault = futures::future::ready(UplinkFailure::new(
+                tonic::Status::data_loss("bad protobuf frame"),
+                false,
+            ))
             .boxed();
             let mut output = live_downlink(events, fault);
             let mut received = 0;
@@ -463,10 +476,10 @@ mod tests {
     async fn opening_fault_does_not_wait_for_unrelated_executor_work() {
         let error = open_live_downlink(
             futures::future::pending(),
-            futures::future::ready(UplinkFailure {
-                status: tonic::Status::data_loss("broken input"),
-                had_input: false,
-            })
+            futures::future::ready(UplinkFailure::new(
+                tonic::Status::data_loss("broken input"),
+                false,
+            ))
             .boxed(),
         )
         .await
@@ -498,10 +511,10 @@ mod tests {
         });
         let mut events = open_live_downlink(
             opening,
-            futures::future::ready(UplinkFailure {
-                status: tonic::Status::data_loss("broken input"),
-                had_input: true,
-            })
+            futures::future::ready(UplinkFailure::new(
+                tonic::Status::data_loss("broken input"),
+                true,
+            ))
             .boxed(),
         )
         .await
@@ -551,6 +564,41 @@ mod tests {
             events.next().await.unwrap().unwrap_err().code(),
             tonic::Code::DataLoss
         );
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_input_bounds_pending_opening_and_first_output() {
+        fn expired_failure() -> UplinkFailure {
+            let mut failure = UplinkFailure::new(tonic::Status::data_loss("bad later frame"), true);
+            failure.deadline = tokio::time::Instant::now();
+            failure
+        }
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            open_live_downlink(
+                futures::future::pending(),
+                futures::future::ready(expired_failure()).boxed(),
+            ),
+        )
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+        assert_eq!(error.message(), "bad later frame");
+
+        let mut events = live_downlink(
+            futures::stream::pending().boxed(),
+            futures::future::ready(expired_failure()).boxed(),
+        );
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+        assert_eq!(error.message(), "bad later frame");
         assert!(events.next().await.is_none());
     }
 
