@@ -17,6 +17,7 @@ pub fn a2a_error_to_rpc_error(err: &A2AError) -> slim_rpc::RpcError {
         | error_code::EXTENDED_CARD_NOT_CONFIGURED => {
             slim_rpc::RpcError::failed_precondition(err.message.clone())
         }
+        error_code::TASK_GENERATION_MISMATCH => slim_rpc::RpcError::aborted(err.message.clone()),
         error_code::CONTENT_TYPE_NOT_SUPPORTED
         | error_code::PARSE_ERROR
         | error_code::INVALID_REQUEST
@@ -29,12 +30,15 @@ pub fn a2a_error_to_rpc_error(err: &A2AError) -> slim_rpc::RpcError {
 }
 
 /// Convert a SLIMRPC status to an A2A error.
+/// Uses the canonical binding map, as SLIMRPC has no A2A `ErrorInfo`
+/// reason: `Aborted` is the binding code for a task generation mismatch.
 pub fn rpc_error_to_a2a_error(error: &slim_rpc::RpcError) -> A2AError {
     use a2a::error_code;
     use slim_rpc::RpcCode;
 
     let code = match error.code() {
         RpcCode::NotFound => error_code::TASK_NOT_FOUND,
+        RpcCode::Aborted => error_code::TASK_GENERATION_MISMATCH,
         RpcCode::FailedPrecondition => error_code::TASK_NOT_CANCELABLE,
         RpcCode::Unimplemented => error_code::UNSUPPORTED_OPERATION,
         RpcCode::InvalidArgument => error_code::INVALID_PARAMS,
@@ -86,6 +90,7 @@ mod tests {
     fn test_rpc_error_to_a2a_error_mapping() {
         let cases = [
             (RpcCode::NotFound, error_code::TASK_NOT_FOUND),
+            (RpcCode::Aborted, error_code::TASK_GENERATION_MISMATCH),
             (RpcCode::FailedPrecondition, error_code::TASK_NOT_CANCELABLE),
             (RpcCode::Unimplemented, error_code::UNSUPPORTED_OPERATION),
             (RpcCode::InvalidArgument, error_code::INVALID_PARAMS),
@@ -113,6 +118,7 @@ mod tests {
                 error_code::EXTENDED_CARD_NOT_CONFIGURED,
                 RpcCode::FailedPrecondition,
             ),
+            (error_code::TASK_GENERATION_MISMATCH, RpcCode::Aborted),
             (error_code::PARSE_ERROR, RpcCode::InvalidArgument),
             (error_code::INVALID_REQUEST, RpcCode::InvalidArgument),
             (123_456, RpcCode::Unknown),

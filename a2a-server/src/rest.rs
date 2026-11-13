@@ -282,6 +282,13 @@ async fn handle_stream_message<H: RequestHandler>(
 pub struct GetTaskQuery {
     #[serde(default, rename = "historyLength")]
     pub history_length: Option<i32>,
+    #[serde(default, rename = "timelineLength")]
+    pub timeline_length: Option<i32>,
+    #[serde(default, rename = "currentGeneration")]
+    pub current_generation: Option<i64>,
+    /// Only meaningful on `:subscribe`.
+    #[serde(default, rename = "lastSeenGeneration")]
+    pub last_seen_generation: Option<i64>,
 }
 
 async fn handle_get_task_inner<H: RequestHandler>(
@@ -291,8 +298,8 @@ async fn handle_get_task_inner<H: RequestHandler>(
     query: GetTaskQuery,
 ) -> axum::response::Response {
     let req = GetTaskRequest {
-        current_generation: None,
-        timeline_length: None,
+        current_generation: query.current_generation,
+        timeline_length: query.timeline_length,
         id,
         history_length: query.history_length,
         tenant,
@@ -315,8 +322,14 @@ async fn handle_get_task_or_subscribe<H: RequestHandler>(
     };
     let params = extract_service_params(&headers);
     if let Some(task_id) = path.id.strip_suffix(":subscribe") {
-        let id = task_id.to_string();
-        return handle_subscribe_to_task_inner(state, params, id, path.tenant).await;
+        return handle_subscribe_to_task_inner(
+            state,
+            params,
+            task_id.to_string(),
+            path.tenant,
+            query.last_seen_generation,
+        )
+        .await;
     }
 
     handle_get_task_inner(state, params, path, query).await
@@ -334,6 +347,8 @@ pub struct ListTasksQuery {
     pub page_token: Option<String>,
     #[serde(default, rename = "historyLength")]
     pub history_length: Option<i32>,
+    #[serde(default, rename = "timelineLength")]
+    pub timeline_length: Option<i32>,
 
     #[serde(default, rename = "statusTimestampAfter")]
     pub status_timestamp_after: Option<DateTime<Utc>>,
@@ -367,7 +382,7 @@ async fn handle_list_tasks<H: RequestHandler>(
         None => None,
     };
     let req = ListTasksRequest {
-        timeline_length: None,
+        timeline_length: query.timeline_length,
         context_id: query.context_id,
         status,
         page_size: query.page_size,
@@ -423,6 +438,7 @@ async fn handle_cancel_task_inner<H: RequestHandler>(
 async fn handle_post_task_action<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(TaskPath { tenant, id }): Path<TaskPath>,
+    Query(query): Query<GetTaskQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -431,10 +447,28 @@ async fn handle_post_task_action<H: RequestHandler>(
         return handle_cancel_task_inner(state, params, task_id.to_string(), tenant, body).await;
     }
     if let Some(task_id) = id.strip_suffix(":subscribe") {
-        return handle_subscribe_to_task_inner(state, params, task_id.to_string(), tenant).await;
+        return handle_subscribe_to_task_inner(
+            state,
+            params,
+            task_id.to_string(),
+            tenant,
+            query.last_seen_generation,
+        )
+        .await;
     }
 
-    rest_error_response(A2AError::invalid_request("unsupported task action"))
+    (
+        StatusCode::NOT_FOUND,
+        Json(RestErrorEnvelope {
+            error: RestErrorStatus {
+                code: 404,
+                status: "NOT_FOUND",
+                message: "unknown task action".into(),
+                details: Vec::new(),
+            },
+        }),
+    )
+        .into_response()
 }
 
 async fn handle_cancel_task_legacy<H: RequestHandler>(
@@ -452,9 +486,10 @@ async fn handle_subscribe_to_task_inner<H: RequestHandler>(
     params: ServiceParams,
     id: String,
     tenant: Option<String>,
+    last_seen_generation: Option<i64>,
 ) -> axum::response::Response {
     let req = SubscribeToTaskRequest {
-        last_seen_generation: None,
+        last_seen_generation,
         id,
         tenant,
     };
@@ -467,10 +502,11 @@ async fn handle_subscribe_to_task_inner<H: RequestHandler>(
 async fn handle_subscribe_to_task_legacy<H: RequestHandler>(
     State(state): State<RestState<H>>,
     Path(id): Path<String>,
+    Query(query): Query<GetTaskQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
-    handle_subscribe_to_task_inner(state, params, id, None).await
+    handle_subscribe_to_task_inner(state, params, id, None, query.last_seen_generation).await
 }
 
 #[derive(Deserialize)]
@@ -726,6 +762,7 @@ fn rest_error_envelope(err: A2AError) -> (StatusCode, RestErrorEnvelope) {
 fn rest_grpc_status(code: i32) -> &'static str {
     match code {
         error_code::TASK_NOT_FOUND => "NOT_FOUND",
+        error_code::TASK_GENERATION_MISMATCH => "ABORTED",
         error_code::METHOD_NOT_FOUND => "UNIMPLEMENTED",
         error_code::TASK_NOT_CANCELABLE
         | error_code::EXTENDED_CARD_NOT_CONFIGURED
@@ -815,11 +852,14 @@ mod tests {
         rest_router(handler)
     }
 
-    fn make_push_app() -> axum::Router {
+    async fn make_push_app() -> axum::Router {
         install_crypto_provider();
         let handler = Arc::new(
-            DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
-                .with_push_config_store(InMemoryPushConfigStore::new()),
+            DefaultRequestHandler::new(
+                EchoExecutor,
+                crate::test_util::seeded_task_store("t1").await,
+            )
+            .with_push_config_store(InMemoryPushConfigStore::new()),
         );
         rest_router(handler)
     }
@@ -975,7 +1015,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_push_config_accepts_raw_config_body() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let body = serde_json::json!({
             "id": "cfg1",
             "url": "http://example.com/callback"
@@ -998,7 +1038,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_push_config_accepts_flat_request_body() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let body = serde_json::json!({
             "taskId": "t1",
             "id": "cfg1",
@@ -1022,7 +1062,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_push_config_rejects_mismatched_task_id_in_body() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let body = serde_json::json!({
             "taskId": "other-task",
             "url": "http://example.com/callback"
@@ -1049,6 +1089,25 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unknown_task_actions_are_http_not_found() {
+        let response = make_app()
+            .oneshot(
+                Request::builder()
+                    .header("A2A-Version", "1.1")
+                    .uri("/tasks/task:unknownAction")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["error"]["code"], 404);
     }
 
     #[tokio::test]
@@ -1326,7 +1385,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_push_configs() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let req = Request::builder()
             .header("a2a-version", "1.0")
             .uri("/tasks/t1/pushNotificationConfigs")
@@ -1356,7 +1415,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_push_config_with_store_returns_ok() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let create_body = serde_json::json!({
             "id": "cfg1",
             "url": "http://example.com/callback"
@@ -1410,7 +1469,7 @@ mod tests {
         let app = make_app();
         let req = Request::builder()
             .header("a2a-version", "1.0")
-            .uri("/tasks?contextId=c1&pageSize=5&pageToken=0&historyLength=3&includeArtifacts=true&statusTimestampAfter=2025-01-01T00:00:00Z")
+            .uri("/tasks?contextId=c1&pageSize=5&pageToken=&historyLength=3&includeArtifacts=true&statusTimestampAfter=2025-01-01T00:00:00Z")
             .method("GET")
             .body(Body::empty())
             .unwrap();
@@ -1801,6 +1860,52 @@ mod tests {
         assert!(resp.status() == StatusCode::OK || resp.status() == StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn test_get_task_honours_the_1_1_query_parameters() {
+        let app = make_app();
+        let body = serde_json::json!({
+            "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hello"}]}
+        });
+        let req = Request::builder()
+            .uri(REST_SEND_MESSAGE_PATH)
+            .header("a2a-version", "1.1")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sent: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let task_id = sent["task"]["id"].as_str().unwrap();
+        assert!(sent["task"]["timeline"].as_array().unwrap().len() > 1);
+
+        let get = |query: &str| {
+            Request::builder()
+                .uri(format!("/tasks/{task_id}{query}"))
+                .header("a2a-version", "1.1")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let resp = app.clone().oneshot(get("?timelineLength=1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let trimmed: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(trimmed["timeline"].as_array().unwrap().len(), 1);
+        // int64 travels as a string in ProtoJSON.
+        assert!(trimmed["generation"].is_string(), "{trimmed}");
+
+        // The task is already past generation 0, so the long-poll answers at once.
+        let resp = app
+            .clone()
+            .oneshot(get("?currentGeneration=0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// The REST binding is bounded by the same limit as JSON-RPC: an
     /// oversized body is rejected at the framework boundary, before any
     /// handler runs.
@@ -1852,8 +1957,10 @@ mod tests {
     #[tokio::test]
     async fn test_unsupported_a2a_version_is_rejected() {
         // §3.6.2, §6.4: same rejection as JSON-RPC, in REST's error shape.
-        let resp = send_message_with_version(REST_SEND_MESSAGE_PATH, Some("99.0")).await;
-        assert_version_not_supported(resp).await;
+        for version in ["99.0", "1"] {
+            let resp = send_message_with_version(REST_SEND_MESSAGE_PATH, Some(version)).await;
+            assert_version_not_supported(resp).await;
+        }
     }
 
     #[tokio::test]
@@ -2293,5 +2400,27 @@ mod tests {
             violation["description"],
             "tenant in the body (body) does not match the tenant in the path (acme)"
         );
+    }
+
+    #[tokio::test]
+    async fn get_and_post_subscription_bindings_report_the_same_missing_task() {
+        for method in ["GET", "POST"] {
+            let handler = DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+                .with_capabilities(AgentCapabilities {
+                    streaming: Some(true),
+                    ..Default::default()
+                });
+            let app = rest_router(Arc::new(handler));
+            let request = Request::builder()
+                .method(method)
+                .uri("/tasks/absent:subscribe")
+                .header("A2A-Version", "1.1")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.oneshot(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND
+            );
+        }
     }
 }

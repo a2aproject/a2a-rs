@@ -21,6 +21,7 @@ pub fn a2a_error_to_status(err: &A2AError) -> tonic::Status {
         error_code::EXTENDED_CARD_NOT_CONFIGURED => tonic::Code::FailedPrecondition,
         error_code::EXTENSION_SUPPORT_REQUIRED => tonic::Code::FailedPrecondition,
         error_code::VERSION_NOT_SUPPORTED => tonic::Code::FailedPrecondition,
+        error_code::TASK_GENERATION_MISMATCH => tonic::Code::Aborted,
         error_code::PARSE_ERROR => tonic::Code::InvalidArgument,
         error_code::INVALID_REQUEST => tonic::Code::InvalidArgument,
         error_code::METHOD_NOT_FOUND => tonic::Code::Unimplemented,
@@ -400,12 +401,62 @@ mod tests {
                 error_code::VERSION_NOT_SUPPORTED,
                 tonic::Code::FailedPrecondition,
             ),
+            (error_code::TASK_GENERATION_MISMATCH, tonic::Code::Aborted),
         ];
 
         for (code, expected_grpc) in cases {
             let err = A2AError::new(code, "test");
             let status = a2a_error_to_status(&err);
             assert_eq!(status.code(), expected_grpc);
+        }
+    }
+
+    #[test]
+    fn test_aborted_status_maps_back_to_generation_mismatch() {
+        let err = A2AError::task_generation_mismatch("t1", 1, 2);
+        let status = a2a_error_to_status(&err);
+
+        assert_eq!(status.code(), tonic::Code::Aborted);
+        assert_eq!(
+            status_to_a2a_error(&status).code,
+            error_code::TASK_GENERATION_MISMATCH
+        );
+        let bare = tonic::Status::new(tonic::Code::Aborted, "conflict");
+        assert_eq!(status_to_a2a_error(&bare).code, error_code::INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn aborted_status_uses_only_recognized_protocol_error_details() {
+        for (reason, domain, expected) in [
+            (
+                "TASK_NOT_CANCELABLE",
+                errordetails::PROTOCOL_DOMAIN,
+                error_code::TASK_NOT_CANCELABLE,
+            ),
+            (
+                "TASK_NOT_FOUND",
+                "other.example",
+                error_code::INTERNAL_ERROR,
+            ),
+            (
+                "UNKNOWN_REASON",
+                errordetails::PROTOCOL_DOMAIN,
+                error_code::INTERNAL_ERROR,
+            ),
+        ] {
+            let details = ErrorDetails::with_error_info(reason, domain, HashMap::new());
+            let status =
+                tonic::Status::with_error_details(tonic::Code::Aborted, "conflict", details);
+            let error = status_to_a2a_error(&status);
+            assert_eq!(error.code, expected, "{reason} in {domain}");
+            assert_eq!(
+                error.message,
+                if expected == error_code::INTERNAL_ERROR {
+                    "gRPC Aborted: conflict"
+                } else {
+                    "conflict"
+                }
+            );
         }
     }
 
