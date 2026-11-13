@@ -377,13 +377,18 @@ async fn spawn_push_http_server() -> (String, tokio::task::JoinHandle<()>) {
         store.create(task).await.unwrap();
     }
     let handler = Arc::new(
-        DefaultRequestHandler::new(PushTransportExecutor, store).with_push_notifications(
-            InMemoryPushConfigStore::new(),
-            HttpPushSender::new(Some(HttpPushSenderConfig {
-                validate_urls: false,
+        DefaultRequestHandler::new(PushTransportExecutor, store)
+            .with_capabilities(a2a::AgentCapabilities {
+                streaming: Some(true),
                 ..Default::default()
-            })),
-        ),
+            })
+            .with_push_notifications(
+                InMemoryPushConfigStore::new(),
+                HttpPushSender::new(Some(HttpPushSenderConfig {
+                    validate_urls: false,
+                    ..Default::default()
+                })),
+            ),
     );
     let app = Router::new()
         .nest("/rest", rest_router(handler.clone()))
@@ -448,8 +453,7 @@ async fn recv_push(receiver: &mut mpsc::UnboundedReceiver<CapturedPush>) -> Capt
         .unwrap()
 }
 
-/// A2A-Version header a real client sends (§3.6.1); every binding rejects
-/// a request without one (§3.6.2).
+/// The A2A-Version header a real 1.1 client sends.
 fn versioned_params() -> ServiceParams {
     let mut params = ServiceParams::new();
     params.insert(SVC_PARAM_VERSION.to_string(), vec![VERSION.to_string()]);
@@ -899,6 +903,27 @@ async fn rest_transport_push_delivery_end_to_end() {
         .unwrap();
     assert!(matches!(response, SendMessageResponse::Task(_)));
 
+    // Client-originated input uses the same Task event source as executor
+    // output, and a 1.1 webhook receives its MessageUpdate first.
+    let input = recv_push(&mut receiver).await;
+    assert_eq!(
+        input.authorization.as_deref(),
+        Some("Basic dGVzdDpzZWNyZXQ=")
+    );
+    assert_eq!(input.notification_token.as_deref(), Some("rest-token"));
+    let input_generation = match input.event {
+        StreamResponse::MessageUpdate(update) => {
+            assert_eq!(update.task_id, "task-rest-push");
+            assert_eq!(
+                update.message.message_id,
+                request.message.as_ref().unwrap().message_id
+            );
+            assert_eq!(update.message.role, Role::User);
+            update.generation
+        }
+        other => panic!("expected client message update push, got {other:?}"),
+    };
+
     let first = recv_push(&mut receiver).await;
     assert_eq!(
         first.authorization.as_deref(),
@@ -909,6 +934,7 @@ async fn rest_transport_push_delivery_end_to_end() {
         StreamResponse::StatusUpdate(update) => {
             assert_eq!(update.task_id, "task-rest-push");
             assert_eq!(update.status.state, TaskState::Working);
+            assert_eq!(update.generation, input_generation + 1);
         }
         _ => panic!("expected status update push"),
     }
@@ -979,6 +1005,24 @@ async fn jsonrpc_transport_push_delivery_end_to_end() {
         .unwrap();
     assert_eq!(saved.url, webhook_url);
 
+    // Client-originated input uses the same Task event source as executor
+    // output, and a 1.1 webhook receives its MessageUpdate first.
+    let input = recv_push(&mut receiver).await;
+    assert_eq!(input.authorization.as_deref(), Some("Bearer rpc-secret"));
+    assert_eq!(input.notification_token.as_deref(), Some("rpc-token"));
+    let input_generation = match input.event {
+        StreamResponse::MessageUpdate(update) => {
+            assert_eq!(update.task_id, "task-rpc-push");
+            assert_eq!(
+                update.message.message_id,
+                request.message.as_ref().unwrap().message_id
+            );
+            assert_eq!(update.message.role, Role::User);
+            update.generation
+        }
+        other => panic!("expected client message update push, got {other:?}"),
+    };
+
     let first = recv_push(&mut receiver).await;
     assert_eq!(first.authorization.as_deref(), Some("Bearer rpc-secret"));
     assert_eq!(first.notification_token.as_deref(), Some("rpc-token"));
@@ -986,6 +1030,7 @@ async fn jsonrpc_transport_push_delivery_end_to_end() {
         StreamResponse::StatusUpdate(update) => {
             assert_eq!(update.task_id, "task-rpc-push");
             assert_eq!(update.status.state, TaskState::Working);
+            assert_eq!(update.generation, input_generation + 1);
         }
         _ => panic!("expected status update push"),
     }

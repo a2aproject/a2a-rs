@@ -335,10 +335,14 @@ async fn spawn_grpc_server() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 async fn spawn_default_handler_grpc_server() -> (String, tokio::task::JoinHandle<()>) {
-    let handler = Arc::new(DefaultRequestHandler::new(
-        StoredTaskExecutor,
-        InMemoryTaskStore::new(),
-    ));
+    let handler = Arc::new(
+        DefaultRequestHandler::new(StoredTaskExecutor, InMemoryTaskStore::new()).with_capabilities(
+            a2a::AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            },
+        ),
+    );
     let service = A2aServiceServer::new(GrpcHandler::new(handler));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -720,7 +724,7 @@ async fn grpc_transport_decodes_error_details_from_a_real_server() {
 }
 
 #[tokio::test]
-async fn live_rpc_preserves_an_unimplemented_method_error() {
+async fn live_rpc_preserves_an_unsupported_operation_error() {
     let (endpoint, server) = spawn_grpc_server().await;
     let transport = GrpcTransport::connect(endpoint).await.unwrap();
     let first = StreamRequest {

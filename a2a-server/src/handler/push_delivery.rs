@@ -1,34 +1,368 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+//! Subscribe to the task broadcast without awaiting webhook network I/O.
 
+use super::DefaultRequestHandler;
+use super::events::{EventKind, ExecutionEvent};
+use super::push_worker::deliver_notifications;
+use super::task_events::TaskEvents;
 use a2a::*;
+use std::{
+    sync::{Arc, MutexGuard},
+    time::Duration,
+};
+use tokio::sync::{Semaphore, broadcast, mpsc};
 
-pub(super) async fn send_push_notifications(
-    task_id: &str,
-    push_config_store: Option<&dyn crate::PushConfigStore>,
-    push_sender: Option<&crate::HttpPushSender>,
-    event: &StreamResponse,
-) -> Result<(), A2AError> {
-    let Some(push_config_store) = push_config_store else {
-        return Ok(());
-    };
-    let Some(push_sender) = push_sender else {
-        return Ok(());
-    };
+pub(super) const PUSH_QUEUE_CAPACITY: usize = 1024;
+const PUSH_WORKER_IDLE: Duration = Duration::from_secs(60);
+const MAX_PUSH_DELIVERIES: usize = 16;
 
-    let configs = push_config_store.list(task_id).await?;
-    for config in configs {
-        push_sender.send_push(&config, event.clone()).await?;
+#[derive(Clone)]
+pub(super) struct NotificationSettings {
+    pub(super) task_id: TaskId,
+    pub(super) store: Arc<dyn crate::PushConfigStore>,
+    pub(super) sender: Arc<crate::HttpPushSender>,
+    pub(super) permits: Arc<Semaphore>,
+}
+
+#[derive(Default)]
+pub(super) struct SubscriptionState {
+    running: bool,
+    previous: Option<tokio_util::sync::CancellationToken>,
+}
+
+pub(super) struct PushSubscriptions {
+    permits: Arc<Semaphore>,
+}
+
+impl Default for PushSubscriptions {
+    fn default() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(MAX_PUSH_DELIVERIES)),
+        }
     }
+}
 
-    Ok(())
+impl PushSubscriptions {
+    pub(super) fn attach(
+        &self,
+        handler: &DefaultRequestHandler,
+        task_id: &str,
+        events: &TaskEvents,
+    ) {
+        if let (Some(store), Some(sender)) = (&handler.push_config_store, &handler.push_sender) {
+            let _ = events.notifications.set(NotificationSettings {
+                task_id: task_id.into(),
+                store: store.clone(),
+                sender: sender.clone(),
+                permits: self.permits.clone(),
+            });
+        }
+    }
+}
+
+/// Called immediately before broadcast send. Holding the returned guard closes
+/// the retirement race: the receiver is registered until this send completes.
+pub(super) fn subscribe(events: &Arc<TaskEvents>) -> MutexGuard<'_, SubscriptionState> {
+    let mut state = events
+        .webhook_subscribed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if events.notifications.get().is_some() && !state.running {
+        let receiver = events.sender.subscribe();
+        let (tx, rx) = mpsc::channel(PUSH_QUEUE_CAPACITY);
+        let previous = state.previous.take();
+        let done = tokio_util::sync::CancellationToken::new();
+        state.previous = Some(done.clone());
+        state.running = true;
+        let source = events.clone();
+        let settings = events.notifications.get().unwrap().clone();
+        tokio::spawn(async move {
+            deliver_notifications(settings, rx, previous, done).await;
+            // Keep the Task source (and its predecessor barrier) alive until
+            // every accepted HTTP delivery has drained, even after intake retires.
+            drop(source);
+        });
+        tokio::spawn(receive_events(events.clone(), receiver, tx));
+    }
+    state
+}
+
+async fn receive_events(
+    events: Arc<TaskEvents>,
+    mut receiver: broadcast::Receiver<ExecutionEvent>,
+    tx: mpsc::Sender<ExecutionEvent>,
+) {
+    loop {
+        let result = match tokio::time::timeout(PUSH_WORKER_IDLE, receiver.recv()).await {
+            Ok(result) => result,
+            Err(_) => {
+                let mut state = events
+                    .webhook_subscribed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match receiver.try_recv() {
+                    Ok(event) => Ok(event),
+                    Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                        Err(broadcast::error::RecvError::Lagged(skipped))
+                    }
+                    Err(_) => {
+                        state.running = false;
+                        return;
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(event)
+                if event.kind == EventKind::Normal
+                    && event
+                        .result
+                        .as_ref()
+                        .is_ok_and(|event| super::protocol::task_id_for_event(event).is_some()) =>
+            {
+                match tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(event)) => {
+                        tracing::warn!(task_id = %events.notifications.get().unwrap().task_id, "webhook queue full; dropping a notification");
+                        super::push_worker::signal_failure(
+                            events.notifications.get().unwrap(),
+                            &event,
+                            A2AError::internal("webhook queue full"),
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        events
+                            .webhook_subscribed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .running = false;
+                        return;
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(task_id = %events.notifications.get().unwrap().task_id, skipped, "webhook subscriber lagged; notifications were lost");
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::handler::test_support::*;
+
+    #[tokio::test]
+    async fn direct_replies_and_errors_do_not_start_webhook_workers() {
+        let handler = make_push_delivery_handler();
+        let source = handler.execution_manager.events_for("uncreated");
+        handler
+            .execution_manager
+            .pushes
+            .attach(&handler, "uncreated", &source);
+        source
+            .publish(
+                Ok(&StreamResponse::Message(make_message())),
+                None,
+                EventKind::Reply,
+                None,
+            )
+            .await;
+        source
+            .publish(
+                Err(&A2AError::internal("no task created")),
+                None,
+                EventKind::Normal,
+                None,
+            )
+            .await;
+        assert!(!source.webhook_subscribed.lock().unwrap().running);
+        assert_eq!(source.sender.receiver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_intake_filters_private_repeated_and_non_task_events() {
+        let handler = make_push_delivery_handler();
+        let source = handler.execution_manager.events_for("task");
+        handler
+            .execution_manager
+            .pushes
+            .attach(&handler, "task", &source);
+        let receiver = source.sender.subscribe();
+        let (tx, mut rx) = mpsc::channel(8);
+        let intake = tokio::spawn(receive_events(source.clone(), receiver, tx));
+        let task = task_with_history("task", "context", 0);
+        let mut events = vec![
+            (EventKind::Repeated, Ok(StreamResponse::Task(task.clone()))),
+            (
+                EventKind::LiveOnly(None),
+                Ok(StreamResponse::Task(task.clone())),
+            ),
+            (
+                EventKind::Reply,
+                Ok(StreamResponse::Message(make_message())),
+            ),
+            (
+                EventKind::Normal,
+                Err(A2AError::internal("execution failed")),
+            ),
+            (
+                EventKind::Normal,
+                Ok(StreamResponse::Error(StreamError {
+                    task_id: "task".into(),
+                    code: "UNAVAILABLE".into(),
+                    message: "private rejection".into(),
+                    reference_id: None,
+                    metadata: None,
+                })),
+            ),
+        ];
+        events.push((EventKind::Normal, Ok(StreamResponse::Task(task))));
+        for (index, (kind, result)) in events.into_iter().enumerate() {
+            source
+                .sender
+                .send(ExecutionEvent {
+                    sequence: index as u64 + 1,
+                    result,
+                    kind,
+                    failure: None,
+                })
+                .unwrap_or_else(|_| panic!("intake must remain subscribed"));
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .sequence,
+            6
+        );
+        assert!(rx.try_recv().is_err());
+        intake.abort();
+    }
+
+    #[tokio::test]
+    async fn full_intake_queue_signals_failure_without_blocking_publication() {
+        let handler = make_push_delivery_handler();
+        let source = handler.execution_manager.events_for("task");
+        handler
+            .execution_manager
+            .pushes
+            .attach(&handler, "task", &source);
+        // Explicit failure policy for queue overflow, independent of HTTP.
+        let mut settings = source.notifications.get().unwrap().clone();
+        settings.sender = Arc::new(crate::HttpPushSender::new(Some(
+            crate::HttpPushSenderConfig {
+                fail_on_error: true,
+                validate_urls: false,
+                timeout: Duration::from_secs(1),
+            },
+        )));
+        let source = TaskEvents::new(Arc::new(tokio::sync::Mutex::new(())), None);
+        assert!(source.notifications.set(settings).is_ok());
+        let receiver = source.sender.subscribe();
+        let (tx, mut rx) = mpsc::channel(1);
+        let intake = tokio::spawn(receive_events(source.clone(), receiver, tx));
+        let (failure, mut observed) = tokio::sync::watch::channel(None);
+        for sequence in [1, 2] {
+            source
+                .sender
+                .send(ExecutionEvent {
+                    sequence,
+                    result: Ok(StreamResponse::Task(task_with_history(
+                        "task", "context", 0,
+                    ))),
+                    kind: EventKind::Normal,
+                    failure: Some(failure.clone()),
+                })
+                .unwrap_or_else(|_| panic!("intake must remain subscribed"));
+        }
+        timeout(Duration::from_secs(1), observed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            observed
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("queue full")
+        );
+        assert_eq!(rx.recv().await.unwrap().sequence, 1);
+        intake.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_failure_wakes_an_executor_waiting_for_more_input() {
+        install_crypto_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let app = Router::new().route("/", post(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let handler = DefaultRequestHandler::new(
+            ResumableExecutor {
+                release: Arc::new(Notify::new()),
+            },
+            InMemoryTaskStore::new(),
+        )
+        .with_capabilities(AgentCapabilities {
+            streaming: Some(true),
+            ..Default::default()
+        })
+        .with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                timeout: Duration::from_secs(1),
+                fail_on_error: true,
+                validate_urls: false,
+            })),
+        );
+        seed_task(&handler, "push-failure", "context").await;
+        handler
+            .create_push_config(
+                &ServiceParams::new(),
+                TaskPushNotificationConfig {
+                    protocol_version: Some("1.1".into()),
+                    task_id: "push-failure".into(),
+                    url,
+                    id: None,
+                    token: None,
+                    authentication: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut events = handler
+            .send_streaming_message(&ServiceParams::new(), send_req(Some("push-failure"), None))
+            .await
+            .unwrap();
+        let error = timeout(Duration::from_secs(3), async {
+            loop {
+                match events.next().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => break error,
+                    None => panic!("the webhook failure must be reported"),
+                }
+            }
+        })
+        .await
+        .expect("webhook failure must wake the driver without another executor event");
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert!(
+            handler
+                .execution_manager
+                .get("push-failure")
+                .await
+                .is_none()
+        );
+        server.abort();
+    }
 
     #[tokio::test]
     async fn test_push_config_not_supported_without_store() {
@@ -510,5 +844,99 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, error_code::PUSH_NOTIFICATION_NOT_SUPPORTED);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_webhook_subscribers_retire_and_restart_without_changing_task_source() {
+        let handler = make_push_delivery_handler();
+        let source = handler.execution_manager.events_for("task");
+        handler
+            .execution_manager
+            .pushes
+            .attach(&handler, "task", &source);
+        let event = StreamResponse::Task(task_with_history("task", "context", 0));
+        source
+            .publish(Ok(&event), None, EventKind::Normal, None)
+            .await;
+        while !source.sender.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(PUSH_WORKER_IDLE + Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!source.webhook_subscribed.lock().unwrap().running);
+        source
+            .publish(Ok(&event), None, EventKind::Normal, None)
+            .await;
+        assert!(source.webhook_subscribed.lock().unwrap().running);
+        assert!(Arc::ptr_eq(
+            &source,
+            &handler.execution_manager.events_for("task")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_lagging_webhook_subscriber_continues_and_a_closed_dispatcher_retires_it() {
+        for closed in [false, true] {
+            let handler = make_push_delivery_handler();
+            let source = handler.execution_manager.events_for("task");
+            handler
+                .execution_manager
+                .pushes
+                .attach(&handler, "task", &source);
+            source.webhook_subscribed.lock().unwrap().running = true;
+            let receiver = source.sender.subscribe();
+            for sequence in 0..super::super::EXECUTION_BUFFER_CAPACITY as u64 + 2 {
+                assert!(
+                    source
+                        .sender
+                        .send(ExecutionEvent {
+                            sequence,
+                            kind: EventKind::Repeated,
+                            result: Ok(StreamResponse::Task(task_with_history(
+                                "task", "context", 0
+                            ))),
+                            failure: None
+                        })
+                        .is_ok()
+                );
+            }
+            assert!(
+                source
+                    .sender
+                    .send(ExecutionEvent {
+                        sequence: 999,
+                        kind: EventKind::Normal,
+                        result: Ok(StreamResponse::Task(task_with_history(
+                            "task", "context", 0
+                        ))),
+                        failure: None
+                    })
+                    .is_ok()
+            );
+            let (tx, mut rx) = mpsc::channel(2);
+            if closed {
+                rx.close();
+            }
+            let intake = tokio::spawn(receive_events(source.clone(), receiver, tx));
+            if closed {
+                timeout(Duration::from_secs(1), intake)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!source.webhook_subscribed.lock().unwrap().running);
+            } else {
+                assert_eq!(
+                    timeout(Duration::from_secs(1), rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .sequence,
+                    999
+                );
+                intake.abort();
+            }
+        }
     }
 }
