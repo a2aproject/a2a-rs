@@ -8,6 +8,7 @@ use a2a::event::{StreamResponse, TaskStatusUpdateEvent};
 use a2a::*;
 use a2a_client::Transport;
 use a2a_client::transport::{ServiceParams, TransportFactory};
+use a2a_pb::proto;
 use a2a_server::RequestHandler;
 use a2a_slimrpc::{
     SLIM_PEER_ISSUER_METADATA_KEY, SLIM_PEER_SUBJECT_METADATA_KEY, SLIM_SRC_METADATA_KEY, SlimApp,
@@ -21,13 +22,17 @@ use slim_auth::auth_provider::{AuthProvider, AuthVerifier};
 use slim_auth::shared_secret::SharedSecret;
 use slim_config::component::id::{ID, Kind};
 use slim_datapath::api::ProtoName as Name;
-use slim_rpc::{Channel, RpcError, Server};
+use slim_rpc::{Channel, RpcCode, RpcError, Server};
 use slim_service::service::Service;
 
 const A2A_SERVICE_NAME: &str = "lf.a2a.v1.A2AService";
 const GET_TASK_METHOD: &str = "GetTask";
 const SEND_MESSAGE_METHOD: &str = "SendMessage";
 const SEND_STREAMING_MESSAGE_METHOD: &str = "SendStreamingMessage";
+const COLLABORATE_SERVICE_NAME: &str =
+    "experimental.slimrpc.collaborative_channel.v1.CollaborativeChannelService";
+const COLLABORATE_METHOD: &str = "Collaborate";
+const NO_PART_CONTENT: &str = "must have one of: text, raw, url, data";
 const SHARED_SECRET: &str = "test-secret-with-sufficient-length-for-hmac-key";
 
 fn sample_message(role: Role, text: &str, task_id: &str) -> Message {
@@ -40,6 +45,25 @@ fn sample_message(role: Role, text: &str, task_id: &str) -> Message {
         metadata: None,
         extensions: None,
         reference_task_ids: None,
+    }
+}
+
+/// A message whose only part carries no content, which the native types
+/// cannot represent.
+fn empty_part_message() -> proto::Message {
+    proto::Message {
+        message_id: "msg-empty".to_string(),
+        role: proto::Role::Agent as i32,
+        parts: vec![proto::Part::default()],
+        ..Default::default()
+    }
+}
+
+fn empty_part_task() -> proto::Task {
+    proto::Task {
+        id: "task-1".to_string(),
+        history: vec![empty_part_message()],
+        ..Default::default()
     }
 }
 
@@ -552,6 +576,15 @@ async fn slimrpc_transport_end_to_end() {
         .await
         .unwrap();
 
+    let card = transport
+        .get_extended_agent_card(
+            &ServiceParams::new(),
+            &GetExtendedAgentCardRequest { tenant: None },
+        )
+        .await
+        .unwrap();
+    assert_eq!(card.name, "SLIMRPC Test Agent");
+
     transport.destroy().await.unwrap();
     env.shutdown().await;
 }
@@ -782,6 +815,200 @@ async fn slimrpc_transport_reports_malformed_payloads() {
     env.shutdown().await;
 }
 
+/// `Part.content` is a required oneof and `message` a REQUIRED field in
+/// a2a.proto: a request without either is INVALID_ARGUMENT naming the field,
+/// on SendMessage and SendStreamingMessage alike.
+#[tokio::test]
+async fn slimrpc_server_rejects_a_missing_message_and_a_part_without_content() {
+    let env = TestEnv::new("server-invalid-request").await;
+    let handler = Arc::new(TestHandler {
+        target: env.target(),
+    });
+    SlimRpcHandler::new(handler).register(&env.server);
+    env.start().await;
+    let channel = Channel::new(env.new_client_app("raw").await, env.server_name.clone());
+
+    let cases = [
+        (
+            Some(empty_part_message()),
+            format!("message.parts[0]: {NO_PART_CONTENT}"),
+        ),
+        (None, "message: is required".to_string()),
+    ];
+    for (message, expected) in cases {
+        let request = proto::SendMessageRequest {
+            message,
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        let error = channel
+            .unary::<Vec<u8>, Vec<u8>>(
+                A2A_SERVICE_NAME,
+                SEND_MESSAGE_METHOD,
+                request.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), RpcCode::InvalidArgument, "{error:?}");
+        assert!(error.message().contains(&expected), "{error:?}");
+
+        let events = channel.unary_stream::<Vec<u8>, Vec<u8>>(
+            A2A_SERVICE_NAME,
+            SEND_STREAMING_MESSAGE_METHOD,
+            request,
+            None,
+            None,
+        );
+        futures::pin_mut!(events);
+        let error = events.next().await.expect("an error item").unwrap_err();
+        assert_eq!(error.code(), RpcCode::InvalidArgument, "{error:?}");
+        assert!(error.message().contains(&expected), "{error:?}");
+    }
+
+    env.shutdown().await;
+}
+
+/// A response that carries a part without content is the peer's fault: the
+/// client reports INTERNAL_ERROR naming the part, as the JSON-RPC client does,
+/// not INVALID_PARAMS, which would blame the caller's request.
+#[tokio::test]
+async fn slimrpc_transport_reports_a_part_without_content_in_a_response_as_internal() {
+    let env = TestEnv::new("transport-empty-part").await;
+
+    for method in [GET_TASK_METHOD, "CancelTask"] {
+        env.server.register_unary_unary(
+            A2A_SERVICE_NAME,
+            method,
+            |_request: Vec<u8>, _context| async move { Ok(empty_part_task().encode_to_vec()) },
+        );
+    }
+    env.server.register_unary_unary(
+        A2A_SERVICE_NAME,
+        "ListTasks",
+        |_request: Vec<u8>, _context| async move {
+            Ok(proto::ListTasksResponse {
+                tasks: vec![proto::Task::default(), empty_part_task()],
+                ..Default::default()
+            }
+            .encode_to_vec())
+        },
+    );
+    env.server.register_unary_unary(
+        A2A_SERVICE_NAME,
+        SEND_MESSAGE_METHOD,
+        |_request: Vec<u8>, _context| async move {
+            Ok(proto::SendMessageResponse {
+                payload: Some(proto::send_message_response::Payload::Task(
+                    empty_part_task(),
+                )),
+            }
+            .encode_to_vec())
+        },
+    );
+    for method in [SEND_STREAMING_MESSAGE_METHOD, "SubscribeToTask"] {
+        env.server.register_unary_stream(
+            A2A_SERVICE_NAME,
+            method,
+            |_request: Vec<u8>, _context| async move {
+                let event = proto::StreamResponse {
+                    payload: Some(proto::stream_response::Payload::Task(empty_part_task())),
+                };
+                Ok(stream::iter(vec![Ok::<Vec<u8>, RpcError>(
+                    event.encode_to_vec(),
+                )]))
+            },
+        );
+    }
+    env.start().await;
+
+    let transport = env.transport_with_connection("empty-part").await;
+    let params = ServiceParams::new();
+    let in_task = format!("history[0].parts[0]: {NO_PART_CONTENT}");
+    let internal = |error: A2AError, path: &str| {
+        assert_eq!(error.code, error_code::INTERNAL_ERROR, "{error:?}");
+        assert_eq!(error.message, format!("invalid response: {path}{in_task}"));
+    };
+
+    internal(
+        transport
+            .send_message(&params, &send_message_request("empty-part"))
+            .await
+            .unwrap_err(),
+        "task.",
+    );
+    internal(
+        transport
+            .get_task(
+                &params,
+                &GetTaskRequest {
+                    id: "task-1".to_string(),
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err(),
+        "",
+    );
+    internal(
+        transport
+            .list_tasks(
+                &params,
+                &ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err(),
+        "tasks[1].",
+    );
+    internal(
+        transport
+            .cancel_task(
+                &params,
+                &CancelTaskRequest {
+                    id: "task-1".to_string(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err(),
+        "",
+    );
+    let sent = transport
+        .send_streaming_message(&params, &send_message_request("empty-part"))
+        .await
+        .unwrap();
+    let subscribed = transport
+        .subscribe_to_task(
+            &params,
+            &SubscribeToTaskRequest {
+                id: "task-1".to_string(),
+                tenant: None,
+            },
+        )
+        .await
+        .unwrap();
+    for events in [sent, subscribed] {
+        let events: Vec<_> = events.collect().await;
+        assert_eq!(events.len(), 1);
+        internal(events.into_iter().next().unwrap().unwrap_err(), "task.");
+    }
+
+    env.shutdown().await;
+}
+
 /// Group `Collaborate`: every member independently broadcasts one intro `Message`
 /// to the others over its own group channel, and every other member's listen-only
 /// `register_collaborate` handler receives it — proving the SLIMRPC collaborative
@@ -883,4 +1110,129 @@ async fn slimrpc_collaborate_broadcasts_to_every_other_member() {
             );
         }
     }
+}
+
+/// A reply on a `Collaborate` session comes back to the sender as a `Message`
+/// attributed to the member that sent it, and a reply whose part carries no
+/// content as INTERNAL_ERROR: the member sent it, not the caller.
+#[tokio::test]
+async fn slimrpc_collaborate_replies_are_attributed_to_their_sender() {
+    let service = Arc::new(Service::new(
+        ID::new_with_name(Kind::new("slim").unwrap(), "collab-echo").unwrap(),
+    ));
+    let mut apps = Vec::new();
+    for suffix in ["echo", "asker"] {
+        let name = Arc::new(Name::from_strings([
+            "org",
+            "test",
+            &format!("collab-{suffix}"),
+        ]));
+        let (provider, verifier) = auth(&format!("collab-provider-{suffix}"));
+        let (app, notifications) = service.create_app(&name, provider, verifier).unwrap();
+        apps.push((name, Arc::new(app), notifications));
+    }
+    let (echo_name, echo_app, notifications) = apps.remove(0);
+    let (_, asker_app, _) = apps.remove(0);
+
+    // The echo member answers every broadcast with the same bytes, then with
+    // a message whose part carries no content.
+    let server = Arc::new(Server::new(
+        echo_app.clone(),
+        echo_app.app_name().clone(),
+        notifications,
+    ));
+    server.register_stream_stream::<_, Vec<u8>, Vec<u8>, _, _>(
+        COLLABORATE_SERVICE_NAME,
+        COLLABORATE_METHOD,
+        |inbound: slim_rpc::DecodedStream<Vec<u8>>, _context: slim_rpc::Context| async move {
+            Ok(inbound
+                .flat_map(|echo| stream::iter([echo, Ok(empty_part_message().encode_to_vec())])))
+        },
+    );
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let transport = SlimRpcTransport::new_group(asker_app, vec![echo_name.clone()]).unwrap();
+    let outbound = stream::once(async { sample_message(Role::Agent, "hello", "collaborate") });
+    let replies = transport.collaborate(outbound, Some(Duration::from_secs(5)));
+    futures::pin_mut!(replies);
+    let reply = replies.next().await.expect("one reply").unwrap();
+    assert_eq!(reply.text(), Some("hello"));
+    let source = reply.metadata.as_ref().unwrap()[SLIM_SRC_METADATA_KEY]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        source.starts_with("org/test/collab-echo/"),
+        "{source} is not the echo member"
+    );
+
+    let error = replies.next().await.expect("a second reply").unwrap_err();
+    assert_eq!(error.code, error_code::INTERNAL_ERROR);
+    assert_eq!(
+        error.message,
+        format!("invalid response: parts[0]: {NO_PART_CONTENT}")
+    );
+}
+
+/// A listen-only member drops a broadcast whose part carries no content and
+/// keeps receiving the ones after it.
+#[tokio::test]
+async fn slimrpc_collaborate_drops_a_message_with_a_part_without_content() {
+    use std::sync::Mutex;
+
+    let service = Arc::new(Service::new(
+        ID::new_with_name(Kind::new("slim").unwrap(), "collab-invalid").unwrap(),
+    ));
+    let mut apps = Vec::new();
+    for suffix in ["listener", "sender"] {
+        let name = Arc::new(Name::from_strings([
+            "org",
+            "test",
+            &format!("collab-invalid-{suffix}"),
+        ]));
+        let (provider, verifier) = auth(&format!("collab-invalid-provider-{suffix}"));
+        let (app, notifications) = service.create_app(&name, provider, verifier).unwrap();
+        apps.push((name, Arc::new(app), notifications));
+    }
+    let (listener_name, listener_app, notifications) = apps.remove(0);
+    let (_, sender_app, _) = apps.remove(0);
+
+    let server = Arc::new(Server::new(
+        listener_app.clone(),
+        listener_app.app_name().clone(),
+        notifications,
+    ));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let sink = received.clone();
+    a2a_slimrpc::register_collaborate(&server, move |message| {
+        sink.lock().unwrap().push(message);
+    });
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let channel = Channel::new_group(sender_app, vec![listener_name]).unwrap();
+    let valid =
+        a2a_pb::pbconv::to_proto_message(&sample_message(Role::Agent, "after", "collaborate"));
+    let outbound = stream::iter([empty_part_message().encode_to_vec(), valid.encode_to_vec()]);
+    let replies = channel.multicast_stream_stream::<Vec<u8>, Vec<u8>>(
+        COLLABORATE_SERVICE_NAME,
+        COLLABORATE_METHOD,
+        outbound,
+        Some(Duration::from_secs(5)),
+        None,
+    );
+    futures::pin_mut!(replies);
+    while replies.next().await.is_some() {}
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let received = received.lock().unwrap();
+    assert_eq!(
+        received.iter().map(|m| m.text()).collect::<Vec<_>>(),
+        [Some("after")]
+    );
 }

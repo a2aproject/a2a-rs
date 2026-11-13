@@ -79,7 +79,8 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
     ) -> Result<tonic::Response<proto::SendMessageResponse>, tonic::Status> {
         let params = extract_service_params(request.metadata());
         validate_protocol_version(&params)?;
-        let native_req = pbconv::from_proto_send_message_request(request.get_ref());
+        let native_req = pbconv::from_proto_send_message_request(request.get_ref())
+            .map_err(|violation| a2a_error_to_status(&pbconv::invalid_request(violation)))?;
         let result = self
             .handler
             .send_message(&params, native_req)
@@ -98,7 +99,8 @@ impl<H: RequestHandler> A2aService for GrpcHandler<H> {
     ) -> Result<tonic::Response<Self::SendStreamingMessageStream>, tonic::Status> {
         let params = extract_service_params(request.metadata());
         validate_protocol_version(&params)?;
-        let native_req = pbconv::from_proto_send_message_request(request.get_ref());
+        let native_req = pbconv::from_proto_send_message_request(request.get_ref())
+            .map_err(|violation| a2a_error_to_status(&pbconv::invalid_request(violation)))?;
         let stream = self
             .handler
             .send_streaming_message(&params, native_req)

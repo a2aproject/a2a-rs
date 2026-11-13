@@ -4,7 +4,7 @@
 use std::fmt;
 
 use a2a::{
-    AgentCard, CancelTaskRequest, DeleteTaskPushNotificationConfigRequest,
+    AgentCard, CancelTaskRequest, DeleteTaskPushNotificationConfigRequest, FieldViolation,
     GetExtendedAgentCardRequest, GetTaskPushNotificationConfigRequest, GetTaskRequest,
     ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
     ListTasksRequest, ListTasksResponse, SendMessageRequest, SendMessageResponse, StreamResponse,
@@ -19,6 +19,8 @@ pub enum ProtoJsonPayloadError {
     Json(serde_json::Error),
     Decode(prost::DecodeError),
     MissingPayload(&'static str),
+    /// A required field is not set; `field` is its JSON path in the payload.
+    Invalid(FieldViolation),
 }
 
 impl fmt::Display for ProtoJsonPayloadError {
@@ -29,6 +31,11 @@ impl fmt::Display for ProtoJsonPayloadError {
             Self::MissingPayload(type_name) => {
                 write!(f, "ProtoJSON payload missing required data for {type_name}")
             }
+            Self::Invalid(violation) => write!(
+                f,
+                "invalid ProtoJSON payload: {}",
+                crate::pbconv::describe(violation)
+            ),
         }
     }
 }
@@ -92,8 +99,11 @@ where
     Dst::decode(source.encode_to_vec().as_slice()).map_err(ProtoJsonPayloadError::Decode)
 }
 
+/// Implements [`ProtoJsonPayload`] for a native type. The converter from proto
+/// is a function that cannot fail, or `|value| expr` for one that can; trait
+/// items to override follow in braces.
 macro_rules! impl_protojson_payload {
-    ($native:path, $proto:path, $protojson:path, $to_proto:path, $from_proto:path) => {
+    ($native:path, $proto:path, $protojson:path, $to_proto:path, |$value:ident| $from_proto:expr $(, { $($item:tt)* })?) => {
         impl ProtoJsonPayload for $native {
             type Proto = $proto;
             type ProtoJson = $protojson;
@@ -102,27 +112,17 @@ macro_rules! impl_protojson_payload {
                 $to_proto(value)
             }
 
-            fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
-                Ok($from_proto(value))
+            fn try_from_proto($value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
+                $from_proto
             }
+
+            $($($item)*)?
         }
     };
-}
-
-macro_rules! impl_protojson_payload_optional {
     ($native:path, $proto:path, $protojson:path, $to_proto:path, $from_proto:path) => {
-        impl ProtoJsonPayload for $native {
-            type Proto = $proto;
-            type ProtoJson = $protojson;
-
-            fn to_proto(value: &Self) -> Self::Proto {
-                $to_proto(value)
-            }
-
-            fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
-                $from_proto(value).ok_or(ProtoJsonPayloadError::MissingPayload(stringify!($native)))
-            }
-        }
+        impl_protojson_payload!($native, $proto, $protojson, $to_proto, |value| Ok($from_proto(
+            value
+        )));
     };
 }
 
@@ -131,7 +131,8 @@ impl_protojson_payload!(
     crate::proto::SendMessageRequest,
     crate::protojson::SendMessageRequest,
     crate::pbconv::to_proto_send_message_request,
-    crate::pbconv::from_proto_send_message_request
+    |value| crate::pbconv::from_proto_send_message_request(value)
+        .map_err(ProtoJsonPayloadError::Invalid)
 );
 impl_protojson_payload!(
     GetTaskRequest,
@@ -201,31 +202,28 @@ impl_protojson_payload!(
     crate::proto::Task,
     crate::protojson::Task,
     crate::pbconv::to_proto_task,
-    crate::pbconv::from_proto_task
+    |value| crate::pbconv::from_proto_task(value).map_err(ProtoJsonPayloadError::Invalid)
 );
-impl ProtoJsonPayload for ListTasksResponse {
-    type Proto = crate::proto::ListTasksResponse;
-    type ProtoJson = crate::protojson::ListTasksResponse;
-
-    fn to_proto(value: &Self) -> Self::Proto {
-        crate::pbconv::to_proto_list_tasks_response(value)
+impl_protojson_payload!(
+    ListTasksResponse,
+    crate::proto::ListTasksResponse,
+    crate::protojson::ListTasksResponse,
+    crate::pbconv::to_proto_list_tasks_response,
+    |value| crate::pbconv::from_proto_list_tasks_response(value)
+        .map_err(ProtoJsonPayloadError::Invalid),
+    {
+        /// REQ-TASK-LIST-002: `nextPageToken` must always be present, even on
+        /// the last page, but the generated serializer follows proto3-JSON's
+        /// own convention of omitting a string left at its default (""). The
+        /// other REQUIRED fields go the same way on an empty page.
+        fn normalize_json(value: &mut Value) {
+            insert_required(
+                value,
+                serde_json::json!({"tasks": [], "nextPageToken": "", "pageSize": 0, "totalSize": 0}),
+            );
+        }
     }
-
-    fn try_from_proto(value: &Self::Proto) -> Result<Self, ProtoJsonPayloadError> {
-        Ok(crate::pbconv::from_proto_list_tasks_response(value))
-    }
-
-    /// REQ-TASK-LIST-002: `nextPageToken` must always be present, even on
-    /// the last page, but the generated serializer follows proto3-JSON's
-    /// own convention of omitting a string left at its default (""). The
-    /// other REQUIRED fields go the same way on an empty page.
-    fn normalize_json(value: &mut Value) {
-        insert_required(
-            value,
-            serde_json::json!({"tasks": [], "nextPageToken": "", "pageSize": 0, "totalSize": 0}),
-        );
-    }
-}
+);
 impl_protojson_payload!(
     ListTaskPushNotificationConfigsResponse,
     crate::proto::ListTaskPushNotificationConfigsResponse,
@@ -262,19 +260,23 @@ impl ProtoJsonPayload for AgentCard {
         );
     }
 }
-impl_protojson_payload_optional!(
+impl_protojson_payload!(
     SendMessageResponse,
     crate::proto::SendMessageResponse,
     crate::protojson::SendMessageResponse,
     crate::pbconv::to_proto_send_message_response,
-    crate::pbconv::from_proto_send_message_response
+    |value| crate::pbconv::from_proto_send_message_response(value)
+        .map_err(ProtoJsonPayloadError::Invalid)?
+        .ok_or(ProtoJsonPayloadError::MissingPayload("SendMessageResponse"))
 );
-impl_protojson_payload_optional!(
+impl_protojson_payload!(
     StreamResponse,
     crate::proto::StreamResponse,
     crate::protojson::StreamResponse,
     crate::pbconv::to_proto_stream_response,
-    crate::pbconv::from_proto_stream_response
+    |value| crate::pbconv::from_proto_stream_response(value)
+        .map_err(ProtoJsonPayloadError::Invalid)?
+        .ok_or(ProtoJsonPayloadError::MissingPayload("StreamResponse"))
 );
 
 #[cfg(test)]
