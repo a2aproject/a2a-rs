@@ -11,6 +11,7 @@ You wrote an agent with a card, an executor and a server, called it over JSON-RP
 
 ## Read on
 
-- [`a2acli`](../../reference/a2acli.md) is a command-line client for A2A agents.
+- The [client quickstart](../client.md) calls the agent from Rust.
+- The [`a2acli` quickstart](../a2acli.md) calls it from the command line, and the [`a2acli` reference](../../reference/a2acli.md) covers the rest of the CLI.
 - The API reference of the crates this page used is on docs.rs: [`a2a-lf`](https://docs.rs/a2a-lf) for the protocol types and [`a2a-server-lf`](https://docs.rs/a2a-server-lf) for the server.
 - [a2a-protocol.org](https://a2a-protocol.org/latest/) describes the protocol itself.

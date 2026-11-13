@@ -30,6 +30,8 @@ nav:
           - Call the agent: quickstart/agent/call-the-agent.md
           - Streaming and multi-turn: quickstart/agent/streaming-and-multi-turn.md
           - Next steps: quickstart/agent/next-steps.md
+      - Client: quickstart/client.md
+      - a2acli: quickstart/a2acli.md
   - Reference:
       - a2acli: reference/a2acli.md
 
