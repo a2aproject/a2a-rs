@@ -3,8 +3,8 @@ name: DCO
 on:
   # Required checks must report on queue entries too, or every entry stalls.
   merge_group:
+  # Stacked PRs target another feature branch and need these checks too.
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read

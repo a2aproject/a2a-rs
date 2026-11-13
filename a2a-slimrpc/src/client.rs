@@ -213,11 +213,8 @@ impl Transport for SlimRpcTransport {
             )
             .await?;
 
-        Ok(Box::pin(stream.map(|item| {
-            item.and_then(|response| {
-                pbconv::from_proto_stream_response(&response)
-                    .ok_or_else(|| A2AError::internal("empty StreamResponse payload"))
-            })
+        Ok(Box::pin(stream.filter_map(|item| {
+            std::future::ready(decode_stream_item(item))
         })))
     }
 
@@ -277,11 +274,8 @@ impl Transport for SlimRpcTransport {
             )
             .await?;
 
-        Ok(Box::pin(stream.map(|item| {
-            item.and_then(|response| {
-                pbconv::from_proto_stream_response(&response)
-                    .ok_or_else(|| A2AError::internal("empty StreamResponse payload"))
-            })
+        Ok(Box::pin(stream.filter_map(|item| {
+            std::future::ready(decode_stream_item(item))
         })))
     }
 
@@ -441,6 +435,18 @@ pub fn parse_slimrpc_target(target: &str) -> Result<Arc<ProtoName>, A2AError> {
     ])))
 }
 
+/// Decodes one item of a server stream. A payload kind this client does not
+/// know decodes to `None` and is skipped, as the spec requires of stream
+/// readers.
+fn decode_stream_item(
+    item: Result<a2a_pb::proto::StreamResponse, A2AError>,
+) -> Option<Result<StreamResponse, A2AError>> {
+    match item {
+        Ok(response) => pbconv::from_proto_stream_response(&response).map(Ok),
+        Err(error) => Some(Err(error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,5 +476,34 @@ mod tests {
     fn test_parse_slimrpc_target_invalid() {
         let error = parse_slimrpc_target("not-a-valid-target").unwrap_err();
         assert_eq!(error.code, a2a::error_code::INVALID_PARAMS);
+    }
+}
+
+#[cfg(test)]
+mod stream_decode_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_stream_payload_is_skipped() {
+        let unknown = a2a_pb::proto::StreamResponse { payload: None };
+        assert!(decode_stream_item(Ok(unknown)).is_none());
+    }
+
+    #[test]
+    fn known_stream_payload_is_decoded() {
+        let known = pbconv::to_proto_stream_response(&StreamResponse::Message(a2a::Message::new(
+            a2a::Role::Agent,
+            vec![a2a::Part::text("hi")],
+        )));
+        assert!(matches!(
+            decode_stream_item(Ok(known)),
+            Some(Ok(StreamResponse::Message(_)))
+        ));
+    }
+
+    #[test]
+    fn stream_error_is_reported() {
+        let item = decode_stream_item(Err(A2AError::internal("boom")));
+        assert!(matches!(item, Some(Err(_))));
     }
 }

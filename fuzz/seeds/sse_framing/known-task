@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task","contextId":"context","status":{"state":"TASK_STATE_WORKING"}}}}
