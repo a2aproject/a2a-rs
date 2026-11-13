@@ -138,6 +138,7 @@ impl From<i64> for JsonRpcId {
 pub mod methods {
     pub const SEND_MESSAGE: &str = "SendMessage";
     pub const SEND_STREAMING_MESSAGE: &str = "SendStreamingMessage";
+    pub const SEND_LIVE_MESSAGE: &str = "SendLiveMessage";
     pub const GET_TASK: &str = "GetTask";
     pub const LIST_TASKS: &str = "ListTasks";
     pub const CANCEL_TASK: &str = "CancelTask";
@@ -149,7 +150,12 @@ pub mod methods {
     pub const GET_EXTENDED_AGENT_CARD: &str = "GetExtendedAgentCard";
 
     pub fn is_streaming(method: &str) -> bool {
-        matches!(method, SEND_STREAMING_MESSAGE | SUBSCRIBE_TO_TASK)
+        // `SendLiveMessage` answers with a stream when it opens an exchange and
+        // with a plain result when it only feeds one that is open.
+        matches!(
+            method,
+            SEND_STREAMING_MESSAGE | SEND_LIVE_MESSAGE | SUBSCRIBE_TO_TASK
+        )
     }
 
     pub fn is_valid(method: &str) -> bool {
@@ -157,6 +163,7 @@ pub mod methods {
             method,
             SEND_MESSAGE
                 | SEND_STREAMING_MESSAGE
+                | SEND_LIVE_MESSAGE
                 | GET_TASK
                 | LIST_TASKS
                 | CANCEL_TASK

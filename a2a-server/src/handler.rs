@@ -266,7 +266,9 @@ fn task_id_for_event(event: &StreamResponse) -> Option<&str> {
         StreamResponse::Task(task) => Some(&task.id),
         StreamResponse::StatusUpdate(update) => Some(&update.task_id),
         StreamResponse::ArtifactUpdate(update) => Some(&update.task_id),
-        StreamResponse::Message(_) => None,
+        StreamResponse::MessageUpdate(update) => Some(&update.task_id),
+        StreamResponse::Message(_) | StreamResponse::Error(_) => None,
+        _ => None,
     }
 }
 
@@ -347,7 +349,7 @@ fn backfill_status_timestamp(event: &mut StreamResponse) {
     let status = match event {
         StreamResponse::Task(task) => &mut task.status,
         StreamResponse::StatusUpdate(update) => &mut update.status,
-        StreamResponse::ArtifactUpdate(_) | StreamResponse::Message(_) => return,
+        _ => return,
     };
     if status.timestamp.is_none() {
         status.timestamp = Some(chrono::Utc::now());
@@ -400,7 +402,7 @@ async fn apply_event_to_task(
             }
             save_task(task_store, task).await.map(Some)
         }
-        StreamResponse::Message(_) => Ok(current_task),
+        _ => Ok(current_task),
     }
 }
 
@@ -443,6 +445,7 @@ async fn fail_task(
 /// CANCELED on `begin_cancel`) is pushed in, like one the executor emits.
 fn status_update(task: &Task) -> StreamResponse {
     StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+        generation: task.generation,
         task_id: task.id.clone(),
         context_id: task.context_id.clone(),
         status: task.status.clone(),
@@ -884,15 +887,19 @@ impl DefaultRequestHandler {
         &self,
         req: &SendMessageRequest,
     ) -> Result<(Task, Option<Task>, String), A2AError> {
+        let message = req
+            .message
+            .as_ref()
+            .ok_or_else(|| A2AError::invalid_params("message is required"))?;
         // A2A §3.4.2: a client-provided taskId MUST reference an existing task,
         // and client-provided ids for *creating* tasks are not supported. Only
         // an absent taskId may mint a new one.
-        let task_id = match req.message.task_id.clone() {
+        let task_id = match message.task_id.clone() {
             Some(id) => id,
             None => new_task_id(),
         };
         let stored = self.task_store.get(&task_id).await?;
-        if stored.is_none() && req.message.task_id.is_some() {
+        if stored.is_none() && message.task_id.is_some() {
             return Err(A2AError::task_not_found(&task_id));
         }
         if stored
@@ -908,7 +915,7 @@ impl DefaultRequestHandler {
         // contextId from the task when only taskId is given.
         let context_id = match stored.as_ref() {
             Some(task) => {
-                if let Some(requested) = req.message.context_id.as_deref() {
+                if let Some(requested) = message.context_id.as_deref() {
                     if requested != task.context_id {
                         return Err(A2AError::invalid_params(format!(
                             "contextId {requested} does not match task {task_id}, \
@@ -919,11 +926,7 @@ impl DefaultRequestHandler {
                 }
                 task.context_id.clone()
             }
-            None => req
-                .message
-                .context_id
-                .clone()
-                .unwrap_or_else(new_context_id),
+            None => message.context_id.clone().unwrap_or_else(new_context_id),
         };
 
         let task = if let Some(mut existing) = stored.clone() {
@@ -944,10 +947,12 @@ impl DefaultRequestHandler {
             }) {
                 history.push(asked);
             }
-            history.push(req.message.clone());
+            history.push(message.clone());
             existing
         } else {
             let task = Task {
+                generation: 0,
+                timeline: None,
                 id: task_id,
                 context_id: context_id.clone(),
                 status: TaskStatus {
@@ -956,7 +961,7 @@ impl DefaultRequestHandler {
                     timestamp: Some(chrono::Utc::now()),
                 },
                 artifacts: None,
-                history: Some(vec![req.message.clone()]),
+                history: Some(vec![message.clone()]),
                 metadata: None,
             };
             self.task_store.create(task.clone()).await?;
@@ -994,7 +999,11 @@ impl DefaultRequestHandler {
         req: SendMessageRequest,
         include_task_snapshot_in_context: bool,
     ) -> Result<(TaskId, BoxStream<'static, Result<StreamResponse, A2AError>>), A2AError> {
-        self.validate_content_types(&req.message)?;
+        self.validate_content_types(
+            req.message
+                .as_ref()
+                .ok_or_else(|| A2AError::invalid_params("message is required"))?,
+        )?;
         let (task, stored_task, context_id) = self.prepare_task_for_execution(&req).await?;
         let task_id = task.id.clone();
         self.save_request_push_config(&task_id, &req).await?;
@@ -1002,7 +1011,7 @@ impl DefaultRequestHandler {
         let receiver = active.subscribe();
 
         let exec_ctx = crate::ExecutorContext {
-            message: Some(req.message),
+            message: req.message,
             task_id: task_id.clone(),
             stored_task: if include_task_snapshot_in_context {
                 Some(task.clone())
@@ -1041,7 +1050,12 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        self.authorize(params, req.message.task_id.as_deref())?;
+        self.authorize(
+            params,
+            req.message
+                .as_ref()
+                .and_then(|message| message.task_id.as_deref()),
+        )?;
         // ACTS CORE-HIST-003: configuration.historyLength governs this
         // response's own inline task the same way it governs a later
         // GetTask, so it has to be applied here too, not just there.
@@ -1085,7 +1099,7 @@ impl RequestHandler for DefaultRequestHandler {
                 Ok(SendMessageResponse::Task(task))
             }
             Some(StreamResponse::Message(message)) => Ok(SendMessageResponse::Message(message)),
-            None => {
+            Some(_) | None => {
                 let mut task = self.load_task(&task_id).await?;
                 apply_history_length(&mut task, history_length);
                 Ok(SendMessageResponse::Task(task))
@@ -1098,7 +1112,12 @@ impl RequestHandler for DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        self.authorize(params, req.message.task_id.as_deref())?;
+        self.authorize(
+            params,
+            req.message
+                .as_ref()
+                .and_then(|message| message.task_id.as_deref()),
+        )?;
         self.require_streaming()?;
         // The history cap binds every Task in the response, streamed ones too.
         let history_length = req
@@ -1467,6 +1486,8 @@ mod tests {
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let task = Task {
+                generation: 0,
+                timeline: None,
                 id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {
@@ -1486,6 +1507,8 @@ mod tests {
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let task = Task {
+                generation: 0,
+                timeline: None,
                 id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {
@@ -1507,6 +1530,7 @@ mod tests {
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let working = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {
@@ -1517,6 +1541,8 @@ mod tests {
                 metadata: None,
             });
             let completed = StreamResponse::Task(Task {
+                generation: 0,
+                timeline: None,
                 id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {
@@ -1537,6 +1563,8 @@ mod tests {
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let task = Task {
+                generation: 0,
+                timeline: None,
                 id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {
@@ -1559,6 +1587,8 @@ mod tests {
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let release = self.release.clone();
             let working_task = Task {
+                generation: 0,
+                timeline: None,
                 id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {
@@ -1571,6 +1601,8 @@ mod tests {
                 metadata: None,
             };
             let completed_task = Task {
+                generation: 0,
+                timeline: None,
                 id: working_task.id.clone(),
                 context_id: working_task.context_id.clone(),
                 status: TaskStatus {
@@ -1605,6 +1637,8 @@ mod tests {
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let task = Task {
+                generation: 0,
+                timeline: None,
                 id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {
@@ -1662,6 +1696,7 @@ mod tests {
         message: Option<Message>,
     ) -> StreamResponse {
         StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: ctx.task_id.clone(),
             context_id: ctx.context_id.clone(),
             status: TaskStatus {
@@ -1695,6 +1730,7 @@ mod tests {
                 TaskState::InputRequired
             };
             let update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {
@@ -1712,6 +1748,8 @@ mod tests {
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let task = Task {
+                generation: 0,
+                timeline: None,
                 id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {
@@ -1796,6 +1834,8 @@ mod tests {
             .min(self.count);
             let tasks = (0..served)
                 .map(|i| Task {
+                    generation: 0,
+                    timeline: None,
                     id: format!("t-{i:04}"),
                     context_id: "c1".into(),
                     status: TaskStatus {
@@ -1857,6 +1897,7 @@ mod tests {
         async fn list(&self, task_id: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
             Ok((0..self.count)
                 .map(|i| TaskPushNotificationConfig {
+                    protocol_version: None,
                     task_id: task_id.to_string(),
                     url: format!("https://example.com/hook/{i}"),
                     id: Some(format!("cfg-{i:04}")),
@@ -1901,6 +1942,8 @@ mod tests {
                 _ => TaskState::InputRequired,
             };
             let update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
+
                 task_id: ctx.task_id,
                 context_id: ctx.context_id,
                 status: TaskStatus {
@@ -1921,9 +1964,15 @@ mod tests {
                 Cancel::Fails => Err(A2AError::internal("cancel failed")),
                 Cancel::SendsAnInapplicableEvent => {
                     Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                        generation: 0,
+
                         task_id: ctx.task_id,
                         context_id: ctx.context_id,
                         artifact: Artifact {
+                            end_generation: None,
+                            role: None,
+                            start_generation: None,
+
                             artifact_id: "missing".into(),
                             name: None,
                             description: None,
@@ -1937,6 +1986,8 @@ mod tests {
                     }))
                 }
                 Cancel::Cancels => Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    generation: 0,
+
                     task_id: ctx.task_id,
                     context_id: ctx.context_id,
                     status: TaskStatus {
@@ -1957,6 +2008,8 @@ mod tests {
         handler
             .task_store
             .create(Task {
+                generation: 0,
+                timeline: None,
                 id: task_id.into(),
                 context_id: context_id.into(),
                 status: TaskStatus {
@@ -2023,7 +2076,9 @@ mod tests {
             .send_message(
                 &ServiceParams::new(),
                 SendMessageRequest {
-                    message: make_message(),
+                    artifact_updates: Vec::new(),
+
+                    message: Some(make_message()),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -2102,7 +2157,8 @@ mod tests {
         let handler = make_handler();
         let params = ServiceParams::new();
         let req = SendMessageRequest {
-            message: make_message(),
+            artifact_updates: Vec::new(),
+            message: Some(make_message()),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -2122,7 +2178,8 @@ mod tests {
         let handler = make_handler();
         let params = ServiceParams::new();
         let req = SendMessageRequest {
-            message: make_message(),
+            artifact_updates: Vec::new(),
+            message: Some(make_message()),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -2142,7 +2199,8 @@ mod tests {
         let handler = make_handler();
         let params = ServiceParams::new();
         let req = SendMessageRequest {
-            message: make_message(),
+            artifact_updates: Vec::new(),
+            message: Some(make_message()),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -2163,9 +2221,13 @@ mod tests {
     #[test]
     fn test_backfill_status_timestamp_ignores_events_without_a_status() {
         let mut artifact_update = StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             artifact: Artifact {
+                end_generation: None,
+                role: None,
+                start_generation: None,
                 artifact_id: "a1".into(),
                 name: None,
                 description: None,
@@ -2195,6 +2257,8 @@ mod tests {
         let store = InMemoryTaskStore::new();
         store
             .create(Task {
+                generation: 0,
+                timeline: None,
                 id: "t-backfill".into(),
                 context_id: "ctx".into(),
                 status: TaskStatus {
@@ -2213,6 +2277,7 @@ mod tests {
             &store,
             None,
             &StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "t-backfill".into(),
                 context_id: "ctx".into(),
                 status: TaskStatus {
@@ -2241,6 +2306,8 @@ mod tests {
         let store = InMemoryTaskStore::new();
         store
             .create(Task {
+                generation: 0,
+                timeline: None,
                 id: "t-preserve".into(),
                 context_id: "ctx".into(),
                 status: TaskStatus {
@@ -2263,6 +2330,7 @@ mod tests {
             &store,
             None,
             &StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "t-preserve".into(),
                 context_id: "ctx".into(),
                 status: TaskStatus {
@@ -2291,6 +2359,8 @@ mod tests {
             &store,
             None,
             &StreamResponse::Task(Task {
+                generation: 0,
+                timeline: None,
                 id: "t-snapshot".into(),
                 context_id: "ctx".into(),
                 status: TaskStatus {
@@ -2332,6 +2402,8 @@ mod tests {
             &store,
             None,
             &StreamResponse::Task(Task {
+                generation: 0,
+                timeline: None,
                 id: "t-snapshot-kept".into(),
                 context_id: "ctx".into(),
                 status: TaskStatus {
@@ -2368,7 +2440,8 @@ mod tests {
             .send_streaming_message(
                 &params,
                 SendMessageRequest {
-                    message,
+                    artifact_updates: Vec::new(),
+                    message: Some(message),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -2388,6 +2461,7 @@ mod tests {
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
+                    last_seen_generation: None,
                     id: "t-disconnect".into(),
                     tenant: None,
                 },
@@ -2416,6 +2490,8 @@ mod tests {
     #[tokio::test]
     async fn test_active_execution_keeps_snapshot_without_subscribers() {
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t-buffering".into(),
             context_id: "c-buffering".into(),
             status: TaskStatus {
@@ -2441,6 +2517,8 @@ mod tests {
     #[tokio::test]
     async fn test_active_execution_publishes_errors_to_subscribers() {
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t-buffering-error".into(),
             context_id: "c-buffering-error".into(),
             status: TaskStatus {
@@ -2491,6 +2569,8 @@ mod tests {
             .get_task(
                 &ServiceParams::new(),
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: task_id,
                     history_length: None,
                     tenant: None,
@@ -2511,9 +2591,13 @@ mod tests {
         let handler = DefaultRequestHandler::new(
             ScriptedExecutor(|ctx: &ExecutorContext| {
                 let append = StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    generation: 0,
                     task_id: ctx.task_id.clone(),
                     context_id: ctx.context_id.clone(),
                     artifact: Artifact {
+                        end_generation: None,
+                        role: None,
+                        start_generation: Some(0),
                         artifact_id: "unknown".into(),
                         name: None,
                         description: None,
@@ -2539,6 +2623,7 @@ mod tests {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -2573,6 +2658,8 @@ mod tests {
         );
         let mut request = send_request();
         request.configuration = Some(SendMessageConfiguration {
+            if_generation_match: None,
+            timeline_length: None,
             accepted_output_modes: None,
             // A loopback webhook is refused by the default URL validation.
             task_push_notification_config: Some(TaskPushNotificationConfig {
@@ -2591,6 +2678,7 @@ mod tests {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -2629,6 +2717,8 @@ mod tests {
         );
         let mut request = send_request();
         request.configuration = Some(SendMessageConfiguration {
+            if_generation_match: None,
+            timeline_length: None,
             accepted_output_modes: None,
             task_push_notification_config: None,
             history_length: None,
@@ -2642,6 +2732,7 @@ mod tests {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -2674,6 +2765,8 @@ mod tests {
             .get_task(
                 &ServiceParams::new(),
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: task_id,
                     history_length: None,
                     tenant: None,
@@ -2707,7 +2800,7 @@ mod tests {
         );
         let params = ServiceParams::new();
         let ask = SendMessageRequest {
-            message: Message::new(Role::User, vec![Part::text("ask")]),
+            message: Some(Message::new(Role::User, vec![Part::text("ask")])),
             ..send_request()
         };
         handler.send_message(&params, ask).await.unwrap();
@@ -2715,6 +2808,7 @@ mod tests {
             .list_tasks(
                 &params,
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -2731,10 +2825,10 @@ mod tests {
             .id
             .clone();
         let answer = SendMessageRequest {
-            message: Message {
+            message: Some(Message {
                 task_id: Some(task_id.clone()),
                 ..Message::new(Role::User, vec![Part::text("main.rs")])
-            },
+            }),
             ..send_request()
         };
         handler.send_message(&params, answer).await.unwrap();
@@ -2743,6 +2837,8 @@ mod tests {
             .get_task(
                 &params,
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: task_id,
                     history_length: None,
                     tenant: None,
@@ -2774,6 +2870,8 @@ mod tests {
                     (true, Some(ask)) if in_history => {
                         let question = Message::new(Role::Agent, vec![Part::text("Which file?")]);
                         StreamResponse::Task(Task {
+                            generation: 0,
+                            timeline: None,
                             id: ctx.task_id.clone(),
                             context_id: ctx.context_id.clone(),
                             status: TaskStatus {
@@ -2804,7 +2902,7 @@ mod tests {
         async fn turn(handler: &DefaultRequestHandler, streaming: bool, message: Message) {
             let params = ServiceParams::new();
             let request = SendMessageRequest {
-                message,
+                message: Some(message),
                 ..send_request()
             };
             if streaming {
@@ -2830,6 +2928,7 @@ mod tests {
             .list_tasks(
                 &params,
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -2854,6 +2953,8 @@ mod tests {
             .get_task(
                 &params,
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: task_id,
                     history_length: None,
                     tenant: None,
@@ -2892,6 +2993,8 @@ mod tests {
                     .map(|text| Message::new(Role::User, vec![Part::text(text)]))
                     .to_vec();
                 let task = Task {
+                    generation: 0,
+                    timeline: None,
                     id: ctx.task_id.clone(),
                     context_id: ctx.context_id.clone(),
                     status: TaskStatus {
@@ -2909,6 +3012,8 @@ mod tests {
         );
         let request = SendMessageRequest {
             configuration: Some(SendMessageConfiguration {
+                if_generation_match: None,
+                timeline_length: None,
                 accepted_output_modes: None,
                 task_push_notification_config: None,
                 history_length: Some(1),
@@ -2987,6 +3092,8 @@ mod tests {
     #[tokio::test]
     async fn test_active_execution_drops_errors_without_subscribers() {
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t-error-no-sub".into(),
             context_id: "c-error-no-sub".into(),
             status: TaskStatus {
@@ -3014,6 +3121,8 @@ mod tests {
     #[tokio::test]
     async fn test_active_execution_publishes_events_with_snapshot_updates() {
         let initial_task = Task {
+            generation: 0,
+            timeline: None,
             id: "t-snapshot-update".into(),
             context_id: "c-snapshot-update".into(),
             status: TaskStatus {
@@ -3029,6 +3138,8 @@ mod tests {
         let mut receiver = active.subscribe();
 
         let updated_task = Task {
+            generation: 0,
+            timeline: None,
             id: "t-snapshot-update".into(),
             context_id: "c-snapshot-update".into(),
             status: TaskStatus {
@@ -3063,6 +3174,8 @@ mod tests {
     #[tokio::test]
     async fn test_active_execution_broadcasts_to_multiple_subscribers() {
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t-multi-sub".into(),
             context_id: "c-multi-sub".into(),
             status: TaskStatus {
@@ -3098,6 +3211,8 @@ mod tests {
         let handler = make_handler();
         let params = ServiceParams::new();
         let req = GetTaskRequest {
+            current_generation: None,
+            timeline_length: None,
             id: "nonexistent".into(),
             history_length: None,
             tenant: None,
@@ -3113,7 +3228,8 @@ mod tests {
         msg.task_id = task_id.map(Into::into);
         msg.context_id = context_id.map(Into::into);
         SendMessageRequest {
-            message: msg,
+            artifact_updates: Vec::new(),
+            message: Some(msg),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -3125,7 +3241,7 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
         let mut req = send_req(None, None);
-        req.message.parts = vec![
+        req.message.as_mut().unwrap().parts = vec![
             Part::data(serde_json::json!({"value": "unsupported"}))
                 .with_media_type("application/x-unsupported-type-12345"),
         ];
@@ -3141,7 +3257,8 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler().with_default_input_modes(vec!["text/plain".into()]);
         let mut req = send_req(None, None);
-        req.message.parts = vec![Part::text("hello").with_media_type("text/plain")];
+        req.message.as_mut().unwrap().parts =
+            vec![Part::text("hello").with_media_type("text/plain")];
         handler
             .send_message(&ServiceParams::new(), req)
             .await
@@ -3153,7 +3270,7 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler();
         let mut req = send_req(None, None);
-        req.message.parts = vec![
+        req.message.as_mut().unwrap().parts = vec![
             Part::data(serde_json::json!({"value": "x"})).with_media_type("application/x-anything"),
         ];
         handler
@@ -3187,6 +3304,8 @@ mod tests {
         handler
             .task_store
             .create(Task {
+                generation: 0,
+                timeline: None,
                 id: "t-done".into(),
                 context_id: "c-done".into(),
                 status: TaskStatus {
@@ -3256,7 +3375,8 @@ mod tests {
             .send_message(
                 &ServiceParams::new(),
                 SendMessageRequest {
-                    message: turn1,
+                    artifact_updates: Vec::new(),
+                    message: Some(turn1),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -3277,7 +3397,8 @@ mod tests {
                 .send_message(
                     &ServiceParams::new(),
                     SendMessageRequest {
-                        message: turn,
+                        artifact_updates: Vec::new(),
+                        message: Some(turn),
                         configuration: None,
                         metadata: None,
                         tenant: None,
@@ -3310,8 +3431,11 @@ mod tests {
             .send_message(
                 &ServiceParams::new(),
                 SendMessageRequest {
-                    message,
+                    artifact_updates: Vec::new(),
+                    message: Some(message),
                     configuration: Some(SendMessageConfiguration {
+                        if_generation_match: None,
+                        timeline_length: None,
                         accepted_output_modes: None,
                         task_push_notification_config: None,
                         history_length: Some(0),
@@ -3361,6 +3485,7 @@ mod tests {
         let listed = handler
             .task_store
             .list(&ListTasksRequest {
+                timeline_length: None,
                 context_id: Some("c-new".into()),
                 status: None,
                 page_size: None,
@@ -3385,7 +3510,8 @@ mod tests {
         msg.context_id = Some("c1".into());
         seed_task(&handler, "t1", "c1").await;
         let req = SendMessageRequest {
-            message: msg,
+            artifact_updates: Vec::new(),
+            message: Some(msg),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -3395,6 +3521,8 @@ mod tests {
             .get_task(
                 &params,
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: "t1".into(),
                     history_length: None,
                     tenant: None,
@@ -3410,6 +3538,7 @@ mod tests {
         let handler = make_handler();
         let params = ServiceParams::new();
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: None,
@@ -3429,6 +3558,9 @@ mod tests {
         let store = InMemoryTaskStore::new();
         store
             .create(Task {
+                generation: 0,
+                timeline: None,
+
                 id: "t-artifact".into(),
                 context_id: "ctx".into(),
                 status: TaskStatus {
@@ -3437,6 +3569,10 @@ mod tests {
                     timestamp: Some(chrono::Utc::now()),
                 },
                 artifacts: Some(vec![Artifact {
+                    end_generation: None,
+                    role: None,
+                    start_generation: None,
+
                     artifact_id: "a1".into(),
                     name: None,
                     description: None,
@@ -3458,6 +3594,8 @@ mod tests {
                 .list_tasks(
                     &params,
                     ListTasksRequest {
+                        timeline_length: None,
+
                         context_id: None,
                         status: None,
                         page_size: None,
@@ -3497,6 +3635,8 @@ mod tests {
         let params = ServiceParams::new();
         // First create a task via the store directly
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t2".into(),
             context_id: "c2".into(),
             status: TaskStatus {
@@ -3523,6 +3663,8 @@ mod tests {
         let handler = Arc::new(make_handler());
         let params = ServiceParams::new();
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t-race".into(),
             context_id: "c-race".into(),
             status: TaskStatus {
@@ -3560,6 +3702,8 @@ mod tests {
         let handler = make_handler();
         let params = ServiceParams::new();
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t3".into(),
             context_id: "c3".into(),
             status: TaskStatus {
@@ -3589,6 +3733,8 @@ mod tests {
         let handler = make_handler();
         let params = ServiceParams::new();
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t-canceled".into(),
             context_id: "c-canceled".into(),
             status: TaskStatus {
@@ -3621,6 +3767,8 @@ mod tests {
             handler
                 .task_store
                 .create(Task {
+                    generation: 0,
+                    timeline: None,
                     id: id.into(),
                     context_id: format!("c-{id}"),
                     status: TaskStatus {
@@ -3653,6 +3801,8 @@ mod tests {
 
     fn task_with_history(id: &str, context_id: &str, n: usize) -> Task {
         Task {
+            generation: 0,
+            timeline: None,
             id: id.into(),
             context_id: context_id.into(),
             status: TaskStatus {
@@ -3684,6 +3834,8 @@ mod tests {
             .get_task(
                 &params,
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: "hist".into(),
                     history_length: None,
                     tenant: None,
@@ -3697,6 +3849,8 @@ mod tests {
             .get_task(
                 &params,
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: "hist".into(),
                     history_length: Some(1),
                     tenant: None,
@@ -3711,6 +3865,8 @@ mod tests {
                 .get_task(
                     &params,
                     GetTaskRequest {
+                        current_generation: None,
+                        timeline_length: None,
                         id: "hist".into(),
                         history_length: Some(hl),
                         tenant: None,
@@ -3744,7 +3900,8 @@ mod tests {
                 .send_message(
                     &params,
                     SendMessageRequest {
-                        message: make_message(),
+                        artifact_updates: Vec::new(),
+                        message: Some(make_message()),
                         configuration: None,
                         metadata: None,
                         tenant: None,
@@ -3758,6 +3915,8 @@ mod tests {
                 .get_task(
                     &params,
                     GetTaskRequest {
+                        current_generation: None,
+                        timeline_length: None,
                         id: "t".into(),
                         history_length: None,
                         tenant: None,
@@ -3771,6 +3930,7 @@ mod tests {
                 .list_tasks(
                     &params,
                     ListTasksRequest {
+                        timeline_length: None,
                         context_id: None,
                         status: None,
                         page_size: None,
@@ -3802,6 +3962,7 @@ mod tests {
                 .subscribe_to_task(
                     &params,
                     SubscribeToTaskRequest {
+                        last_seen_generation: None,
                         id: "t".into(),
                         tenant: None,
                     },
@@ -3814,6 +3975,7 @@ mod tests {
                 .create_push_config(
                     &params,
                     TaskPushNotificationConfig {
+                        protocol_version: None,
                         url: "https://example.com/push".into(),
                         id: None,
                         task_id: "t".into(),
@@ -3878,6 +4040,7 @@ mod tests {
         let handler = make_handler();
         let params = ServiceParams::new();
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "t1".into(),
             tenant: None,
         };
@@ -3895,6 +4058,8 @@ mod tests {
         handler
             .task_store
             .create(Task {
+                generation: 0,
+                timeline: None,
                 id: "t-done".into(),
                 context_id: "c-done".into(),
                 status: TaskStatus {
@@ -3912,6 +4077,7 @@ mod tests {
             .subscribe_to_task(
                 &ServiceParams::new(),
                 SubscribeToTaskRequest {
+                    last_seen_generation: None,
                     id: "t-done".into(),
                     tenant: None,
                 },
@@ -3933,6 +4099,9 @@ mod tests {
             .get_task(
                 &params,
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
+
                     id: task.id.clone(),
                     history_length: None,
                     tenant: None,
@@ -3946,6 +4115,8 @@ mod tests {
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
+                    last_seen_generation: None,
+
                     id: task.id.clone(),
                     tenant: None,
                 },
@@ -3967,6 +4138,8 @@ mod tests {
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
+                    last_seen_generation: None,
+
                     id: task.id.clone(),
                     tenant: None,
                 },
@@ -4019,6 +4192,8 @@ mod tests {
                 .subscribe_to_task(
                     &params,
                     SubscribeToTaskRequest {
+                        last_seen_generation: None,
+
                         id: task.id.clone(),
                         tenant: None,
                     },
@@ -4059,6 +4234,8 @@ mod tests {
         let params = ServiceParams::new();
         let task = task_awaiting_input(&handler).await;
         let subscribe = || SubscribeToTaskRequest {
+            last_seen_generation: None,
+
             id: task.id.clone(),
             tenant: None,
         };
@@ -4079,7 +4256,9 @@ mod tests {
             .send_message(
                 &params,
                 SendMessageRequest {
-                    message: follow_up,
+                    artifact_updates: Vec::new(),
+
+                    message: Some(follow_up),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -4122,6 +4301,8 @@ mod tests {
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
+                    last_seen_generation: None,
+
                     id: task.id.clone(),
                     tenant: None,
                 },
@@ -4148,8 +4329,11 @@ mod tests {
             .send_message(
                 &params,
                 SendMessageRequest {
-                    message,
+                    artifact_updates: Vec::new(),
+                    message: Some(message),
                     configuration: Some(SendMessageConfiguration {
+                        if_generation_match: None,
+                        timeline_length: None,
                         accepted_output_modes: None,
                         task_push_notification_config: None,
                         history_length: None,
@@ -4173,6 +4357,7 @@ mod tests {
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
+                    last_seen_generation: None,
                     id: "t-resume".into(),
                     tenant: None,
                 },
@@ -4200,6 +4385,7 @@ mod tests {
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
+                    last_seen_generation: None,
                     id: "t-resume".into(),
                     tenant: None,
                 },
@@ -4219,6 +4405,7 @@ mod tests {
             .create_push_config(
                 &params,
                 TaskPushNotificationConfig {
+                    protocol_version: None,
                     task_id: "t1".into(),
                     url: "http://example.com".into(),
                     id: None,
@@ -4240,6 +4427,7 @@ mod tests {
             .create_push_config(
                 &params,
                 TaskPushNotificationConfig {
+                    protocol_version: None,
                     task_id: "t1".into(),
                     url: "https://example.com/callback".into(),
                     id: Some("cfg-1".into()),
@@ -4280,6 +4468,7 @@ mod tests {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: Some(1_000_000),
@@ -4304,6 +4493,8 @@ mod tests {
         // Pin that, so a later edit cannot quietly make them lie.
         let tasks = PagingTaskStore::new(0, true);
         let task = Task {
+            generation: 0,
+            timeline: None,
             id: "t-delegated".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -4360,6 +4551,7 @@ mod tests {
         let configs = PagingPushConfigStore::new(0);
         configs
             .save(TaskPushNotificationConfig {
+                protocol_version: None,
                 task_id: "t1".into(),
                 url: "https://example.com/callback".into(),
                 id: Some("cfg-1".into()),
@@ -4392,6 +4584,7 @@ mod tests {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: Some(1_000_000),
@@ -4429,6 +4622,7 @@ mod tests {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: None,
@@ -4459,6 +4653,7 @@ mod tests {
             .list_tasks(
                 &ServiceParams::new(),
                 ListTasksRequest {
+                    timeline_length: None,
                     context_id: None,
                     status: None,
                     page_size: Some(7),
@@ -4515,6 +4710,7 @@ mod tests {
                 .create_push_config(
                     &params,
                     TaskPushNotificationConfig {
+                        protocol_version: None,
                         task_id: "t1".into(),
                         url: format!("https://example.com/callback/{i}"),
                         id: Some(format!("cfg-{i:03}")),
@@ -4557,6 +4753,7 @@ mod tests {
             .create_push_config(
                 &params,
                 TaskPushNotificationConfig {
+                    protocol_version: None,
                     task_id: "t1".into(),
                     url: "https://example.com/first".into(),
                     id: Some("cfg-1".into()),
@@ -4573,6 +4770,7 @@ mod tests {
             .create_push_config(
                 &params,
                 TaskPushNotificationConfig {
+                    protocol_version: None,
                     task_id: "t1".into(),
                     url: "https://example.com/second".into(),
                     id: Some("cfg-2".into()),
@@ -4671,10 +4869,14 @@ mod tests {
             .send_message(
                 &params,
                 SendMessageRequest {
-                    message,
+                    artifact_updates: Vec::new(),
+                    message: Some(message),
                     configuration: Some(SendMessageConfiguration {
+                        if_generation_match: None,
+                        timeline_length: None,
                         accepted_output_modes: None,
                         task_push_notification_config: Some(TaskPushNotificationConfig {
+                            protocol_version: None,
                             task_id: String::new(),
                             url: url.clone(),
                             id: Some("cfg-request".into()),
@@ -4750,6 +4952,7 @@ mod tests {
             .create_push_config(
                 &params,
                 TaskPushNotificationConfig {
+                    protocol_version: None,
                     task_id: "t-push-stored".into(),
                     url: url.clone(),
                     id: Some("cfg-stored".into()),
@@ -4769,7 +4972,8 @@ mod tests {
             .send_message(
                 &params,
                 SendMessageRequest {
-                    message,
+                    artifact_updates: Vec::new(),
+                    message: Some(message),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -4809,6 +5013,7 @@ mod tests {
 
     fn handler_with_extensions(extensions: Vec<(&str, Option<bool>)>) -> DefaultRequestHandler {
         make_handler().with_capabilities(AgentCapabilities {
+            user_artifacts: None,
             streaming: None,
             push_notifications: None,
             extensions: Some(
@@ -4853,6 +5058,8 @@ mod tests {
             .get_task(
                 &params,
                 GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: "t1".into(),
                     history_length: None,
                     tenant: None,
@@ -4912,6 +5119,8 @@ mod tests {
         }));
         let mut request = send_request();
         request.configuration = Some(SendMessageConfiguration {
+            if_generation_match: None,
+            timeline_length: None,
             accepted_output_modes: None,
             task_push_notification_config: Some(TaskPushNotificationConfig {
                 url: url.clone(),
@@ -5066,6 +5275,7 @@ mod tests {
     #[test]
     fn test_with_capabilities() {
         let handler = make_handler().with_capabilities(AgentCapabilities {
+            user_artifacts: None,
             streaming: Some(true),
             push_notifications: None,
             extensions: None,
@@ -5085,6 +5295,7 @@ mod tests {
 
     fn caps(streaming: Option<bool>, push: Option<bool>) -> AgentCapabilities {
         AgentCapabilities {
+            user_artifacts: None,
             streaming,
             push_notifications: push,
             extensions: None,
@@ -5094,7 +5305,8 @@ mod tests {
 
     fn send_request() -> SendMessageRequest {
         SendMessageRequest {
-            message: Message::new(Role::User, vec![Part::text("hi")]),
+            artifact_updates: Vec::new(),
+            message: Some(Message::new(Role::User, vec![Part::text("hi")])),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -5103,6 +5315,7 @@ mod tests {
 
     fn push_config(task_id: &str) -> TaskPushNotificationConfig {
         TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: task_id.into(),
             url: "https://example.com/callback".into(),
             id: Some("cfg-1".into()),
@@ -5131,6 +5344,7 @@ mod tests {
             .subscribe_to_task(
                 &params,
                 SubscribeToTaskRequest {
+                    last_seen_generation: None,
                     id: "t1".into(),
                     tenant: None,
                 },
@@ -5277,6 +5491,8 @@ mod tests {
             handler
                 .task_store
                 .create(Task {
+                    generation: 0,
+                    timeline: None,
                     id: task_id.into(),
                     context_id: context_id.into(),
                     status: TaskStatus {
@@ -5295,9 +5511,13 @@ mod tests {
                 handler.task_store.as_ref(),
                 None,
                 &StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    generation: 0,
                     task_id: task_id.into(),
                     context_id: context_id.into(),
                     artifact: Artifact {
+                        end_generation: None,
+                        role: None,
+                        start_generation: None,
                         artifact_id: artifact_id.into(),
                         name: None,
                         description: None,
@@ -5319,6 +5539,8 @@ mod tests {
                 .get_task(
                     &params,
                     GetTaskRequest {
+                        current_generation: None,
+                        timeline_length: None,
                         id: task_id.into(),
                         history_length: None,
                         tenant: None,
@@ -5389,6 +5611,7 @@ mod tests {
     #[tokio::test]
     async fn test_unconfigured_extended_card_reports_its_own_code() {
         let handler = make_handler().with_capabilities(AgentCapabilities {
+            user_artifacts: None,
             streaming: None,
             push_notifications: None,
             extensions: None,
@@ -5410,6 +5633,7 @@ mod tests {
         let handler = make_handler()
             .with_extended_agent_card(extended_card("x"))
             .with_capabilities(AgentCapabilities {
+                user_artifacts: None,
                 streaming: None,
                 push_notifications: None,
                 extensions: None,
@@ -5444,6 +5668,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(card.name, "full");
+    }
+    #[tokio::test]
+    async fn idle_interrupted_tasks_can_be_canceled_with_each_executor_style() {
+        let handlers = [
+            make_push_delivery_handler(),
+            make_resumable_handler().0,
+            DefaultRequestHandler::new(MultiTurnExecutor, InMemoryTaskStore::new()),
+        ];
+        for handler in handlers {
+            seed_task(&handler, "idle-cancel", "context").await;
+            let mut task = handler.load_task("idle-cancel").await.unwrap();
+            task.status.state = TaskState::InputRequired;
+            handler.task_store.update(task).await.unwrap();
+            let canceled = handler
+                .cancel_task(
+                    &ServiceParams::new(),
+                    CancelTaskRequest {
+                        id: "idle-cancel".into(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(canceled.id, "idle-cancel");
+            assert_eq!(canceled.context_id, "context");
+            assert_eq!(canceled.status.state, TaskState::Canceled);
+            assert_eq!(
+                handler.load_task("idle-cancel").await.unwrap().status.state,
+                TaskState::Canceled
+            );
+        }
     }
 }
 

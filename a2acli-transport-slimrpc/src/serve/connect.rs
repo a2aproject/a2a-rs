@@ -398,6 +398,8 @@ mod tests {
 
     fn fake_task() -> Task {
         Task {
+            generation: 0,
+            timeline: None,
             id: "task-1".into(),
             context_id: "ctx-1".into(),
             status: TaskStatus {
@@ -426,6 +428,7 @@ mod tests {
 
     fn fake_push_config() -> TaskPushNotificationConfig {
         TaskPushNotificationConfig {
+            protocol_version: None,
             url: "https://example.test/callback".into(),
             id: Some("cfg-1".into()),
             task_id: "task-1".into(),
@@ -589,7 +592,8 @@ mod tests {
     async fn test_send_message_forwards_stripped_params_and_returns_the_transport_response() {
         let h = handler();
         let req = SendMessageRequest {
-            message: fake_message(),
+            artifact_updates: Vec::new(),
+            message: Some(fake_message()),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -606,7 +610,8 @@ mod tests {
     async fn test_send_streaming_message_forwards_and_streams_the_transport_response() {
         let h = handler();
         let req = SendMessageRequest {
-            message: fake_message(),
+            artifact_updates: Vec::new(),
+            message: Some(fake_message()),
             configuration: None,
             metadata: None,
             tenant: None,
@@ -623,6 +628,8 @@ mod tests {
     async fn test_get_task_forwards_and_returns_the_transport_response() {
         let h = handler();
         let req = GetTaskRequest {
+            current_generation: None,
+            timeline_length: None,
             id: "task-1".into(),
             history_length: None,
             tenant: None,
@@ -641,6 +648,7 @@ mod tests {
     async fn test_list_tasks_forwards_and_returns_the_transport_response() {
         let h = handler();
         let req = ListTasksRequest {
+            timeline_length: None,
             context_id: None,
             status: None,
             page_size: None,
@@ -670,6 +678,7 @@ mod tests {
     async fn test_subscribe_to_task_forwards_and_streams_the_transport_response() {
         let h = handler();
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "task-1".into(),
             tenant: None,
         };

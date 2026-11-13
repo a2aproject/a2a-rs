@@ -32,6 +32,8 @@ fn sample_message(role: Role, text: &str) -> Message {
 
 fn sample_task(id: &str, state: TaskState) -> Task {
     Task {
+        generation: 0,
+        timeline: None,
         id: id.to_string(),
         context_id: "ctx-1".to_string(),
         status: TaskStatus {
@@ -47,6 +49,7 @@ fn sample_task(id: &str, state: TaskState) -> Task {
 
 fn sample_push_config(id: &str) -> TaskPushNotificationConfig {
     TaskPushNotificationConfig {
+        protocol_version: None,
         task_id: "task-1".to_string(),
         tenant: None,
         url: "https://example.com/callback".to_string(),
@@ -89,7 +92,13 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        let task_id = req.message.task_id.unwrap_or_else(|| "task-1".to_string());
+        let task_id = req
+            .message
+            .as_ref()
+            .unwrap()
+            .task_id
+            .clone()
+            .unwrap_or_else(|| "task-1".to_string());
         Ok(SendMessageResponse::Task(sample_task(
             &task_id,
             TaskState::Completed,
@@ -103,6 +112,7 @@ impl RequestHandler for TestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         Ok(Box::pin(stream::iter(vec![
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "task-1".to_string(),
                 context_id: "ctx-1".to_string(),
                 status: TaskStatus {
@@ -174,6 +184,7 @@ impl RequestHandler for TestHandler {
         }
         Ok(Box::pin(stream::once(async move {
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: req.id,
                 context_id: "ctx-1".to_string(),
                 status: TaskStatus {
@@ -206,6 +217,7 @@ impl RequestHandler for TestHandler {
             return Err(A2AError::task_not_found(&req.id));
         }
         Ok(TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: req.task_id,
             tenant: req.tenant,
             url: "https://example.com/callback".to_string(),
@@ -256,6 +268,8 @@ impl a2a_server::AgentExecutor for StoredTaskExecutor {
         ctx: a2a_server::ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let response = StreamResponse::Task(Task {
+            generation: 0,
+            timeline: None,
             id: ctx.task_id.clone(),
             context_id: ctx.context_id.clone(),
             status: TaskStatus {
@@ -285,6 +299,8 @@ impl a2a_server::AgentExecutor for StoredTaskExecutor {
         ctx: a2a_server::ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let response = StreamResponse::Task(Task {
+            generation: 0,
+            timeline: None,
             id: ctx.task_id.clone(),
             context_id: ctx.context_id.clone(),
             status: TaskStatus {
@@ -353,7 +369,8 @@ fn versioned_params() -> ServiceParams {
 
 fn send_message_request() -> SendMessageRequest {
     SendMessageRequest {
-        message: sample_message(Role::User, "hello"),
+        artifact_updates: Vec::new(),
+        message: Some(sample_message(Role::User, "hello")),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -374,6 +391,8 @@ async fn grpc_transport_end_to_end() {
         .get_task(
             &versioned_params(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "task-1".to_string(),
                 history_length: Some(1),
                 tenant: None,
@@ -387,6 +406,7 @@ async fn grpc_transport_end_to_end() {
         .list_tasks(
             &versioned_params(),
             &ListTasksRequest {
+                timeline_length: None,
                 context_id: Some("ctx-1".to_string()),
                 status: Some(TaskState::Completed),
                 page_size: Some(1),
@@ -492,6 +512,7 @@ async fn grpc_transport_streaming_and_error_paths() {
         .subscribe_to_task(
             &versioned_params(),
             &SubscribeToTaskRequest {
+                last_seen_generation: None,
                 id: "task-1".to_string(),
                 tenant: None,
             },
@@ -505,6 +526,8 @@ async fn grpc_transport_streaming_and_error_paths() {
         .get_task(
             &versioned_params(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "missing".to_string(),
                 history_length: None,
                 tenant: None,
@@ -551,6 +574,8 @@ async fn grpc_transport_accepts_bare_host_port_endpoints() {
         .get_task(
             &versioned_params(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "task-1".to_string(),
                 history_length: Some(1),
                 tenant: None,
@@ -587,7 +612,8 @@ async fn grpc_transport_treats_zero_page_size_as_unset() {
         .send_message(
             &versioned_params(),
             &SendMessageRequest {
-                message: Message::new(Role::User, vec![Part::text("hello")]),
+                artifact_updates: Vec::new(),
+                message: Some(Message::new(Role::User, vec![Part::text("hello")])),
                 configuration: None,
                 metadata: None,
                 tenant: None,
@@ -605,6 +631,7 @@ async fn grpc_transport_treats_zero_page_size_as_unset() {
         .list_tasks(
             &versioned_params(),
             &ListTasksRequest {
+                timeline_length: None,
                 context_id: Some(task.context_id.clone()),
                 status: None,
                 page_size: Some(0),
@@ -664,6 +691,8 @@ async fn grpc_transport_decodes_error_details_from_a_real_server() {
         .get_task(
             &versioned_params(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "invalid".to_string(),
                 history_length: None,
                 tenant: None,

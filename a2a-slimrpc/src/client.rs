@@ -437,12 +437,15 @@ pub fn parse_slimrpc_target(target: &str) -> Result<Arc<ProtoName>, A2AError> {
 
 /// Decodes one item of a server stream. A payload kind this client does not
 /// know decodes to `None` and is skipped, as the spec requires of stream
-/// readers.
+/// readers. A missing message-update message surfaces as a decoding error.
 fn decode_stream_item(
     item: Result<a2a_pb::proto::StreamResponse, A2AError>,
 ) -> Option<Result<StreamResponse, A2AError>> {
     match item {
-        Ok(response) => pbconv::from_proto_stream_response(&response).map(Ok),
+        Ok(response) => match pbconv::try_from_proto_stream_response(&response) {
+            Ok(event) => event.map(Ok),
+            Err(error) => Some(Err(error)),
+        },
         Err(error) => Some(Err(error)),
     }
 }
@@ -482,6 +485,35 @@ mod tests {
 #[cfg(test)]
 mod stream_decode_tests {
     use super::*;
+
+    #[test]
+    fn a_known_message_update_without_a_message_is_an_error_and_later_events_survive() {
+        let malformed = a2a_pb::proto::StreamResponse {
+            payload: Some(a2a_pb::proto::stream_response::Payload::MessageUpdate(
+                a2a_pb::proto::TaskMessageUpdateEvent {
+                    task_id: "task".into(),
+                    context_id: "context".into(),
+                    generation: 7,
+                    message: None,
+                    metadata: None,
+                },
+            )),
+        };
+        let unknown = a2a_pb::proto::StreamResponse { payload: None };
+        let valid = pbconv::to_proto_stream_response(&StreamResponse::Message(a2a::Message::new(
+            a2a::Role::Agent,
+            vec![a2a::Part::text("next")],
+        )));
+        let items: Vec<_> = [malformed, unknown, valid]
+            .into_iter()
+            .filter_map(|item| decode_stream_item(Ok(item)))
+            .collect();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[0], Err(error) if error.code == a2a::error_code::INTERNAL_ERROR));
+        assert!(
+            matches!(&items[1], Ok(StreamResponse::Message(message)) if message.text() == Some("next"))
+        );
+    }
 
     #[test]
     fn unknown_stream_payload_is_skipped() {

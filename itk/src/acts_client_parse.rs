@@ -152,7 +152,8 @@ async fn run(operation: &str, endpoint: &str) -> Result<Value, A2AError> {
             let client = client_for(endpoint.to_string()).map_err(A2AError::internal)?;
             let response = client
                 .send_message(&SendMessageRequest {
-                    message: Message::new(Role::User, vec![Part::text("acts")]),
+                    artifact_updates: Vec::new(),
+                    message: Some(Message::new(Role::User, vec![Part::text("acts")])),
                     configuration: None,
                     metadata: None,
                     tenant: None,
@@ -167,6 +168,8 @@ async fn run(operation: &str, endpoint: &str) -> Result<Value, A2AError> {
             let client = client_for(endpoint.to_string()).map_err(A2AError::internal)?;
             let task = client
                 .get_task(&GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: "acts".to_string(),
                     history_length: None,
                     tenant: None,

@@ -45,6 +45,8 @@ fn sample_message(role: Role, text: &str, task_id: &str) -> Message {
 
 fn sample_task(id: &str, state: TaskState) -> Task {
     Task {
+        generation: 0,
+        timeline: None,
         id: id.to_string(),
         context_id: "ctx-1".to_string(),
         status: TaskStatus {
@@ -60,6 +62,7 @@ fn sample_task(id: &str, state: TaskState) -> Task {
 
 fn sample_push_config(id: &str) -> TaskPushNotificationConfig {
     TaskPushNotificationConfig {
+        protocol_version: None,
         task_id: "task-1".to_string(),
         tenant: None,
         url: "https://example.com/callback".to_string(),
@@ -90,7 +93,8 @@ fn sample_agent_card(target: &str) -> AgentCard {
 
 fn send_message_request(task_id: &str) -> SendMessageRequest {
     SendMessageRequest {
-        message: sample_message(Role::User, "hello", task_id),
+        artifact_updates: Vec::new(),
+        message: Some(sample_message(Role::User, "hello", task_id)),
         configuration: None,
         metadata: None,
         tenant: None,
@@ -206,13 +210,13 @@ impl RequestHandler for TestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        if req.message.task_id.as_deref() == Some("metadata-required")
+        if req.message.as_ref().unwrap().task_id.as_deref() == Some("metadata-required")
             && params.get("x-trace") != Some(&vec!["alpha, beta".to_string()])
         {
             return Err(A2AError::invalid_params("missing x-trace metadata"));
         }
 
-        if req.message.task_id.as_deref() == Some("identity-required") {
+        if req.message.as_ref().unwrap().task_id.as_deref() == Some("identity-required") {
             // The caller's identity comes from the session: its SLIM name and
             // the verified subject of its shared-secret token (id plus a
             // per-instance suffix), never the spoofed values it sent.
@@ -232,7 +236,7 @@ impl RequestHandler for TestHandler {
             }
         }
 
-        if req.message.task_id.as_deref() == Some("message-response") {
+        if req.message.as_ref().unwrap().task_id.as_deref() == Some("message-response") {
             return Ok(SendMessageResponse::Message(sample_message(
                 Role::Agent,
                 "pong",
@@ -242,6 +246,8 @@ impl RequestHandler for TestHandler {
 
         let task_id = req
             .message
+            .as_ref()
+            .unwrap()
             .task_id
             .clone()
             .unwrap_or_else(|| "task-1".to_string());
@@ -257,9 +263,10 @@ impl RequestHandler for TestHandler {
         _params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        if req.message.task_id.as_deref() == Some("stream-error") {
+        if req.message.as_ref().unwrap().task_id.as_deref() == Some("stream-error") {
             return Ok(Box::pin(stream::iter(vec![
                 Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    generation: 0,
                     task_id: "task-1".to_string(),
                     context_id: "ctx-1".to_string(),
                     status: TaskStatus {
@@ -275,6 +282,7 @@ impl RequestHandler for TestHandler {
 
         Ok(Box::pin(stream::iter(vec![
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "task-1".to_string(),
                 context_id: "ctx-1".to_string(),
                 status: TaskStatus {
@@ -336,6 +344,7 @@ impl RequestHandler for TestHandler {
         }
         Ok(Box::pin(stream::once(async move {
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: req.id,
                 context_id: "ctx-1".to_string(),
                 status: TaskStatus {
@@ -368,6 +377,7 @@ impl RequestHandler for TestHandler {
             return Err(A2AError::task_not_found(&req.id));
         }
         Ok(TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: req.task_id,
             tenant: req.tenant,
             url: "https://example.com/callback".to_string(),
@@ -467,6 +477,8 @@ async fn slimrpc_transport_end_to_end() {
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "task-1".to_string(),
                 history_length: Some(1),
                 tenant: None,
@@ -480,6 +492,7 @@ async fn slimrpc_transport_end_to_end() {
         .list_tasks(
             &ServiceParams::new(),
             &ListTasksRequest {
+                timeline_length: None,
                 context_id: Some("ctx-1".to_string()),
                 status: Some(TaskState::Completed),
                 page_size: Some(1),
@@ -593,6 +606,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
         .subscribe_to_task(
             &ServiceParams::new(),
             &SubscribeToTaskRequest {
+                last_seen_generation: None,
                 id: "task-1".to_string(),
                 tenant: None,
             },
@@ -607,6 +621,8 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
             .get_task(
                 &ServiceParams::new(),
                 &GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
                     id: "missing".to_string(),
                     history_length: None,
                     tenant: None,
@@ -665,6 +681,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
         .subscribe_to_task(
             &ServiceParams::new(),
             &SubscribeToTaskRequest {
+                last_seen_generation: None,
                 id: "missing".to_string(),
                 tenant: None,
             },
@@ -746,6 +763,8 @@ async fn slimrpc_transport_reports_malformed_payloads() {
         .get_task(
             &ServiceParams::new(),
             &GetTaskRequest {
+                current_generation: None,
+                timeline_length: None,
                 id: "task-1".to_string(),
                 history_length: None,
                 tenant: None,

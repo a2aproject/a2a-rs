@@ -291,6 +291,8 @@ async fn handle_get_task_inner<H: RequestHandler>(
     query: GetTaskQuery,
 ) -> axum::response::Response {
     let req = GetTaskRequest {
+        current_generation: None,
+        timeline_length: None,
         id,
         history_length: query.history_length,
         tenant,
@@ -365,6 +367,7 @@ async fn handle_list_tasks<H: RequestHandler>(
         None => None,
     };
     let req = ListTasksRequest {
+        timeline_length: None,
         context_id: query.context_id,
         status,
         page_size: query.page_size,
@@ -450,7 +453,11 @@ async fn handle_subscribe_to_task_inner<H: RequestHandler>(
     id: String,
     tenant: Option<String>,
 ) -> axum::response::Response {
-    let req = SubscribeToTaskRequest { id, tenant };
+    let req = SubscribeToTaskRequest {
+        last_seen_generation: None,
+        id,
+        tenant,
+    };
     match state.handler.subscribe_to_task(&params, req).await {
         Ok(stream) => rest_sse(protojson_stream(stream)),
         Err(e) => rest_error_response(e),
@@ -758,6 +765,8 @@ mod tests {
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let task = Task {
+                generation: 0,
+                timeline: None,
                 id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {
@@ -779,6 +788,8 @@ mod tests {
             ctx: ExecutorContext,
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             let task = Task {
+                generation: 0,
+                timeline: None,
                 id: ctx.task_id.clone(),
                 context_id: ctx.context_id.clone(),
                 status: TaskStatus {
@@ -1954,6 +1965,7 @@ mod tests {
         ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
             *self.0.lock().unwrap() = ctx.metadata.clone();
             let update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: ctx.task_id,
                 context_id: ctx.context_id,
                 status: TaskStatus {

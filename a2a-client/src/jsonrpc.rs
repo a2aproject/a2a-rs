@@ -238,6 +238,9 @@ fn decode_stream_value(
                 "status_update",
                 "artifactUpdate",
                 "artifact_update",
+                "messageUpdate",
+                "message_update",
+                "error",
             ]
             .iter()
             .any(|field| fields.contains_key(*field))
@@ -795,6 +798,7 @@ mod tests {
 
     fn sample_create_push_config_request() -> TaskPushNotificationConfig {
         TaskPushNotificationConfig {
+            protocol_version: None,
             task_id: "task-1".into(),
             url: "https://example.invalid/webhook".into(),
             id: Some("cfg-1".into()),
@@ -811,6 +815,7 @@ mod tests {
     async fn test_parse_sse_stream_jsonrpc_envelope() {
         // Build a JSON-RPC response wrapping a StreamResponse (StatusUpdate)
         let status_update = TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -856,6 +861,7 @@ mod tests {
     async fn test_parse_sse_stream_direct_stream_response() {
         // When the data is not a valid JSON-RPC envelope, try parsing directly as StreamResponse
         let status_update = TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -878,6 +884,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_sse_stream_rest_ok() {
         let status_update = TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -919,6 +926,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_sse_stream_rest_skips_unknown_payload() {
         let known = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -980,6 +988,9 @@ mod tests {
             "status_update",
             "artifactUpdate",
             "artifact_update",
+            "messageUpdate",
+            "message_update",
+            "error",
         ] {
             for extra_unknown in [false, true] {
                 let mut payload = serde_json::json!({field: null});
@@ -1029,6 +1040,9 @@ mod tests {
             "status_update",
             "artifactUpdate",
             "artifact_update",
+            "messageUpdate",
+            "message_update",
+            "error",
         ] {
             let envelope =
                 JsonRpcResponse::success(JsonRpcId::Number(1), serde_json::json!({field: null}));
@@ -1084,6 +1098,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_updates_without_a_required_message_are_reported() {
+        for field in ["messageUpdate", "message_update"] {
+            for null_message in [false, true] {
+                let mut update =
+                    serde_json::json!({"taskId":"task", "contextId":"context", "generation":"7"});
+                if null_message {
+                    update["message"] = serde_json::json!(null);
+                }
+                let payload = serde_json::json!({field:update});
+                for jsonrpc in [false, true] {
+                    let value = if jsonrpc {
+                        serde_json::to_value(JsonRpcResponse::success(
+                            JsonRpcId::Number(1),
+                            payload.clone(),
+                        ))
+                        .unwrap()
+                    } else {
+                        payload.clone()
+                    };
+                    let bytes = byte_stream(vec![format!("data: {value}\n\n")]);
+                    let items: Vec<_> = if jsonrpc {
+                        parse_sse_stream(bytes)
+                    } else {
+                        parse_sse_stream_rest(bytes)
+                    }
+                    .collect()
+                    .await;
+                    assert_eq!(items.len(), 1, "{value}");
+                    assert!(
+                        items[0].is_err(),
+                        "a missing message must not be fabricated or skipped: {items:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_parse_sse_stream_rest_parse_error() {
         let sse_text = "data: not-valid-json\n\n".to_string();
         let stream = byte_stream(vec![sse_text]);
@@ -1096,6 +1148,7 @@ mod tests {
     async fn test_parse_sse_stream_empty_data_lines_skipped() {
         // Event with no data: lines should be skipped
         let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1119,6 +1172,7 @@ mod tests {
     async fn test_parse_sse_stream_chunked_delivery() {
         // Data arrives split across multiple chunks
         let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1144,6 +1198,7 @@ mod tests {
     async fn test_parse_sse_stream_data_no_space() {
         // data:VALUE (no space after colon) is valid SSE
         let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1166,6 +1221,7 @@ mod tests {
     async fn test_parse_sse_stream_multiple_events_separate_chunks() {
         let make_sr = |state| {
             StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "t1".into(),
                 context_id: "c1".into(),
                 status: TaskStatus {
@@ -1200,6 +1256,7 @@ mod tests {
     async fn test_parse_sse_stream_multiple_events_single_chunk() {
         let make_status = |state| {
             StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "t1".into(),
                 context_id: "c1".into(),
                 status: TaskStatus {
@@ -1240,6 +1297,7 @@ mod tests {
     async fn test_parse_sse_stream_rest_multiple_events_single_chunk() {
         let make_status = |state| {
             StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: "t1".into(),
                 context_id: "c1".into(),
                 status: TaskStatus {
@@ -1289,6 +1347,7 @@ mod tests {
             reference_task_ids: None,
         };
         let status_update = TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1455,6 +1514,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_sse_stream_crlf_line_endings() {
         let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1479,6 +1539,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_sse_stream_cr_line_endings() {
         let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "t1".into(),
             context_id: "c1".into(),
             status: TaskStatus {
@@ -1644,6 +1705,7 @@ mod tests {
         // end to end through the real HTTP call, not just via the parser's
         // own unit tests.
         let status_update = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            generation: 0,
             task_id: "task-1".into(),
             context_id: "ctx-1".into(),
             status: TaskStatus {
@@ -1663,6 +1725,7 @@ mod tests {
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "task-1".into(),
             tenant: None,
         };
@@ -1696,6 +1759,7 @@ mod tests {
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "task-1".into(),
             tenant: None,
         };
@@ -1729,6 +1793,7 @@ mod tests {
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "task-1".into(),
             tenant: None,
         };
@@ -1757,6 +1822,7 @@ mod tests {
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
             id: "task-1".into(),
             tenant: None,
         };
@@ -1783,6 +1849,9 @@ mod tests {
             .get_task(
                 &ServiceParams::new(),
                 &GetTaskRequest {
+                    current_generation: None,
+                    timeline_length: None,
+
                     id: "task-1".into(),
                     history_length: None,
                     tenant: None,
@@ -1803,6 +1872,8 @@ mod tests {
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
         let req = SubscribeToTaskRequest {
+            last_seen_generation: None,
+
             id: "task-1".into(),
             tenant: None,
         };

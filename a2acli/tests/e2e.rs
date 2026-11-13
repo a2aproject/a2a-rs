@@ -238,6 +238,9 @@ fn raw_file_part(bytes: &[u8], filename: Option<&str>) -> Part {
 
 fn file_artifact(name: &str, bytes: &[u8]) -> Artifact {
     Artifact {
+        end_generation: None,
+        role: None,
+        start_generation: None,
         artifact_id: "file-1".to_string(),
         name: Some(name.to_string()),
         description: None,
@@ -249,6 +252,7 @@ fn file_artifact(name: &str, bytes: &[u8]) -> Artifact {
 
 fn file_chunk(task_id: &str, bytes: &[u8], append: bool) -> Result<StreamResponse, A2AError> {
     Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+        generation: 0,
         task_id: task_id.to_string(),
         context_id: format!("{task_id}-ctx"),
         artifact: file_artifact("log.txt", bytes),
@@ -270,9 +274,13 @@ fn task_with_file(
 
 fn artifact_update(task_id: &str) -> Result<StreamResponse, A2AError> {
     Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+        generation: 0,
         task_id: task_id.to_string(),
         context_id: format!("{task_id}-ctx"),
         artifact: Artifact {
+            end_generation: None,
+            role: None,
+            start_generation: None,
             artifact_id: "artifact-1".to_string(),
             name: None,
             description: None,
@@ -288,6 +296,7 @@ fn artifact_update(task_id: &str) -> Result<StreamResponse, A2AError> {
 
 fn working_status_update(task_id: &str) -> Result<StreamResponse, A2AError> {
     Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+        generation: 0,
         task_id: task_id.to_string(),
         context_id: format!("{task_id}-ctx"),
         status: TaskStatus {
@@ -595,7 +604,7 @@ impl RequestHandler for TestHandler {
             .unwrap()
             .push(req.tenant.clone());
 
-        let text = req.message.text().unwrap_or_default();
+        let text = req.message.as_ref().unwrap().text().unwrap_or_default();
         if text == "send-error" {
             return Err(A2AError::invalid_request("send failed"));
         }
@@ -604,12 +613,12 @@ impl RequestHandler for TestHandler {
         // task, and a --context-id given alongside it must match that
         // task's actual context — the server rejects a mismatch rather
         // than reconciling it (SPEC.md §8.1, INTERACT_002).
-        if let Some(requested_task_id) = &req.message.task_id {
+        if let Some(requested_task_id) = &req.message.as_ref().unwrap().task_id {
             let tasks = self.state.tasks.lock().unwrap();
             match tasks.get(requested_task_id) {
                 None => return Err(A2AError::task_not_found(requested_task_id)),
                 Some(existing) => {
-                    if let Some(requested_context_id) = &req.message.context_id {
+                    if let Some(requested_context_id) = &req.message.as_ref().unwrap().context_id {
                         if requested_context_id != &existing.context_id {
                             return Err(A2AError::invalid_params(format!(
                                 "task {requested_task_id} belongs to context {}, not {requested_context_id}",
@@ -623,11 +632,15 @@ impl RequestHandler for TestHandler {
 
         let task_id = req
             .message
+            .as_ref()
+            .unwrap()
             .task_id
             .clone()
             .unwrap_or_else(|| "task-send".to_string());
         let context_id = req
             .message
+            .as_ref()
+            .unwrap()
             .context_id
             .clone()
             .unwrap_or_else(|| "ctx-send".to_string());
@@ -668,8 +681,8 @@ impl RequestHandler for TestHandler {
         // on the exact parts (and their order/media types) the CLI sent;
         // a single-part message keeps the simpler "Echo: {text}" form so
         // existing single-part assertions are unaffected.
-        let response_parts = if req.message.parts.len() > 1 {
-            req.message.parts.clone()
+        let response_parts = if req.message.as_ref().unwrap().parts.len() > 1 {
+            req.message.as_ref().unwrap().parts.clone()
         } else {
             vec![Part::text(format!("Echo: {text}"))]
         };
@@ -702,15 +715,19 @@ impl RequestHandler for TestHandler {
             .push("send_streaming_message");
         let task_id = req
             .message
+            .as_ref()
+            .unwrap()
             .task_id
             .clone()
             .unwrap_or_else(|| "task-stream".to_string());
         let context_id = req
             .message
+            .as_ref()
+            .unwrap()
             .context_id
             .clone()
             .unwrap_or_else(|| "ctx-stream".to_string());
-        let text = req.message.text().unwrap_or_default();
+        let text = req.message.as_ref().unwrap().text().unwrap_or_default();
         if text == "stream-error" {
             return Ok(Box::pin(stream::once(async {
                 Err(A2AError::internal("stream failed"))
@@ -723,6 +740,33 @@ impl RequestHandler for TestHandler {
                 file_chunk(&task_id, b"two ", true),
                 file_chunk(&task_id, b"three", true),
                 task_event(&task_id, TaskState::Completed),
+            ])));
+        }
+        if text == "stream-client-file" {
+            let mut input = req.message.unwrap();
+            input.task_id = Some(task_id.clone());
+            input.context_id = Some(context_id.clone());
+            let completed = make_task_with_parts(
+                &task_id,
+                &context_id,
+                TaskState::Completed,
+                vec![raw_file_part(b"agent output", Some("reply.bin"))],
+            );
+            return Ok(Box::pin(stream::iter(vec![
+                Ok(StreamResponse::Task(make_task(
+                    &task_id,
+                    &context_id,
+                    TaskState::Working,
+                    "started",
+                ))),
+                Ok(StreamResponse::MessageUpdate(TaskMessageUpdateEvent {
+                    task_id,
+                    context_id,
+                    message: input,
+                    generation: 1,
+                    metadata: None,
+                })),
+                Ok(StreamResponse::Task(completed)),
             ])));
         }
         if text == "stream-open-error" {
@@ -754,6 +798,7 @@ impl RequestHandler for TestHandler {
 
         Ok(Box::pin(stream::iter(vec![
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id,
                 context_id,
                 status: TaskStatus {
@@ -883,6 +928,7 @@ impl RequestHandler for TestHandler {
 
         Ok(Box::pin(stream::iter(vec![
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                generation: 0,
                 task_id: req.id.clone(),
                 context_id: task.context_id.clone(),
                 status: TaskStatus {
@@ -1022,6 +1068,7 @@ fn make_agent_card(base_url: &str, name: &str) -> AgentCard {
             AgentInterface::new(format!("{base_url}/rest"), TRANSPORT_PROTOCOL_HTTP_JSON),
         ],
         capabilities: AgentCapabilities {
+            user_artifacts: None,
             streaming: Some(true),
             push_notifications: Some(true),
             extensions: None,
@@ -1050,6 +1097,8 @@ fn make_task_with_parts(
     parts: Vec<Part>,
 ) -> Task {
     Task {
+        generation: 0,
+        timeline: None,
         id: task_id.to_string(),
         context_id: context_id.to_string(),
         status: TaskStatus {
@@ -3836,6 +3885,7 @@ fn declares(
     extended_agent_card: bool,
 ) -> AgentCapabilities {
     AgentCapabilities {
+        user_artifacts: None,
         streaming: Some(streaming),
         push_notifications: Some(push_notifications),
         extensions: None,
@@ -4233,6 +4283,60 @@ async fn send_saves_the_raw_file_parts_of_the_response() {
     assert_eq!(
         BASE64.decode(parts[1]["raw"].as_str().unwrap()).unwrap(),
         b"binary payload"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_send_prints_client_files_but_only_saves_agent_files() {
+    let server = TestServer::spawn().await;
+    let input = ScratchDir::new("client-echo-in");
+    input.create();
+    let input_file = input.join("note.bin");
+    std::fs::write(&input_file, b"client input").unwrap();
+    let out = ScratchDir::new("client-echo-out");
+    out.create();
+    std::fs::write(out.join("note.bin"), b"existing local file").unwrap();
+
+    let output = run_cli_output(
+        &server,
+        &[
+            "--output",
+            "json",
+            "--compact",
+            "send",
+            "--text-part",
+            "stream-client-file",
+            "--file-part",
+            input_file.to_str().unwrap(),
+            "--stream",
+            "--save-fileparts",
+            out.arg(),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read(&input_file).unwrap(), b"client input");
+    assert_eq!(
+        std::fs::read(out.join("note.bin")).unwrap(),
+        b"existing local file"
+    );
+    assert_eq!(
+        std::fs::read(out.join("reply.bin")).unwrap(),
+        b"agent output"
+    );
+    assert_eq!(std::fs::read_dir(&out.0).unwrap().count(), 2);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("reply.bin"), "{stderr}");
+    assert!(!stderr.contains("note.bin"), "{stderr}");
+
+    // The input notification is still printed with its original file bytes.
+    let events = parse_json_lines(&String::from_utf8(output.stdout).unwrap());
+    let message = &events[1]["messageUpdate"]["message"];
+    assert_eq!(message["role"], "ROLE_USER");
+    assert_eq!(
+        BASE64
+            .decode(message["parts"][1]["raw"].as_str().unwrap())
+            .unwrap(),
+        b"client input"
     );
 }
 
