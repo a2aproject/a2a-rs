@@ -10,6 +10,9 @@ use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use tokio_stream::wrappers::ReceiverStream;
 
+#[path = "quickstart/agent.rs"]
+pub mod quickstart;
+
 // ---------------------------------------------------------------------------
 // EchoExecutor — shared across plain and TLS server examples
 // ---------------------------------------------------------------------------

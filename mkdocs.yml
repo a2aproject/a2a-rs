@@ -21,6 +21,15 @@ copyright: Copyright A2A Contributors. Licensed under the Apache License, Versio
 # Navigation
 nav:
   - Home: index.md
+  - Quickstart:
+      - Agent:
+          - quickstart/agent/index.md
+          - The agent card: quickstart/agent/agent-card.md
+          - The executor: quickstart/agent/executor.md
+          - Start the server: quickstart/agent/start-the-server.md
+          - Call the agent: quickstart/agent/call-the-agent.md
+          - Streaming and multi-turn: quickstart/agent/streaming-and-multi-turn.md
+          - Next steps: quickstart/agent/next-steps.md
   - Reference:
       - a2acli: reference/a2acli.md
 
