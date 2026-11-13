@@ -67,14 +67,22 @@ impl ActiveExecution {
         result: Result<&StreamResponse, &A2AError>,
         snapshot_task: Option<Task>,
     ) {
-        let sequence = {
-            let mut state = self.state.write().await;
-            if let Some(task) = snapshot_task {
-                state.snapshot_task = Some(task);
-            }
-            state.sequence += 1;
-            state.sequence
-        };
+        let mut state = self.state.write().await;
+        // An event can be persisted before cancellation, but held up while
+        // its push notification is sent. It must not restore the old snapshot
+        // or reach subscribers after the cancellation has been published.
+        if state
+            .snapshot_task
+            .as_ref()
+            .is_some_and(|task| task.status.state.is_terminal())
+        {
+            return;
+        }
+        if let Some(task) = snapshot_task {
+            state.snapshot_task = Some(task);
+        }
+        state.sequence += 1;
+        let sequence = state.sequence;
 
         // Task state remains available for a later subscription, but transient
         // events do not need to be allocated when no subscriber is listening.
@@ -86,6 +94,7 @@ impl ActiveExecution {
             sequence,
             result: result.cloned().map_err(Clone::clone),
         };
+        // Keep sequence assignment and broadcast ordered with the snapshot.
         let _ = self.sender.send(event);
     }
 
@@ -1235,13 +1244,23 @@ impl RequestHandler for DefaultRequestHandler {
                             .await?;
                     current_task = updated_task.clone();
 
-                    send_push_notifications(
+                    if let Err(error) = send_push_notifications(
                         &req.id,
                         self.push_config_store.as_deref(),
                         self.push_sender.as_deref(),
                         &event,
                     )
-                    .await?;
+                    .await
+                    {
+                        // The cancellation is already persisted. Release attached
+                        // subscribers and update the active snapshot before removing
+                        // the execution, even though delivery failed.
+                        if let Some(active) = &active_execution {
+                            active.publish(Err(&error), updated_task).await;
+                            self.execution_manager.finish(&req.id, active).await;
+                        }
+                        return Err(error);
+                    }
 
                     if let Some(active) = &active_execution {
                         active.publish(Ok(&event), updated_task).await;
@@ -4942,6 +4961,268 @@ mod tests {
 
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
+    }
+
+    struct PausedPushStore {
+        inner: InMemoryPushConfigStore,
+        calls: AtomicI32,
+        started: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl PushConfigStore for PausedPushStore {
+        async fn save(
+            &self,
+            config: TaskPushNotificationConfig,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.inner.save(config).await
+        }
+
+        async fn get(
+            &self,
+            task_id: &str,
+            config_id: &str,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.inner.get(task_id, config_id).await
+        }
+
+        async fn list(&self, _task_id: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.notify_one();
+                self.resume.notified().await;
+                Ok(Vec::new())
+            } else {
+                Err(A2AError::internal("push store unavailable"))
+            }
+        }
+
+        async fn delete(&self, task_id: &str, config_id: &str) -> Result<(), A2AError> {
+            self.inner.delete(task_id, config_id).await
+        }
+
+        async fn delete_all(&self, task_id: &str) -> Result<(), A2AError> {
+            self.inner.delete_all(task_id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_push_failure_rejects_in_flight_older_event() {
+        install_crypto_provider();
+        let started = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                if ctx.message.is_some() {
+                    vec![(None, Ok(status_event(ctx, TaskState::Working, None)))]
+                } else {
+                    vec![(None, Ok(status_event(ctx, TaskState::Canceled, None)))]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        )
+        .with_push_notifications(
+            PausedPushStore {
+                inner: InMemoryPushConfigStore::new(),
+                calls: AtomicI32::new(0),
+                started: started.clone(),
+                resume: resume.clone(),
+            },
+            crate::HttpPushSender::new(None),
+        );
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-push-race", "c-push-race").await;
+        let mut request = send_request();
+        request.message.task_id = Some("t-push-race".into());
+        let _stream = handler
+            .send_streaming_message(&params, request)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        let active = handler.execution_manager.get("t-push-race").await.unwrap();
+        let mut subscriber = active.subscribe();
+
+        assert!(
+            handler
+                .cancel_task(
+                    &params,
+                    CancelTaskRequest {
+                        id: "t-push-race".into(),
+                        metadata: None,
+                        tenant: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(subscriber.recv().await.unwrap().result.is_err());
+        resume.notify_one();
+        timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&active) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("execution did not finish");
+
+        assert!(active.snapshot_is_terminal().await);
+        assert!(matches!(
+            subscriber.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            handler.load_task("t-push-race").await.unwrap().status.state,
+            TaskState::Canceled
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_push_failure_notifies_and_releases_active_execution() {
+        install_crypto_provider();
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                vec![(None, Ok(status_event(ctx, TaskState::Canceled, None)))]
+            }),
+            InMemoryTaskStore::new(),
+        )
+        .with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(None),
+        );
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-cancel-push-error", "c-cancel-push-error").await;
+        let task = handler.load_task("t-cancel-push-error").await.unwrap();
+        let active = handler.execution_manager.start(task).await.unwrap();
+        let mut subscriber = active.subscribe();
+        handler
+            .create_push_config(
+                &params,
+                TaskPushNotificationConfig {
+                    url: "http://127.0.0.1:9/callback".into(),
+                    ..push_config("t-cancel-push-error")
+                },
+            )
+            .await
+            .unwrap();
+
+        handler
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: "t-cancel-push-error".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        let event = timeout(Duration::from_secs(1), subscriber.recv())
+            .await
+            .expect("the active subscriber must not remain blocked")
+            .unwrap();
+        assert!(event.result.is_err());
+        assert!(active.snapshot_is_terminal().await);
+        assert!(
+            handler
+                .execution_manager
+                .get("t-cancel-push-error")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            handler
+                .load_task("t-cancel-push-error")
+                .await
+                .unwrap()
+                .status
+                .state,
+            TaskState::Canceled
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_push_failure_ends_running_stream() {
+        install_crypto_provider();
+        let gate = Arc::new(Notify::new());
+        let resume = gate.clone();
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(move |ctx: &ExecutorContext| {
+                if ctx.message.is_some() {
+                    vec![
+                        (None, Ok(status_event(ctx, TaskState::Working, None))),
+                        (
+                            Some(gate.clone()),
+                            Ok(status_event(ctx, TaskState::Completed, None)),
+                        ),
+                    ]
+                } else {
+                    vec![(None, Ok(status_event(ctx, TaskState::Canceled, None)))]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        )
+        .with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(None),
+        );
+        let params = ServiceParams::new();
+        let mut stream = handler
+            .send_streaming_message(&params, send_request())
+            .await
+            .unwrap();
+        let working = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let task_id = match working {
+            StreamResponse::StatusUpdate(event) => {
+                assert_eq!(event.status.state, TaskState::Working);
+                event.task_id
+            }
+            event => panic!("expected working status, got {event:?}"),
+        };
+        handler
+            .create_push_config(
+                &params,
+                TaskPushNotificationConfig {
+                    url: "http://127.0.0.1:9/callback".into(),
+                    ..push_config(&task_id)
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            handler
+                .cancel_task(
+                    &params,
+                    CancelTaskRequest {
+                        id: task_id.clone(),
+                        metadata: None,
+                        tenant: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(stream.next().await.is_none());
+        resume.notify_one();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            handler.load_task(&task_id).await.unwrap().status.state,
+            TaskState::Canceled
+        );
     }
 
     /// The CANCELED state `begin_cancel` commits is pushed even when the
