@@ -61,7 +61,6 @@ pin-project-lite = "0.2"
 axum = { version = "0.8", features = ["macros"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "query"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["cors"] }
 http = "1"
 hyper = "1"
 axum-server = {version = "0.8", default-features = false }
@@ -69,7 +68,6 @@ rustls = "0.23"
 
 # gRPC + protobuf
 tonic = "0.14"
-tonic-build = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tonic-types = "0.14"
@@ -92,7 +90,6 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.23"
 thiserror = "2"
 uuid = { version = "1", features = ["v7"] }
-semver = "1"
 tracing = "0.1"
 auto_impl = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

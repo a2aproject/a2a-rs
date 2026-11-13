@@ -44,7 +44,6 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
- "semver",
  "serde",
  "serde_json",
  "tokio",
@@ -130,7 +129,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tower",
- "tower-http 0.7.1",
  "tracing",
  "uuid",
 ]
@@ -5479,7 +5477,6 @@ dependencies = [
  "hyper-util",
  "socket2",
  "tokio",
- "tokio-native-tls",
  "tokio-rustls",
  "tonic",
  "tower",

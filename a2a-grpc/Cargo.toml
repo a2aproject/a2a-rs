@@ -39,7 +39,6 @@ default = ["rustls-tls"]
 native-tls = [
     "a2a-client/native-tls",
     "a2a-server/native-tls",
-    "tonic-tls/native"
 ]
 
 rustls-tls = [
@@ -52,6 +51,5 @@ rustls-tls = [
 rustls-no-provider = [
     "a2a-client/rustls-no-provider",
     "a2a-server/rustls-no-provider",
-    "tonic-tls/rustls",
     "dep:rustls",
 ]
