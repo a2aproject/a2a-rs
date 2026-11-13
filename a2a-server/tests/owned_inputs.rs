@@ -11,7 +11,6 @@ use a2a_server::{
 use futures::{StreamExt, stream::BoxStream};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{Notify, mpsc};
-use tokio_stream::wrappers::ReceiverStream;
 
 fn status(task: &str, context: &str, state: TaskState, text: &str) -> StreamResponse {
     StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
@@ -40,16 +39,16 @@ impl AgentExecutor for WorkerExecutor {
         &self,
         ctx: ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-        let (task, context) = (ctx.task_id, ctx.context_id);
+        let (task, context) = (ctx.task_id.clone(), ctx.context_id.clone());
         let text = ctx
             .message
             .as_ref()
             .and_then(Message::text)
             .unwrap_or("")
             .to_string();
-        let mut inputs = ctx.inputs;
         let processed = self.processed.clone();
         if text == "hold" {
+            let mut inputs = ctx.inputs;
             let read = self.read_old_inbox.clone();
             let result = self.old_result.clone();
             // Deliberately retains ownership beyond the output stream's EOF.
@@ -69,17 +68,11 @@ impl AgentExecutor for WorkerExecutor {
                 Ok(status(&task, &context, TaskState::Completed, "done"))
             }));
         }
-        let (output, events) = mpsc::channel(8);
-        // Input processing and event production live in an independent task.
-        tokio::spawn(async move {
-            if output
-                .send(Ok(status(&task, &context, TaskState::Working, "ready")))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            while let Some(input) = inputs.recv().await {
+        let events = ctx.spawn_worker(8, move |mut ctx, output| async move {
+            output
+                .send(status(&task, &context, TaskState::Working, "ready"))
+                .await?;
+            while let Some(input) = ctx.inputs.recv().await {
                 let text = input.message.text().unwrap_or("").to_string();
                 let finished = text == "finish";
                 processed.send(text.clone()).unwrap();
@@ -93,12 +86,14 @@ impl AgentExecutor for WorkerExecutor {
                     },
                     &text,
                 );
-                if output.send(Ok(event)).await.is_err() || finished {
+                output.send_for(&input, event).await?;
+                if finished {
                     break;
                 }
             }
+            Ok(())
         });
-        ReceiverStream::new(events).boxed()
+        Box::pin(events)
     }
 
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
@@ -187,7 +182,23 @@ async fn detached_receiver_is_revoked_without_waiting_for_its_worker_to_finish()
         StreamResponse::MessageUpdate(_)
     ));
     end_turn.notify_one();
-    // The next invocation must complete while the old worker still owns its receiver.
+    // EOF rejects the unread input; owning its old inbox cannot cause replay.
+    loop {
+        if let StreamResponse::Error(error) = next(&mut stream).await {
+            assert_eq!(error.code, "UNAVAILABLE");
+            break;
+        }
+    }
+    assert!(messages.try_recv().is_err());
+    // Only this fresh request starts execution, even while the old worker still
+    // owns its revoked receiver.
+    assert!(matches!(
+        handler
+            .send_live_request(&p, send("finish", Some(&task.id)))
+            .await
+            .unwrap(),
+        LiveResponse::Ack(_)
+    ));
     assert_eq!(received(&mut messages).await, "finish");
     loop {
         let event = next(&mut stream).await;
@@ -202,9 +213,12 @@ async fn detached_receiver_is_revoked_without_waiting_for_its_worker_to_finish()
     read_old_inbox.notify_one();
     assert!(
         received(&mut old_results).await.is_none(),
-        "the old worker cannot steal handed-off input"
+        "the old worker cannot read rejected input"
     );
-    assert!(messages.try_recv().is_err(), "the input is processed once");
+    assert!(
+        messages.try_recv().is_err(),
+        "only the fresh input is processed"
+    );
 }
 
 #[tokio::test]

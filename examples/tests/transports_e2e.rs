@@ -374,6 +374,10 @@ async fn spawn_push_http_server() -> (String, tokio::task::JoinHandle<()>) {
     ] {
         let mut task = sample_task(id, TaskState::Submitted);
         task.context_id = context.to_string();
+        if let Some(message) = &mut task.status.message {
+            message.task_id = Some(id.to_owned());
+            message.context_id = Some(context.to_owned());
+        }
         store.create(task).await.unwrap();
     }
     let handler = Arc::new(

@@ -19,26 +19,7 @@ pub type ServiceParams = HashMap<String, Vec<String>>;
 /// Section 3.6 requires `Major.Minor`: a bare `1` is invalid. A numeric
 /// patch component is tolerated and ignored when negotiating compatibility.
 pub fn check_a2a_version(params: &ServiceParams) -> Result<(), A2AError> {
-    let mut values = params
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("a2a-version"))
-        .flat_map(|(_, values)| values);
-    let requested = values.next().map(String::as_str).unwrap_or("0.3");
-    if values.next().is_some() {
-        return Err(A2AError::version_not_supported(requested));
-    }
-    let parts: Vec<_> = requested.trim().split('.').collect();
-    let numeric = (2..=3).contains(&parts.len())
-        && parts.iter().all(|part| {
-            !part.is_empty()
-                && part.bytes().all(|byte| byte.is_ascii_digit())
-                && part.parse::<u32>().is_ok()
-        });
-    if numeric && parts[0].parse::<u32>() == Ok(1) {
-        Ok(())
-    } else {
-        Err(A2AError::version_not_supported(requested))
-    }
+    crate::handler::protocol::validate_protocol_version(params)
 }
 
 /// Build [`ServiceParams`] from an axum [`HeaderMap`].
@@ -182,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_protocol_version_accepts_supported_versions() {
-        for version in ["1.0", "1.1", "1.4", "1.1.99"] {
+        for version in ["1.0", "1.1", "1.1.99"] {
             let params = ServiceParams::from([("a2a-version".to_string(), vec![version.into()])]);
             assert!(check_a2a_version(&params).is_ok(), "{version}");
         }
@@ -197,7 +178,7 @@ mod tests {
         );
 
         for version in [
-            "", "1", "1.", ".1", "1..1", "1.1.x", "0.3", "2.0", "invalid",
+            "", "1", "1.", ".1", "1..1", "1.1.x", "0.3", "1.4", "1.999", "2.0", "invalid",
         ] {
             let params = ServiceParams::from([("a2a-version".to_string(), vec![version.into()])]);
             assert_eq!(

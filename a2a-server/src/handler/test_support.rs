@@ -455,7 +455,8 @@ impl crate::PushConfigStore for PagingPushConfigStore {
 /// §3.4.2 forbids client-provided taskIds for *creating* tasks.
 pub(super) async fn seed_task(handler: &DefaultRequestHandler, task_id: &str, context_id: &str) {
     handler
-        .task_store
+        .tasks
+        .store()
         .create(Task {
             generation: 0,
             timeline: None,
@@ -627,7 +628,7 @@ pub(super) fn reject_unauthenticated(
     Err(A2AError::invalid_request("authentication required"))
 }
 
-// §13.3 (#203): a capability the card does not declare is not served.
+// A2A 1.1 §3.3.4: a capability the card does not declare is not served.
 
 pub(super) fn caps(streaming: Option<bool>, push: Option<bool>) -> AgentCapabilities {
     AgentCapabilities {

@@ -126,6 +126,7 @@ dependencies = [
  "hmac",
  "http-body-util",
  "hyper",
+ "parking_lot",
  "reqwest",
  "rustls",
  "serde",

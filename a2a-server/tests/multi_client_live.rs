@@ -225,35 +225,55 @@ fn caller(observed: Observed, user: &str, text: &str, initial: bool) -> String {
 }
 
 #[tokio::test]
-async fn caller_context_survives_unread_handoff_and_remaining_queued_inputs() {
+async fn unread_inputs_are_private_and_fresh_requests_keep_their_own_caller_context() {
     let (handler, mut receiver, release) = handler();
     let (id, _owner) = start(&handler, &params("alice", Some("a")), "hold").await;
     let first_execution = caller(seen(&mut receiver).await, "alice", "hold", true);
-    let mut bob = open(
+    let bob_request = send("resume", Some(&id));
+    let alice_request = send("finish", Some(&id));
+    let reference = |request: &StreamRequest| match &request.payload {
+        StreamRequestPayload::SendMessage(request) => {
+            request.message.as_ref().unwrap().message_id.clone()
+        }
+        _ => unreachable!(),
+    };
+    let bob_id = reference(&bob_request);
+    let alice_id = reference(&alice_request);
+    let mut bob = open(&handler, &params("bob", Some("b")), bob_request).await;
+    next(&mut bob).await;
+    let mut alice = open(&handler, &params("alice", Some("c")), alice_request).await;
+    next(&mut alice).await;
+    release.notify_one();
+    for (downlink, id) in [(&mut bob, bob_id), (&mut alice, alice_id)] {
+        loop {
+            if let StreamResponse::Error(error) = next(downlink).await {
+                assert_eq!(error.code, "UNAVAILABLE");
+                assert_eq!(error.reference_id.as_deref(), Some(id.as_str()));
+                break;
+            }
+        }
+    }
+    assert!(
+        receiver.try_recv().is_err(),
+        "unread inputs cannot start another execution"
+    );
+    ack(
         &handler,
         &params("bob", Some("b")),
-        send("resume", Some(&id)),
+        send("resume-fresh", Some(&id)),
     )
     .await;
-    next(&mut bob).await; // Queued, with Bob's own downlink.
-    let mut alice = open(
+    let next_execution = caller(seen(&mut receiver).await, "bob", "resume-fresh", true);
+    assert_ne!(first_execution, next_execution);
+    ack(
         &handler,
         &params("alice", Some("c")),
         send("finish", Some(&id)),
     )
     .await;
-    next(&mut alice).await;
-    release.notify_one();
-    let next_execution = caller(seen(&mut receiver).await, "bob", "resume", true);
-    let queued_execution = caller(seen(&mut receiver).await, "alice", "finish", false);
-    assert_ne!(
-        first_execution, next_execution,
-        "handoff starts a new execution for the same task"
-    );
-    assert_eq!(
-        next_execution, queued_execution,
-        "queued inputs share their receiving execution"
-    );
+    let receiving_execution = caller(seen(&mut receiver).await, "alice", "finish", false);
+    assert_eq!(next_execution, receiving_execution);
+    handler.shutdown().await;
 }
 
 #[tokio::test]
@@ -360,23 +380,21 @@ async fn shared_credentials_have_independent_rejection_streams_and_bound_task_ro
 }
 
 #[tokio::test]
-async fn another_principal_cannot_use_an_existing_exchange_identifier() {
+async fn exchange_identifier_is_scoped_to_the_authenticated_principal() {
     let (handler, mut receiver, _) = handler();
-    let (id, _owner) = start(&handler, &params("alice", Some("a")), "start").await;
+    let alice = params("alice", Some("shared-id"));
+    let bob = params("bob", Some("shared-id"));
+    let (alice_task, _alice_output) = start(&handler, &alice, "start").await;
     caller(seen(&mut receiver).await, "alice", "start", true);
-    assert!(
-        handler
-            .send_live_request(&params("bob", Some("a")), send("forbidden", Some(&id)))
-            .await
-            .is_err()
-    );
-    let _bob = open(
-        &handler,
-        &params("bob", Some("b")),
-        send("finish", Some(&id)),
-    )
-    .await;
+    // The same spelling in Bob's scope opens his own exchange and task;
+    // it must not inherit Alice's implicit task binding.
+    let (bob_task, _bob_output) = start(&handler, &bob, "start").await;
+    caller(seen(&mut receiver).await, "bob", "start", true);
+    assert_ne!(alice_task, bob_task);
+    ack(&handler, &bob, send("finish", None)).await;
     caller(seen(&mut receiver).await, "bob", "finish", false);
+    ack(&handler, &alice, send("finish", None)).await;
+    caller(seen(&mut receiver).await, "alice", "finish", false);
 }
 
 #[tokio::test]

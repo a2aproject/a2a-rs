@@ -59,7 +59,7 @@ fn artifact(id: &str, role: Role) -> Artifact {
     }
 }
 #[tokio::test]
-async fn cancellation_finishes_existing_and_hook_created_artifacts() {
+async fn cancellation_finishes_existing_artifacts_and_rejects_post_terminal_artifacts() {
     for hook in [Hook::Empty, Hook::Status, Hook::Snapshot, Hook::Artifact] {
         let store = InMemoryTaskStore::new();
         let mut already_closed = artifact("complete", Role::Agent);
@@ -86,7 +86,7 @@ async fn cancellation_finishes_existing_and_hook_created_artifacts() {
             .await
             .unwrap();
         let handler = DefaultRequestHandler::new(Agent(hook), store);
-        let canceled = handler
+        let result = handler
             .cancel_task(
                 &ServiceParams::new(),
                 CancelTaskRequest {
@@ -95,8 +95,34 @@ async fn cancellation_finishes_existing_and_hook_created_artifacts() {
                     metadata: None,
                 },
             )
-            .await
-            .unwrap();
+            .await;
+        let canceled = if matches!(hook, Hook::Artifact) {
+            assert_eq!(result.unwrap_err().code, error_code::INVALID_AGENT_RESPONSE);
+            let task = handler
+                .get_task(
+                    &ServiceParams::new(),
+                    GetTaskRequest {
+                        id: "task".into(),
+                        tenant: None,
+                        history_length: None,
+                        timeline_length: None,
+                        current_generation: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                !task
+                    .artifacts
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|artifact| artifact.artifact_id == "during-cancel")
+            );
+            task
+        } else {
+            result.unwrap()
+        };
         assert_eq!(canceled.status.state, TaskState::Canceled);
         for artifact in canceled.artifacts.as_ref().unwrap() {
             let end = artifact

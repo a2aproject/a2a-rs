@@ -12,6 +12,7 @@ rust-version.workspace = true
 name = "a2a_server"
 
 [dependencies]
+async-stream = { workspace = true }
 a2a = { workspace = true }
 a2a-pb = { workspace = true }
 serde = { workspace = true }
@@ -25,6 +26,7 @@ tokio-stream = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures = { workspace = true }
 async-trait = { workspace = true }
+parking_lot = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 hyper = { workspace = true }
@@ -58,6 +60,5 @@ fuzzing = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-async-stream = { workspace = true }
 http-body-util = "0.1"
 rustls = { workspace = true }

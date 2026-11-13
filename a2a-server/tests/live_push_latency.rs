@@ -1,8 +1,8 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-//! A client that answers at once, while the final push of the turn is still in
-//! flight, starts the next turn instead of being declined.
+//! A running executor receives client input while earlier webhook requests
+//! remain in flight; webhook I/O does not hold the task controller.
 use std::time::Duration;
 
 use a2a::*;
@@ -33,12 +33,15 @@ struct Agent;
 impl AgentExecutor for Agent {
     fn execute(
         &self,
-        ctx: ExecutorContext,
+        mut ctx: ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let (t, c) = (ctx.task_id.clone(), ctx.context_id.clone());
-        Box::pin(stream::once(async move {
-            Ok(status(&t, &c, TaskState::InputRequired, "need input"))
-        }))
+        Box::pin(async_stream::stream! {
+            yield Ok(status(&t, &c, TaskState::InputRequired, "need input"));
+            while ctx.inputs.recv().await.is_some() {
+                yield Ok(status(&t, &c, TaskState::InputRequired, "need input"));
+            }
+        })
     }
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         Box::pin(stream::once(async move {

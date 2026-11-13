@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Owned task inputs and cancellation-safe receipt tracking.
 
+mod offer;
+pub(crate) use offer::InputOffer;
+
 use crate::middleware::{ServiceParams, User};
 use a2a::*;
 use serde_json::Value;
@@ -10,10 +13,10 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicI64, AtomicU8, Ordering},
     },
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 /// A client message that reached a running execution: sent on a live stream
@@ -79,34 +82,43 @@ impl ClientInput {
 /// or sent to the working task (see [`super::ExecutorContext::inputs`]).
 ///
 /// The receiver is owned and can move into a Tokio task. The server tracks
-/// delivery receipts: a message still unread at the end of a nonterminal
-/// turn is handed to the next execution. If the task ends, its
-/// sender receives a `StreamError`. An executor reads with [`recv`](Self::recv),
+/// delivery receipts: a message still unread when its execution ends is never
+/// replayed into another call. A waiting unary or streaming sender receives
+/// an error; a live sender receives a private
+/// `StreamError`. An executor reads with [`recv`](Self::recv),
 /// alongside its own work.
 pub struct ClientInputs {
     receiver: Option<mpsc::Receiver<QueuedInput>>,
     closed: CancellationToken,
     revoked: CancellationToken,
     returned: Option<oneshot::Sender<mpsc::Receiver<QueuedInput>>>,
+    received_generation: Arc<AtomicI64>,
+    offers: watch::Receiver<Option<Arc<offer::OfferedInput>>>,
 }
 
 impl ClientInputs {
     /// A bounded channel for exercising an executor on its own.
     pub fn channel(capacity: usize) -> (ClientInputSender, ClientInputs) {
         let (sender, receiver) = mpsc::channel(capacity);
+        let (offers, offered) = watch::channel(None);
         let closed = CancellationToken::new();
         let revoked = CancellationToken::new();
+        let received_generation = Arc::new(AtomicI64::new(0));
         (
             ClientInputSender {
                 sender,
                 closed: closed.clone(),
                 revoked: revoked.clone(),
+                received_generation: received_generation.clone(),
+                offers,
             },
             ClientInputs {
                 receiver: Some(receiver),
                 closed,
                 revoked,
                 returned: None,
+                received_generation,
+                offers: offered,
             },
         )
     }
@@ -128,11 +140,20 @@ impl ClientInputs {
 
     /// The next message, waiting for one if none is queued. Closing the
     /// sending end preserves buffered messages; after those, returns `None`.
+    /// Canceling this future withdraws its uncommitted read claim. If a write
+    /// has already started, its input can still commit, but stays queued with
+    /// an unread receipt until actually received or rejected at execution end.
     pub async fn recv(&mut self) -> Option<ClientInput> {
+        let mut claim = None::<offer::ReadClaim>;
         loop {
             if self.revoked.is_cancelled() {
                 return None;
             }
+            if claim.is_none() {
+                let offered = self.offers.borrow_and_update().clone();
+                claim = offered.and_then(|offer| offer.claim());
+            }
+            let released = claim.as_ref().map(offer::ReadClaim::ready);
             let receiver = self.receiver.as_mut().expect("receiver exists until drop");
             let input = tokio::select! {
                 biased;
@@ -142,30 +163,44 @@ impl ClientInputs {
                     receiver.recv().await
                 }
                 input = receiver.recv() => input,
+                _ = async { match released { Some(ready) => ready.cancelled().await, None => std::future::pending().await } } => { claim = None; continue; },
+                _ = self.offers.changed() => continue,
             }?;
             if self.revoked.is_cancelled() {
                 return None;
             }
             if let Some(input) = input.claim() {
+                self.received_generation
+                    .fetch_max(input.generation, Ordering::AcqRel);
+                super::outputs::input_read(&self.received_generation, input.generation);
                 return Some(input);
             }
         }
     }
 
-    /// A message that is already queued, without waiting.
+    /// A committed message that is already available, without waiting.
+    /// It never claims an uncommitted answer. Use `recv` to accept an answer
+    /// offered to an interrupted execution and await its committed value.
     pub fn try_recv(&mut self) -> Option<ClientInput> {
-        if self.revoked.is_cancelled() {
-            return None;
+        loop {
+            if self.revoked.is_cancelled() {
+                return None;
+            }
+            let receiver = self.receiver.as_mut().expect("receiver exists until drop");
+            if self.closed.is_cancelled() {
+                receiver.close();
+            }
+            let input = receiver.try_recv().ok()?;
+            if self.revoked.is_cancelled() {
+                return None;
+            }
+            if let Some(input) = input.claim() {
+                self.received_generation
+                    .fetch_max(input.generation, Ordering::AcqRel);
+                super::outputs::input_read(&self.received_generation, input.generation);
+                return Some(input);
+            }
         }
-        let receiver = self.receiver.as_mut().expect("receiver exists until drop");
-        if self.closed.is_cancelled() {
-            receiver.close();
-        }
-        let input = receiver.try_recv().ok()?;
-        if self.revoked.is_cancelled() {
-            return None;
-        }
-        input.claim()
     }
 
     #[cfg(test)]
@@ -195,7 +230,7 @@ const RECEIVED: u8 = 1;
 const RECLAIMED: u8 = 2;
 
 /// Reading and reclaiming race through one atomic receipt. This lets a worker
-/// own the receiver without letting it read messages handed to a later turn.
+/// own the receiver without letting it read messages already rejected at EOF.
 #[derive(Clone)]
 pub(crate) struct QueuedInput {
     input: Arc<ClientInput>,
@@ -209,24 +244,21 @@ impl QueuedInput {
             state: Arc::new(AtomicU8::new(UNREAD)),
         }
     }
-
     pub(crate) fn pending(&self) -> bool {
         self.state.load(Ordering::Acquire) == UNREAD
     }
-
     fn claim(self) -> Option<ClientInput> {
         self.take(RECEIVED)
     }
-
     pub(crate) fn reclaim(self) -> Option<ClientInput> {
         self.take(RECLAIMED)
     }
-
-    fn take(self, state: u8) -> Option<ClientInput> {
-        self.state
-            .compare_exchange(UNREAD, state, Ordering::AcqRel, Ordering::Acquire)
+    fn take(self, target: u8) -> Option<ClientInput> {
+        let Self { input, state } = self;
+        state
+            .compare_exchange(UNREAD, target, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
-        Some(Arc::try_unwrap(self.input).unwrap_or_else(|input| (*input).clone()))
+        Some(Arc::try_unwrap(input).unwrap_or_else(|input| (*input).clone()))
     }
 }
 
@@ -244,12 +276,55 @@ pub struct ClientInputSender {
     pub(crate) sender: mpsc::Sender<QueuedInput>,
     pub(crate) closed: CancellationToken,
     revoked: CancellationToken,
+    received_generation: Arc<AtomicI64>,
+    offers: watch::Sender<Option<Arc<offer::OfferedInput>>>,
 }
 
 impl ClientInputSender {
+    pub(crate) fn offer(&self, offer: Option<Arc<offer::OfferedInput>>) {
+        self.offers.send_if_modified(|current| {
+            let same = match (&*current, &offer) {
+                (Some(current), Some(offer)) => Arc::ptr_eq(current, offer),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                *current = offer;
+            }
+            !same
+        });
+    }
+
+    pub(crate) fn clear_offer(&self, offer: &Arc<offer::OfferedInput>) {
+        self.offers.send_if_modified(|current| {
+            if current
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, offer))
+            {
+                *current = None;
+                true
+            } else {
+                false
+            }
+        });
+    }
+    /// The opening message is delivered through ExecutorContext, outside the inbox.
+    pub(crate) fn received(&self, generation: i64) {
+        self.received_generation
+            .fetch_max(generation, Ordering::AcqRel);
+    }
+
+    pub(crate) fn progress(&self) -> Arc<AtomicI64> {
+        self.received_generation.clone()
+    }
+
+    pub(crate) fn received_generation(&self) -> i64 {
+        self.received_generation.load(Ordering::Acquire)
+    }
+
     /// Queues `input`. `Err` gives it back when the channel is full or closed.
     pub fn try_send(&self, input: ClientInput) -> Result<(), Box<ClientInput>> {
-        if self.closed.is_cancelled() {
+        if self.closed.is_cancelled() || self.revoked.is_cancelled() {
             return Err(Box::new(input));
         }
         self.sender
@@ -269,10 +344,19 @@ impl ClientInputSender {
         self.closed.cancel();
     }
 
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.revoked.is_cancelled()
+    }
+
     /// End this invocation's right to read, including in detached workers.
     pub(crate) fn revoke(&self) {
-        self.revoked.cancel();
+        self.revoke_reads();
         self.closed.cancel();
+    }
+
+    /// Stop old receivers at inline EOF while the driver drains buffered output.
+    pub(crate) fn revoke_reads(&self) {
+        self.revoked.cancel();
     }
 }
 
@@ -288,6 +372,32 @@ mod tests {
             },
             1,
         )
+    }
+
+    #[tokio::test]
+    async fn input_progress_advances_only_when_the_executor_reads_input() {
+        let (sender, mut inputs) = ClientInputs::channel(2);
+        sender
+            .try_send(ClientInput::new(input("first").message, 3))
+            .unwrap();
+        sender
+            .try_send(ClientInput::new(input("second").message, 5))
+            .unwrap();
+        assert_eq!(
+            sender.received_generation(),
+            0,
+            "queue admission is not receipt"
+        );
+        inputs.recv().await.unwrap();
+        assert_eq!(sender.received_generation(), 3);
+        sender.received(2);
+        assert_eq!(
+            sender.received_generation(),
+            3,
+            "an earlier opening cannot move progress backwards"
+        );
+        inputs.try_recv().unwrap();
+        assert_eq!(sender.received_generation(), 5);
     }
 
     #[tokio::test]
@@ -343,11 +453,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handler_drains_only_unread_inputs_at_turn_end() {
+    async fn handler_rejects_only_unread_inputs_at_execution_end() {
         let (sender, mut inputs) = ClientInputs::channel(3);
         sender.try_send(input("read")).unwrap();
-        sender.try_send(input("next-turn-first")).unwrap();
-        sender.try_send(input("next-turn-second")).unwrap();
+        sender.try_send(input("unread-first")).unwrap();
+        sender.try_send(input("unread-second")).unwrap();
         assert_eq!(inputs.recv().await.unwrap().message.message_id, "read");
         let unread = inputs.close_and_drain();
         assert_eq!(
@@ -355,7 +465,7 @@ mod tests {
                 .iter()
                 .map(|i| i.message.message_id.as_str())
                 .collect::<Vec<_>>(),
-            ["next-turn-first", "next-turn-second"]
+            ["unread-first", "unread-second"]
         );
         assert!(inputs.recv().await.is_none());
         assert!(sender.try_send(input("late")).is_err());
@@ -372,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn a_concurrent_reader_and_handoff_deliver_each_input_once() {
+    fn a_concurrent_reader_and_rejection_dispose_of_each_input_once() {
         for _ in 0..64 {
             let queued = QueuedInput::new(input("raced"));
             let reader = queued.clone();
@@ -383,9 +493,9 @@ mod tests {
                     reading.wait();
                     reader.claim()
                 });
-                let handing_off = &start;
+                let rejecting = &start;
                 let reclaim = scope.spawn(move || {
-                    handing_off.wait();
+                    rejecting.wait();
                     queued.reclaim()
                 });
                 start.wait();
@@ -415,16 +525,16 @@ mod tests {
         assert!(inputs.try_recv().is_none());
 
         let (sender, mut inputs) = ClientInputs::channel(1);
-        sender.try_send(input("handed-off")).unwrap();
+        sender.try_send(input("rejected")).unwrap();
         sender.revoke();
         assert!(inputs.try_recv().is_none());
         assert!(inputs.recv().await.is_none());
     }
 
     #[tokio::test]
-    async fn recv_skips_receipts_already_reclaimed_for_a_later_turn() {
+    async fn recv_skips_receipts_already_reclaimed_for_rejection() {
         let (sender, mut inputs) = ClientInputs::channel(2);
-        let first = QueuedInput::new(input("handed-off"));
+        let first = QueuedInput::new(input("rejected"));
         assert!(first.clone().reclaim().is_some());
         sender.sender.try_send(first).unwrap();
         sender.try_send(input("still-unread")).unwrap();

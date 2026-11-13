@@ -5,18 +5,20 @@ use crate::middleware::{ServiceParams, User};
 use a2a::*;
 use futures::stream::BoxStream;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 mod inputs;
+pub(crate) mod outputs;
 pub use inputs::{ClientInput, ClientInputSender, ClientInputs};
-pub(crate) use inputs::{QueuedInput, ReturnedInputs};
+pub(crate) use inputs::{InputOffer, QueuedInput, ReturnedInputs};
+pub use outputs::{ExecutorOutput, ExecutorOutputReceiver, ExecutorOutputSender};
 
 /// Context passed to the [`AgentExecutor`] for each execution.
 ///
 /// Non-exhaustive: fields are added as the protocol grows, and only the
 /// handler builds one. Inputs are owned and can move into a worker task.
-/// Once the execution stream ends the old inbox stops yielding messages; unread
-/// inputs remain available to the server for the next invocation.
+/// The returned stream defines execution lifetime. EOF revokes its inbox;
+/// unread inputs are rejected, never replayed into another execution.
 ///
 /// ```no_run
 /// use a2a_server::ExecutorContext;
@@ -36,9 +38,12 @@ pub struct ExecutorContext {
     pub message: Option<Message>,
     /// The task ID being executed.
     pub task_id: TaskId,
-    /// The existing task, if this is a continuation. For a new task it is
-    /// `None`, except on a blocking `SendMessage`, where it is the task as the
-    /// request prepared it (not saved yet: the executor's first event creates it).
+    /// The task snapshot prepared for this invocation, including its admitted
+    /// client input. The handler supplies it in every response mode; use
+    /// `new_task` to distinguish the first invocation from a continuation.
+    /// For deferred creation this snapshot is provisional until the executor's
+    /// first task event commits it. A typed [`Agent::execute`] receives the
+    /// committed snapshot after [`Agent::start`] creates its task.
     pub stored_task: Option<Task>,
     /// Context ID grouping related interactions.
     pub context_id: String,
@@ -52,11 +57,18 @@ pub struct ExecutorContext {
     pub tenant: Option<String>,
     /// Client messages queued for this task while this execution runs, on a
     /// live stream or sent to the working task. The executor can read them
-    /// alongside its own work. Messages left unread at the end of a nonterminal
-    /// turn are handed to the next execution.
+    /// alongside its own work. Messages left unread when execution ends are
+    /// rejected to their senders, never replayed into another execution.
     pub inputs: ClientInputs,
-    /// Whether this message creates the task, which has not existed until now.
+    /// Whether this is the task's first invocation. This remains true for a
+    /// typed agent's first `execute` call after `start` has created the task.
     pub new_task: bool,
+    // The typed adapter refreshes its context after its opening Task is committed.
+    // A weak reference keeps this lookup from extending the task's lifetime.
+    pub(crate) task_snapshot: Option<crate::handler::WeakTaskHandle>,
+    // Captured before execute/restart can read another input. Channel creation
+    // later in the invocation must not relabel output for the opening request.
+    pub(crate) opening_input_generation: i64,
 }
 
 impl ExecutorContext {
@@ -80,8 +92,35 @@ impl ExecutorContext {
             service_params: ServiceParams::new(),
             tenant: None,
             inputs,
+            opening_input_generation: 0,
             new_task: false,
+            task_snapshot: None,
         }
+    }
+
+    /// Create the stream this execution will return and a sender for its workers.
+    /// Move the sender into the worker and return the receiver as a boxed stream.
+    /// `send_for` preserves per-input correlation through this receiver; return
+    /// it directly rather than buffering its untagged items in another stream.
+    /// Perform asynchronous transforms in the worker before `send_for`.
+    /// Dropping all senders ends execution after buffered output is delivered.
+    pub fn output_channel(
+        &self,
+        capacity: usize,
+    ) -> (ExecutorOutputSender, ExecutorOutputReceiver) {
+        ExecutorOutputSender::for_execution(capacity, self.opening_input_generation)
+    }
+
+    /// Run an owned worker and return its monitored output stream.
+    /// Panics and returned errors fail execution; dropping the returned stream
+    /// aborts the worker. Read inputs and use `send_for` inside the closure.
+    pub fn spawn_worker<F, Fut>(self, capacity: usize, worker: F) -> ExecutorOutputReceiver
+    where
+        F: FnOnce(Self, ExecutorOutputSender) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), A2AError>> + Send + 'static,
+    {
+        let (outputs, events) = self.output_channel(capacity);
+        events.with_worker(tokio::spawn(async move { worker(self, outputs).await }))
     }
 
     pub fn with_inputs(mut self, inputs: ClientInputs) -> Self {
@@ -130,14 +169,238 @@ impl ExecutorContext {
 /// The executor returns a stream of events (status updates, artifact updates,
 /// messages, or task objects).
 ///
+/// For a new task its first event decides whether a task exists (A2A §3.1.1):
+/// a task, status or artifact event creates it, and the server saves it then;
+/// a [`Message`] is a direct reply, nothing is saved, and whatever the
+/// executor's output stream is dropped immediately after that reply. An executor that fails or panics before it has said anything
+/// leaves no task; one that ends without an event leaves the task as the
+/// request prepared it. Live openings and unary `returnImmediately` calls
+/// create the task up front. See [`Agent`] for the same contract as a typed return
+/// value.
+///
+/// Artifact updates are explicit writes: an executor may append to or replace
+/// client-originated artifacts with [`TaskArtifactUpdateEvent`]. The server keeps
+/// the artifact's original `role`; it identifies its creator, not its latest editor.
+/// Full [`Task`] snapshots carry forward the committed client-originated artifacts
+/// instead of copying their supplied versions, so an old snapshot cannot undo newer
+/// client or executor edits. Use artifact update events to edit those artifacts.
 #[async_trait::async_trait]
 pub trait AgentExecutor: Send + Sync + 'static {
-    /// Execute a message. Returns an owned stream of events.
+    /// Execute a message and return owned output. The returned stream defines
+    /// execution lifetime, including when input is read in a spawned worker.
+    /// Use `ctx.spawn_worker(capacity, |ctx, outputs| async move { ... })` and
+    /// return its receiver as the output stream to monitor worker failures.
+    /// `ctx.output_channel` also supports manually managed producers; attach
+    /// their JoinHandle with `receiver.with_worker(handle)` to monitor them.
+    /// `sender.send_for(&input, event)` preserves producer-side correlation.
+    /// Inline input reads correlate subsequent yielded interruptions. Arbitrary
+    /// custom buffering without tags cannot provide exact producer provenance.
     fn execute(&self, ctx: ExecutorContext)
     -> BoxStream<'static, Result<StreamResponse, A2AError>>;
 
-    /// Cancel an in-progress task. Returns a stream of events.
+    /// Resume a persisted nonterminal task during opt-in startup recovery.
+    ///
+    /// `ctx.stored_task` contains the persisted snapshot; `ctx.message` is None.
+    /// The execution ID and inbox are fresh. Caller credentials and process-local
+    /// state are not restored. Return None (the default) to leave this task idle.
+    /// Hook construction and stream polling run outside task serialization.
+    fn restart(
+        &self,
+        ctx: ExecutorContext,
+    ) -> Option<BoxStream<'static, Result<StreamResponse, A2AError>>> {
+        let _ = ctx;
+        None
+    }
+
+    /// Clean up a task whose cancellation has already been committed.
+    ///
+    /// `ctx.stored_task` is CANCELED. Canceled Task/status outputs acknowledge
+    /// cleanup; their status message and timestamp do not modify that terminal
+    /// snapshot. Artifact updates and contradictory states are rejected.
+    /// The handler announces the committed cancellation after cleanup finishes.
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>>;
+}
+
+/// A message with no `taskId`, which an [`Agent`] answers or turns into a task.
+#[non_exhaustive]
+pub struct NewMessage {
+    /// ID shared by this start decision and its subsequent execution.
+    pub execution_id: String,
+    /// The message.
+    pub message: Message,
+    /// The ID the task gets if the agent creates one.
+    pub task_id: TaskId,
+    /// The context the task would belong to.
+    pub context_id: String,
+    /// Trusted caller resolved by the server's authorizer.
+    pub user: Option<User>,
+    /// Request metadata.
+    pub metadata: Option<HashMap<String, Value>>,
+    /// Service parameters (headers/metadata) from the request.
+    pub service_params: ServiceParams,
+    /// Optional tenant ID.
+    pub tenant: Option<String>,
+}
+
+impl NewMessage {
+    /// A task in `state` with this message's ids, for [`Start::Task`].
+    pub fn new_task(&self, state: TaskState) -> Task {
+        Task {
+            id: self.task_id.clone(),
+            context_id: self.context_id.clone(),
+            status: TaskStatus {
+                state,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            timeline: None,
+            metadata: None,
+            generation: 0,
+        }
+    }
+}
+
+/// What an [`Agent`] makes of a message that names no task (A2A §3.1.1).
+// A value built once per request and consumed at once: boxing the variants
+// would only make it harder to write.
+#[allow(clippy::large_enum_variant)]
+pub enum Start {
+    /// A one-shot reply. No task exists, and nothing is saved: neither the
+    /// client's message nor its artifacts. The call ends with the reply; an
+    /// agent that has more to do spawns it.
+    Message(Message),
+    /// Create this task (its `id` and `context_id` are the ones in the
+    /// [`NewMessage`]). The server saves it, with the client's message in its
+    /// timeline, and then runs [`Agent::execute`] for the message, as it does
+    /// for every message to a task.
+    Task(Task),
+}
+
+/// An agent that decides, for a message with no `taskId`, whether to answer it
+/// at once or create a task, and that works on tasks once they exist.
+///
+/// [`Agent::start`] makes that one decision. Everything about a task, its first
+/// execution included, is [`Agent::execute`]: the task is always there, and the
+/// client's messages queue for it only from then on. An agent that never keeps
+/// tasks implements `start` alone. [`AgentExecutor`] is the same contract as
+/// one stream of events, whose first event decides; it runs on the server
+/// unchanged.
+#[async_trait::async_trait]
+pub trait Agent: Send + Sync + 'static {
+    /// A message with no `taskId`: reply, or create the task.
+    async fn start(&self, msg: NewMessage) -> Result<Start, A2AError>;
+
+    /// A message to an existing task (`ctx.stored_task` is set): the work of a
+    /// execution, as a stream of status and artifact events. The first message of a
+    /// task [`Agent::start`] created arrives here too. Fails by default, for an
+    /// agent that keeps no tasks.
+    fn execute(&self, ctx: ExecutorContext) -> EventStream {
+        let _ = ctx;
+        Box::pin(futures::stream::once(async {
+            Err(A2AError::unsupported_operation("this agent keeps no tasks"))
+        }))
+    }
+
+    /// Resume a stored task when the handler explicitly runs startup recovery.
+    /// The default opts out; no new message or task is created.
+    fn restart(&self, ctx: ExecutorContext) -> Option<EventStream> {
+        let _ = ctx;
+        None
+    }
+
+    /// Clean up an already-canceled task. Returned canceled Task/status events
+    /// acknowledge cleanup and cannot modify its committed terminal snapshot.
+    /// The default needs no additional cleanup: the handler has already committed
+    /// cancellation and stopped execution. Override this hook to release agent resources.
+    fn cancel(&self, ctx: ExecutorContext) -> EventStream {
+        let _ = ctx;
+        Box::pin(futures::stream::empty())
+    }
+}
+
+type EventStream = BoxStream<'static, Result<StreamResponse, A2AError>>;
+
+/// An [`Agent`] as the executor the server drives: for a new task the first
+/// event is the task, or the reply; the rest is [`Agent::execute`].
+pub(crate) struct AgentExecutorAdapter<A: Agent>(pub(crate) Arc<A>);
+
+impl<A: Agent> AgentExecutor for AgentExecutorAdapter<A> {
+    fn execute(&self, ctx: ExecutorContext) -> EventStream {
+        use futures::StreamExt;
+
+        let agent = Arc::clone(&self.0);
+        if !ctx.new_task {
+            return agent.execute(ctx);
+        }
+        Box::pin(
+            futures::stream::once(async move {
+                let Some(message) = ctx.message.clone() else {
+                    return futures::stream::once(async {
+                        Err(A2AError::invalid_agent_response())
+                    })
+                    .boxed();
+                };
+                let msg = NewMessage {
+                    execution_id: ctx.execution_id.clone(),
+                    message,
+                    task_id: ctx.task_id.clone(),
+                    context_id: ctx.context_id.clone(),
+                    user: ctx.user.clone(),
+                    metadata: ctx.metadata.clone(),
+                    service_params: ctx.service_params.clone(),
+                    tenant: ctx.tenant.clone(),
+                };
+                match agent.start(msg).await {
+                    Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
+                    Ok(Start::Message(message)) => {
+                        futures::stream::once(async move { Ok(StreamResponse::Message(message)) })
+                            .boxed()
+                    }
+                    // The task is the one this execution is for.
+                    Ok(Start::Task(task))
+                        if task.id != ctx.task_id || task.context_id != ctx.context_id =>
+                    {
+                        futures::stream::once(async { Err(A2AError::invalid_agent_response()) })
+                            .boxed()
+                    }
+                    Ok(Start::Task(task)) => {
+                        let mut ctx = ctx;
+                        let opening = StreamResponse::Task(task.clone());
+                        futures::stream::once(async move { Ok(opening) })
+                            // The execution starts once the task has been created.
+                            .chain(
+                                futures::stream::once(async move {
+                                    // The handler polls us again only after accepting
+                                    // and saving the opening. Include its normalized
+                                    // input, artifacts and generation in the context.
+                                    ctx.stored_task = Some(
+                                        ctx.task_snapshot
+                                            .take()
+                                            .and_then(|source| source.snapshot())
+                                            // Standalone contexts have no handler source.
+                                            .unwrap_or(task),
+                                    );
+                                    agent.execute(ctx)
+                                })
+                                .flatten(),
+                            )
+                            .boxed()
+                    }
+                }
+            })
+            .flatten(),
+        )
+    }
+
+    fn restart(&self, ctx: ExecutorContext) -> Option<EventStream> {
+        self.0.restart(ctx)
+    }
+
+    fn cancel(&self, ctx: ExecutorContext) -> EventStream {
+        self.0.cancel(ctx)
+    }
 }
 
 #[cfg(test)]
@@ -158,11 +421,106 @@ mod tests {
             service_params: HashMap::new(),
             tenant: None,
             inputs,
+            opening_input_generation: 0,
             new_task: false,
+            task_snapshot: None,
         };
         let (tid, cid) = ctx.task_info();
         assert_eq!(tid, "t1");
         assert_eq!(cid, "c1");
+    }
+    #[tokio::test]
+    async fn output_channel_keeps_the_opener_when_created_after_another_input_is_read() {
+        let (sender, inputs) = ClientInputs::channel(1);
+        let mut ctx = ExecutorContext::new("task", "context", inputs);
+        ctx.opening_input_generation = 3;
+        sender
+            .try_send(ClientInput::new(Message::new(Role::User, vec![]), 7))
+            .unwrap();
+        ctx.inputs.recv().await.unwrap();
+        let (outputs, mut receiver) = ctx.output_channel(1);
+        outputs
+            .send(StreamResponse::Message(Message::new(Role::Agent, vec![])))
+            .await
+            .unwrap();
+        assert_eq!(receiver.recv().await.unwrap().input_generation, 3);
+    }
+
+    struct StartOnly;
+    #[async_trait::async_trait]
+    impl Agent for StartOnly {
+        async fn start(&self, message: NewMessage) -> Result<Start, A2AError> {
+            Ok(Start::Task(message.new_task(TaskState::Working)))
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_agents_require_execute_but_default_to_successful_cancellation() {
+        use futures::StreamExt;
+        let adapter = AgentExecutorAdapter(Arc::new(StartOnly));
+        let mut context = ExecutorContext::new("task", "context", ClientInputs::closed())
+            .with_message(Message::new(Role::User, vec![Part::text("input")]));
+        context.new_task = true;
+        let mut events = adapter.execute(context);
+        assert!(
+            matches!(events.next().await.unwrap().unwrap(), StreamResponse::Task(task) if task.id == "task")
+        );
+        assert_eq!(
+            events.next().await.unwrap().unwrap_err().code,
+            error_code::UNSUPPORTED_OPERATION
+        );
+        let mut resumed = adapter.execute(ExecutorContext::new(
+            "task",
+            "context",
+            ClientInputs::closed(),
+        ));
+        assert_eq!(
+            resumed.next().await.unwrap().unwrap_err().code,
+            error_code::UNSUPPORTED_OPERATION
+        );
+        let mut events = adapter.cancel(ExecutorContext::new(
+            "task",
+            "context",
+            ClientInputs::closed(),
+        ));
+        assert!(events.next().await.is_none());
+    }
+
+    struct InvalidStart(bool);
+    #[async_trait::async_trait]
+    impl Agent for InvalidStart {
+        async fn start(&self, message: NewMessage) -> Result<Start, A2AError> {
+            if self.0 {
+                return Err(A2AError::internal("start refused"));
+            }
+            let mut task = message.new_task(TaskState::Working);
+            task.context_id = "unrelated-context".into();
+            Ok(Start::Task(task))
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_start_rejects_missing_messages_foreign_tasks_and_start_failures() {
+        use futures::StreamExt;
+        for (message, failure) in [(false, false), (true, false), (true, true)] {
+            let adapter = AgentExecutorAdapter(Arc::new(InvalidStart(failure)));
+            let mut context = ExecutorContext::new("task", "context", ClientInputs::closed());
+            context.new_task = true;
+            if message {
+                context.message = Some(Message::new(Role::User, vec![Part::text("input")]));
+            }
+            let mut events = adapter.execute(context);
+            let error = events.next().await.unwrap().unwrap_err();
+            assert_eq!(
+                error.code,
+                if failure {
+                    error_code::INTERNAL_ERROR
+                } else {
+                    error_code::INVALID_AGENT_RESPONSE
+                }
+            );
+            assert!(events.next().await.is_none());
+        }
     }
     #[test]
     fn executor_context_preserves_caller_identity_and_request_data() {

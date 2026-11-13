@@ -177,6 +177,12 @@ async fn next(d: &mut Downlink) -> StreamResponse {
 
 fn text(e: &StreamResponse) -> Option<String> {
     match e {
+        StreamResponse::Task(task) => task
+            .status
+            .message
+            .as_ref()
+            .and_then(Message::text)
+            .map(str::to_owned),
         StreamResponse::StatusUpdate(u) => u
             .status
             .message
@@ -255,10 +261,18 @@ async fn p1_starting_a_turn_does_not_drop_the_previous_turns_buffered_events() {
             continue;
         }
         let mut seen = Vec::new();
+        let mut observed = Vec::new();
         let mut last_gen = task.generation;
         let mut gap = false;
         loop {
-            let e = next(&mut down).await;
+            let e = match tokio::time::timeout(Duration::from_secs(5), down.next()).await {
+                Ok(Some(Ok(event))) => event,
+                other => panic!(
+                    "followup stalled: {other:?}; observed={observed:?}; stored={:?}",
+                    get(&h, &task.id).await
+                ),
+            };
+            observed.push(e.clone());
             if let Some(g) = gen_of(&e) {
                 if g != last_gen + 1 && !matches!(e, StreamResponse::Task(_)) {
                     gap = true;
@@ -355,9 +369,10 @@ async fn p3_call_from_another_client_reaches_the_task_input_queue() {
     );
 }
 
-/// a session that dies (panic) ends the opener's downlink: is it told?
+/// A failed store read must not silently end a response. A Task-scoped
+/// subscription can deliver the committed cancellation without rereading storage.
 #[tokio::test]
-async fn p4_session_panic_tells_the_downlink() {
+async fn p4_cancellation_is_observable_even_when_a_store_read_panics() {
     let (h, store) = handler_with();
     let p = params("1.1", "a");
     let (up, rx) = mpsc::channel(8);
@@ -371,8 +386,8 @@ async fn p4_session_panic_tells_the_downlink() {
         other => panic!("{other:?}"),
     };
     next(&mut down).await; // INPUT_REQUIRED
-    // Another client cancels the task: the idle session wakes and reads it, and
-    // the store panics on that read.
+    // Another client cancels the task. A response that rereads storage may
+    // fail; one following the Task broadcast can observe cancellation directly.
     store.panic_on_canceled.store(true, Ordering::SeqCst);
     let canceller = h.clone();
     tokio::spawn(async move {
@@ -390,14 +405,28 @@ async fn p4_session_panic_tells_the_downlink() {
     let end = tokio::time::timeout(Duration::from_secs(3), down.next())
         .await
         .expect("the downlink ends");
+    let observable = match &end {
+        Some(Err(error)) => error.code == a2a::error_code::INTERNAL_ERROR,
+        Some(Ok(StreamResponse::Task(task))) => task.status.state == TaskState::Canceled,
+        Some(Ok(StreamResponse::StatusUpdate(update))) => {
+            update.status.state == TaskState::Canceled
+        }
+        _ => false,
+    };
     assert!(
-        matches!(end, Some(Err(_))),
-        "the downlink ended silently: {end:?}"
+        observable,
+        "neither cancellation nor its failure was delivered: {end:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), down.next())
+            .await
+            .expect("a terminal update or error closes the downlink")
+            .is_none()
     );
 }
 
-/// A message sent as one turn asks for input starts the next turn rather than
-/// being declined.
+/// Every input racing an execution boundary gets either an agent response
+/// or a private rejection. Recorded input is never silently replayed.
 async fn p5_run() -> (usize, usize) {
     let (h, _) = handler_with();
     let p = params("1.1", "a");
@@ -407,46 +436,72 @@ async fn p5_run() -> (usize, usize) {
         .send_live_message(&p, ReceiverStream::new(rx).boxed())
         .await
         .unwrap();
-    let opening = next(&mut down).await;
-    let task_id = match &opening {
-        StreamResponse::Task(task) => task.id.clone(),
+    let task_id = match next(&mut down).await {
+        StreamResponse::Task(task) => task.id,
         other => panic!("{other:?}"),
     };
-    let mut down = stream::once(async move { Ok(opening) }).chain(down).boxed();
+    loop {
+        if let StreamResponse::StatusUpdate(update) = next(&mut down).await
+            && update.status.state == TaskState::InputRequired
+        {
+            break;
+        }
+    }
     let mut declined = 0;
     let rounds = 50;
-    for round in 0..=rounds {
-        // A completed turn can arrive as its status event or a fresh snapshot,
-        // including when it finishes before the opening snapshot is delivered.
+    for _ in 0..rounds {
+        let request = send("ask", Some(&task_id));
+        let reference = match &request.payload {
+            StreamRequestPayload::SendMessage(request) => {
+                request.message.as_ref().unwrap().message_id.clone()
+            }
+            _ => unreachable!(),
+        };
+        up.send(request).await.unwrap();
+        let mut committed = None;
         loop {
             match next(&mut down).await {
+                StreamResponse::MessageUpdate(update) if update.message.message_id == reference => {
+                    committed = Some(update.generation)
+                }
                 StreamResponse::StatusUpdate(update)
-                    if update.status.state == TaskState::InputRequired =>
+                    if update.status.state == TaskState::InputRequired
+                        && committed.is_some_and(|generation| update.generation > generation) =>
                 {
                     break;
                 }
-                StreamResponse::Task(task) if task.status.state == TaskState::InputRequired => {
+                StreamResponse::Task(task)
+                    if task.status.state == TaskState::InputRequired
+                        && committed.is_some_and(|generation| task.generation > generation) =>
+                {
                     break;
                 }
-                StreamResponse::Error(_) => {
+                StreamResponse::Error(error) => {
+                    assert_eq!(error.reference_id.as_deref(), Some(reference.as_str()));
+                    assert_eq!(error.code, "UNAVAILABLE");
+                    assert!(
+                        committed.is_some(),
+                        "only recorded input is rejected unread"
+                    );
                     declined += 1;
                     break;
                 }
                 _ => {}
             }
         }
-        if round < rounds {
-            up.send(send("ask", Some(&task_id))).await.unwrap();
-        }
     }
     assert_eq!(applied(&get(&h, &task_id).await, "ask"), rounds + 1);
+    h.shutdown().await;
     (declined, rounds)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn p5_message_at_turn_end_is_not_declined() {
+async fn p5_messages_at_execution_end_get_an_explicit_outcome() {
     let (declined, rounds) = p5_run().await;
-    assert_eq!(declined, 0);
+    assert_eq!(
+        declined, 0,
+        "an immediate answer must start fresh, never be rejected"
+    );
     assert_eq!(rounds, 50);
 }
 
@@ -478,10 +533,13 @@ async fn an_exchange_that_fell_behind_carries_on_from_the_task() {
         up.send(send("ask", Some(&task.id)))
             .await
             .unwrap_or_else(|_| panic!("round {round}: the exchange ended"));
-        // The exchange goes on to the next turn, with no error on the way.
+        // EOF was observed before the interrupted status became visible.
         let reached = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match down.next().await {
+                    Some(Ok(StreamResponse::Error(error))) => {
+                        panic!("round {round}: an immediate answer was rejected: {error:?}")
+                    }
                     Some(Ok(event)) => {
                         if text(&event).as_deref() == Some("need input") {
                             return;
