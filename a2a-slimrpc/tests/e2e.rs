@@ -28,6 +28,7 @@ const A2A_SERVICE_NAME: &str = "lf.a2a.v1.A2AService";
 const GET_TASK_METHOD: &str = "GetTask";
 const SEND_MESSAGE_METHOD: &str = "SendMessage";
 const SEND_STREAMING_MESSAGE_METHOD: &str = "SendStreamingMessage";
+const SEND_LIVE_MESSAGE_METHOD: &str = "SendLiveMessage";
 const SHARED_SECRET: &str = "test-secret-with-sufficient-length-for-hmac-key";
 
 fn sample_message(role: Role, text: &str, task_id: &str) -> Message {
@@ -201,6 +202,173 @@ impl TestEnv {
 
 struct TestHandler {
     target: String,
+}
+
+#[tokio::test]
+async fn live_inputs_start_and_progress_without_polling_the_downlink() {
+    let env = TestEnv::new("live-eager-inputs").await;
+    let (received, mut inputs) = tokio::sync::mpsc::unbounded_channel();
+    env.server.register_stream_stream(
+        A2A_SERVICE_NAME,
+        SEND_LIVE_MESSAGE_METHOD,
+        move |mut requests: slim_rpc::DecodedStream<Vec<u8>>, _| {
+            let received = received.clone();
+            async move {
+                Ok(async_stream::stream! {
+                    while let Some(request) = requests.next().await {
+                        let request = a2a_pb::proto::StreamRequest::decode(request?.as_slice()).unwrap();
+                        received.send(a2a_pb::pbconv::from_proto_stream_request(&request)).unwrap();
+                        let event = StreamResponse::Task(sample_task("task-1", TaskState::Working));
+                        yield Ok::<_, RpcError>(a2a_pb::pbconv::to_proto_stream_response(&event).encode_to_vec());
+                    }
+                })
+            }
+        },
+    );
+    env.start().await;
+    let transport = env.transport("client").await;
+    let request = StreamRequest {
+        tenant: None,
+        payload: StreamRequestPayload::SendMessage(send_message_request("task-1")),
+    };
+    let connection = transport
+        .send_live_message(&ServiceParams::new(), &request)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        assert_eq!(inputs.recv().await.unwrap(), request);
+        // Exercise both bounded queues beyond their capacity, with no response
+        // polling: the RPC's input task must still make progress.
+        for index in 0..64 {
+            let mut next = request.clone();
+            if let StreamRequestPayload::SendMessage(send) = &mut next.payload {
+                send.message.as_mut().unwrap().message_id = format!("follow-up-{index}");
+            }
+            assert!(matches!(
+                connection.sender.send(next.clone()).await.unwrap(),
+                a2a_client::LiveAck::Sent
+            ));
+            assert_eq!(inputs.recv().await.unwrap(), next);
+        }
+    })
+    .await
+    .expect("live inputs depend on polling the downlink");
+
+    drop(connection.sender);
+    let events: Vec<_> = tokio::time::timeout(Duration::from_secs(5), connection.events.collect())
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 65);
+    assert!(events.iter().all(Result::is_ok));
+    transport.destroy().await.unwrap();
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn dropping_an_unpolled_live_downlink_closes_the_rpc_input() {
+    let env = TestEnv::new("live-drop-input").await;
+    let opened = Arc::new(tokio::sync::Notify::new());
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let opened_handler = opened.clone();
+    let closed_handler = closed.clone();
+    env.server.register_stream_stream(
+        A2A_SERVICE_NAME,
+        SEND_LIVE_MESSAGE_METHOD,
+        move |mut requests: slim_rpc::DecodedStream<Vec<u8>>, _| {
+            let opened = opened_handler.clone();
+            let closed = closed_handler.clone();
+            async move {
+                assert!(requests.next().await.unwrap().is_ok());
+                opened.notify_one();
+                Ok(stream::once(async move {
+                    assert!(requests.next().await.is_none());
+                    closed.notify_one();
+                    Ok::<_, RpcError>(Vec::<u8>::new())
+                }))
+            }
+        },
+    );
+    env.start().await;
+    let transport = env.transport("client").await;
+    let request = StreamRequest {
+        tenant: None,
+        payload: StreamRequestPayload::SendMessage(send_message_request("task-1")),
+    };
+    let connection = transport
+        .send_live_message(&ServiceParams::new(), &request)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), opened.notified())
+        .await
+        .unwrap();
+    drop(connection.events);
+    assert_eq!(
+        connection.sender.send(request).await.err().unwrap().code,
+        error_code::INVALID_REQUEST
+    );
+    tokio::time::timeout(Duration::from_secs(5), closed.notified())
+        .await
+        .expect("dropped downlink left the RPC input task alive");
+    transport.destroy().await.unwrap();
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn live_rpc_completion_closes_input_and_preserves_decode_errors() {
+    let env = TestEnv::new("live-remote-complete").await;
+    env.server.register_stream_stream(
+        A2A_SERVICE_NAME,
+        SEND_LIVE_MESSAGE_METHOD,
+        |mut requests: slim_rpc::DecodedStream<Vec<u8>>, _| async move {
+            assert!(requests.next().await.unwrap().is_ok());
+            let malformed = a2a_pb::proto::StreamResponse {
+                payload: Some(a2a_pb::proto::stream_response::Payload::MessageUpdate(
+                    a2a_pb::proto::TaskMessageUpdateEvent {
+                        message: None,
+                        ..Default::default()
+                    },
+                )),
+            };
+            let unknown = a2a_pb::proto::StreamResponse::default();
+            let done = a2a_pb::pbconv::to_proto_stream_response(&StreamResponse::Message(
+                sample_message(Role::Agent, "done", "task-1"),
+            ));
+            Ok(stream::iter(
+                [malformed, unknown, done].map(|event| Ok::<_, RpcError>(event.encode_to_vec())),
+            ))
+        },
+    );
+    env.start().await;
+    let transport = env.transport("client").await;
+    let request = StreamRequest {
+        tenant: None,
+        payload: StreamRequestPayload::SendMessage(send_message_request("task-1")),
+    };
+    let connection = transport
+        .send_live_message(&ServiceParams::new(), &request)
+        .await
+        .unwrap();
+    // A peer that finishes must close the uplink even if the application has
+    // not consumed the buffered response yet.
+    let error = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Err(error) = connection.sender.send(request.clone()).await {
+                break error;
+            }
+        }
+    })
+    .await
+    .expect("finished RPC retained its input receiver");
+    assert_eq!(error.code, error_code::INVALID_REQUEST);
+    let events: Vec<_> = connection.events.collect().await;
+    assert_eq!(events.len(), 2);
+    assert!(matches!(&events[0], Err(error) if error.code == error_code::INTERNAL_ERROR));
+    assert!(
+        matches!(&events[1], Ok(StreamResponse::Message(message)) if message.text() == Some("done"))
+    );
+    transport.destroy().await.unwrap();
+    env.shutdown().await;
 }
 
 #[async_trait]

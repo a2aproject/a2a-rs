@@ -19,6 +19,7 @@ const PAYLOAD_SIG_KEY: &str = "slim-payload-sig";
 pub const A2A_SLIMRPC_SERVICE: &str = "lf.a2a.v1.A2AService";
 pub const METHOD_SEND_MESSAGE: &str = "SendMessage";
 pub const METHOD_SEND_STREAMING_MESSAGE: &str = "SendStreamingMessage";
+pub const METHOD_SEND_LIVE_MESSAGE: &str = "SendLiveMessage";
 pub const METHOD_GET_TASK: &str = "GetTask";
 pub const METHOD_LIST_TASKS: &str = "ListTasks";
 pub const METHOD_CANCEL_TASK: &str = "CancelTask";

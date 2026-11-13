@@ -11,6 +11,19 @@ This crate is published as `a2a-client-lf` and imported in Rust as `a2a_client`.
 - A high-level `A2AClient` wrapper
 - Streaming response parsing for SSE-based endpoints
 
+## Live Connections
+
+Each REST or JSON-RPC `send_live_message` call creates its own exchange identifier
+and sends it in the optional `x-a2a-rs-live-exchange` header. Its `LiveSender`
+reuses that identifier so inputs and their rejections stay with the intended
+downlink, including when several connections share a task and credentials.
+Task updates remain visible to every subscribed client.
+
+The header is a Rust SDK routing convention, not a standard A2A field or an
+authentication credential. Servers without this convention may ignore it and
+apply their own HTTP live-routing policy. gRPC already associates input with its
+native duplex stream and does not use this header.
+
 ## Install
 
 ```sh

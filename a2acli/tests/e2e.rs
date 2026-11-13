@@ -111,6 +111,7 @@ const SUBSCRIBE_CUT_THEN_SETTLE_ID: &str = "task-subscribe-cut-then-settle";
 /// the reconciling echo a real server would send, which must be
 /// suppressed rather than printed as a second, spurious event.
 const SUBSCRIBE_CUT_UNCHANGED_ID: &str = "task-subscribe-cut-unchanged";
+const SUBSCRIBE_NEW_GENERATION_ID: &str = "task-subscribe-new-generation";
 /// Every attempt ends unsettled; never reconciles. Exercises `--timeout`
 /// on the reconnect path the way `STUCK_TASK_ID` does for polling.
 const SUBSCRIBE_STUCK_ID: &str = "task-subscribe-stuck";
@@ -330,6 +331,7 @@ fn subscribe_resumption_events(
     if ![
         SUBSCRIBE_CUT_THEN_SETTLE_ID,
         SUBSCRIBE_CUT_UNCHANGED_ID,
+        SUBSCRIBE_NEW_GENERATION_ID,
         SUBSCRIBE_STUCK_ID,
         SUBSCRIBE_RESUBSCRIBE_FAILS_ONCE_ID,
         SUBSCRIBE_CUT_FILE_ID,
@@ -348,6 +350,19 @@ fn subscribe_resumption_events(
         *counter += 1;
         *counter
     };
+
+    if task_id == SUBSCRIBE_NEW_GENERATION_ID {
+        let event = |state, generation| {
+            let mut task = make_task(task_id, "context", state, "updated content");
+            task.generation = generation;
+            Ok(StreamResponse::Task(task))
+        };
+        return Some(Ok(if attempt == 1 {
+            vec![event(TaskState::Working, 1)]
+        } else {
+            vec![event(TaskState::Working, 2), event(TaskState::Completed, 3)]
+        }));
+    }
 
     if task_id == SUBSCRIBE_RESUBSCRIBE_FAILS_ONCE_ID {
         return Some(match attempt {
@@ -1430,6 +1445,35 @@ async fn task_subscribe_suppresses_an_unchanged_reconciliation_event() {
     assert_eq!(events.len(), 2, "{events:?}");
     assert_eq!(events[0]["task"]["status"]["state"], "TASK_STATE_WORKING");
     assert_eq!(events[1]["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_subscribe_prints_a_same_state_snapshot_with_a_new_generation() {
+    let server = TestServer::spawn().await;
+    let output = run_cli_success(
+        &server,
+        &[
+            "--compact",
+            "--poll-interval",
+            "10ms",
+            "task",
+            "subscribe",
+            SUBSCRIBE_NEW_GENERATION_ID,
+        ],
+    );
+    let events = parse_json_lines(&output);
+    let generations: Vec<_> = events
+        .iter()
+        .map(|event| event["task"]["generation"].clone())
+        .collect();
+    assert_eq!(
+        generations,
+        vec![
+            serde_json::json!("1"),
+            serde_json::json!("2"),
+            serde_json::json!("3")
+        ]
+    );
 }
 
 /// A cut that never reconciles exhausts `--timeout` and reports

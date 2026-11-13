@@ -35,6 +35,21 @@ fn parse_jsonrpc_error(err: JsonRpcError) -> A2AError {
     a2a::a2a_error_from_details(err.code, err.message, details)
 }
 
+fn decode_jsonrpc_response(body: &str) -> Result<JsonRpcResponse, serde_json::Error> {
+    validate_jsonrpc_response(serde_json::from_str(body)?)
+}
+
+fn validate_jsonrpc_response(
+    response: JsonRpcResponse,
+) -> Result<JsonRpcResponse, serde_json::Error> {
+    if response.jsonrpc != "2.0" {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "jsonrpc must be exactly 2.0",
+        ));
+    }
+    Ok(response)
+}
+
 /// Parses a JSON-RPC envelope. A body that is not one, sent with a non-success
 /// status (an authenticating proxy's 401, a gateway's 429 or 502), is reported
 /// with that status, as the REST transport reports it.
@@ -42,7 +57,7 @@ fn parse_jsonrpc_response(
     status: reqwest::StatusCode,
     body: &str,
 ) -> Result<JsonRpcResponse, A2AError> {
-    serde_json::from_str(body).map_err(|e| {
+    decode_jsonrpc_response(body).map_err(|e| {
         if status.is_success() {
             A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
         } else {
@@ -51,13 +66,32 @@ fn parse_jsonrpc_response(
     })
 }
 
+// Classify routing failures by envelope shape, independently of strict decoding.
+// A missing/invalid ID or malformed error is a protocol failure, not evidence
+// that this endpoint does not support SendLiveMessage.
+fn looks_like_jsonrpc_response(body: &str) -> bool {
+    serde_json::from_str::<Value>(body).is_ok_and(|value| {
+        value.as_object().is_some_and(|object| {
+            object.contains_key("jsonrpc")
+                && (object.contains_key("error") || object.contains_key("result"))
+        })
+    })
+}
+
 /// JSON-RPC transport implementation.
 ///
 /// Sends all requests as JSON-RPC 2.0 POSTs to a single endpoint.
 /// Streaming responses are received via Server-Sent Events (SSE).
+#[derive(Clone)]
 pub struct JsonRpcTransport {
     client: Client,
     endpoint: String,
+}
+
+/// What a call that may either stream or answer plainly came back with.
+enum StreamOrResult {
+    Stream(BoxStream<'static, Result<StreamResponse, A2AError>>),
+    Result(serde_json::Value),
 }
 
 impl JsonRpcTransport {
@@ -143,16 +177,42 @@ impl JsonRpcTransport {
     where
         Req: ProtoJsonPayload,
     {
+        match self
+            .call_stream_or_result(params, method, request_params)
+            .await?
+        {
+            StreamOrResult::Stream(stream) => Ok(stream),
+            StreamOrResult::Result(_) => Err(A2AError::internal(
+                "expected streaming response but got non-streaming JSON-RPC result",
+            )),
+        }
+    }
+
+    /// A call whose answer is a stream, or, for `SendLiveMessage`, a plain
+    /// result when the call only fed an exchange that was already open.
+    async fn call_stream_or_result<Req>(
+        &self,
+        params: &ServiceParams,
+        method: &str,
+        request_params: &Req,
+    ) -> Result<StreamOrResult, A2AError>
+    where
+        Req: ProtoJsonPayload,
+    {
         let id = JsonRpcId::String(uuid::Uuid::now_v7().to_string());
         let payload = protojson_conv::to_value(request_params).map_err(|e| {
             A2AError::internal(format!("failed to serialize request as ProtoJSON: {e}"))
         })?;
         let rpc_request = JsonRpcRequest::new(id, method, Some(payload));
 
-        let mut builder = self
-            .client
-            .post(&self.endpoint)
-            .header("Accept", "text/event-stream");
+        let mut builder = self.client.post(&self.endpoint).header(
+            "Accept",
+            if method == methods::SEND_LIVE_MESSAGE {
+                "text/event-stream, application/json"
+            } else {
+                "text/event-stream"
+            },
+        );
         for (key, values) in params {
             for v in values {
                 builder = builder.header(key, v);
@@ -179,18 +239,67 @@ impl JsonRpcTransport {
 
         if is_event_stream {
             let stream = response.bytes_stream();
-            Ok(parse_sse_stream(stream))
+            Ok(StreamOrResult::Stream(parse_sse_stream(stream)))
         } else {
             let body = wire::response_text(response).await.map_err(|e| {
                 A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
             })?;
-            let rpc_response = parse_jsonrpc_response(status, &body)?;
+            let rpc_response = match parse_jsonrpc_response(status, &body) {
+                Err(_)
+                    if method == methods::SEND_LIVE_MESSAGE
+                        && matches!(status.as_u16(), 404 | 405 | 501)
+                        && !looks_like_jsonrpc_response(&body) =>
+                {
+                    return Err(A2AError::unsupported_operation(format!(
+                        "HTTP {status} during SendLiveMessage: {body}"
+                    )));
+                }
+                response => response?,
+            };
 
-            match rpc_response.error {
-                Some(err) => Err(parse_jsonrpc_error(err)),
-                None => Err(A2AError::internal(
-                    "expected streaming response but got non-streaming JSON-RPC result",
-                )),
+            match (rpc_response.error, rpc_response.result) {
+                (Some(err), _) => {
+                    let mut error = parse_jsonrpc_error(err);
+                    if method == methods::SEND_LIVE_MESSAGE
+                        && error.code == error_code::METHOD_NOT_FOUND
+                    {
+                        error.code = error_code::UNSUPPORTED_OPERATION;
+                    }
+                    Err(error)
+                }
+                (None, Some(result)) => Ok(StreamOrResult::Result(result)),
+                (None, None) => Err(A2AError::internal("JSON-RPC response missing result")),
+            }
+        }
+    }
+}
+
+/// The uplink of a live exchange over JSON-RPC: each request is a short-lived
+/// call to the same method, which the server answers with the task.
+#[derive(Clone)]
+struct JsonRpcLiveUplink {
+    transport: JsonRpcTransport,
+    params: ServiceParams,
+}
+
+#[async_trait]
+impl crate::LiveUplink for JsonRpcLiveUplink {
+    async fn send(&self, request: StreamRequest) -> Result<crate::LiveAck, A2AError> {
+        match self
+            .transport
+            .call_stream_or_result(&self.params, methods::SEND_LIVE_MESSAGE, &request)
+            .await?
+        {
+            StreamOrResult::Result(result) => protojson_conv::from_value(result)
+                .map(|task| crate::LiveAck::Task(Box::new(task)))
+                .map_err(|e| A2AError::internal(format!("failed to deserialize result: {e}"))),
+            // The exchange this was meant for is gone, so the server opened a
+            // new one for it and carried the request out: this is that one.
+            StreamOrResult::Stream(events) => {
+                Ok(crate::LiveAck::Reopened(Box::new(crate::LiveConnection {
+                    events,
+                    sender: crate::LiveSender::new(std::sync::Arc::new(self.clone())),
+                })))
             }
         }
     }
@@ -303,7 +412,7 @@ pub(crate) fn parse_stream_tail(
     }
 
     // A plain JSON-RPC envelope answering the streaming call.
-    if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(text) {
+    if let Ok(response) = decode_jsonrpc_response(text) {
         if let Some(error) = response.error {
             return Some(Err(parse_jsonrpc_error(error)));
         }
@@ -394,47 +503,62 @@ where
 }
 
 /// Parse an SSE byte stream into StreamResponse events (JSON-RPC envelope).
-fn parse_sse_stream(
+pub(crate) fn parse_sse_stream(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-    parse_sse_bytes(stream, |event_text| {
-        // Extract `data:` lines from the SSE event
-        let mut data = String::new();
-        for line in event_text.lines() {
-            if let Some(d) = line.strip_prefix("data: ") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(d);
-            } else if let Some(d) = line.strip_prefix("data:") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(d);
-            }
-        }
-        if data.is_empty() {
-            return None;
-        }
+    parse_sse_bytes(stream, parse_jsonrpc_sse_event)
+}
 
-        // Try JSON-RPC envelope first
-        match serde_json::from_str::<JsonRpcResponse>(&data) {
-            Ok(rpc_resp) => {
-                if let Some(err) = rpc_resp.error {
-                    return Some(Err(parse_jsonrpc_error(err)));
-                }
-                if let Some(result) = rpc_resp.result {
-                    decode_stream_value(result, "SSE parse error")
-                } else {
-                    None
-                }
+pub(crate) fn parse_jsonrpc_sse_event(
+    event_text: &str,
+) -> Option<Result<StreamResponse, A2AError>> {
+    // Extract `data:` lines from the SSE event
+    let mut data = String::new();
+    for line in event_text.lines() {
+        if let Some(d) = line.strip_prefix("data: ") {
+            if !data.is_empty() {
+                data.push('\n');
             }
-            Err(_) => {
-                // Fallback: parse directly as StreamResponse
-                decode_stream_text(&data, "SSE parse error")
+            data.push_str(d);
+        } else if let Some(d) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(d);
+        }
+    }
+    if data.is_empty() {
+        return None;
+    }
+
+    let value: Value = match serde_json::from_str(&data) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(A2AError::internal(format!("SSE parse error: {error}")))),
+    };
+    let envelope = value.as_object().is_some_and(|fields| {
+        ["jsonrpc", "id", "result"]
+            .iter()
+            .any(|key| fields.contains_key(*key))
+    });
+    if !envelope {
+        return decode_stream_value(value, "SSE parse error");
+    }
+    match serde_json::from_value::<JsonRpcResponse>(value).and_then(validate_jsonrpc_response) {
+        Ok(response) => {
+            if let Some(error) = response.error {
+                return Some(Err(parse_jsonrpc_error(error)));
+            }
+            match response.result {
+                Some(result) => decode_stream_value(result, "SSE parse error"),
+                None => Some(Err(A2AError::internal(
+                    "JSON-RPC stream response missing result",
+                ))),
             }
         }
-    })
+        Err(error) => Some(Err(A2AError::internal(format!(
+            "invalid JSON-RPC stream envelope: {error}"
+        )))),
+    }
 }
 
 /// Parse an SSE byte stream into StreamResponse events (REST binding).
@@ -461,8 +585,26 @@ pub(crate) fn parse_sse_stream_rest(
         if data.is_empty() {
             return None;
         }
-        if let Some(error) = crate::rest::rest_error(&data) {
-            return Some(Err(error));
+        let fatal_frame = event_text.lines().any(|line| {
+            line.strip_prefix("event:")
+                .is_some_and(|name| name.trim() == "error")
+        });
+        let status_code = serde_json::from_str::<Value>(&data)
+            .ok()
+            .and_then(|value| value.get("error")?.get("code").cloned());
+        // Empty/default StreamError codes are omitted by ProtoJSON. The SSE
+        // error event name or a numeric status code identifies a fatal binding
+        // error; a symbolic/absent live code stays on the live event stream.
+        let numeric_status = status_code.as_ref().is_some_and(|code| {
+            code.is_number()
+                || code
+                    .as_str()
+                    .is_some_and(|code| code.parse::<f64>().is_ok())
+        });
+        if fatal_frame || numeric_status {
+            return Some(Err(crate::rest::rest_error(&data).unwrap_or_else(|| {
+                A2AError::internal(format!("invalid REST error frame: {data}"))
+            })));
         }
 
         decode_stream_text(&data, "SSE parse error")
@@ -486,6 +628,40 @@ impl Transport for JsonRpcTransport {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.call_streaming(params, methods::SEND_STREAMING_MESSAGE, req)
             .await
+    }
+
+    async fn send_live_message(
+        &self,
+        params: &ServiceParams,
+        first: &StreamRequest,
+    ) -> Result<crate::LiveConnection, A2AError> {
+        let params = crate::transport::live_params(params);
+        match self
+            .call_stream_or_result(&params, methods::SEND_LIVE_MESSAGE, first)
+            .await?
+        {
+            StreamOrResult::Stream(events) => Ok(crate::LiveConnection {
+                events,
+                sender: crate::LiveSender::new(std::sync::Arc::new(JsonRpcLiveUplink {
+                    transport: self.clone(),
+                    params: params.clone(),
+                })),
+            }),
+            // A peer without the SDK routing convention may acknowledge this
+            // opening as input to an existing exchange instead of streaming.
+            StreamOrResult::Result(result) => {
+                let task: Task = protojson_conv::from_value(result).map_err(|e| {
+                    A2AError::internal(format!("failed to deserialize result: {e}"))
+                })?;
+                Ok(crate::LiveConnection {
+                    events: futures::stream::iter([Ok(StreamResponse::Task(task))]).boxed(),
+                    sender: crate::LiveSender::new(std::sync::Arc::new(JsonRpcLiveUplink {
+                        transport: self.clone(),
+                        params: params.clone(),
+                    })),
+                })
+            }
+        }
     }
 
     async fn get_task(
@@ -649,6 +825,54 @@ impl TransportFactory for JsonRpcTransportFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn empty_live_error_codes_are_not_fatal_rest_status_frames() {
+        for error in [
+            serde_json::json!({"code":"", "message":"rejected"}),
+            serde_json::json!({"taskId":"task", "message":"rejected"}),
+            serde_json::json!({"message":"rejected"}),
+        ] {
+            let frame = format!(
+                "data: {}\n\ndata: {}\n\n",
+                serde_json::json!({"error":error}),
+                serde_json::json!({"task":{"id":"task","contextId":"context","status":{"state":"TASK_STATE_WORKING"}}})
+            );
+            let events: Vec<_> = parse_sse_stream_rest(byte_stream(vec![frame]))
+                .collect()
+                .await;
+            assert_eq!(events.len(), 2);
+            assert!(
+                matches!(&events[0], Ok(StreamResponse::Error(error)) if error.code.is_empty())
+            );
+            assert!(matches!(&events[1], Ok(StreamResponse::Task(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_streaming_calls_only_advertise_event_stream_success() {
+        let (url, captured) = spawn_jsonrpc_server(
+            serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}).to_string(),
+        )
+        .await;
+        let request: SendMessageRequest = serde_json::from_value(
+            serde_json::json!({"message":{"messageId":"m","role":"ROLE_USER","parts":[]}}),
+        )
+        .unwrap();
+        let _ = JsonRpcTransport::new(Client::new(), url)
+            .send_streaming_message(&ServiceParams::new(), &request)
+            .await;
+        let raw = captured.await.unwrap();
+        let accept = raw
+            .lines()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("accept"))
+                    .map(|(_, value)| value.trim())
+            })
+            .unwrap();
+        assert_eq!(accept, "text/event-stream");
+    }
 
     #[tokio::test]
     async fn legacy_events_and_incomplete_envelopes_are_errors_on_both_http_streams() {
@@ -2362,5 +2586,238 @@ mod tests {
 
         assert_eq!(items.len(), 1, "expected one item, got {items:?}");
         assert!(items.into_iter().next().unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_responses_require_exactly_version_two() {
+        for version in ["1.0", "2", "3.0", "2.0 ", ""] {
+            let mut body = json!({"jsonrpc":version,"id":1,"result":{"futureEvent":{}}});
+            // A malformed envelope must not fall back to an unrelated payload.
+            body["message"] =
+                json!({"messageId":"poison", "role":"ROLE_AGENT", "parts":[{"text":"poison"}]});
+            let body = body.to_string();
+            assert!(parse_jsonrpc_response(reqwest::StatusCode::OK, &body).is_err());
+            for data in [body.clone(), format!("data: {body}\n\n")] {
+                let events: Vec<_> = parse_sse_stream(byte_stream(vec![data])).collect().await;
+                assert_eq!(events.len(), 1);
+                assert!(events[0].is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn framed_envelopes_without_a_result_match_unterminated_tail_errors() {
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+        ] {
+            for data in [format!("data: {body}\n\n"), body.into()] {
+                let events: Vec<_> = parse_sse_stream(byte_stream(vec![data])).collect().await;
+                assert_eq!(events.len(), 1);
+                assert!(events[0].is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_rpc_live_http_unsupported_statuses_are_normalized() {
+        use crate::LiveUplink;
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        for status in [
+            "404 Not Found",
+            "405 Method Not Allowed",
+            "501 Not Implemented",
+        ] {
+            for body in [
+                "<html>not supported</html>",
+                r#"{"detail":"Not Found"}"#,
+                r#"{"status":404,"error":"Not Found"}"#,
+                "null",
+            ] {
+                for opening in [true, false] {
+                    let endpoint = spawn_http_error_server(status, body).await;
+                    let transport = JsonRpcTransport::new(Client::new(), endpoint);
+                    let error = if opening {
+                        transport
+                            .send_live_message(&ServiceParams::new(), &request)
+                            .await
+                            .err()
+                            .unwrap()
+                    } else {
+                        JsonRpcLiveUplink {
+                            transport,
+                            params: ServiceParams::new(),
+                        }
+                        .send(request.clone())
+                        .await
+                        .err()
+                        .unwrap()
+                    };
+                    assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+                    assert!(error.message.contains(status));
+                    assert!(error.message.contains(body));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_error_envelopes_on_http_404_keep_their_protocol_error() {
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        for (body, code) in [
+            (
+                r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"agent refused"}}"#,
+                error_code::INTERNAL_ERROR, // Missing IDs remain malformed RPC.
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32602,"message":"agent refused"}}"#,
+                error_code::INVALID_PARAMS,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":{},"error":{"code":-32602,"message":"agent refused"}}"#,
+                error_code::INTERNAL_ERROR,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","result":"agent refused"}"#,
+                error_code::INTERNAL_ERROR,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"agent refused"}}"#,
+                error_code::INVALID_PARAMS,
+            ),
+            (
+                r#"{"jsonrpc":"1.0","id":1,"error":{"code":-32602,"message":"agent refused"}}"#,
+                error_code::INTERNAL_ERROR,
+            ),
+        ] {
+            let endpoint = spawn_http_error_server("404 Not Found", body).await;
+            let transport = JsonRpcTransport::new(Client::new(), endpoint);
+            let error = transport
+                .send_live_message(&ServiceParams::new(), &request)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.code, code);
+            assert!(error.message.contains("agent refused"));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_live_method_is_unsupported_for_opening_and_followups() {
+        use crate::LiveUplink;
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        for opening in [true, false] {
+            let (url, _) = spawn_jsonrpc_server(
+                json!({"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method missing"}})
+                    .to_string(),
+            )
+            .await;
+            let transport = JsonRpcTransport::new(Client::new(), url);
+            let error = if opening {
+                transport
+                    .send_live_message(&ServiceParams::new(), &request)
+                    .await
+                    .err()
+                    .unwrap()
+            } else {
+                JsonRpcLiveUplink {
+                    transport,
+                    params: ServiceParams::new(),
+                }
+                .send(request.clone())
+                .await
+                .err()
+                .unwrap()
+            };
+            assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_live_receipts_are_errors_for_opening_and_follow_up_calls() {
+        use crate::LiveUplink;
+        let request = StreamRequest {
+            tenant: None,
+            payload: StreamRequestPayload::Subscribe(SubscribeToTaskRequest {
+                id: "task".into(),
+                tenant: None,
+                last_seen_generation: None,
+            }),
+        };
+        for opening in [true, false] {
+            let (url, _captured) = spawn_jsonrpc_server(
+                json!({"jsonrpc":"2.0","id":1,"result":"not-a-task"}).to_string(),
+            )
+            .await;
+            let transport = JsonRpcTransport::new(Client::new(), url);
+            let error = if opening {
+                transport
+                    .send_live_message(&ServiceParams::new(), &request)
+                    .await
+                    .err()
+                    .expect("malformed opening receipt")
+            } else {
+                JsonRpcLiveUplink {
+                    transport,
+                    params: ServiceParams::new(),
+                }
+                .send(request.clone())
+                .await
+                .err()
+                .expect("malformed follow-up receipt")
+            };
+            assert_eq!(error.code, error_code::INTERNAL_ERROR);
+            assert!(error.message.contains("deserialize"));
+        }
+        let (url, _captured) =
+            spawn_jsonrpc_server(json!({"jsonrpc":"2.0","id":1}).to_string()).await;
+        let error = JsonRpcTransport::new(Client::new(), url)
+            .send_live_message(&ServiceParams::new(), &request)
+            .await
+            .err()
+            .expect("missing receipt");
+        assert!(error.message.contains("missing result"));
+    }
+    #[tokio::test]
+    async fn rest_live_rejections_do_not_end_the_response_stream() {
+        let rejection = serde_json::json!({"error":{
+            "taskId":"task", "code":"INVALID_ARGUMENT", "message":"bad input", "referenceId":"message"
+        }});
+        let update = serde_json::json!({"statusUpdate":{
+            "taskId":"task", "contextId":"context", "generation":"2", "status":{"state":"TASK_STATE_WORKING"}
+        }});
+        let mut events = parse_sse_stream_rest(byte_stream(vec![format!(
+            "data: {rejection}\n\ndata: {update}\n\n"
+        )]));
+        assert!(
+            matches!(events.next().await, Some(Ok(StreamResponse::Error(error)))
+            if error.code == "INVALID_ARGUMENT" && error.reference_id.as_deref() == Some("message"))
+        );
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(StreamResponse::StatusUpdate(_)))
+        ));
+        assert!(events.next().await.is_none());
     }
 }
