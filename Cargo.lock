@@ -5477,7 +5477,6 @@ dependencies = [
  "hyper-util",
  "socket2",
  "tokio",
- "tokio-native-tls",
  "tokio-rustls",
  "tonic",
  "tower",
