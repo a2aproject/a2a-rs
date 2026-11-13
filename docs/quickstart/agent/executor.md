@@ -12,7 +12,7 @@ The executor is the agent's logic. You implement the `AgentExecutor` trait, and 
 
 - `message` is the message from the client.
 - `task_info()` returns the ids of the task and of its context. Every event carries them.
-- `stored_task` is the task as saved before this message, if it exists. It is how the greeter knows that a message answers its question.
+- `stored_task` is the task as the server currently has it. For a new task it may already exist, in `Submitted` state, so check its state rather than whether it is `Some`. The greeter checks for `InputRequired`, which is how it knows that a message answers its question.
 
 ## What the executor returns
 

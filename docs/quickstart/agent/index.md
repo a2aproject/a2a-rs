@@ -16,7 +16,7 @@ The steps follow the files in the repository:
 
 ## Prerequisites
 
-- Rust 1.85 or later, the minimum the workspace declares, with `cargo`.
+- Rust 1.89 or later, with `cargo`. The locked dependencies need it, although the workspace declares 1.85.
 - `git`, `curl` and [`jq`](https://jqlang.github.io/jq/).
 
 ## Get the code
