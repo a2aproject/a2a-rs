@@ -1273,6 +1273,15 @@ impl RequestHandler for DefaultRequestHandler {
         }
 
         if let Some(active) = active_execution {
+            if !terminal_pushed {
+                // begin_cancel persisted CANCELED even if the executor emitted
+                // no terminal event. Attached subscribers need that final state.
+                if let Some(task) = &current_task {
+                    active
+                        .publish(Ok(&status_update(task)), Some(task.clone()))
+                        .await;
+                }
+            }
             self.execution_manager.finish(&req.id, &active).await;
         }
 
@@ -4942,6 +4951,66 @@ mod tests {
 
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_empty_cancel_unblocks_running_stream() {
+        let gate = Arc::new(Notify::new());
+        let release = gate.clone();
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(move |ctx: &ExecutorContext| {
+                if ctx.message.is_some() {
+                    vec![
+                        (None, Ok(status_event(ctx, TaskState::Working, None))),
+                        (
+                            Some(gate.clone()),
+                            Ok(status_event(ctx, TaskState::Completed, None)),
+                        ),
+                    ]
+                } else {
+                    Vec::<Step>::new()
+                }
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let params = ServiceParams::new();
+        let mut stream = handler
+            .send_streaming_message(&params, send_request())
+            .await
+            .unwrap();
+        let working = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let task_id = match working {
+            StreamResponse::StatusUpdate(update) => update.task_id,
+            other => panic!("expected working, got {other:?}"),
+        };
+        let canceled = handler
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: task_id.clone(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(canceled.status.state, TaskState::Canceled);
+        assert_eq!(
+            handler.load_task(&task_id).await.unwrap().status.state,
+            TaskState::Canceled
+        );
+        let next = timeout(Duration::from_millis(500), stream.next())
+            .await
+            .expect("stream remained blocked after successful cancellation");
+        assert!(
+            matches!(next, Some(Ok(StreamResponse::StatusUpdate(update))) if update.status.state == TaskState::Canceled)
+        );
+        assert!(stream.next().await.is_none());
+        release.notify_one();
     }
 
     /// The CANCELED state `begin_cancel` commits is pushed even when the
