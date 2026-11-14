@@ -814,6 +814,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_client_role_validation_through_rest() {
+        for path in [REST_SEND_MESSAGE_PATH, REST_STREAM_MESSAGE_PATH] {
+            for role in ["ROLE_AGENT", "ROLE_UNSPECIFIED"] {
+                let body = serde_json::json!({
+                    "message": {
+                        "messageId": "role-validation",
+                        "role": role,
+                        "parts": [{"text": "hello"}]
+                    }
+                });
+                let req = Request::builder()
+                    .header("a2a-version", "1.0")
+                    .uri(path)
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap();
+                let response = make_app().oneshot(req).await.unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(error["error"]["status"], "INVALID_ARGUMENT");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_send_message() {
         let app = make_app();
         let body = serde_json::json!({

@@ -579,6 +579,66 @@ async fn grpc_transport_accepts_bare_host_port_endpoints() {
 }
 
 #[tokio::test]
+async fn grpc_transport_rejects_client_agent_and_unspecified_roles() {
+    let (endpoint, handle) = spawn_default_handler_grpc_server().await;
+    let transport = GrpcTransport::connect(endpoint.clone()).await.unwrap();
+
+    for role in [Role::Agent, Role::Unspecified] {
+        let request = SendMessageRequest {
+            message: Message::new(role, vec![Part::text("hello")]),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        };
+        let error = transport
+            .send_message(&versioned_params(), &request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::INVALID_PARAMS);
+
+        let error = match transport
+            .send_streaming_message(&versioned_params(), &request)
+            .await
+        {
+            Ok(_) => panic!("invalid role was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, error_code::INVALID_PARAMS);
+    }
+
+    let mut raw = a2a_pb::proto::a2a_service_client::A2aServiceClient::connect(endpoint)
+        .await
+        .unwrap();
+    let request = SendMessageRequest {
+        message: Message::new(Role::User, vec![Part::text("unknown role")]),
+        configuration: None,
+        metadata: None,
+        tenant: None,
+    };
+    let mut proto = a2a_pb::pbconv::to_proto_send_message_request(&request);
+    proto.message.as_mut().unwrap().role = 42;
+    let mut unary = tonic::Request::new(proto.clone());
+    unary
+        .metadata_mut()
+        .insert("a2a-version", "1.0".parse().unwrap());
+    assert_eq!(
+        raw.send_message(unary).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    let mut streaming = tonic::Request::new(proto);
+    streaming
+        .metadata_mut()
+        .insert("a2a-version", "1.0".parse().unwrap());
+    match raw.send_streaming_message(streaming).await {
+        Ok(_) => panic!("unknown numeric role was accepted"),
+        Err(error) => assert_eq!(error.code(), tonic::Code::InvalidArgument),
+    }
+
+    transport.destroy().await.unwrap();
+    handle.abort();
+}
+
+#[tokio::test]
 async fn grpc_transport_treats_zero_page_size_as_unset() {
     let (endpoint, handle) = spawn_default_handler_grpc_server().await;
     let transport = GrpcTransport::connect(endpoint).await.unwrap();
