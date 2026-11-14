@@ -416,6 +416,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_client_role_validation_through_jsonrpc() {
+        for method in [methods::SEND_MESSAGE, methods::SEND_STREAMING_MESSAGE] {
+            for role in ["ROLE_AGENT", "ROLE_UNSPECIFIED"] {
+                let params = serde_json::json!({
+                    "message": {
+                        "messageId": "role-validation",
+                        "role": role,
+                        "parts": [{"text": "hello"}]
+                    }
+                });
+                let response = post_jsonrpc(make_app(), method, params).await;
+                assert!(response.result.is_none());
+                assert_eq!(response.error.unwrap().code, error_code::INVALID_PARAMS);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_send_message() {
         let app = make_app();
         let params = serde_json::json!({
