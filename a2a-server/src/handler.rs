@@ -994,6 +994,11 @@ impl DefaultRequestHandler {
         req: SendMessageRequest,
         include_task_snapshot_in_context: bool,
     ) -> Result<(TaskId, BoxStream<'static, Result<StreamResponse, A2AError>>), A2AError> {
+        if req.message.role != Role::User {
+            return Err(A2AError::invalid_params(
+                "client messages must have role ROLE_USER",
+            ));
+        }
         self.validate_content_types(&req.message)?;
         let (task, stored_task, context_id) = self.prepare_task_for_execution(&req).await?;
         let task_id = task.id.clone();
@@ -1447,6 +1452,25 @@ mod tests {
     };
 
     struct EchoExecutor;
+
+    struct CountingExecutor(Arc<AtomicI32>);
+
+    impl crate::AgentExecutor for CountingExecutor {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            EchoExecutor.execute(ctx)
+        }
+
+        fn cancel(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            EchoExecutor.cancel(ctx)
+        }
+    }
 
     struct PushEventExecutor;
 
@@ -2095,6 +2119,101 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_client_role_validation_precedes_task_creation_and_execution() {
+        for role in [Role::Agent, Role::Unspecified] {
+            for streaming in [false, true] {
+                let executions = Arc::new(AtomicI32::new(0));
+                let handler = DefaultRequestHandler::new(
+                    CountingExecutor(executions.clone()),
+                    InMemoryTaskStore::new(),
+                );
+                let mut message = make_message();
+                message.role = role.clone();
+                let req = SendMessageRequest {
+                    message,
+                    configuration: None,
+                    metadata: None,
+                    tenant: None,
+                };
+                let error = if streaming {
+                    match handler
+                        .send_streaming_message(&ServiceParams::new(), req)
+                        .await
+                    {
+                        Ok(_) => panic!("invalid role was accepted"),
+                        Err(error) => error,
+                    }
+                } else {
+                    handler
+                        .send_message(&ServiceParams::new(), req)
+                        .await
+                        .unwrap_err()
+                };
+                assert_eq!(error.code, error_code::INVALID_PARAMS);
+                assert_eq!(executions.load(Ordering::SeqCst), 0);
+                let tasks = handler
+                    .task_store
+                    .list(&ListTasksRequest {
+                        context_id: None,
+                        status: None,
+                        page_size: None,
+                        page_token: None,
+                        history_length: None,
+                        status_timestamp_after: None,
+                        include_artifacts: None,
+                        tenant: None,
+                    })
+                    .await
+                    .unwrap();
+                assert!(tasks.tasks.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalid_client_role_does_not_change_existing_task() {
+        for streaming in [false, true] {
+            let executions = Arc::new(AtomicI32::new(0));
+            let handler = DefaultRequestHandler::new(
+                CountingExecutor(executions.clone()),
+                InMemoryTaskStore::new(),
+            );
+            seed_task(&handler, "existing-task", "existing-context").await;
+            let before = handler.task_store.get("existing-task").await.unwrap();
+            let mut message = make_message();
+            message.role = Role::Agent;
+            message.task_id = Some("existing-task".into());
+            message.context_id = Some("existing-context".into());
+            let request = SendMessageRequest {
+                message,
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            };
+            let error = if streaming {
+                match handler
+                    .send_streaming_message(&ServiceParams::new(), request)
+                    .await
+                {
+                    Ok(_) => panic!("invalid role was accepted"),
+                    Err(error) => error,
+                }
+            } else {
+                handler
+                    .send_message(&ServiceParams::new(), request)
+                    .await
+                    .unwrap_err()
+            };
+            assert_eq!(error.code, error_code::INVALID_PARAMS);
+            assert_eq!(
+                handler.task_store.get("existing-task").await.unwrap(),
+                before
+            );
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]
