@@ -9,7 +9,7 @@ use axum::{
     Json,
     body::Bytes,
     extract::{
-        Path, Query, Request, State,
+        OriginalUri, Path, Query, Request, State,
         rejection::{JsonRejection, QueryRejection},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -18,6 +18,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream::BoxStream};
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -190,6 +191,15 @@ struct TaskPath {
     id: String,
 }
 
+fn has_task_action(uri: &axum::http::Uri, action: &str) -> bool {
+    uri.path()
+        .rsplit('/')
+        .next()
+        .and_then(|segment| segment.rsplit_once(':'))
+        .and_then(|(_, action)| percent_decode_str(action).decode_utf8().ok())
+        .is_some_and(|actual| actual == action)
+}
+
 /// The path of a push-config route; `tenant` is set on its `/{tenant}/…` binding.
 #[derive(Deserialize)]
 struct PushConfigPath {
@@ -303,6 +313,7 @@ async fn handle_get_task_inner<H: RequestHandler>(
 
 async fn handle_get_task_or_subscribe<H: RequestHandler>(
     State(state): State<RestState<H>>,
+    OriginalUri(original_uri): OriginalUri,
     Path(path): Path<TaskPath>,
     query: Result<Query<GetTaskQuery>, QueryRejection>,
     headers: HeaderMap,
@@ -312,7 +323,11 @@ async fn handle_get_task_or_subscribe<H: RequestHandler>(
         Err(rejection) => return rest_payload_error_response(rejection.body_text()),
     };
     let params = extract_service_params(&headers);
-    if let Some(task_id) = path.id.strip_suffix(":subscribe") {
+    // Check the raw URI before stripping from the decoded ID: an encoded colon
+    // belongs to the ID and is not an action separator.
+    if has_task_action(&original_uri, "subscribe")
+        && let Some(task_id) = path.id.strip_suffix(":subscribe")
+    {
         let id = task_id.to_string();
         return handle_subscribe_to_task_inner(state, params, id, path.tenant).await;
     }
@@ -419,15 +434,21 @@ async fn handle_cancel_task_inner<H: RequestHandler>(
 
 async fn handle_post_task_action<H: RequestHandler>(
     State(state): State<RestState<H>>,
+    OriginalUri(original_uri): OriginalUri,
     Path(TaskPath { tenant, id }): Path<TaskPath>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
-    if let Some(task_id) = id.strip_suffix(":cancel") {
+    // Distinguish a literal action separator from a colon encoded in the ID.
+    if has_task_action(&original_uri, "cancel")
+        && let Some(task_id) = id.strip_suffix(":cancel")
+    {
         return handle_cancel_task_inner(state, params, task_id.to_string(), tenant, body).await;
     }
-    if let Some(task_id) = id.strip_suffix(":subscribe") {
+    if has_task_action(&original_uri, "subscribe")
+        && let Some(task_id) = id.strip_suffix(":subscribe")
+    {
         return handle_subscribe_to_task_inner(state, params, task_id.to_string(), tenant).await;
     }
 
@@ -2281,5 +2302,171 @@ mod tests {
             violation["description"],
             "tenant in the body (body) does not match the tenant in the path (acme)"
         );
+    }
+}
+
+#[cfg(test)]
+mod encoded_task_action_regression {
+    use super::*;
+    use crate::test_util::CapturingHandler;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn encoded_action_suffix_is_part_of_id() {
+        for (uri, id) in [
+            ("/tasks/foo%3Asubscribe", "foo:subscribe"),
+            ("/tasks/foo%3As%75bscribe", "foo:subscribe"),
+            ("/tasks/foo%3asubscribe?historyLength=1", "foo:subscribe"),
+            ("/tasks/foo%253Asubscribe", "foo%3Asubscribe"),
+        ] {
+            let (handler, _) = CapturingHandler::new();
+            let req = Request::builder()
+                .uri(uri)
+                .header("a2a-version", "1.0")
+                .body(Body::empty())
+                .unwrap();
+            let _ = rest_router(handler.clone()).oneshot(req).await.unwrap();
+            assert!(
+                handler.take_tenant("get_task").is_some(),
+                "{uri}: not dispatched to get_task"
+            );
+            assert_eq!(handler.take_id("get_task").as_deref(), Some(id));
+            assert!(
+                handler.take_tenant("subscribe_to_task").is_none(),
+                "{uri}: dispatched to subscribe"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unencoded_action_suffix_subscribes() {
+        for (uri, id) in [
+            ("/tasks/foo:subscribe", "foo"),
+            ("/tasks/foo:s%75bscribe", "foo"),
+            ("/tasks/foo%3Asubscribe:s%75bscribe", "foo:subscribe"),
+            ("/tasks/foo%3Asubscribe:subscribe", "foo:subscribe"),
+            (
+                "/tenant/tasks/foo%3Asubscribe:subscribe?x=y",
+                "foo:subscribe",
+            ),
+        ] {
+            let (handler, _) = CapturingHandler::new();
+            let req = Request::builder()
+                .uri(uri)
+                .header("a2a-version", "1.0")
+                .body(Body::empty())
+                .unwrap();
+            let _ = rest_router(handler.clone()).oneshot(req).await.unwrap();
+            assert!(
+                handler.take_tenant("subscribe_to_task").is_some(),
+                "{uri}: not dispatched to subscribe"
+            );
+            assert_eq!(handler.take_id("subscribe_to_task").as_deref(), Some(id));
+        }
+    }
+
+    #[tokio::test]
+    async fn post_encoded_action_suffix_does_not_cancel_other_task() {
+        for uri in [
+            "/tasks/foo%3Acancel",
+            "/tasks/foo%3Ac%61ncel",
+            "/tenant/tasks/foo%3acancel?x=y",
+            "/tasks/foo%253Acancel",
+        ] {
+            let (handler, _) = CapturingHandler::new();
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("a2a-version", "1.0")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let _ = rest_router(handler.clone()).oneshot(req).await.unwrap();
+            assert!(
+                handler.take_tenant("cancel_task").is_none(),
+                "{uri}: incorrectly cancelled a different task"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn post_literal_action_suffix_cancels() {
+        for (uri, id) in [
+            ("/tasks/foo:cancel", "foo"),
+            ("/tasks/foo:c%61ncel", "foo"),
+            ("/tenant/tasks/foo%3Acancel:c%61ncel?x=y", "foo:cancel"),
+            ("/tenant/tasks/foo%3Acancel:cancel?x=y", "foo:cancel"),
+        ] {
+            let (handler, _) = CapturingHandler::new();
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("a2a-version", "1.0")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let _ = rest_router(handler.clone()).oneshot(req).await.unwrap();
+            assert!(
+                handler.take_tenant("cancel_task").is_some(),
+                "{uri}: not dispatched to cancel"
+            );
+            assert_eq!(handler.take_id("cancel_task").as_deref(), Some(id));
+        }
+    }
+
+    #[tokio::test]
+    async fn post_subscribe_requires_literal_suffix_and_preserves_id() {
+        for (uri, expected) in [
+            ("/tasks/foo%3Asubscribe", None),
+            ("/tasks/foo%253Asubscribe", None),
+            ("/tasks/foo:s%75bscribe", Some("foo")),
+            (
+                "/tasks/foo%3Asubscribe:subscribe?x=y",
+                Some("foo:subscribe"),
+            ),
+        ] {
+            let (handler, _) = CapturingHandler::new();
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("a2a-version", "1.0")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let _ = rest_router(handler.clone()).oneshot(req).await.unwrap();
+            assert_eq!(
+                handler.take_id("subscribe_to_task").as_deref(),
+                expected,
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_works_under_nested_base_path() {
+        for (uri, method, id) in [
+            (
+                "/a2a/tasks/foo%3Asubscribe?x=:subscribe",
+                "get_task",
+                "foo:subscribe",
+            ),
+            (
+                "/a2a/tasks/foo%3Asubscribe:subscribe",
+                "subscribe_to_task",
+                "foo:subscribe",
+            ),
+        ] {
+            let (handler, _) = CapturingHandler::new();
+            let app = axum::Router::new().nest("/a2a", rest_router(handler.clone()));
+            let req = Request::builder()
+                .uri(uri)
+                .header("a2a-version", "1.0")
+                .body(Body::empty())
+                .unwrap();
+            let _ = app.oneshot(req).await.unwrap();
+            assert_eq!(handler.take_id(method).as_deref(), Some(id), "{uri}");
+        }
     }
 }

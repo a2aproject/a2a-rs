@@ -135,6 +135,7 @@ pub(crate) mod test_util {
     pub(crate) struct CapturingHandler {
         captured: CapturedParams,
         tenants: Mutex<HashMap<&'static str, Option<String>>>,
+        ids: Mutex<HashMap<&'static str, String>>,
     }
 
     impl CapturingHandler {
@@ -143,6 +144,7 @@ pub(crate) mod test_util {
             let handler = Arc::new(CapturingHandler {
                 captured: captured.clone(),
                 tenants: Mutex::new(HashMap::new()),
+                ids: Mutex::new(HashMap::new()),
             });
             (handler, captured)
         }
@@ -158,6 +160,10 @@ pub(crate) mod test_util {
         /// The tenant of `method`'s last call; `None` if it was not called since.
         pub fn take_tenant(&self, method: &str) -> Option<Option<String>> {
             self.tenants.lock().unwrap().remove(method)
+        }
+
+        pub fn take_id(&self, method: &str) -> Option<String> {
+            self.ids.lock().unwrap().remove(method)
         }
     }
 
@@ -186,6 +192,7 @@ pub(crate) mod test_util {
             params: &ServiceParams,
             req: GetTaskRequest,
         ) -> Result<Task, A2AError> {
+            self.ids.lock().unwrap().insert("get_task", req.id.clone());
             self.record("get_task", params, req.tenant.as_deref());
             Err(A2AError::task_not_found("stub"))
         }
@@ -209,6 +216,10 @@ pub(crate) mod test_util {
             params: &ServiceParams,
             req: CancelTaskRequest,
         ) -> Result<Task, A2AError> {
+            self.ids
+                .lock()
+                .unwrap()
+                .insert("cancel_task", req.id.clone());
             self.record("cancel_task", params, req.tenant.as_deref());
             Err(A2AError::task_not_found("stub"))
         }
@@ -218,6 +229,10 @@ pub(crate) mod test_util {
             params: &ServiceParams,
             req: SubscribeToTaskRequest,
         ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+            self.ids
+                .lock()
+                .unwrap()
+                .insert("subscribe_to_task", req.id.clone());
             self.record("subscribe_to_task", params, req.tenant.as_deref());
             Ok(Box::pin(futures::stream::empty()))
         }

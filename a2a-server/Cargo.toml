@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 hyper = { workspace = true }
+percent-encoding = "2"
 reqwest = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
