@@ -156,6 +156,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "a2a-websocket"
+version = "0.1.0"
+dependencies = [
+ "a2a-client-lf",
+ "a2a-lf",
+ "a2a-pb",
+ "a2a-server-lf",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "fastwebsockets",
+ "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "parking_lot",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tower",
+ "tracing",
+ "uuid",
+ "webpki-roots",
+]
+
+[[package]]
 name = "a2acli-transport-slimrpc"
 version = "0.1.8"
 dependencies = [
@@ -1804,6 +1837,7 @@ dependencies = [
  "a2a-lf",
  "a2a-pb",
  "a2a-server-lf",
+ "a2a-websocket",
  "async-trait",
  "axum",
  "chrono",
@@ -1855,8 +1889,11 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "305d3ba574508e27190906d11707dad683e0494e6b85eae9b044cb2734a5e422"
 dependencies = [
+ "async-trait",
+ "axum-core",
  "base64 0.21.7",
  "bytes",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -4551,6 +4588,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -6026,6 +6064,15 @@ name = "webpki-root-certs"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]
