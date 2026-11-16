@@ -54,7 +54,7 @@ jobs:
 
       - name: Setup Rust
         if: steps.changes.outputs.code == 'true'
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           components: clippy, rustfmt
           # Only main writes; pull requests restore from it. The repo sits at
@@ -63,7 +63,7 @@ jobs:
 
       - name: Install just
         if: steps.changes.outputs.code == 'true'
-        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
         with:
           tool: just
 
