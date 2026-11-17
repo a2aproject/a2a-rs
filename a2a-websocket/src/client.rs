@@ -1285,7 +1285,7 @@ where
     }
 }
 
-/// `wss://` (TLS) support, built on rustls with the `ring` crypto provider.
+/// `wss://` (TLS) support, built on rustls with the `aws-lc-rs` crypto provider.
 #[cfg(feature = "tls")]
 mod tls {
     use std::sync::Arc;
@@ -1318,7 +1318,7 @@ mod tls {
     pub(super) fn build_client_config(
         options: &TlsOptions,
     ) -> Result<rustls::ClientConfig, A2AError> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .map_err(|err| A2AError::internal(format!("failed to configure TLS: {err}")))?;

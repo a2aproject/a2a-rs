@@ -348,7 +348,7 @@ The transport identifier in agent cards is
 ## TLS (`wss://`)
 
 Native `wss://` client support is provided by the default `tls` feature, built
-on [`rustls`] with the `ring` crypto provider. The client validates the server
+on [`rustls`] with the `aws-lc-rs` crypto provider. The client validates the server
 certificate against the platform trust store (falling back to the bundled
 Mozilla roots). Private CAs and self-signed certificates can be trusted
 explicitly via `TlsOptions`:

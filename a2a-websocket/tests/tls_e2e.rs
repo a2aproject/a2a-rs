@@ -2,7 +2,7 @@
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 //! End-to-end tests for the `wss://` (TLS) transport path. These tests boot a
-//! real TLS-terminating server (rustls + `ring`, self-signed via `rcgen`),
+//! real TLS-terminating server (rustls + `aws-lc-rs`, self-signed via `rcgen`),
 //! serve the standard `websocket_router(...)` over it through hyper, and drive
 //! a real `WebSocketTransport` over `wss://`.
 
@@ -69,7 +69,7 @@ fn self_signed_localhost() -> (String, rustls::ServerConfig) {
         certified.signing_key.serialize_der(),
     ));
 
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("safe protocol versions")

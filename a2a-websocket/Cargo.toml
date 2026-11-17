@@ -13,8 +13,9 @@ name = "a2a_websocket"
 
 [features]
 default = ["tls"]
-# Native `wss://` (TLS) client support, built on rustls with the `ring` crypto
-# provider (avoids the aws-lc-rs native build).
+# Native `wss://` (TLS) client support, built on rustls with the `aws-lc-rs`
+# crypto provider used by the rest of the workspace. Enabling `ring` as well
+# would leave rustls without a default provider for every crate in the build.
 tls = [
     "dep:tokio-rustls",
     "dep:rustls",
@@ -45,12 +46,12 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
 tokio-rustls = { version = "0.26", default-features = false, features = [
-    "ring",
+    "aws_lc_rs",
     "tls12",
     "logging",
 ], optional = true }
 rustls = { version = "0.23", default-features = false, features = [
-    "ring",
+    "aws_lc_rs",
     "std",
     "tls12",
     "logging",
@@ -65,4 +66,4 @@ axum = { workspace = true }
 async-trait = { workspace = true }
 hyper = { workspace = true, features = ["server", "http1"] }
 hyper-util = { workspace = true, features = ["server", "server-auto", "http1", "tokio"] }
-rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "ring"] }
+rcgen = { workspace = true }

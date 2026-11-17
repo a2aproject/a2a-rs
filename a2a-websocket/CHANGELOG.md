@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The `tls` feature now uses the `aws-lc-rs` crypto provider instead of
+  `ring`**, matching the rest of the workspace. Enabling both providers left
+  rustls unable to pick a process-level default, so any crate in the same build
+  relying on it (such as `a2acli-transport-slimrpc`) panicked at runtime.
 - **Aligned with the current binding specification (breaking).**
   - The transport identifier is now
     `https://a2a-protocol.org/bindings/experimental-websocket/v1` and is
