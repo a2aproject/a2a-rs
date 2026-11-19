@@ -2217,6 +2217,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_user_role_executes_in_unary_and_streaming_requests() {
+        use futures::StreamExt;
+
+        for streaming in [false, true] {
+            let executions = Arc::new(AtomicI32::new(0));
+            let handler = DefaultRequestHandler::new(
+                CountingExecutor(executions.clone()),
+                InMemoryTaskStore::new(),
+            );
+            let request = SendMessageRequest {
+                message: make_message(),
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            };
+            let task = if streaming {
+                let mut stream = handler
+                    .send_streaming_message(&ServiceParams::new(), request)
+                    .await
+                    .unwrap();
+                match stream.next().await.unwrap().unwrap() {
+                    StreamResponse::Task(task) => task,
+                    other => panic!("expected task response, got {other:?}"),
+                }
+            } else {
+                match handler
+                    .send_message(&ServiceParams::new(), request)
+                    .await
+                    .unwrap()
+                {
+                    SendMessageResponse::Task(task) => task,
+                    other => panic!("expected task response, got {other:?}"),
+                }
+            };
+            assert_eq!(task.status.state, TaskState::Completed);
+            assert_eq!(executions.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_role_validation_does_not_block_canceling_existing_task() {
+        let executions = Arc::new(AtomicI32::new(0));
+        let handler = DefaultRequestHandler::new(
+            CountingExecutor(executions.clone()),
+            InMemoryTaskStore::new(),
+        );
+        seed_task(&handler, "pending-task", "pending-context").await;
+        let task = handler
+            .cancel_task(
+                &ServiceParams::new(),
+                CancelTaskRequest {
+                    id: "pending-task".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.status.state, TaskState::Canceled);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn test_send_message_creates_task() {
         let handler = make_handler();
         let params = ServiceParams::new();
