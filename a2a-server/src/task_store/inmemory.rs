@@ -130,7 +130,7 @@ impl TaskStore for InMemoryTaskStore {
         }
         entry.version += 1;
         entry.task.status.state = TaskState::Canceled;
-        entry.task.status.timestamp = Some(chrono::Utc::now());
+        entry.task.status.timestamp = Some(a2a::Timestamp::now());
         let task = entry.task.clone();
         store.retire(task_id, self.terminal_task_limit);
         Ok(task)
@@ -487,16 +487,14 @@ mod tests {
     #[tokio::test]
     async fn test_list_filter_by_status_timestamp_after() {
         let store = InMemoryTaskStore::new();
-        let cutoff = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let cutoff = "2025-01-01T00:00:00Z".parse::<a2a::Timestamp>().unwrap();
 
         let mut old = make_task("old", "c1", TaskState::Completed);
-        old.status.timestamp = Some(cutoff - chrono::Duration::seconds(1));
+        old.status.timestamp = Some("2024-12-31T23:59:59Z".parse().unwrap());
         store.create(old).await.unwrap();
 
         let mut recent = make_task("recent", "c1", TaskState::Completed);
-        recent.status.timestamp = Some(cutoff + chrono::Duration::seconds(1));
+        recent.status.timestamp = Some("2025-01-01T00:00:01Z".parse().unwrap());
         store.create(recent).await.unwrap();
 
         // The bound itself is included: "greater than or equal".

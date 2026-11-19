@@ -1,49 +1,13 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
+use crate::Timestamp;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
-
-/// Support for the `fuzzing` feature: kept beside the types it services so
-/// the two evolve together, rather than in a separate crate module.
-#[cfg(feature = "fuzzing")]
-mod fuzz_support {
-    use arbitrary::{Arbitrary, Result, Unstructured};
-    use chrono::{DateTime, NaiveDate, Utc};
-
-    /// Generates a timestamp within `google.protobuf.Timestamp`'s own
-    /// documented valid range (0001-01-01T00:00:00Z to
-    /// 9999-12-31T23:59:59.999999999Z) rather than `chrono`'s much wider one.
-    ///
-    /// Outside that range, `a2a-pb`'s `to_proto_timestamp` previously produced
-    /// well-known-type JSON that could not be parsed back (the #261 round-trip
-    /// bug, now fixed: it returns `None`). Generating only in-range values here
-    /// keeps fuzz target 2 pointed at timestamps a real `Task` could actually
-    /// carry, rather than at values whose behaviour #261 already pins.
-    pub(crate) fn bounded_timestamp(u: &mut Unstructured) -> Result<Option<DateTime<Utc>>> {
-        if !bool::arbitrary(u)? {
-            return Ok(None);
-        }
-        let min = NaiveDate::from_ymd_opt(1, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc();
-        let max = NaiveDate::from_ymd_opt(9999, 12, 31)
-            .unwrap()
-            .and_hms_nano_opt(23, 59, 59, 999_999_999)
-            .unwrap()
-            .and_utc();
-        let secs = u.int_in_range(min.timestamp()..=max.timestamp())?;
-        let nanos = u.int_in_range(0u32..=999_999_999u32)?;
-        Ok(DateTime::from_timestamp(secs, nanos))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // TaskID / ArtifactID / ContextID
@@ -420,8 +384,7 @@ pub struct TaskStatus {
     pub message: Option<Message>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "fuzzing", arbitrary(with = fuzz_support::bounded_timestamp))]
-    pub timestamp: Option<DateTime<Utc>>,
+    pub timestamp: Option<Timestamp>,
 }
 
 // ---------------------------------------------------------------------------
@@ -589,8 +552,7 @@ pub struct ListTasksRequest {
     pub history_length: Option<i32>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "fuzzing", arbitrary(with = fuzz_support::bounded_timestamp))]
-    pub status_timestamp_after: Option<DateTime<Utc>>,
+    pub status_timestamp_after: Option<Timestamp>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_artifacts: Option<bool>,

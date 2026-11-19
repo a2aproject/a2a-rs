@@ -26,7 +26,6 @@ hyper = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-chrono = { workspace = true }
 axum-server = { workspace = true, default-features = false, optional = true }
 rustls = { workspace = true, optional = true }
 

@@ -21,7 +21,6 @@ pbjson-types = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
 
 [build-dependencies]
 pbjson-build = { workspace = true }

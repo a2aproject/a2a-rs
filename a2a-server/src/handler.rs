@@ -324,7 +324,7 @@ async fn save_task(task_store: &dyn crate::TaskStore, mut task: Task) -> Result<
     // backfilling here covers the task-snapshot and status-update paths
     // alike, while preserving any timestamp the executor already supplied.
     if task.status.timestamp.is_none() {
-        task.status.timestamp = Some(chrono::Utc::now());
+        task.status.timestamp = Some(a2a::Timestamp::now());
     }
     match task_store.update(task.clone()).await {
         Ok(_) => Ok(task),
@@ -350,7 +350,7 @@ fn backfill_status_timestamp(event: &mut StreamResponse) {
         StreamResponse::ArtifactUpdate(_) | StreamResponse::Message(_) => return,
     };
     if status.timestamp.is_none() {
-        status.timestamp = Some(chrono::Utc::now());
+        status.timestamp = Some(a2a::Timestamp::now());
     }
 }
 
@@ -425,7 +425,7 @@ async fn fail_task(
             context_id: Some(task.context_id.clone()),
             ..Message::new(Role::Agent, vec![Part::text(text)])
         }),
-        timestamp: Some(chrono::Utc::now()),
+        timestamp: Some(a2a::Timestamp::now()),
     };
     let task = save_task(runtime.task_store.as_ref(), task).await.ok()?;
     let _ = send_push_notifications(
@@ -953,7 +953,7 @@ impl DefaultRequestHandler {
                 status: TaskStatus {
                     state: TaskState::Submitted,
                     message: None,
-                    timestamp: Some(chrono::Utc::now()),
+                    timestamp: Some(a2a::Timestamp::now()),
                 },
                 artifacts: None,
                 history: Some(vec![req.message.clone()]),
@@ -2200,7 +2200,7 @@ mod tests {
                 status: TaskStatus {
                     state: TaskState::Submitted,
                     message: None,
-                    timestamp: Some(chrono::Utc::now()),
+                    timestamp: Some(a2a::Timestamp::now()),
                 },
                 artifacts: None,
                 history: None,
@@ -2255,9 +2255,7 @@ mod tests {
             .await
             .unwrap();
 
-        let supplied = chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let supplied = "2020-01-02T03:04:05Z".parse::<a2a::Timestamp>().unwrap();
 
         let updated = apply_event_to_task(
             &store,
@@ -2324,9 +2322,7 @@ mod tests {
     async fn test_task_snapshot_preserves_supplied_timestamp() {
         let store = InMemoryTaskStore::new();
 
-        let supplied = chrono::DateTime::parse_from_rfc3339("2021-06-07T08:09:10Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let supplied = "2021-06-07T08:09:10Z".parse::<a2a::Timestamp>().unwrap();
 
         let returned = apply_event_to_task(
             &store,
@@ -3434,7 +3430,7 @@ mod tests {
                 status: TaskStatus {
                     state: TaskState::Completed,
                     message: None,
-                    timestamp: Some(chrono::Utc::now()),
+                    timestamp: Some(a2a::Timestamp::now()),
                 },
                 artifacts: Some(vec![Artifact {
                     artifact_id: "a1".into(),

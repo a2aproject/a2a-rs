@@ -39,7 +39,7 @@ impl AgentExecutor for ArtifactAgent {
             status: TaskStatus {
                 state: TaskState::Submitted,
                 message: None,
-                timestamp: Some(chrono::Utc::now()),
+                timestamp: Some(a2a::Timestamp::now()),
             },
             artifacts: None,
             history: ctx.message.map(|message| vec![message]),
@@ -66,7 +66,7 @@ impl AgentExecutor for ArtifactAgent {
             status: TaskStatus {
                 state: TaskState::Completed,
                 message: None,
-                timestamp: Some(chrono::Utc::now()),
+                timestamp: Some(a2a::Timestamp::now()),
             },
             metadata: None,
         })));
