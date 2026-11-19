@@ -5032,6 +5032,20 @@ mod tests {
         );
         let params = ServiceParams::new();
         seed_task(&handler, "t-push-race", "c-push-race").await;
+        // A delivery failure must not prevent the owner from inspecting and
+        // removing the task's push configurations.
+        for id in ["cfg-1", "cfg-2"] {
+            handler
+                .create_push_config(
+                    &params,
+                    TaskPushNotificationConfig {
+                        id: Some(id.into()),
+                        ..push_config("t-push-race")
+                    },
+                )
+                .await
+                .unwrap();
+        }
         let mut request = send_request();
         request.message.task_id = Some("t-push-race".into());
         let _stream = handler
@@ -5058,6 +5072,49 @@ mod tests {
                 .is_err()
         );
         assert!(subscriber.recv().await.unwrap().result.is_err());
+        let get_config = |id: &str| GetTaskPushNotificationConfigRequest {
+            task_id: "t-push-race".into(),
+            id: id.into(),
+            tenant: None,
+        };
+        assert_eq!(
+            handler
+                .get_push_config(&params, get_config("cfg-1"))
+                .await
+                .unwrap()
+                .id
+                .as_deref(),
+            Some("cfg-1")
+        );
+        handler
+            .delete_push_config(
+                &params,
+                DeleteTaskPushNotificationConfigRequest {
+                    task_id: "t-push-race".into(),
+                    id: "cfg-1".into(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            handler
+                .get_push_config(&params, get_config("cfg-1"))
+                .await
+                .is_err()
+        );
+        handler
+            .push_config_store_checked()
+            .unwrap()
+            .delete_all("t-push-race")
+            .await
+            .unwrap();
+        assert!(
+            handler
+                .get_push_config(&params, get_config("cfg-2"))
+                .await
+                .is_err()
+        );
         resume.notify_one();
         timeout(Duration::from_secs(5), async {
             while Arc::strong_count(&active) > 1 {
