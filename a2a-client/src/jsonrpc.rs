@@ -919,6 +919,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiline_sse_jsonrpc_error_validates_response_id() {
+        for (response_id, expected_code) in [
+            ("expected", -32600),
+            ("another-request", error_code::INVALID_AGENT_RESPONSE),
+        ] {
+            let event = format!(
+                "data: {{\"jsonrpc\":\"2.0\",\ndata:\"id\":\"{response_id}\",\ndata: \"error\":{{\"code\":-32600,\"message\":\"bad request\"}}}}\n\n"
+            );
+            let stream = byte_stream(vec![event]);
+            let mut parsed =
+                parse_sse_stream_with_id(stream, Some(JsonRpcId::String("expected".into())));
+            assert_eq!(
+                parsed.next().await.unwrap().unwrap_err().code,
+                expected_code
+            );
+            assert!(parsed.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn multiline_rest_sse_event_preserves_status_update() {
+        let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "task-1".into(),
+            context_id: "context-1".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        let data =
+            serde_json::to_string_pretty(&protojson_conv::to_value(&event).unwrap()).unwrap();
+        let sse = data
+            .lines()
+            .enumerate()
+            .map(|(i, line)| format!("{}{}\n", if i % 2 == 0 { "data: " } else { "data:" }, line))
+            .collect::<String>()
+            + "\n";
+        let mut parsed = parse_sse_stream_rest(byte_stream(vec![sse]));
+        match parsed.next().await.unwrap().unwrap() {
+            StreamResponse::StatusUpdate(update) => {
+                assert_eq!(update.task_id, "task-1");
+                assert_eq!(update.status.state, TaskState::Working);
+            }
+            other => panic!("expected status update, got {other:?}"),
+        }
+        assert!(parsed.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_parse_sse_stream_direct_stream_response() {
         // When the data is not a valid JSON-RPC envelope, try parsing directly as StreamResponse
         let status_update = TaskStatusUpdateEvent {
