@@ -88,6 +88,7 @@ async fn main() {
 
     let grpc_service = A2aServiceServer::new(GrpcHandler::new(handler));
 
+    // --8<-- [start:tls-config]
     let rustls_config = load_rustls_config();
     let https_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_config);
     let https_addr: std::net::SocketAddr = "0.0.0.0:3443".parse().unwrap();
@@ -96,6 +97,7 @@ async fn main() {
     let grpc_addr: std::net::SocketAddr = "0.0.0.0:50052".parse().unwrap();
     let tcp_incoming = TcpIncoming::bind(grpc_addr).expect("bind gRPC address");
     let tls_incoming = TlsIncoming::new(tcp_incoming, grpc_tls_config);
+    // --8<-- [end:tls-config]
 
     tracing::info!("Hello World Agent starting (TLS)");
     tracing::info!("Agent card:  https://localhost:3443/.well-known/agent-card.json");
