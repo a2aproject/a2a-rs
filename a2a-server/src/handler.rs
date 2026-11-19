@@ -4983,10 +4983,16 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        let task_id = match working {
-            StreamResponse::StatusUpdate(update) => update.task_id,
-            other => panic!("expected working, got {other:?}"),
-        };
+        assert!(
+            matches!(
+                &working,
+                StreamResponse::StatusUpdate(update) if update.status.state == TaskState::Working
+            ),
+            "expected working status, got {working:?}"
+        );
+        let task_id = task_id_for_event(&working)
+            .expect("working status has a task ID")
+            .to_owned();
         let canceled = handler
             .cancel_task(
                 &params,
