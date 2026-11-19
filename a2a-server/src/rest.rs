@@ -191,13 +191,23 @@ struct TaskPath {
     id: String,
 }
 
-fn has_task_action(uri: &axum::http::Uri, action: &str) -> bool {
-    uri.path()
+/// Recognize only a literal separator in the raw URI, then strip the action
+/// from the already-decoded task ID. Encoded colons remain part of the ID.
+fn task_id_for_action<'a>(
+    uri: &axum::http::Uri,
+    decoded_id: &'a str,
+    action: &str,
+) -> Option<&'a str> {
+    let actual_action = uri
+        .path()
         .rsplit('/')
         .next()
         .and_then(|segment| segment.rsplit_once(':'))
-        .and_then(|(_, action)| percent_decode_str(action).decode_utf8().ok())
-        .is_some_and(|actual| actual == action)
+        .and_then(|(_, action)| percent_decode_str(action).decode_utf8().ok())?;
+    if actual_action != action {
+        return None;
+    }
+    decoded_id.strip_suffix(action)?.strip_suffix(':')
 }
 
 /// The path of a push-config route; `tenant` is set on its `/{tenant}/…` binding.
@@ -325,9 +335,7 @@ async fn handle_get_task_or_subscribe<H: RequestHandler>(
     let params = extract_service_params(&headers);
     // Check the raw URI before stripping from the decoded ID: an encoded colon
     // belongs to the ID and is not an action separator.
-    if has_task_action(&original_uri, "subscribe")
-        && let Some(task_id) = path.id.strip_suffix(":subscribe")
-    {
+    if let Some(task_id) = task_id_for_action(&original_uri, &path.id, "subscribe") {
         let id = task_id.to_string();
         return handle_subscribe_to_task_inner(state, params, id, path.tenant).await;
     }
@@ -441,14 +449,10 @@ async fn handle_post_task_action<H: RequestHandler>(
 ) -> impl IntoResponse {
     let params = extract_service_params(&headers);
     // Distinguish a literal action separator from a colon encoded in the ID.
-    if has_task_action(&original_uri, "cancel")
-        && let Some(task_id) = id.strip_suffix(":cancel")
-    {
+    if let Some(task_id) = task_id_for_action(&original_uri, &id, "cancel") {
         return handle_cancel_task_inner(state, params, task_id.to_string(), tenant, body).await;
     }
-    if has_task_action(&original_uri, "subscribe")
-        && let Some(task_id) = id.strip_suffix(":subscribe")
-    {
+    if let Some(task_id) = task_id_for_action(&original_uri, &id, "subscribe") {
         return handle_subscribe_to_task_inner(state, params, task_id.to_string(), tenant).await;
     }
 
@@ -2308,10 +2312,82 @@ mod tests {
 #[cfg(test)]
 mod encoded_task_action_regression {
     use super::*;
+    use crate::executor::ExecutorContext;
+    use crate::handler::DefaultRequestHandler;
+    use crate::task_store::InMemoryTaskStore;
     use crate::test_util::CapturingHandler;
     use axum::body::Body;
     use axum::http::Request;
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    struct CustomTaskIdExecutor;
+
+    impl crate::AgentExecutor for CustomTaskIdExecutor {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let task = Task {
+                id: "foo:subscribe".into(),
+                context_id: ctx.context_id,
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            };
+            Box::pin(futures::stream::once(async move {
+                Ok(StreamResponse::Task(task))
+            }))
+        }
+
+        fn cancel(
+            &self,
+            _ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    #[tokio::test]
+    async fn get_task_with_encoded_colon_emitted_by_executor() {
+        let app = rest_router(Arc::new(DefaultRequestHandler::new(
+            CustomTaskIdExecutor,
+            InMemoryTaskStore::new(),
+        )));
+        let message = serde_json::json!({ "message": {
+            "messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hello"}]
+        }});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/message:send")
+            .header("a2a-version", "1.0")
+            .header("content-type", "application/json")
+            .body(Body::from(message.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["task"]["id"], "foo:subscribe");
+
+        let request = Request::builder()
+            .uri("/tasks/foo%3Asubscribe")
+            .header("a2a-version", "1.0")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["id"], "foo:subscribe");
+    }
 
     #[tokio::test]
     async fn encoded_action_suffix_is_part_of_id() {
