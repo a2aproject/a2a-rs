@@ -13,6 +13,7 @@
 //! Third-party store implementations are encouraged to use
 //! [`resolve_page_size`] so every deployment agrees on what a page is.
 
+// --8<-- [start:page-size]
 /// Page size used when the caller does not ask for one.
 pub const DEFAULT_PAGE_SIZE: usize = 50;
 
@@ -32,6 +33,7 @@ pub fn resolve_page_size(requested: Option<i32>) -> usize {
         _ => DEFAULT_PAGE_SIZE,
     }
 }
+// --8<-- [end:page-size]
 
 #[cfg(test)]
 mod tests {
