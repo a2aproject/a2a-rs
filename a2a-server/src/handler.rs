@@ -995,9 +995,14 @@ impl DefaultRequestHandler {
         include_task_snapshot_in_context: bool,
     ) -> Result<(TaskId, BoxStream<'static, Result<StreamResponse, A2AError>>), A2AError> {
         if req.message.role != Role::User {
-            return Err(A2AError::invalid_params(
-                "client messages must have role ROLE_USER",
-            ));
+            let received = match req.message.role {
+                Role::Agent => "ROLE_AGENT",
+                Role::Unspecified => "ROLE_UNSPECIFIED",
+                Role::User => "ROLE_USER",
+            };
+            return Err(A2AError::invalid_params(format!(
+                "client messages must have role ROLE_USER, got decoded role {received}"
+            )));
         }
         self.validate_content_types(&req.message)?;
         let (task, stored_task, context_id) = self.prepare_task_for_execution(&req).await?;
@@ -2153,6 +2158,17 @@ mod tests {
                         .unwrap_err()
                 };
                 assert_eq!(error.code, error_code::INVALID_PARAMS);
+                let received = match role {
+                    Role::Agent => "ROLE_AGENT",
+                    Role::Unspecified => "ROLE_UNSPECIFIED",
+                    Role::User => "ROLE_USER",
+                };
+                assert_eq!(
+                    error.message,
+                    format!(
+                        "client messages must have role ROLE_USER, got decoded role {received}"
+                    )
+                );
                 assert_eq!(executions.load(Ordering::SeqCst), 0);
                 let tasks = handler
                     .task_store

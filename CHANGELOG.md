@@ -14,6 +14,10 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+### Changed
+
+- *(a2a-server)* **Breaking:** The default request handler now rejects client-sent messages with `ROLE_AGENT` or `ROLE_UNSPECIFIED` as invalid parameters for both normal and streaming sends. Clients must use `ROLE_USER`.
+
 ## [0.4.5](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.4.4...a2a-cli-v0.4.5) - 2026-10-18
 
 ### Other

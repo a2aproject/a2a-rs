@@ -583,7 +583,10 @@ async fn grpc_transport_rejects_client_agent_and_unspecified_roles() {
     let (endpoint, handle) = spawn_default_handler_grpc_server().await;
     let transport = GrpcTransport::connect(endpoint.clone()).await.unwrap();
 
-    for role in [Role::Agent, Role::Unspecified] {
+    for (role, role_name) in [
+        (Role::Agent, "ROLE_AGENT"),
+        (Role::Unspecified, "ROLE_UNSPECIFIED"),
+    ] {
         let request = SendMessageRequest {
             message: Message::new(role, vec![Part::text("hello")]),
             configuration: None,
@@ -595,6 +598,7 @@ async fn grpc_transport_rejects_client_agent_and_unspecified_roles() {
             .await
             .unwrap_err();
         assert_eq!(error.code, error_code::INVALID_PARAMS);
+        assert!(error.message.contains(role_name), "{}", error.message);
 
         let error = match transport
             .send_streaming_message(&versioned_params(), &request)
@@ -604,6 +608,7 @@ async fn grpc_transport_rejects_client_agent_and_unspecified_roles() {
             Err(error) => error,
         };
         assert_eq!(error.code, error_code::INVALID_PARAMS);
+        assert!(error.message.contains(role_name), "{}", error.message);
     }
 
     let mut raw = a2a_pb::proto::a2a_service_client::A2aServiceClient::connect(endpoint)
@@ -621,9 +626,13 @@ async fn grpc_transport_rejects_client_agent_and_unspecified_roles() {
     unary
         .metadata_mut()
         .insert("a2a-version", "1.0".parse().unwrap());
-    assert_eq!(
-        raw.send_message(unary).await.unwrap_err().code(),
-        tonic::Code::InvalidArgument
+    let unknown_unary = raw.send_message(unary).await.unwrap_err();
+    assert_eq!(unknown_unary.code(), tonic::Code::InvalidArgument);
+    // Unknown protobuf enum values are decoded to ROLE_UNSPECIFIED.
+    assert!(
+        unknown_unary
+            .message()
+            .contains("decoded role ROLE_UNSPECIFIED")
     );
     let mut streaming = tonic::Request::new(proto);
     streaming
@@ -631,7 +640,10 @@ async fn grpc_transport_rejects_client_agent_and_unspecified_roles() {
         .insert("a2a-version", "1.0".parse().unwrap());
     match raw.send_streaming_message(streaming).await {
         Ok(_) => panic!("unknown numeric role was accepted"),
-        Err(error) => assert_eq!(error.code(), tonic::Code::InvalidArgument),
+        Err(error) => {
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("decoded role ROLE_UNSPECIFIED"));
+        }
     }
 
     transport.destroy().await.unwrap();

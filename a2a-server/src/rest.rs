@@ -836,6 +836,7 @@ mod tests {
                 let bytes = response.into_body().collect().await.unwrap().to_bytes();
                 let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(error["error"]["status"], "INVALID_ARGUMENT");
+                assert!(error["error"]["message"].as_str().unwrap().contains(role));
             }
         }
     }

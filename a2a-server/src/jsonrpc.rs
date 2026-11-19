@@ -428,7 +428,9 @@ mod tests {
                 });
                 let response = post_jsonrpc(make_app(), method, params).await;
                 assert!(response.result.is_none());
-                assert_eq!(response.error.unwrap().code, error_code::INVALID_PARAMS);
+                let error = response.error.unwrap();
+                assert_eq!(error.code, error_code::INVALID_PARAMS);
+                assert!(error.message.contains(role), "{}", error.message);
             }
         }
     }
