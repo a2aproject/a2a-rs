@@ -81,8 +81,8 @@ the provenance do that.
 ## Run
 
 Commands are namespaced by the resource they act on (`card get`, `task get`,
-`task push-config create`, …), matching the command layout in the
-[a2a-cli command reference](https://github.com/a2aproject/a2a-cli/blob/main/docs/reference/commands/a2a.md):
+`task push-config create`, …), matching the command taxonomy in the
+[a2a-cli documentation](https://a2aproject.github.io/a2a-cli/):
 
 ```sh
 cargo run --bin a2acli -- card get
