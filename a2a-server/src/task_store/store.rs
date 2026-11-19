@@ -14,6 +14,7 @@ pub struct StoredTask {
     pub version: TaskVersion,
 }
 
+// --8<-- [start:task-store]
 /// Interface for persisting and retrieving tasks.
 #[async_trait]
 pub trait TaskStore: Send + Sync + 'static {
@@ -51,3 +52,4 @@ pub trait TaskStore: Send + Sync + 'static {
     /// holds its write lock across both.
     async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError>;
 }
+// --8<-- [end:task-store]
