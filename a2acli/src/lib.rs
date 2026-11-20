@@ -27,7 +27,7 @@ use std::time::Duration;
 use a2a::*;
 use a2a_client::auth::AuthInterceptor;
 use a2a_client::{A2AClient, A2AClientFactory, BoxStream};
-use a2a_collab::{require_collaborative_extensions, translate_peer_response};
+use a2a_collab::{CollaborativeSession, require_collaborative_extensions};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use fileparts::{FilePartSaver, FilePartSource};
@@ -1660,137 +1660,55 @@ async fn run_collaborate_command(cli: &Cli, command: &CollaborateCommand) -> Res
         ));
     }
 
-    // Build initial parts from the same flags as `send`.
     let parts = resolve_collaborate_parts(command)?;
-
-    // Resolve each agent to a card + client.
     let http = build_http_client(cli)?;
     let factory = A2AClientFactory::builder().build();
 
-    struct AgentSession {
-        label: String,
-        client: A2AClient<Box<dyn a2a_client::Transport>>,
-    }
-
-    let mut sessions: Vec<AgentSession> = Vec::with_capacity(command.agents.len());
+    let mut agents: Vec<(String, A2AClient<Box<dyn a2a_client::Transport>>)> =
+        Vec::with_capacity(command.agents.len());
     for reference in &command.agents {
         let card = fetch_card_for_reference(reference, &http).await?;
         require_collaborative_extensions(&card).map_err(CliError::A2A)?;
         let label = card.name.clone();
-        let (client, _) = factory.create_from_card_with_interface(&card).await?;
-        sessions.push(AgentSession { label, client });
+        let mut client = factory.create_from_card(&card).await?;
+        if let Some(ref t) = cli.tenant {
+            client = client.with_tenant(t.clone());
+        }
+        agents.push((label, client));
     }
 
-    // Build the initial SendMessageRequest.
-    let initial_request = {
-        let msg = Message::new(Role::User, parts);
-        // No context_id / task_id — this is the first message.
-        SendMessageRequest {
-            message: msg,
-            configuration: None,
-            metadata: None,
-            tenant: cli.tenant.clone(),
-        }
+    let initial_request = SendMessageRequest {
+        message: Message::new(Role::User, parts),
+        configuration: None,
+        metadata: None,
+        tenant: cli.tenant.clone(),
     };
 
-    // Open a streaming connection to each agent.
-    type TaggedEvent = (usize, Result<StreamResponse, A2AError>);
+    let mut stream = CollaborativeSession::new(agents)
+        .start(initial_request)
+        .await
+        .map_err(CliError::A2A)?;
 
-    let mut all_streams: Vec<futures::stream::BoxStream<'static, TaggedEvent>> = Vec::new();
-    for (idx, session) in sessions.iter().enumerate() {
-        let stream = session
-            .client
-            .send_streaming_message(&initial_request)
-            .await
-            .map_err(CliError::A2A)?;
-        let tagged = stream.map(move |ev| (idx, ev));
-        all_streams.push(Box::pin(tagged));
-    }
-
-    // Per-agent session IDs, populated from the first Task event each agent sends.
-    let mut context_ids: Vec<Option<String>> = vec![None; sessions.len()];
-    let mut task_ids: Vec<Option<String>> = vec![None; sessions.len()];
-
-    let mut merged = futures::stream::select_all(all_streams);
     let deadline = tokio::time::Instant::now() + cli.timeout;
-
     loop {
-        let next = tokio::time::timeout_at(deadline, merged.next()).await;
-        match next {
-            Err(_elapsed) => {
-                // Timeout reached — exit cleanly.
-                break;
-            }
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Err(_elapsed) => break,
             Ok(None) => break,
-            Ok(Some((src_idx, Err(error)))) => {
-                let label = &sessions[src_idx].label;
-                eprintln!("error from [{label}]: {error}");
-                break;
-            }
-            Ok(Some((src_idx, Ok(event)))) => {
-                let label = &sessions[src_idx].label;
-
-                // Cache session IDs from the first Task event.
-                if let StreamResponse::Task(task) = &event {
-                    if context_ids[src_idx].is_none() {
-                        context_ids[src_idx] = Some(task.context_id.clone());
-                        task_ids[src_idx] = Some(task.id.clone());
+            Ok(Some((label, event))) => match cli.output {
+                OutputFormat::Json => {
+                    let line = serde_json::to_string(&serde_json::json!({
+                        "agent": &label,
+                        "event": &event,
+                    }))?;
+                    println!("{line}");
+                }
+                OutputFormat::Text => {
+                    for line in event.render_text().lines() {
+                        println!("[{label}] {line}");
                     }
                 }
-
-                // Print to stdout.
-                match cli.output {
-                    OutputFormat::Json => {
-                        let line = serde_json::to_string(&serde_json::json!({
-                            "agent": label,
-                            "event": &event,
-                        }))?;
-                        println!("{line}");
-                    }
-                    OutputFormat::Text => {
-                        let rendered = event.render_text();
-                        for line in rendered.lines() {
-                            println!("[{label}] {line}");
-                        }
-                    }
-                }
-
-                // Relay to every other agent that has a known session ID.
-                let sender_identity = &sessions[src_idx].label;
-                for (dst_idx, dst_session) in sessions.iter().enumerate() {
-                    if dst_idx == src_idx {
-                        continue; // Echo suppression.
-                    }
-                    let (Some(ctx), Some(tid)) =
-                        (&context_ids[dst_idx], &task_ids[dst_idx])
-                    else {
-                        continue; // No session ID yet — skip until first Task arrives.
-                    };
-
-                    if let Some(mut relay_req) =
-                        translate_peer_response(&event, sender_identity, ctx, tid)
-                    {
-                        relay_req.configuration = Some(SendMessageConfiguration {
-                            return_immediately: Some(true),
-                            accepted_output_modes: None,
-                            task_push_notification_config: None,
-                            history_length: None,
-                        });
-                        relay_req.tenant = cli.tenant.clone();
-                        // Fire-and-forget: relay failures are non-fatal.
-                        if let Err(err) = dst_session.client.send_message(&relay_req).await {
-                            let dst_label = &dst_session.label;
-                            eprintln!("warning: relay to [{dst_label}] failed: {err}");
-                        }
-                    }
-                }
-            }
+            },
         }
-    }
-
-    // Clean up all clients.
-    for session in sessions {
-        let _ = session.client.destroy().await;
     }
 
     Ok(())
@@ -1856,7 +1774,13 @@ async fn fetch_card_for_reference(
     match normalize_card_reference(reference) {
         CardReference::File(path) => Ok(read_agent_card_file(&path)?.0),
         CardReference::Url(url) => {
-            let raw: Value = http.get(&url).send().await?.error_for_status()?.json().await?;
+            let raw: Value = http
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
             serde_json::from_value(raw)
                 .map_err(|error| CliError::CardInvalid(format!("{url}: {error}")))
         }
