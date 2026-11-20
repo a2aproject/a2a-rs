@@ -9,11 +9,7 @@ use a2a::{A2AError, AgentCard, EXTENSION_URI_COLLABORATIVE_TASK, EXTENSION_URI_S
 /// `EXTENSION_URI_COLLABORATIVE_TASK` are present in `capabilities.extensions`.
 /// Returns `A2AError::extension_support_required` naming the first missing URI.
 pub fn require_collaborative_extensions(card: &AgentCard) -> Result<(), A2AError> {
-    let extensions = card
-        .capabilities
-        .extensions
-        .as_deref()
-        .unwrap_or_default();
+    let extensions = card.capabilities.extensions.as_deref().unwrap_or_default();
 
     for required in [EXTENSION_URI_SHARED_TASK, EXTENSION_URI_COLLABORATIVE_TASK] {
         if !extensions.iter().any(|e| e.uri == required) {

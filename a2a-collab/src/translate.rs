@@ -1,9 +1,7 @@
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
 
-use a2a::{
-    Message, Part, Role, SendMessageRequest, StreamResponse, shared_task_attribution,
-};
+use a2a::{Message, Part, Role, SendMessageRequest, StreamResponse, shared_task_attribution};
 
 const MEDIA_TASK: &str = "application/vnd.a2a.task+json";
 const MEDIA_STATUS_UPDATE: &str = "application/vnd.a2a.task-status-update+json";
@@ -110,10 +108,7 @@ mod tests {
         let req = translate(&StreamResponse::Task(task));
         assert_common(&req);
         assert_eq!(req.message.parts.len(), 1);
-        assert_eq!(
-            req.message.parts[0].media_type.as_deref(),
-            Some(MEDIA_TASK)
-        );
+        assert_eq!(req.message.parts[0].media_type.as_deref(), Some(MEDIA_TASK));
     }
 
     #[test]
@@ -191,10 +186,7 @@ mod tests {
 
     #[test]
     fn message_variant_passes_through_parts() {
-        let original = Message::new(
-            Role::Agent,
-            vec![Part::text("hello"), Part::text("world")],
-        );
+        let original = Message::new(Role::Agent, vec![Part::text("hello"), Part::text("world")]);
         let req = translate(&StreamResponse::Message(original));
         assert_common(&req);
         assert_eq!(req.message.parts.len(), 2);

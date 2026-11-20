@@ -57,8 +57,12 @@ dependencies = [
 name = "a2a-collab"
 version = "0.1.0"
 dependencies = [
+ "a2a-client-lf",
  "a2a-lf",
+ "futures",
  "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
