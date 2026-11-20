@@ -47,7 +47,9 @@ async fn main() {
         .merge(a2a_server::agent_card::agent_card_router(card_producer));
     // --8<-- [end:routers]
 
+    // --8<-- [start:grpc]
     let grpc_service = A2aServiceServer::new(GrpcHandler::new(handler));
+    // --8<-- [end:grpc]
 
     tracing::info!("Hello World Agent starting");
     tracing::info!("Agent card:  http://localhost:3000/.well-known/agent-card.json");

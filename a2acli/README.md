@@ -82,7 +82,7 @@ the provenance do that.
 
 Commands are namespaced by the resource they act on (`card get`, `task get`,
 `task push-config create`, …), matching the command taxonomy in the
-[a2a-cli specification](https://github.com/a2aproject/a2a-cli/blob/main/specification/SPEC.md#7-command-surface--global-options):
+[a2a-cli documentation](https://a2aproject.github.io/a2a-cli/):
 
 ```sh
 cargo run --bin a2acli -- card get
