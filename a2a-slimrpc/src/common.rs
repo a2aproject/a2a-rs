@@ -29,16 +29,12 @@ pub const METHOD_LIST_PUSH_CONFIGS: &str = "ListTaskPushNotificationConfigs";
 pub const METHOD_DELETE_PUSH_CONFIG: &str = "DeleteTaskPushNotificationConfig";
 pub const METHOD_GET_EXTENDED_AGENT_CARD: &str = "GetExtendedAgentCard";
 
-/// Key for the sender's SLIM name.
-///
-/// - On every inbound `Collaborate` message, the SLIMRPC layer sets it in
-///   `Message.metadata`, per the collaborative channel spec's
-///   message-attribution requirement.
-/// - On every request a [`SlimRpcHandler`](crate::SlimRpcHandler) serves, it is
-///   a reserved service-params key holding the caller's SLIM name as the
-///   session reports it. Caller-supplied values are dropped. The name is the
-///   one the caller claimed when it set up the session; for authorization, use
-///   [`SLIM_PEER_SUBJECT_METADATA_KEY`], which is verified.
+/// Reserved service-params key holding the caller's SLIM name as the session
+/// reports it. Set by the SLIMRPC layer on every request a
+/// [`SlimRpcHandler`](crate::SlimRpcHandler) serves; caller-supplied values
+/// are dropped. The name is the one the caller claimed when setting up the
+/// session; for authorization, use [`SLIM_PEER_SUBJECT_METADATA_KEY`], which
+/// is cryptographically verified.
 pub const SLIM_SRC_METADATA_KEY: &str = "slim-src";
 
 /// Reserved service-params key holding the verified subject (`sub`) of the
