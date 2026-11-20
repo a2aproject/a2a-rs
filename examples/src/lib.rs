@@ -13,6 +13,8 @@ use tokio_stream::wrappers::ReceiverStream;
 #[path = "quickstart/agent.rs"]
 pub mod quickstart;
 
+pub mod collaborate;
+
 // ---------------------------------------------------------------------------
 // EchoExecutor — shared across plain and TLS server examples
 // ---------------------------------------------------------------------------
