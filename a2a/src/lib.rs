@@ -29,8 +29,7 @@ pub const SVC_PARAM_VERSION: &str = "A2A-Version";
 pub const SVC_PARAM_EXTENSIONS: &str = "A2A-Extensions";
 
 /// Extension URI for the shared-task extension (§4.1 of the collaborative task spec).
-pub const EXTENSION_URI_SHARED_TASK: &str =
-    "https://a2a-protocol.org/extensions/shared-task/v1";
+pub const EXTENSION_URI_SHARED_TASK: &str = "https://a2a-protocol.org/extensions/shared-task/v1";
 
 /// Extension URI for the collaborative-task extension.
 pub const EXTENSION_URI_COLLABORATIVE_TASK: &str =

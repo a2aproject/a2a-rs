@@ -113,10 +113,7 @@ pub fn shared_task_attribution(sender: impl Into<String>) -> HashMap<String, Val
     let mut inner = serde_json::Map::new();
     inner.insert("message-sender".to_string(), Value::String(sender.into()));
     let mut outer = HashMap::new();
-    outer.insert(
-        EXTENSION_URI_SHARED_TASK.to_string(),
-        Value::Object(inner),
-    );
+    outer.insert(EXTENSION_URI_SHARED_TASK.to_string(), Value::Object(inner));
     outer
 }
 
@@ -236,7 +233,10 @@ mod tests {
             .unwrap()
             .as_object()
             .unwrap();
-        assert_eq!(inner["message-sender"], Value::String("agent-orders".into()));
+        assert_eq!(
+            inner["message-sender"],
+            Value::String("agent-orders".into())
+        );
     }
 
     #[test]
