@@ -29,13 +29,6 @@ pub const METHOD_LIST_PUSH_CONFIGS: &str = "ListTaskPushNotificationConfigs";
 pub const METHOD_DELETE_PUSH_CONFIG: &str = "DeleteTaskPushNotificationConfig";
 pub const METHOD_GET_EXTENDED_AGENT_CARD: &str = "GetExtendedAgentCard";
 
-/// The `Collaborate` operation (many-to-many messaging on a SLIM group channel;
-/// see the SLIMRPC collaborative channel extension spec) lives on its own service,
-/// separate from the point-to-point `A2AService`.
-pub const A2A_COLLABORATIVE_CHANNEL_SERVICE: &str =
-    "experimental.slimrpc.collaborative_channel.v1.CollaborativeChannelService";
-pub const METHOD_COLLABORATE: &str = "Collaborate";
-
 /// Key for the sender's SLIM name.
 ///
 /// - On every inbound `Collaborate` message, the SLIMRPC layer sets it in

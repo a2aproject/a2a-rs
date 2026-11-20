@@ -14,8 +14,6 @@
 //!   `slim://` or `slimrpc://`; see [`parse_slimrpc_target`].
 //! - **Server:** [`SlimRpcHandler`] registers the methods of an
 //!   [`a2a_server::RequestHandler`] on a `slim_rpc::Server`.
-//!   [`register_collaborate`] adds a listen-only participant for the
-//!   collaborative channel, which is not a request/response operation.
 //! - **Errors:** [`errors`] converts between [`a2a::A2AError`] and SLIM RPC
 //!   errors.
 //!
@@ -37,7 +35,7 @@ pub use client::{SlimApp, SlimRpcTransport, SlimRpcTransportFactory, parse_slimr
 pub use common::{
     SLIM_PEER_ISSUER_METADATA_KEY, SLIM_PEER_SUBJECT_METADATA_KEY, SLIM_SRC_METADATA_KEY,
 };
-pub use server::{SlimRpcHandler, register_collaborate};
+pub use server::SlimRpcHandler;
 
 // Wire internals reached by the fuzz target in fuzz/ — see #238. Thin
 // wrappers, not re-exports: the originals stay crate-private.
