@@ -54,6 +54,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "a2a-collab"
+version = "0.1.0"
+dependencies = [
+ "a2a-lf",
+ "serde_json",
+]
+
+[[package]]
 name = "a2a-grpc"
 version = "0.3.11"
 dependencies = [
