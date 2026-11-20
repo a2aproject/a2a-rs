@@ -1813,6 +1813,7 @@ name = "examples"
 version = "0.1.0"
 dependencies = [
  "a2a-client-lf",
+ "a2a-collab",
  "a2a-grpc",
  "a2a-lf",
  "a2a-pb",
