@@ -1,7 +1,6 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-use chrono::{DateTime, Utc};
 use pbjson_types::Timestamp;
 use serde::{Serialize, Serializer};
 
@@ -16,8 +15,10 @@ pub(crate) struct WireTimestamp<'a>(pub(crate) &'a Timestamp);
 
 impl Serialize for WireTimestamp<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let timestamp: DateTime<Utc> = (*self.0).try_into().map_err(serde::ser::Error::custom)?;
-        serializer.serialize_str(&a2a::format_timestamp(&timestamp))
+        let nanos = self.0.nanos.try_into().map_err(serde::ser::Error::custom)?;
+        let timestamp = a2a::Timestamp::from_unix_parts(self.0.seconds, nanos)
+            .ok_or_else(|| serde::ser::Error::custom("invalid protobuf timestamp"))?;
+        timestamp.serialize(serializer)
     }
 }
 

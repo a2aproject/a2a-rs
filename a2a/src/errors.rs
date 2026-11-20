@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::collections::HashMap;
 
-use chrono::Utc;
+use crate::Timestamp;
 use serde_json::Value;
 
 use crate::errordetails::{self, TypedDetail};
@@ -278,7 +278,8 @@ impl A2AError {
     /// is always appended as the last element, matching the Go SDK behavior.
     pub fn to_jsonrpc_error(&self) -> crate::JsonRpcError {
         let reason = error_reason(self.code);
-        let metadata = HashMap::from([("timestamp".to_string(), format_timestamp(&Utc::now()))]);
+        let metadata =
+            HashMap::from([("timestamp".to_string(), format_timestamp(&Timestamp::now()))]);
 
         let mut data: Vec<Value> = self
             .details
@@ -454,7 +455,7 @@ mod tests {
         let data = rpc.data.unwrap();
         let timestamp = data[0]["metadata"]["timestamp"].as_str().unwrap();
         assert!(timestamp.ends_with('Z'), "{timestamp}");
-        assert!(timestamp.parse::<chrono::DateTime<Utc>>().is_ok());
+        assert!(timestamp.parse::<Timestamp>().is_ok());
     }
 
     #[test]

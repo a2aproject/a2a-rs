@@ -93,35 +93,18 @@ fn json_number(n: f64) -> Option<serde_json::Number> {
     }
 }
 
-/// Lowest `seconds` a `google.protobuf.Timestamp` may carry: `0001-01-01T00:00:00Z`.
-const PROTO_TIMESTAMP_MIN_SECONDS: i64 = -62_135_596_800;
-/// Highest `seconds` a `google.protobuf.Timestamp` may carry: `9999-12-31T23:59:59Z`.
-const PROTO_TIMESTAMP_MAX_SECONDS: i64 = 253_402_300_799;
-
-/// Convert `chrono::DateTime<Utc>` to `prost_types::Timestamp`.
-///
-/// Returns `None` when `dt` falls outside the range `google.protobuf.Timestamp`
-/// is defined for (`0001-01-01T00:00:00Z` .. `9999-12-31T23:59:59.999999999Z`).
-/// `chrono::DateTime` represents a wider range; passing such a value through
-/// unconditionally produces protojson this crate's own deserializer then
-/// rejects, so it is rejected here rather than converted.
-/// ([`from_proto_timestamp`] is also fallible, but only on chrono's own
-/// wider bounds, so a wire timestamp outside the protobuf range is still
-/// accepted rather than rejected symmetrically.)
-pub fn to_proto_timestamp(dt: &chrono::DateTime<chrono::Utc>) -> Option<prost_types::Timestamp> {
-    let seconds = dt.timestamp();
-    if !(PROTO_TIMESTAMP_MIN_SECONDS..=PROTO_TIMESTAMP_MAX_SECONDS).contains(&seconds) {
-        return None;
-    }
+/// Encode an A2A timestamp as a protobuf instant.
+/// The optional return type is retained for callers using `Option::and_then`.
+pub fn to_proto_timestamp(dt: &a2a::Timestamp) -> Option<prost_types::Timestamp> {
     Some(prost_types::Timestamp {
-        seconds,
-        nanos: dt.timestamp_subsec_nanos() as i32,
+        seconds: dt.unix_seconds(),
+        nanos: dt.subsec_nanoseconds() as i32,
     })
 }
 
-/// Convert `prost_types::Timestamp` to `chrono::DateTime<Utc>`.
-pub fn from_proto_timestamp(ts: &prost_types::Timestamp) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
+/// Reject seconds or nanoseconds outside the protobuf timestamp domain.
+pub fn from_proto_timestamp(ts: &prost_types::Timestamp) -> Option<a2a::Timestamp> {
+    a2a::Timestamp::from_unix_parts(ts.seconds, ts.nanos.try_into().ok()?)
 }
 
 fn opt_metadata_to_proto(meta: &Option<HashMap<String, Value>>) -> Option<prost_types::Struct> {
@@ -2070,52 +2053,49 @@ mod tests {
 
     #[test]
     fn test_timestamp_roundtrip() {
-        use chrono::Utc;
-        let now = Utc::now();
-        let proto = to_proto_timestamp(&now).expect("current time is within proto range");
-        let back = from_proto_timestamp(&proto).unwrap();
-        // Compare to microsecond level (proto loses sub-nanosecond)
-        assert_eq!(now.timestamp(), back.timestamp());
-    }
-
-    #[test]
-    fn test_to_proto_timestamp_rejects_out_of_range() {
-        // Regression for #261: a chrono value beyond google.protobuf.Timestamp's
-        // range must not silently convert into unparseable protojson.
-        let too_late = chrono::DateTime::from_timestamp(300_000_000_000, 0).unwrap();
-        assert!(to_proto_timestamp(&too_late).is_none());
-        // Both inclusive boundaries still convert.
-        let max = chrono::DateTime::from_timestamp(PROTO_TIMESTAMP_MAX_SECONDS, 0).unwrap();
-        let min = chrono::DateTime::from_timestamp(PROTO_TIMESTAMP_MIN_SECONDS, 0).unwrap();
-        assert!(to_proto_timestamp(&max).is_some());
-        assert!(to_proto_timestamp(&min).is_some());
-        // One second past each boundary must be rejected (off-by-one guard).
-        let past_max =
-            chrono::DateTime::from_timestamp(PROTO_TIMESTAMP_MAX_SECONDS + 1, 0).unwrap();
-        let past_min =
-            chrono::DateTime::from_timestamp(PROTO_TIMESTAMP_MIN_SECONDS - 1, 0).unwrap();
-        assert!(to_proto_timestamp(&past_max).is_none());
-        assert!(to_proto_timestamp(&past_min).is_none());
-    }
-
-    #[test]
-    fn test_task_status_out_of_range_timestamp_roundtrips() {
-        // The exact class of value fuzz target 2 (#238) surfaced: an out-of-range
-        // status timestamp must drop to None rather than yield a TaskStatus that
-        // this crate can serialize but not read back.
-        let ts = TaskStatus {
-            state: TaskState::Working,
-            message: None,
-            timestamp: chrono::DateTime::from_timestamp(4_650_000_000_000, 0),
-        };
-        assert!(ts.timestamp.is_some(), "chrono represents the wide value");
-        let proto = to_proto_task_status(&ts);
-        assert!(
-            proto.timestamp.is_none(),
-            "out-of-range timestamp is dropped, not emitted"
+        let now = a2a::Timestamp::now();
+        assert_eq!(
+            from_proto_timestamp(&to_proto_timestamp(&now).unwrap()),
+            Some(now)
         );
-        let back = from_proto_task_status(&proto);
-        assert!(back.timestamp.is_none());
+    }
+
+    #[test]
+    fn test_timestamp_range_at_the_proto_boundary() {
+        for (seconds, nanos) in [
+            (-62_135_596_800, 0),
+            (-1, 500_000_000),
+            (253_402_300_799, 999_999_999),
+        ] {
+            let wire = prost_types::Timestamp { seconds, nanos };
+            assert_eq!(
+                to_proto_timestamp(&from_proto_timestamp(&wire).unwrap()),
+                Some(wire)
+            );
+        }
+        for (seconds, nanos) in [
+            (-62_135_596_801, 0),
+            (253_402_300_800, 0),
+            (0, -1),
+            (0, 1_000_000_000),
+        ] {
+            let wire = prost_types::Timestamp { seconds, nanos };
+            assert!(from_proto_timestamp(&wire).is_none());
+        }
+    }
+
+    #[test]
+    fn an_invalid_wire_timestamp_is_omitted_from_task_status() {
+        let wire = proto::TaskStatus {
+            timestamp: Some(prost_types::Timestamp {
+                seconds: 4_650_000_000_000,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        let status = from_proto_task_status(&wire);
+        assert!(status.timestamp.is_none());
+        assert!(to_proto_task_status(&status).timestamp.is_none());
     }
 
     #[test]
@@ -2123,7 +2103,7 @@ mod tests {
         let ts = TaskStatus {
             state: TaskState::Completed,
             message: Some(Message::new(Role::Agent, vec![Part::text("done")])),
-            timestamp: chrono::DateTime::from_timestamp(1700000000, 0),
+            timestamp: a2a::Timestamp::from_unix_parts(1700000000, 0),
         };
         let proto = to_proto_task_status(&ts);
         let back = from_proto_task_status(&proto);

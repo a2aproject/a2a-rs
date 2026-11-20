@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(not_an_object, Value::Null);
     }
 
-    fn sample_task_with_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> Task {
+    fn sample_task_with_timestamp(timestamp: a2a::Timestamp) -> Task {
         Task {
             id: "task-1".to_string(),
             context_id: "ctx-1".to_string(),
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn test_task_status_timestamp_uses_z_suffix_not_offset() {
         let timestamp = "2026-09-23T02:07:57.846477544Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
+            .parse::<a2a::Timestamp>()
             .unwrap();
         let json = to_value(&sample_task_with_timestamp(timestamp)).unwrap();
         let rendered = json["status"]["timestamp"].as_str().unwrap();
@@ -406,7 +406,7 @@ mod tests {
             ("2026-09-23T02:07:57.5Z", "2026-09-23T02:07:57.500Z"),
             ("2026-09-23T02:07:57.000123Z", "2026-09-23T02:07:57.000123Z"),
         ] {
-            let timestamp = input.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+            let timestamp = input.parse::<a2a::Timestamp>().unwrap();
             let json = to_value(&sample_task_with_timestamp(timestamp)).unwrap();
             assert_eq!(json["status"]["timestamp"], expected, "{input}");
         }
@@ -414,9 +414,7 @@ mod tests {
 
     #[test]
     fn test_nested_task_timestamps_use_z_suffix() {
-        let timestamp = "2026-09-23T02:07:57Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .unwrap();
+        let timestamp = "2026-09-23T02:07:57Z".parse::<a2a::Timestamp>().unwrap();
         let response = ListTasksResponse {
             tasks: vec![sample_task_with_timestamp(timestamp)],
             next_page_token: String::new(),
@@ -452,9 +450,7 @@ mod tests {
     #[test]
     fn test_caller_content_under_a_timestamp_key_is_left_as_sent() {
         let offset = "2026-09-23T02:07:57+00:00";
-        let timestamp = "2026-09-23T02:07:57Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .unwrap();
+        let timestamp = "2026-09-23T02:07:57Z".parse::<a2a::Timestamp>().unwrap();
         let mut task = sample_task_with_timestamp(timestamp);
         task.metadata = Some(std::collections::HashMap::from([(
             "timestamp".to_string(),

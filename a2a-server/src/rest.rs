@@ -16,7 +16,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream::BoxStream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -334,7 +333,7 @@ pub struct ListTasksQuery {
     pub history_length: Option<i32>,
 
     #[serde(default, rename = "statusTimestampAfter")]
-    pub status_timestamp_after: Option<DateTime<Utc>>,
+    pub status_timestamp_after: Option<Timestamp>,
 
     #[serde(default, rename = "includeArtifacts")]
     pub include_artifacts: Option<bool>,
@@ -679,8 +678,10 @@ fn rest_error_envelope(err: A2AError) -> (StatusCode, RestErrorEnvelope) {
     let reason = error_reason(err.code);
     let grpc_status = rest_grpc_status(err.code);
 
-    let mut metadata =
-        HashMap::from([("timestamp".to_string(), a2a::format_timestamp(&Utc::now()))]);
+    let mut metadata = HashMap::from([(
+        "timestamp".to_string(),
+        a2a::format_timestamp(&Timestamp::now()),
+    )]);
     let mut details = Vec::new();
 
     if let Some(extra) = err.details {
@@ -1217,7 +1218,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(timestamp.ends_with('Z'), "{timestamp}");
-        assert!(timestamp.parse::<DateTime<Utc>>().is_ok());
+        assert!(timestamp.parse::<Timestamp>().is_ok());
     }
 
     #[tokio::test]

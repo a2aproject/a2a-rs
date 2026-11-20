@@ -47,7 +47,7 @@ impl AgentExecutor for EchoExecutor {
             status: TaskStatus {
                 state: TaskState::Working,
                 message: None,
-                timestamp: Some(chrono::Utc::now()),
+                timestamp: Some(a2a::Timestamp::now()),
             },
             metadata: None,
         });
@@ -90,7 +90,7 @@ impl AgentExecutor for EchoExecutor {
                         extensions: None,
                         reference_task_ids: None,
                     }),
-                    timestamp: Some(chrono::Utc::now()),
+                    timestamp: Some(a2a::Timestamp::now()),
                 },
                 artifacts: None,
                 history: None,
@@ -112,7 +112,7 @@ impl AgentExecutor for EchoExecutor {
                 status: TaskStatus {
                     state: TaskState::Canceled,
                     message: None,
-                    timestamp: Some(chrono::Utc::now()),
+                    timestamp: Some(a2a::Timestamp::now()),
                 },
                 metadata: None,
             }))

@@ -9,13 +9,8 @@
 //! value: proto3 scalar fields have no wire presence, so `Some("")` and
 //! `None` are indistinguishable once encoded, and a value can legitimately
 //! change on its *first* round trip. What must hold is that it does not
-//! change again on a *second* one -- the conversion has a fixed point, and
-//! every value reaches it in exactly one step. That held for 3,000 generated
-//! values per variant here before landing, with one exception fixed by
-//! bounding the timestamp fields' generated range: a `DateTime<Utc>` outside
-//! `google.protobuf.Timestamp`'s own documented validity window converts to
-//! JSON `to_value` accepts producing but `from_value` cannot parse, filed as
-//! #261 rather than fixed, since no real clock produces such a value.
+//! change again on a *second* one -- the conversion has a fixed point. Generated A2A timestamps span the
+//! protobuf year range, including values before the Unix epoch (#261).
 
 #![no_main]
 
