@@ -476,7 +476,7 @@ values.
 ## Conformance
 
 This CLI is tracked against the
-[a2a-cli specification](https://github.com/a2aproject/a2a-cli/blob/main/specification/SPEC.md)
+[a2a-cli documentation](https://a2aproject.github.io/a2a-cli/)
 Tier 1 ("Core") requirements; see
 [a2aproject/a2a-rs#164](https://github.com/a2aproject/a2a-rs/issues/164) for the
 current gap list and in-progress work (blocking-by-default `send`/polling,
