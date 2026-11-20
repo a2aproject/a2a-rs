@@ -782,4 +782,4 @@ async fn slimrpc_transport_reports_malformed_payloads() {
     env.shutdown().await;
 }
 
-// TODO(#569): re-add when SLIM shared-responses is ready for SLIMRPC native-mode server
+// TODO(#578): re-add slimrpc_collaborate_broadcasts_to_every_other_member when SLIM shared-responses is ready for SLIMRPC native-mode server
