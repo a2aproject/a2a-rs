@@ -99,7 +99,6 @@ impl CollabExecutor {
             inbox,
         }
     }
-
 }
 
 impl AgentExecutor for CollabExecutor {
@@ -167,34 +166,29 @@ impl AgentExecutor for CollabExecutor {
             }
 
             // Drain relay messages until the channel closes or we hit a timeout.
-            let deadline = tokio::time::Instant::now()
-                + tokio::time::Duration::from_secs(30);
-            loop {
-                match tokio::time::timeout_at(deadline, relay_rx.recv()).await {
-                    Ok(Some(relay_msg)) => {
-                        let relay_text = relay_msg.text().unwrap_or_default().to_string();
-                        // Also check Part::data envelopes for text content.
-                        let combined = format!("{relay_text} {}", {
-                            relay_msg
-                                .parts
-                                .iter()
-                                .filter_map(|p| {
-                                    if let PartContent::Data(v) = &p.content {
-                                        Some(v.to_string())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        });
-                        if let Some(event) = check_and_reply(&combined) {
-                            if tx.send(Ok(event)).await.is_err() {
-                                break;
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+            while let Ok(Some(relay_msg)) = tokio::time::timeout_at(deadline, relay_rx.recv()).await
+            {
+                let relay_text = relay_msg.text().unwrap_or_default().to_string();
+                // Also check Part::data envelopes for text content.
+                let combined = format!("{relay_text} {}", {
+                    relay_msg
+                        .parts
+                        .iter()
+                        .filter_map(|p| {
+                            if let PartContent::Data(v) = &p.content {
+                                Some(v.to_string())
+                            } else {
+                                None
                             }
-                        }
-                    }
-                    Ok(None) | Err(_) => break, // Channel closed or timed out.
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
+                if let Some(event) = check_and_reply(&combined)
+                    && tx.send(Ok(event)).await.is_err()
+                {
+                    break;
                 }
             }
 
@@ -219,10 +213,7 @@ impl AgentExecutor for CollabExecutor {
         Box::pin(ReceiverStream::new(rx))
     }
 
-    fn cancel(
-        &self,
-        ctx: ExecutorContext,
-    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let (task_id, context_id) = ctx.task_info();
         self.inbox.unregister(&task_id);
         Box::pin(stream::once(async move {

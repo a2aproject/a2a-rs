@@ -10,7 +10,7 @@ use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::rest::rest_router;
 use a2a_server::{DefaultRequestHandler, InMemoryTaskStore, StaticAgentCard};
 
-use super::agent::{agent_card, CollabExecutor};
+use super::agent::{CollabExecutor, agent_card};
 use super::fan_in::{FanInHandler, InboxRegistry};
 
 /// Start one of the three e-commerce collaborative agents.

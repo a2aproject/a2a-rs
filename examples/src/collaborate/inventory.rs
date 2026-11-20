@@ -8,9 +8,7 @@
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
     examples_lib::collaborate::server::run_server(
         "inventory",
         "E-commerce inventory agent: knows stock levels and restock timelines.",

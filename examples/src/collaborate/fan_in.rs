@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use a2a::*;
-use a2a_server::{RequestHandler, ServiceParams};
 use a2a_client::BoxStream;
+use a2a_server::{RequestHandler, ServiceParams};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
@@ -92,27 +92,23 @@ impl<H: RequestHandler> RequestHandler for FanInHandler<H> {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        if let Some(task_id) = &req.message.task_id {
-            if self.inbox.try_deliver(task_id, req.message.clone()) {
-                // Relay message delivered to the active executor.
-                // Return a minimal in-progress task as acknowledgement.
-                return Ok(SendMessageResponse::Task(Task {
-                    id: task_id.clone(),
-                    context_id: req
-                        .message
-                        .context_id
-                        .clone()
-                        .unwrap_or_default(),
-                    status: TaskStatus {
-                        state: TaskState::Working,
-                        message: None,
-                        timestamp: None,
-                    },
-                    artifacts: None,
-                    history: None,
-                    metadata: None,
-                }));
-            }
+        if let Some(task_id) = &req.message.task_id
+            && self.inbox.try_deliver(task_id, req.message.clone())
+        {
+            // Relay message delivered to the active executor.
+            // Return a minimal in-progress task as acknowledgement.
+            return Ok(SendMessageResponse::Task(Task {
+                id: task_id.clone(),
+                context_id: req.message.context_id.clone().unwrap_or_default(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            }));
         }
         self.inner.send_message(params, req).await
     }

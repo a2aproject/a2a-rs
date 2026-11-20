@@ -47,7 +47,6 @@ path = "src/collaborate/shipping.rs"
 [dependencies]
 a2a = { workspace = true }
 a2a-client = { workspace = true, features = ["rustls-tls"] }
-a2a-collab = { workspace = true }
 a2a-grpc = { workspace = true, features = ["rustls-tls"] }
 a2a-pb = { workspace = true }
 a2a-server = { workspace = true, features = ["rustls-tls"] }
