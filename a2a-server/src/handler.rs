@@ -481,7 +481,10 @@ fn subscription_stream(
                         state.min_sequence = event.sequence;
                         match &event.result {
                             Ok(item) if is_terminal_event(item) => state.done = true,
-                            Err(_) => state.done = true,
+                            // §3.1.2: a Message answer is "exactly one Message
+                            // object and then close immediately"; a pending
+                            // cancellation's later items do not follow it.
+                            Ok(StreamResponse::Message(_)) | Err(_) => state.done = true,
                             _ => {}
                         }
                         return Some((event.result.clone(), state));
@@ -3161,9 +3164,11 @@ mod tests {
         assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
     }
 
-    /// Nothing may follow a Message that answered the request.
+    /// Nothing may follow a Message that answered the request: the response
+    /// stream ends at the Message (§3.1.2), and the later event fails the
+    /// task in the store.
     #[tokio::test]
-    async fn test_event_after_an_answering_message_is_an_invalid_agent_response() {
+    async fn test_event_after_an_answering_message_fails_the_task_behind_the_closed_stream() {
         let handler = DefaultRequestHandler::new(
             ScriptedExecutor(|ctx: &ExecutorContext| {
                 vec![
@@ -3179,16 +3184,302 @@ mod tests {
             }),
             InMemoryTaskStore::new(),
         );
-        let events: Vec<_> = handler
+        let stream = handler
             .send_streaming_message(&ServiceParams::new(), send_request())
             .await
-            .unwrap()
-            .collect()
-            .await;
-        assert!(matches!(events[0], Ok(StreamResponse::Message(_))));
+            .unwrap();
+        let events = within(stream.collect::<Vec<_>>()).await;
         assert!(
-            matches!(&events[1], Err(error) if error.code == error_code::INVALID_AGENT_RESPONSE)
+            matches!(&events[..], [Ok(StreamResponse::Message(_))]),
+            "{events:?}"
         );
+
+        let task_id = only_task_id(&handler).await;
+        timeout(Duration::from_secs(5), async {
+            while handler.execution_manager.get(&task_id).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let task = handler
+            .get_task(
+                &ServiceParams::new(),
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.status.state, TaskState::Failed);
+    }
+
+    /// The id of the one task the handler stores.
+    async fn only_task_id(handler: &DefaultRequestHandler) -> TaskId {
+        let listed = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.tasks.len(), 1);
+        listed.tasks[0].id.clone()
+    }
+
+    /// An event after an answering Message is classified at the execution
+    /// layer as an invalid agent response, before any response stream.
+    #[tokio::test]
+    async fn test_event_after_an_answering_message_is_published_as_an_invalid_agent_response() {
+        let late = Arc::new(Notify::new());
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor({
+                let late = late.clone();
+                move |ctx: &ExecutorContext| {
+                    let message = Message::new(Role::Agent, vec![Part::text("answer")]);
+                    vec![
+                        (None, Ok(StreamResponse::Message(message))),
+                        (
+                            Some(late.clone()),
+                            Ok(status_event(ctx, TaskState::Completed, None)),
+                        ),
+                    ]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let _stream = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap();
+        let task_id = only_task_id(&handler).await;
+        // The execution waits for `late`, so it is still registered.
+        let mut events = handler
+            .execution_manager
+            .get(&task_id)
+            .await
+            .expect("the execution waits for its late event")
+            .subscribe();
+        late.notify_one();
+        let result = within(async {
+            loop {
+                match events.recv().await.unwrap().result {
+                    Ok(StreamResponse::Message(_)) => continue,
+                    other => break other,
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(&result, Err(error) if error.code == error_code::INVALID_AGENT_RESPONSE),
+            "{result:?}"
+        );
+    }
+
+    /// Bounds a wait of a test, so a stream that stays open fails it.
+    async fn within<T>(future: impl Future<Output = T>) -> T {
+        timeout(Duration::from_secs(5), future)
+            .await
+            .expect("timed out")
+    }
+
+    /// The gates of `cancel_race_handler`'s executor.
+    #[derive(Default)]
+    struct CancelRace {
+        /// Releases the Message that answers any message but "ask".
+        answer: Arc<Notify>,
+        /// Notified when the cancel calls the executor: CANCELED is then
+        /// committed and the cancel holds the execution.
+        canceling: Arc<Notify>,
+        /// Releases the cancel's CANCELED status.
+        cancel_ends: Arc<Notify>,
+    }
+
+    /// An executor that leaves the task awaiting input on "ask", answers any
+    /// other message with a Message, and is canceled with CANCELED, each
+    /// step behind the gates of the returned `CancelRace`.
+    fn cancel_race_handler() -> (Arc<DefaultRequestHandler>, CancelRace) {
+        let race = CancelRace::default();
+        let (answer, canceling, cancel_ends) = (
+            race.answer.clone(),
+            race.canceling.clone(),
+            race.cancel_ends.clone(),
+        );
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(move |ctx: &ExecutorContext| match &ctx.message {
+                Some(message) if message.text() == Some("ask") => {
+                    vec![(None, Ok(status_event(ctx, TaskState::InputRequired, None)))]
+                }
+                Some(_) => {
+                    let message = Message::new(Role::Agent, vec![Part::text("answer")]);
+                    vec![(Some(answer.clone()), Ok(StreamResponse::Message(message)))]
+                }
+                None => {
+                    canceling.notify_one();
+                    vec![(
+                        Some(cancel_ends.clone()),
+                        Ok(status_event(ctx, TaskState::Canceled, None)),
+                    )]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        );
+        (Arc::new(handler), race)
+    }
+
+    fn start_cancel(
+        handler: &Arc<DefaultRequestHandler>,
+        task_id: &str,
+    ) -> tokio::task::JoinHandle<Result<Task, A2AError>> {
+        let handler = Arc::clone(handler);
+        let request = CancelTaskRequest {
+            id: task_id.into(),
+            metadata: None,
+            tenant: None,
+        };
+        tokio::spawn(async move { handler.cancel_task(&ServiceParams::new(), request).await })
+    }
+
+    /// Releases a cancel `start_cancel` started and checks its own answer.
+    async fn finish_cancel(
+        race: &CancelRace,
+        cancel: tokio::task::JoinHandle<Result<Task, A2AError>>,
+    ) {
+        race.cancel_ends.notify_one();
+        let canceled = within(cancel).await.unwrap().unwrap();
+        assert_eq!(canceled.status.state, TaskState::Canceled);
+    }
+
+    /// §3.1.2: a Message answer is "exactly one Message object and then close
+    /// immediately", also while a cancel of the request's task waits for the
+    /// executor: the stream closes before the cancel ends, its CANCELED
+    /// status never follows the Message, and the cancel itself succeeds.
+    #[tokio::test]
+    async fn test_message_answer_ends_the_stream_before_a_pending_cancel() {
+        let (handler, race) = cancel_race_handler();
+        let mut stream = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap();
+        let task_id = only_task_id(&handler).await;
+        let cancel = start_cancel(&handler, &task_id);
+        within(race.canceling.notified()).await;
+        race.answer.notify_one();
+
+        assert!(matches!(
+            within(stream.next()).await,
+            Some(Ok(StreamResponse::Message(_)))
+        ));
+        assert!(within(stream.next()).await.is_none());
+        assert!(!cancel.is_finished(), "the cancel is still pending");
+        finish_cancel(&race, cancel).await;
+    }
+
+    /// A subscription attached to the running execution ends at its Message
+    /// too, while the cancel is pending.
+    #[tokio::test]
+    async fn test_message_answer_ends_an_attached_subscription_before_a_pending_cancel() {
+        let (handler, race) = cancel_race_handler();
+        let _stream = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap();
+        let task_id = only_task_id(&handler).await;
+        let subscription = handler
+            .subscribe_to_task(
+                &ServiceParams::new(),
+                SubscribeToTaskRequest {
+                    id: task_id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        let cancel = start_cancel(&handler, &task_id);
+        within(race.canceling.notified()).await;
+        race.answer.notify_one();
+
+        let items = within(subscription.collect::<Vec<_>>()).await;
+        assert!(
+            matches!(
+                &items[..],
+                [Ok(StreamResponse::Task(task)), Ok(StreamResponse::Message(_))]
+                    if task.status.state == TaskState::Submitted
+            ),
+            "{items:?}"
+        );
+        assert!(!cancel.is_finished(), "the cancel is still pending");
+        finish_cancel(&race, cancel).await;
+    }
+
+    /// A subscription waiting for a task's next turn follows that turn to its
+    /// Message and ends there, while the cancel is pending.
+    #[tokio::test]
+    async fn test_message_answer_ends_a_waiting_subscription_before_a_pending_cancel() {
+        let (handler, race) = cancel_race_handler();
+        let params = ServiceParams::new();
+        let ask = SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("ask")]),
+            ..send_request()
+        };
+        let SendMessageResponse::Task(task) = handler.send_message(&params, ask).await.unwrap()
+        else {
+            panic!("expected a task awaiting input");
+        };
+        assert_eq!(task.status.state, TaskState::InputRequired);
+        let subscription = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: task.id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let follow_up = SendMessageRequest {
+            message: Message {
+                task_id: Some(task.id.clone()),
+                ..Message::new(Role::User, vec![Part::text("go")])
+            },
+            ..send_request()
+        };
+        let _stream = handler
+            .send_streaming_message(&params, follow_up)
+            .await
+            .unwrap();
+        let cancel = start_cancel(&handler, &task.id);
+        within(race.canceling.notified()).await;
+        race.answer.notify_one();
+
+        // The stored task, the task as the turn found it, then the answer.
+        let items = within(subscription.collect::<Vec<_>>()).await;
+        assert!(
+            matches!(
+                &items[..],
+                [
+                    Ok(StreamResponse::Task(stored)),
+                    Ok(StreamResponse::Task(found)),
+                    Ok(StreamResponse::Message(_)),
+                ] if stored.status.state == TaskState::InputRequired
+                    && found.status.state == TaskState::InputRequired
+            ),
+            "{items:?}"
+        );
+        assert!(!cancel.is_finished(), "the cancel is still pending");
+        finish_cancel(&race, cancel).await;
     }
 
     #[tokio::test]
