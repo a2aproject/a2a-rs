@@ -159,6 +159,7 @@ mod tests {
         events: Vec<Result<StreamResponse, A2AError>>,
         relayed: Arc<Mutex<Vec<SendMessageRequest>>>,
         fail_start: bool,
+        fail_relay: bool,
     }
 
     impl MockTransport {
@@ -167,6 +168,7 @@ mod tests {
                 events: events.into_iter().map(Ok).collect(),
                 relayed,
                 fail_start: false,
+                fail_relay: false,
             }
         }
     }
@@ -178,6 +180,9 @@ mod tests {
             _params: &ServiceParams,
             req: &SendMessageRequest,
         ) -> Result<SendMessageResponse, A2AError> {
+            if self.fail_relay {
+                return Err(A2AError::internal("mock relay failure"));
+            }
             self.relayed.lock().unwrap().push(req.clone());
             Ok(SendMessageResponse::Task(make_task("relay", "relay-ctx")))
         }
@@ -303,6 +308,7 @@ mod tests {
                     events: vec![],
                     relayed: Arc::new(Mutex::new(vec![])),
                     fail_start: true,
+                    fail_relay: false,
                 }),
             ),
             (
@@ -355,6 +361,7 @@ mod tests {
                     ],
                     relayed: Arc::new(Mutex::new(vec![])),
                     fail_start: false,
+                    fail_relay: false,
                 }),
             ),
             (
@@ -435,5 +442,160 @@ mod tests {
         while stream.next().await.is_some() {}
 
         assert!(relayed_b.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn relay_send_message_failure_does_not_abort_session() {
+        // B at index 0 with fail_relay: true — relay warning path (line 126) is exercised.
+        let session = CollaborativeSession::new(vec![
+            (
+                "b".into(),
+                A2AClient::new(MockTransport {
+                    events: vec![Ok(StreamResponse::Task(make_task("tb", "cb")))],
+                    relayed: Arc::new(Mutex::new(vec![])),
+                    fail_start: false,
+                    fail_relay: true,
+                }),
+            ),
+            (
+                "a".into(),
+                A2AClient::new(MockTransport::new(
+                    vec![StreamResponse::Task(make_task("ta", "ca"))],
+                    Arc::new(Mutex::new(vec![])),
+                )),
+            ),
+        ]);
+
+        let mut stream = session.start(initial_request()).await.unwrap();
+        let mut count = 0;
+        while stream.next().await.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn mock_transport_unimplemented_methods_return_errors() {
+        let transport = MockTransport::new(vec![], Arc::new(Mutex::new(vec![])));
+        let params = ServiceParams::new();
+        assert!(
+            transport
+                .get_task(
+                    &params,
+                    &GetTaskRequest {
+                        id: "t".into(),
+                        history_length: None,
+                        tenant: None
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            transport
+                .list_tasks(
+                    &params,
+                    &ListTasksRequest {
+                        context_id: None,
+                        status: None,
+                        page_size: None,
+                        page_token: None,
+                        history_length: None,
+                        status_timestamp_after: None,
+                        include_artifacts: None,
+                        tenant: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            transport
+                .cancel_task(
+                    &params,
+                    &CancelTaskRequest {
+                        id: "t".into(),
+                        metadata: None,
+                        tenant: None
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            transport
+                .subscribe_to_task(
+                    &params,
+                    &SubscribeToTaskRequest {
+                        id: "t".into(),
+                        tenant: None
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            transport
+                .create_push_config(
+                    &params,
+                    &TaskPushNotificationConfig {
+                        url: "http://x".into(),
+                        id: None,
+                        task_id: "t".into(),
+                        token: None,
+                        authentication: None,
+                        tenant: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            transport
+                .get_push_config(
+                    &params,
+                    &GetTaskPushNotificationConfigRequest {
+                        task_id: "t".into(),
+                        id: "c".into(),
+                        tenant: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            transport
+                .list_push_configs(
+                    &params,
+                    &ListTaskPushNotificationConfigsRequest {
+                        task_id: "t".into(),
+                        page_size: None,
+                        page_token: None,
+                        tenant: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            transport
+                .delete_push_config(
+                    &params,
+                    &DeleteTaskPushNotificationConfigRequest {
+                        task_id: "t".into(),
+                        id: "c".into(),
+                        tenant: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            transport
+                .get_extended_agent_card(&params, &GetExtendedAgentCardRequest { tenant: None })
+                .await
+                .is_err()
+        );
+        assert!(transport.destroy().await.is_ok());
     }
 }
