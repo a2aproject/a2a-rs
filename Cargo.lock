@@ -59,6 +59,7 @@ version = "0.1.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
+ "async-trait",
  "futures",
  "serde_json",
  "tokio",

@@ -137,3 +137,303 @@ impl<T: Transport + Send + 'static> CollaborativeSession<T> {
         Ok(Box::pin(rx))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use a2a::{
+        AgentCard, CancelTaskRequest, DeleteTaskPushNotificationConfigRequest,
+        GetExtendedAgentCardRequest, GetTaskPushNotificationConfigRequest, GetTaskRequest,
+        ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
+        ListTasksRequest, ListTasksResponse, Message, Part, Role, SendMessageRequest,
+        SendMessageResponse, StreamResponse, SubscribeToTaskRequest, Task,
+        TaskPushNotificationConfig, TaskState, TaskStatus, TaskStatusUpdateEvent,
+    };
+    use a2a_client::{A2AClient, transport::ServiceParams};
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use futures::stream::BoxStream;
+    use std::sync::{Arc, Mutex};
+
+    struct MockTransport {
+        events: Vec<Result<StreamResponse, A2AError>>,
+        relayed: Arc<Mutex<Vec<SendMessageRequest>>>,
+        fail_start: bool,
+    }
+
+    impl MockTransport {
+        fn new(events: Vec<StreamResponse>, relayed: Arc<Mutex<Vec<SendMessageRequest>>>) -> Self {
+            Self {
+                events: events.into_iter().map(Ok).collect(),
+                relayed,
+                fail_start: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Transport for MockTransport {
+        async fn send_message(
+            &self,
+            _params: &ServiceParams,
+            req: &SendMessageRequest,
+        ) -> Result<SendMessageResponse, A2AError> {
+            self.relayed.lock().unwrap().push(req.clone());
+            Ok(SendMessageResponse::Task(make_task("relay", "relay-ctx")))
+        }
+
+        async fn send_streaming_message(
+            &self,
+            _params: &ServiceParams,
+            _req: &SendMessageRequest,
+        ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+            if self.fail_start {
+                return Err(A2AError::internal("mock failure"));
+            }
+            Ok(Box::pin(futures::stream::iter(self.events.clone())))
+        }
+
+        async fn get_task(&self, _: &ServiceParams, _: &GetTaskRequest) -> Result<Task, A2AError> {
+            Err(A2AError::internal("not implemented"))
+        }
+        async fn list_tasks(
+            &self,
+            _: &ServiceParams,
+            _: &ListTasksRequest,
+        ) -> Result<ListTasksResponse, A2AError> {
+            Err(A2AError::internal("not implemented"))
+        }
+        async fn cancel_task(
+            &self,
+            _: &ServiceParams,
+            _: &CancelTaskRequest,
+        ) -> Result<Task, A2AError> {
+            Err(A2AError::internal("not implemented"))
+        }
+        async fn subscribe_to_task(
+            &self,
+            _: &ServiceParams,
+            _: &SubscribeToTaskRequest,
+        ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+            Err(A2AError::internal("not implemented"))
+        }
+        async fn create_push_config(
+            &self,
+            _: &ServiceParams,
+            _: &TaskPushNotificationConfig,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            Err(A2AError::internal("not implemented"))
+        }
+        async fn get_push_config(
+            &self,
+            _: &ServiceParams,
+            _: &GetTaskPushNotificationConfigRequest,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            Err(A2AError::internal("not implemented"))
+        }
+        async fn list_push_configs(
+            &self,
+            _: &ServiceParams,
+            _: &ListTaskPushNotificationConfigsRequest,
+        ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
+            Err(A2AError::internal("not implemented"))
+        }
+        async fn delete_push_config(
+            &self,
+            _: &ServiceParams,
+            _: &DeleteTaskPushNotificationConfigRequest,
+        ) -> Result<(), A2AError> {
+            Err(A2AError::internal("not implemented"))
+        }
+        async fn get_extended_agent_card(
+            &self,
+            _: &ServiceParams,
+            _: &GetExtendedAgentCardRequest,
+        ) -> Result<AgentCard, A2AError> {
+            Err(A2AError::internal("not implemented"))
+        }
+        async fn destroy(&self) -> Result<(), A2AError> {
+            Ok(())
+        }
+    }
+
+    fn make_task(id: &str, ctx: &str) -> Task {
+        Task {
+            id: id.into(),
+            context_id: ctx.into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        }
+    }
+
+    fn initial_request() -> SendMessageRequest {
+        SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("hello")]),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        }
+    }
+
+    fn make_status_update(task_id: &str, ctx: &str) -> StreamResponse {
+        StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: task_id.into(),
+            context_id: ctx.into(),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: Some(Message::new(Role::Agent, vec![Part::text("done")])),
+                timestamp: None,
+            },
+            metadata: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn start_returns_error_when_transport_fails() {
+        let session = CollaborativeSession::new(vec![
+            (
+                "a".into(),
+                A2AClient::new(MockTransport {
+                    events: vec![],
+                    relayed: Arc::new(Mutex::new(vec![])),
+                    fail_start: true,
+                }),
+            ),
+            (
+                "b".into(),
+                A2AClient::new(MockTransport::new(vec![], Arc::new(Mutex::new(vec![])))),
+            ),
+        ]);
+        assert!(session.start(initial_request()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_yields_events_from_all_agents() {
+        let session = CollaborativeSession::new(vec![
+            (
+                "a".into(),
+                A2AClient::new(MockTransport::new(
+                    vec![StreamResponse::Task(make_task("ta", "ca"))],
+                    Arc::new(Mutex::new(vec![])),
+                )),
+            ),
+            (
+                "b".into(),
+                A2AClient::new(MockTransport::new(
+                    vec![StreamResponse::Task(make_task("tb", "cb"))],
+                    Arc::new(Mutex::new(vec![])),
+                )),
+            ),
+        ]);
+
+        let mut stream = session.start(initial_request()).await.unwrap();
+        let mut labels = vec![];
+        while let Some((label, _)) = stream.next().await {
+            labels.push(label);
+        }
+
+        assert_eq!(labels.len(), 2);
+        assert!(labels.contains(&"a".to_string()));
+        assert!(labels.contains(&"b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stream_errors_are_skipped() {
+        let session = CollaborativeSession::new(vec![
+            (
+                "a".into(),
+                A2AClient::new(MockTransport {
+                    events: vec![
+                        Err(A2AError::internal("transient")),
+                        Ok(StreamResponse::Task(make_task("ta", "ca"))),
+                    ],
+                    relayed: Arc::new(Mutex::new(vec![])),
+                    fail_start: false,
+                }),
+            ),
+            (
+                "b".into(),
+                A2AClient::new(MockTransport::new(
+                    vec![StreamResponse::Task(make_task("tb", "cb"))],
+                    Arc::new(Mutex::new(vec![])),
+                )),
+            ),
+        ]);
+
+        let mut stream = session.start(initial_request()).await.unwrap();
+        let mut count = 0;
+        while stream.next().await.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn relay_forwards_event_to_peer_once_session_established() {
+        let relayed_b = Arc::new(Mutex::new(vec![]));
+
+        // Agent b is at index 0 so its Task event is processed first by
+        // select_all, establishing session IDs before agent a's StatusUpdate.
+        let session = CollaborativeSession::new(vec![
+            (
+                "b".into(),
+                A2AClient::new(MockTransport::new(
+                    vec![StreamResponse::Task(make_task("tb", "cb"))],
+                    Arc::clone(&relayed_b),
+                )),
+            ),
+            (
+                "a".into(),
+                A2AClient::new(MockTransport::new(
+                    vec![
+                        StreamResponse::Task(make_task("ta", "ca")),
+                        make_status_update("ta", "ca"),
+                    ],
+                    Arc::new(Mutex::new(vec![])),
+                )),
+            ),
+        ]);
+
+        let mut stream = session.start(initial_request()).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        // B receives A's Task relay then A's StatusUpdate relay — 2 total,
+        // since all StreamResponse variants are relayable.
+        assert_eq!(relayed_b.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn no_relay_before_peer_establishes_session() {
+        let relayed_b = Arc::new(Mutex::new(vec![]));
+
+        // Agent b yields nothing, so it never establishes a session.
+        // Agent a's StatusUpdate must not be forwarded to b.
+        let session = CollaborativeSession::new(vec![
+            (
+                "a".into(),
+                A2AClient::new(MockTransport::new(
+                    vec![
+                        StreamResponse::Task(make_task("ta", "ca")),
+                        make_status_update("ta", "ca"),
+                    ],
+                    Arc::new(Mutex::new(vec![])),
+                )),
+            ),
+            (
+                "b".into(),
+                A2AClient::new(MockTransport::new(vec![], Arc::clone(&relayed_b))),
+            ),
+        ]);
+
+        let mut stream = session.start(initial_request()).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        assert!(relayed_b.lock().unwrap().is_empty());
+    }
+}
