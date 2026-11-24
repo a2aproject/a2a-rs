@@ -9,8 +9,8 @@ mount more than one on the same handler.
 
 | Binding | Crate | Wire format | When to use it |
 | --- | --- | --- | --- |
-| JSON-RPC | `a2a-server`, `a2a-client` | JSON over HTTP POST | Default. Widest client support and the simplest to debug. |
-| REST | `a2a-server`, `a2a-client` | JSON over HTTP verbs | You want resource-oriented URLs and plain HTTP tooling. |
+| JSON-RPC | `a2a-server-lf`, `a2a-client-lf` | JSON over HTTP POST | Default. Widest client support and the simplest to debug. |
+| REST | `a2a-server-lf`, `a2a-client-lf` | JSON over HTTP verbs | You want resource-oriented URLs and plain HTTP tooling. |
 | gRPC | `a2a-grpc`, `a2a-pb` | Protocol Buffers | You already use gRPC, or want generated clients in many languages. |
 | SLIMRPC | `a2a-slimrpc` | SLIM peer transport | You are inside a SLIM deployment and want its identity model. |
 
