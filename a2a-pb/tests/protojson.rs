@@ -333,3 +333,96 @@ fn integers_in_data_parts_stay_integers() {
     );
     assert_eq!(data["ratio"], json!(0.5));
 }
+
+/// `Part.content` is a required oneof: a part that carries none is invalid
+/// input rather than an empty text part, and the error names it.
+#[test]
+fn send_message_request_rejects_part_without_content() {
+    let request = json!({
+        "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{}]}
+    });
+    let error = a2a_pb::protojson_conv::from_value::<a2a::SendMessageRequest>(request).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid ProtoJSON payload: message.parts[0]: must have one of: text, raw, url, data"
+    );
+}
+
+/// `Part.data` is a `google.protobuf.Value`, for which JSON null is a value:
+/// a data part holding null is written as `{"data": null}` and read back as
+/// the same part, not as a part without content.
+#[test]
+fn a_null_data_part_round_trips() {
+    let message = a2a::Message::new(a2a::Role::Agent, vec![a2a::Part::data(JsonValue::Null)]);
+    let request = a2a::SendMessageRequest {
+        message: message.clone(),
+        configuration: None,
+        metadata: None,
+        tenant: None,
+    };
+
+    let wire = a2a_pb::protojson_conv::to_value(&request).unwrap();
+    assert_eq!(wire["message"]["parts"][0], json!({"data": null}));
+
+    let back: a2a::SendMessageRequest = a2a_pb::protojson_conv::from_value(wire).unwrap();
+    assert_eq!(back.message.parts, message.parts);
+}
+
+fn send_message_request_with_part(part: &str) -> String {
+    format!(r#"{{"message":{{"messageId":"m1","role":"ROLE_USER","parts":[{part}]}}}}"#)
+}
+
+/// A null member of the `Part.content` oneof is not set, wherever it stands
+/// among the keys: `from_str` reads them in document order, `from_value` in
+/// the order of `serde_json::Map`.
+#[test]
+fn a_null_part_member_is_unset_in_any_key_order() {
+    for part in [
+        r#"{"text":"x","raw":null}"#,
+        r#"{"raw":null,"text":"x"}"#,
+        r#"{"url":null,"text":"x","raw":null}"#,
+    ] {
+        let body = send_message_request_with_part(part);
+        let from_str: a2a::SendMessageRequest = a2a_pb::protojson_conv::from_str(&body).unwrap();
+        let from_value: a2a::SendMessageRequest =
+            a2a_pb::protojson_conv::from_value(serde_json::from_str(&body).unwrap()).unwrap();
+        assert_eq!(from_str.message.parts, [a2a::Part::text("x")], "{part}");
+        assert_eq!(from_value.message.parts, from_str.message.parts, "{part}");
+    }
+}
+
+/// `data: null` is a value, so next to another member it sets the oneof a
+/// second time, in either key order.
+#[test]
+fn a_null_data_member_next_to_another_member_is_rejected_in_any_key_order() {
+    for part in [r#"{"text":"x","data":null}"#, r#"{"data":null,"text":"x"}"#] {
+        let body = send_message_request_with_part(part);
+        let from_str =
+            a2a_pb::protojson_conv::from_str::<a2a::SendMessageRequest>(&body).unwrap_err();
+        let from_value = a2a_pb::protojson_conv::from_value::<a2a::SendMessageRequest>(
+            serde_json::from_str(&body).unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            from_str.to_string().contains("duplicate field"),
+            "{part}: {from_str}"
+        );
+        assert!(
+            from_value.to_string().contains("duplicate field"),
+            "{part}: {from_value}"
+        );
+    }
+}
+
+/// The null rule holds for every oneof, not only `Part.content`.
+#[test]
+fn a_null_stream_response_member_is_unset() {
+    let response: StreamResponse = serde_json::from_str(
+        r#"{"message":{"messageId":"m1","role":"ROLE_AGENT","parts":[{"text":"x"}]},"task":null}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        response.payload,
+        Some(stream_response::Payload::Message(_))
+    ));
+}
