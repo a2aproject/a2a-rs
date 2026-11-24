@@ -84,6 +84,14 @@ const NULL_REPEATED_FIELD_REPLACEMENTS: &[(&str, &str)] = &[
         "history__ = Some(map_.next_value::<Option<_>>()?.unwrap_or_default());",
     ),
 ];
+/// `Part.data` is a `google.protobuf.Value`, for which JSON null is a value
+/// (`NullValue`), not an unset field: pbjson reads every null oneof member as
+/// unset, which would turn `{"data": null}` into a part without content.
+/// Every other member goes through [`skip_null_oneof_members`].
+const NULL_DATA_PART_REPLACEMENT: (&str, &str) = (
+    "content__ = map_.next_value::<::std::option::Option<_>>()?.map(part::Content::Data)",
+    "content__ = Some(part::Content::Data(map_.next_value()?))",
+);
 const NULL_MAP_REPLACEMENT: (&str, &str) = (
     "map_.next_value::<std::collections::HashMap<_, _>>()?",
     "map_.next_value::<Option<std::collections::HashMap<_, _>>>()?.unwrap_or_default()",
@@ -144,10 +152,16 @@ fn patch_generated_protojson_serde(
     let mut generated = std::fs::read_to_string(&serde_path)?;
 
     generated = replace_if_present(generated, NULL_MAP_REPLACEMENT.0, NULL_MAP_REPLACEMENT.1);
+    generated = replace_if_present(
+        generated,
+        NULL_DATA_PART_REPLACEMENT.0,
+        NULL_DATA_PART_REPLACEMENT.1,
+    );
 
     for &(from, to) in NULL_REPEATED_FIELD_REPLACEMENTS {
         generated = replace_if_present(generated, from, to);
     }
+    generated = skip_null_oneof_members(&generated, &nullable_oneof_members(descriptor_set)?)?;
 
     for (message, json_name) in timestamp_fields(descriptor_set)? {
         generated = write_timestamp_as_wire_form(generated, &message, &json_name)?;
@@ -155,6 +169,100 @@ fn patch_generated_protojson_serde(
 
     std::fs::write(serde_path, generated)?;
     Ok(())
+}
+
+/// The `(oneof, JSON name)` of every oneof member for which JSON null means
+/// "not set": all of them except a `google.protobuf.Value`, where null is the
+/// value. A pair is listed once per message that declares it.
+fn nullable_oneof_members(
+    descriptor_set: &[u8],
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    use prost::Message;
+    use prost_types::{DescriptorProto, FileDescriptorSet};
+
+    fn collect(message: &DescriptorProto, members: &mut Vec<(String, String)>) {
+        for field in &message.field {
+            // A proto3 `optional` field is a oneof in the descriptor only.
+            if let Some(index) = field.oneof_index
+                && !field.proto3_optional()
+                && field.type_name() != ".google.protobuf.Value"
+            {
+                let oneof = message.oneof_decl[index as usize].name();
+                members.push((oneof.to_string(), field.json_name().to_string()));
+            }
+        }
+        for nested in &message.nested_type {
+            collect(nested, members);
+        }
+    }
+
+    let mut members = Vec::new();
+    for file in FileDescriptorSet::decode(descriptor_set)?.file {
+        if PROTOJSON_PACKAGES.contains(&format!(".{}", file.package()).as_str()) {
+            for message in &file.message_type {
+                collect(message, &mut members);
+            }
+        }
+    }
+    Ok(members)
+}
+
+/// Read a oneof member before checking that the oneof is still unset.
+///
+/// pbjson checks first, so a null member fails as a duplicate when it follows
+/// the member that is set and is skipped when it precedes it: whether
+/// `{"text": "x", "raw": null}` parses depends on the key order. ProtoJSON
+/// skips a null member wherever it stands. Every member has to be patched, and
+/// a miss fails the build: a pbjson upgrade that changes its output must not
+/// silently bring the order dependence back.
+fn skip_null_oneof_members(
+    generated: &str,
+    members: &[(String, String)],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let lines: Vec<&str> = generated.lines().collect();
+    let mut patched = String::with_capacity(generated.len());
+    let mut arms = 0;
+    let mut at = 0;
+    while at < lines.len() {
+        let arm = members.iter().find_map(|(oneof, json_name)| {
+            let read = lines
+                .get(at + 3)?
+                .trim()
+                .strip_prefix(&format!("{oneof}__ = "))?;
+            (lines[at].trim() == format!("if {oneof}__.is_some() {{")
+                && lines[at + 1].contains(&format!("duplicate_field(\"{json_name}\")"))
+                && read.starts_with("map_.next_value::<::std::option::Option<"))
+            .then_some((oneof, read))
+        });
+        let Some((oneof, read)) = arm else {
+            patched.push_str(lines[at]);
+            patched.push('\n');
+            at += 1;
+            continue;
+        };
+        // pbjson ends the read of a message member on a line of its own.
+        let (read, len) = match read.strip_suffix(';') {
+            Some(read) => (read, 4),
+            None if lines.get(at + 4).is_some_and(|line| line.trim() == ";") => (read, 5),
+            None => return Err(format!("pbjson output changed: `{read}` has no end").into()),
+        };
+        patched.push_str(&format!(
+            "let member__ = {read};\nif member__.is_some() {{\n{}\n{}\n{}\n{oneof}__ = member__;\n}}\n",
+            lines[at],
+            lines[at + 1],
+            lines[at + 2]
+        ));
+        arms += 1;
+        at += len;
+    }
+    if arms != members.len() {
+        return Err(format!(
+            "pbjson output changed: patched {arms} of {} oneof members",
+            members.len()
+        )
+        .into());
+    }
+    Ok(patched)
 }
 
 /// The `(message, JSON name)` of every `google.protobuf.Timestamp` field.
