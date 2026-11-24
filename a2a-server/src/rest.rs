@@ -2406,7 +2406,9 @@ mod encoded_task_action_regression {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    struct CustomTaskIdExecutor;
+    struct CustomTaskIdExecutor {
+        state: TaskState,
+    }
 
     impl crate::AgentExecutor for CustomTaskIdExecutor {
         fn execute(
@@ -2417,7 +2419,7 @@ mod encoded_task_action_regression {
                 id: "foo:subscribe".into(),
                 context_id: ctx.context_id,
                 status: TaskStatus {
-                    state: TaskState::Completed,
+                    state: self.state.clone(),
                     message: None,
                     timestamp: None,
                 },
@@ -2441,7 +2443,9 @@ mod encoded_task_action_regression {
     #[tokio::test]
     async fn get_task_with_encoded_colon_emitted_by_executor() {
         let app = rest_router(Arc::new(DefaultRequestHandler::new(
-            CustomTaskIdExecutor,
+            CustomTaskIdExecutor {
+                state: TaskState::Completed,
+            },
             InMemoryTaskStore::new(),
         )));
         let message = serde_json::json!({ "message": {
@@ -2472,6 +2476,87 @@ mod encoded_task_action_regression {
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         assert_eq!(body["id"], "foo:subscribe");
+    }
+
+    #[tokio::test]
+    async fn cancel_task_with_encoded_colon_emitted_by_executor() {
+        use crate::task_store::TaskStore;
+
+        let store = InMemoryTaskStore::new();
+        store
+            .create(Task {
+                id: "foo".into(),
+                context_id: "unrelated".into(),
+                status: TaskStatus {
+                    state: TaskState::InputRequired,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let app = rest_router(Arc::new(DefaultRequestHandler::new(
+            CustomTaskIdExecutor {
+                state: TaskState::InputRequired,
+            },
+            store,
+        )));
+        let message = serde_json::json!({ "message": {
+            "messageId": "m-cancel", "role": "ROLE_USER", "parts": [{"text": "hello"}]
+        }});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/message:send")
+            .header("a2a-version", "1.0")
+            .header("content-type", "application/json")
+            .body(Body::from(message.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["task"]["id"], "foo:subscribe");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/tasks/foo%3Asubscribe:cancel")
+            .header("a2a-version", "1.0")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["id"], "foo:subscribe");
+        assert_eq!(body["status"]["state"], "TASK_STATE_CANCELED");
+
+        for (uri, id, state) in [
+            (
+                "/tasks/foo%3Asubscribe",
+                "foo:subscribe",
+                "TASK_STATE_CANCELED",
+            ),
+            ("/tasks/foo", "foo", "TASK_STATE_INPUT_REQUIRED"),
+        ] {
+            let request = Request::builder()
+                .uri(uri)
+                .header("a2a-version", "1.0")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["id"], id);
+            assert_eq!(body["status"]["state"], state);
+        }
     }
 
     #[tokio::test]
