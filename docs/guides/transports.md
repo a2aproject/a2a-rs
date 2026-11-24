@@ -45,6 +45,19 @@ Serve it with Tonic over a TCP listener. The hello world example serves HTTP and
 gRPC from one process with `tokio::select!`; see
 `examples/src/helloworld/server.rs` for the full `main`.
 
+## SLIMRPC
+
+`a2a-slimrpc` exposes an `a2a_server::RequestHandler` through `slim_rpc`, and
+implements the A2A `Transport` so a card advertising `SLIMRPC` can be called over
+a SLIM peer session; the server registers with `SlimRpcHandler::register(&slim_rpc::Server, ...)`.
+The card's `supportedInterfaces[].url` is read as a SLIM peer
+name, in the form `org/namespace/app` (or `slim://org/namespace/app`).
+
+Unlike the bindings above, the crate has no runnable example in this repository
+yet, so this page cannot include one from a compiled file. Its `README.md`
+documents the caller-identity keys it sets on `ServiceParams` and the target
+format in detail; `a2a-slimrpc/tests/e2e.rs` is the working reference.
+
 ## Serving several bindings from one handler
 
 Every binding takes the same `RequestHandler`, so one executor can be reached
@@ -60,15 +73,15 @@ should use, and keep those URLs in step with where you actually listen.
 
 `a2a_server::tls` re-exports the pieces needed to terminate TLS in-process. The
 `rustls-tls` feature is on by default and uses `rustls`; `native-tls` switches
-`a2a-server` and `a2a-client` to the platform TLS stack instead. Pick one and
+`a2a-server-lf` and `a2a-client-lf` to the platform TLS stack instead. Pick one and
 enable it consistently on both sides:
 
 ```toml
 # Default: rustls
-a2a-server = { version = "0.4", features = ["rustls-tls"] }
+a2a-server-lf = { version = "0.5", features = ["rustls-tls"] }
 
 # Or the platform stack
-a2a-server = { version = "0.4", default-features = false, features = ["native-tls"] }
+a2a-server-lf = { version = "0.5", default-features = false, features = ["native-tls"] }
 ```
 
 The server is built from a `rustls::ServerConfig` for HTTP and a second one for
@@ -80,17 +93,7 @@ gRPC, whose ALPN must advertise HTTP/2. The `helloworld_tls` example shows both:
 
 Run it with `cargo run --bin helloworld-tls-server --package examples` and call
 it with the matching client. The `helloworld_tls` example's `client.rs` shows the
-other side: a `rustls::ClientConfig` with the CA added to the root store, and a
-`TlsIncoming` for the gRPC channel.
+other side: a `rustls::ClientConfig` with the CA added to the root store, passed
+to `GrpcTransportFactory::with_rustls_config()`. (`TlsIncoming` is the
+server-side accept-loop wrapper around `TcpIncoming`, not a client type.)
 
-## SLIMRPC
-
-`a2a-slimrpc` exposes an `a2a_server::RequestHandler` through `slim_bindings`, and
-implements the A2A `Transport` so a card advertising `SLIMRPC` can be called over
-a SLIM peer session. The card's `supportedInterfaces[].url` is read as a SLIM peer
-name, in the form `org/namespace/app` (or `slim://org/namespace/app`).
-
-Unlike the bindings above, the crate has no runnable example in this repository
-yet, so this page cannot include one from a compiled file. Its `README.md`
-documents the caller-identity keys it sets on `ServiceParams` and the target
-format in detail; `a2a-slimrpc/tests/e2e.rs` is the working reference.
