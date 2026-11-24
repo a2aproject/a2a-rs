@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::types::{ProtocolVersion, TRANSPORT_PROTOCOL_GRPC, TransportProtocol};
 
@@ -38,7 +38,11 @@ pub struct AgentCard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_url: Option<String>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_sorted_map"
+    )]
     pub security_schemes: Option<HashMap<String, SecurityScheme>>,
 
     #[serde(
@@ -105,12 +109,48 @@ where
 
 #[derive(Serialize)]
 struct SerializedSecurityRequirement<'a> {
-    schemes: HashMap<&'a str, SerializedSecurityScopes<'a>>,
+    // BTreeMap, not HashMap: a requirement with several schemes must serialize in
+    // a stable key order so cards are byte-stable for diffs, caching and signing.
+    schemes: BTreeMap<&'a str, SerializedSecurityScopes<'a>>,
 }
 
 #[derive(Serialize)]
 struct SerializedSecurityScopes<'a> {
+    // ProtoJSON (a2a-pb, Python SDK) omits an empty StringList, so an empty scope
+    // list serializes as {} rather than {"list": []}. A proto reader treats them
+    // the same; this pins the canonical form.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
     list: &'a [String],
+}
+
+/// Serialize a map with its keys in sorted order.
+///
+/// The card's maps are `HashMap`s, so iteration order differs between instances
+/// and between processes. Sorting at the serialization boundary keeps the public
+/// types unchanged while making a card reproducible for diffs and for a content
+/// hash, which is one of the ETag forms section 8.6.1 allows. Signatures are not
+/// affected: section 8.4.1 canonicalises with JCS, which already orders keys.
+fn serialize_sorted_map<S, V>(map: &HashMap<String, V>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    V: Serialize,
+{
+    map.iter().collect::<BTreeMap<_, _>>().serialize(serializer)
+}
+
+/// [`serialize_sorted_map`] for an optional field.
+fn serialize_optional_sorted_map<S, V>(
+    map: &Option<HashMap<String, V>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    V: Serialize,
+{
+    match map {
+        Some(map) => serialize_sorted_map(map, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 fn parse_security_requirement_value<E>(value: Value) -> Result<SecurityRequirement, E>
@@ -320,7 +360,11 @@ pub struct AgentExtension {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_sorted_map"
+    )]
     #[cfg_attr(feature = "fuzzing", arbitrary(default))]
     pub params: Option<HashMap<String, Value>>,
 }
@@ -535,6 +579,7 @@ impl<'de> Deserialize<'de> for OAuthFlows {
 pub struct AuthorizationCodeOAuthFlow {
     pub authorization_url: String,
     pub token_url: String,
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub scopes: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_url: Option<String>,
@@ -547,6 +592,7 @@ pub struct AuthorizationCodeOAuthFlow {
 #[serde(rename_all = "camelCase")]
 pub struct ClientCredentialsOAuthFlow {
     pub token_url: String,
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub scopes: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_url: Option<String>,
@@ -558,6 +604,7 @@ pub struct ClientCredentialsOAuthFlow {
 pub struct DeviceCodeOAuthFlow {
     pub device_authorization_url: String,
     pub token_url: String,
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub scopes: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_url: Option<String>,
@@ -568,6 +615,7 @@ pub struct DeviceCodeOAuthFlow {
 #[serde(rename_all = "camelCase")]
 pub struct ImplicitOAuthFlow {
     pub authorization_url: String,
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub scopes: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_url: Option<String>,
@@ -578,6 +626,7 @@ pub struct ImplicitOAuthFlow {
 #[serde(rename_all = "camelCase")]
 pub struct PasswordOAuthFlow {
     pub token_url: String,
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub scopes: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_url: Option<String>,
@@ -601,7 +650,11 @@ pub type SecurityRequirement = HashMap<String, Vec<String>>;
 pub struct AgentCardSignature {
     pub protected: String,
     pub signature: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_sorted_map"
+    )]
     #[cfg_attr(feature = "fuzzing", arbitrary(default))]
     pub header: Option<HashMap<String, Value>>,
 }
@@ -937,7 +990,8 @@ mod tests {
         let value = serde_json::to_value(&card).unwrap();
         assert_eq!(
             value["securityRequirements"],
-            serde_json::json!([{"schemes": {"bearer": {"list": []}}}])
+            // An empty scope list is omitted, matching ProtoJSON.
+            serde_json::json!([{"schemes": {"bearer": {}}}])
         );
         let back: AgentCard = serde_json::from_value(value).unwrap();
         assert_eq!(card, back);
@@ -967,6 +1021,125 @@ mod tests {
         );
         let back: AgentSkill = serde_json::from_value(value).unwrap();
         assert_eq!(skill, back);
+    }
+
+    /// A minimal card carrying the given security requirements, for the
+    /// serialization tests below.
+    fn card_with_requirements(requirements: Vec<SecurityRequirement>) -> AgentCard {
+        AgentCard {
+            name: "Secure Agent".to_string(),
+            description: String::new(),
+            version: "1.0.0".to_string(),
+            supported_interfaces: vec![],
+            capabilities: AgentCapabilities::default(),
+            default_input_modes: vec![],
+            default_output_modes: vec![],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: None,
+            security_requirements: Some(requirements),
+            signatures: None,
+        }
+    }
+
+    #[test]
+    fn security_requirements_serialize_in_stable_sorted_order() {
+        // A requirement with several schemes used to serialize in HashMap iteration
+        // order, so the same card produced different bytes from run to run: 56
+        // distinct strings over 60 clones of a six-scheme requirement (#361).
+        let names = ["zeta", "alpha", "mike", "bravo", "yankee", "charlie"];
+        let requirement: SecurityRequirement = names
+            .iter()
+            .map(|scheme| (scheme.to_string(), vec!["scope".to_string()]))
+            .collect();
+        let card = card_with_requirements(vec![requirement]);
+
+        // The exact string, so the assertion checks order and framing together.
+        assert_eq!(
+            serde_json::to_string(&card).unwrap(),
+            concat!(
+                r#"{"name":"Secure Agent","description":"","version":"1.0.0","supportedInterfaces":[],"#,
+                r#""capabilities":{},"defaultInputModes":[],"defaultOutputModes":[],"skills":[],"#,
+                r#""securityRequirements":[{"schemes":{"alpha":{"list":["scope"]},"#,
+                r#""bravo":{"list":["scope"]},"charlie":{"list":["scope"]},"mike":{"list":["scope"]},"#,
+                r#""yankee":{"list":["scope"]},"zeta":{"list":["scope"]}}}]}"#
+            )
+        );
+    }
+
+    #[test]
+    fn empty_scope_list_is_omitted_like_protojson() {
+        let card =
+            card_with_requirements(vec![[("bearer".to_string(), vec![])].into_iter().collect()]);
+        let value = serde_json::to_value(&card).unwrap();
+        assert_eq!(
+            value["securityRequirements"],
+            serde_json::json!([{"schemes": {"bearer": {}}}])
+        );
+    }
+
+    #[test]
+    fn scheme_literally_named_schemes_round_trips() {
+        let card = card_with_requirements(vec![
+            [("schemes".to_string(), vec!["read".to_string()])]
+                .into_iter()
+                .collect(),
+        ]);
+        let value = serde_json::to_value(&card).unwrap();
+        assert_eq!(
+            value["securityRequirements"],
+            serde_json::json!([{"schemes": {"schemes": {"list": ["read"]}}}])
+        );
+        let back: AgentCard = serde_json::from_value(value).unwrap();
+        assert_eq!(card, back);
+    }
+
+    #[test]
+    fn empty_security_requirements_round_trip() {
+        // Both the bare-object and the wrapped form mean "no scheme required".
+        for requirement in [serde_json::json!({}), serde_json::json!({"schemes": {}})] {
+            let card: AgentCard = serde_json::from_value(serde_json::json!({
+                "name": "Secure Agent",
+                "version": "1.0.0",
+                "supportedInterfaces": [],
+                "capabilities": {},
+                "securityRequirements": [requirement.clone()],
+            }))
+            .unwrap_or_else(|e| panic!("{requirement} did not parse: {e}"));
+
+            let requirements = card.security_requirements.clone().unwrap();
+            assert_eq!(requirements.len(), 1);
+            assert!(requirements[0].is_empty(), "{requirement} was not empty");
+
+            let value = serde_json::to_value(&card).unwrap();
+            assert_eq!(
+                value["securityRequirements"],
+                serde_json::json!([{"schemes": {}}]),
+                "{requirement} did not round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_flat_security_requirements_still_parse() {
+        // Pre-1.0 cards carried the schemes at the top level of the requirement.
+        let card: AgentCard = serde_json::from_value(serde_json::json!({
+            "name": "Secure Agent",
+            "version": "1.0.0",
+            "supportedInterfaces": [],
+            "capabilities": {},
+            "securityRequirements": [{"bearer": ["read"]}],
+        }))
+        .unwrap();
+
+        let requirements = card.security_requirements.unwrap();
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(
+            requirements[0].get("bearer"),
+            Some(&vec!["read".to_string()])
+        );
     }
 
     #[test]
@@ -1130,5 +1303,120 @@ mod tests {
                 .contains("invalid wrapped security scopes for bearerAuth"),
             "{err}"
         );
+    }
+
+    /// A card populated with every map the card graph serializes, so a
+    /// determinism test can see all of them.
+    fn card_with_every_map() -> AgentCard {
+        let mut schemes = HashMap::new();
+        for name in ["zeta", "alpha", "mike", "bravo", "yankee", "charlie"] {
+            schemes.insert(
+                name.to_string(),
+                SecurityScheme::HttpAuth(HttpAuthSecurityScheme {
+                    scheme: format!("{name}-scheme"),
+                    description: None,
+                    bearer_format: None,
+                }),
+            );
+        }
+        let mut scopes = HashMap::new();
+        for name in ["omega", "beta", "delta"] {
+            scopes.insert(name.to_string(), format!("{name} scope"));
+        }
+        schemes.insert(
+            "oauth".to_string(),
+            SecurityScheme::OAuth2(OAuth2SecurityScheme {
+                flows: OAuthFlows::AuthorizationCode(AuthorizationCodeOAuthFlow {
+                    authorization_url: "https://example.com/authorize".to_string(),
+                    token_url: "https://example.com/token".to_string(),
+                    scopes,
+                    refresh_url: None,
+                    pkce_required: None,
+                }),
+                description: None,
+                oauth2_metadata_url: None,
+            }),
+        );
+
+        let mut params = HashMap::new();
+        for name in ["zeta", "alpha", "mike", "bravo"] {
+            params.insert(name.to_string(), Value::String(format!("{name}-param")));
+        }
+
+        let mut header = HashMap::new();
+        for name in ["zeta", "alpha"] {
+            header.insert(name.to_string(), Value::String(format!("{name}-header")));
+        }
+
+        AgentCard {
+            name: "Secure Agent".to_string(),
+            description: String::new(),
+            version: "1.0.0".to_string(),
+            supported_interfaces: vec![],
+            capabilities: AgentCapabilities {
+                extensions: Some(vec![AgentExtension {
+                    uri: "https://example.com/ext".to_string(),
+                    description: None,
+                    required: Some(false),
+                    params: Some(params),
+                }]),
+                ..AgentCapabilities::default()
+            },
+            default_input_modes: vec![],
+            default_output_modes: vec![],
+            skills: vec![],
+            provider: None,
+            documentation_url: None,
+            icon_url: None,
+            security_schemes: Some(schemes),
+            security_requirements: Some(vec![
+                [
+                    ("zeta".to_string(), vec!["write".to_string()]),
+                    ("alpha".to_string(), vec!["read".to_string()]),
+                ]
+                .into_iter()
+                .collect(),
+            ]),
+            signatures: Some(vec![AgentCardSignature {
+                protected: "protected-header".to_string(),
+                signature: "c2ln".to_string(),
+                header: Some(header),
+            }]),
+        }
+    }
+
+    #[test]
+    fn agent_card_serializes_byte_identically_on_every_run() {
+        // #361 acceptance: a card serializes identically on every run. Rebuilding
+        // this card 60 times used to yield 60 distinct strings, because every map
+        // in the card graph iterated in HashMap order: securitySchemes alone was
+        // 60 distinct, extension params 22, and the signature header 2. The
+        // requirement's own schemes were fixed first and stayed at 1.
+        const EXPECTED: &str = concat!(
+            r#"{"name":"Secure Agent","description":"","version":"1.0.0","supportedInterfaces":[],"#,
+            r#""capabilities":{"extensions":[{"uri":"https://example.com/ext","required":false,"#,
+            r#""params":{"alpha":"alpha-param","bravo":"bravo-param","mike":"mike-param","zeta":"zeta-param"}}]},"#,
+            r#""defaultInputModes":[],"defaultOutputModes":[],"skills":[],"securitySchemes":{"#,
+            r#""alpha":{"httpAuthSecurityScheme":{"scheme":"alpha-scheme"}},"#,
+            r#""bravo":{"httpAuthSecurityScheme":{"scheme":"bravo-scheme"}},"#,
+            r#""charlie":{"httpAuthSecurityScheme":{"scheme":"charlie-scheme"}},"#,
+            r#""mike":{"httpAuthSecurityScheme":{"scheme":"mike-scheme"}},"#,
+            r#""oauth":{"oauth2SecurityScheme":{"flows":{"authorizationCode":{"#,
+            r#""authorizationUrl":"https://example.com/authorize","tokenUrl":"https://example.com/token","#,
+            r#""scopes":{"beta":"beta scope","delta":"delta scope","omega":"omega scope"}}}}},"#,
+            r#""yankee":{"httpAuthSecurityScheme":{"scheme":"yankee-scheme"}},"#,
+            r#""zeta":{"httpAuthSecurityScheme":{"scheme":"zeta-scheme"}}},"#,
+            r#""securityRequirements":[{"schemes":{"alpha":{"list":["read"]},"zeta":{"list":["write"]}}}],"#,
+            r#""signatures":[{"protected":"protected-header","signature":"c2ln","#,
+            r#""header":{"alpha":"alpha-header","zeta":"zeta-header"}}]}"#
+        );
+
+        for run in 0..60 {
+            assert_eq!(
+                serde_json::to_string(&card_with_every_map()).unwrap(),
+                EXPECTED,
+                "serialization differed on run {run}"
+            );
+        }
     }
 }
