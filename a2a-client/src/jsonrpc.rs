@@ -41,14 +41,30 @@ fn parse_jsonrpc_error(err: JsonRpcError) -> A2AError {
 fn parse_jsonrpc_response(
     status: reqwest::StatusCode,
     body: &str,
+    expected_id: &JsonRpcId,
 ) -> Result<JsonRpcResponse, A2AError> {
-    serde_json::from_str(body).map_err(|e| {
+    let response: JsonRpcResponse = serde_json::from_str(body).map_err(|e| {
         if status.is_success() {
             A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
         } else {
             A2AError::internal(format!("HTTP {status}: {body}"))
         }
-    })
+    })?;
+    validate_response_id(&response, expected_id)?;
+    Ok(response)
+}
+
+fn validate_response_id(response: &JsonRpcResponse, expected: &JsonRpcId) -> Result<(), A2AError> {
+    if response.id == *expected || (response.id == JsonRpcId::Null && response.error.is_some()) {
+        return Ok(());
+    }
+    Err(A2AError::new(
+        error_code::INVALID_AGENT_RESPONSE,
+        format!(
+            "JSON-RPC response ID mismatch: expected {expected:?}, got {:?}",
+            response.id
+        ),
+    ))
 }
 
 /// JSON-RPC transport implementation.
@@ -73,7 +89,7 @@ impl JsonRpcTransport {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, A2AError> {
         let id = JsonRpcId::String(uuid::Uuid::now_v7().to_string());
-        let rpc_request = JsonRpcRequest::new(id, method, Some(payload));
+        let rpc_request = JsonRpcRequest::new(id.clone(), method, Some(payload));
 
         let mut builder = self.client.post(&self.endpoint);
         for (key, values) in params {
@@ -91,7 +107,7 @@ impl JsonRpcTransport {
         let body = wire::response_text(response)
             .await
             .map_err(|e| A2AError::internal(format!("failed to parse JSON-RPC response: {e}")))?;
-        let rpc_response = parse_jsonrpc_response(status, &body)?;
+        let rpc_response = parse_jsonrpc_response(status, &body, &id)?;
 
         if let Some(err) = rpc_response.error {
             return Err(parse_jsonrpc_error(err));
@@ -147,7 +163,7 @@ impl JsonRpcTransport {
         let payload = protojson_conv::to_value(request_params).map_err(|e| {
             A2AError::internal(format!("failed to serialize request as ProtoJSON: {e}"))
         })?;
-        let rpc_request = JsonRpcRequest::new(id, method, Some(payload));
+        let rpc_request = JsonRpcRequest::new(id.clone(), method, Some(payload));
 
         let mut builder = self
             .client
@@ -179,12 +195,12 @@ impl JsonRpcTransport {
 
         if is_event_stream {
             let stream = response.bytes_stream();
-            Ok(parse_sse_stream(stream))
+            Ok(parse_sse_stream_with_id(stream, Some(id)))
         } else {
             let body = wire::response_text(response).await.map_err(|e| {
                 A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
             })?;
-            let rpc_response = parse_jsonrpc_response(status, &body)?;
+            let rpc_response = parse_jsonrpc_response(status, &body, &id)?;
 
             match rpc_response.error {
                 Some(err) => Err(parse_jsonrpc_error(err)),
@@ -238,6 +254,7 @@ pub(crate) fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
 pub(crate) fn parse_stream_tail(
     buf: &[u8],
     parse_event: &dyn Fn(&str) -> Option<Result<StreamResponse, A2AError>>,
+    expected_id: Option<&JsonRpcId>,
 ) -> Option<Result<StreamResponse, A2AError>> {
     let text = match std::str::from_utf8(buf) {
         Ok(text) => text,
@@ -259,6 +276,11 @@ pub(crate) fn parse_stream_tail(
 
     // A plain JSON-RPC envelope answering the streaming call.
     if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(text) {
+        if let Some(expected_id) = expected_id {
+            if let Err(error) = validate_response_id(&response, expected_id) {
+                return Some(Err(error));
+            }
+        }
         if let Some(error) = response.error {
             return Some(Err(parse_jsonrpc_error(error)));
         }
@@ -279,6 +301,29 @@ pub(crate) fn parse_stream_tail(
     ))))
 }
 
+/// Keep locally detected protocol failures distinct from errors sent by the
+/// server, even when both carry the same A2A error code.
+struct ParsedEvent {
+    item: Result<StreamResponse, A2AError>,
+    terminal: bool,
+}
+
+impl ParsedEvent {
+    fn deliver(item: Result<StreamResponse, A2AError>) -> Self {
+        Self {
+            item,
+            terminal: false,
+        }
+    }
+
+    fn terminal(error: A2AError) -> Self {
+        Self {
+            item: Err(error),
+            terminal: true,
+        }
+    }
+}
+
 /// Shared SSE byte-stream parser that abstracts over the event-parse callback.
 ///
 /// `parse_event` is invoked on each complete `\n\n`/`\r\r`/`\r\n\r\n`-delimited
@@ -286,29 +331,42 @@ pub(crate) fn parse_stream_tail(
 fn parse_sse_bytes<F>(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     parse_event: F,
+    expected_id: Option<JsonRpcId>,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>>
 where
-    F: Fn(&str) -> Option<Result<StreamResponse, A2AError>> + Clone + Send + 'static,
+    F: Fn(&str) -> Option<ParsedEvent> + Clone + Send + 'static,
 {
     let mapped = stream::unfold(
         (
             // Fused: after the tail is emitted the unfold polls once more,
             // and polling a stream after it has returned `None` is allowed
             // to panic.
-            Box::pin(stream.fuse()),
+            Some(Box::pin(stream.fuse())),
             Vec::<u8>::new(),
-            VecDeque::new(),
+            VecDeque::<ParsedEvent>::new(),
             parse_event,
+            expected_id,
+            false,
         ),
-        |(mut stream, mut buf, mut pending, parse_event)| async move {
+        |(mut stream, mut buf, mut pending, parse_event, expected_id, terminal)| async move {
+            if terminal {
+                return None;
+            }
             loop {
                 // Drain already-parsed events before reading more bytes.
                 // Ensures all events from a single chunk are delivered before
                 // polling the stream again.
-                if let Some(item) = pending.pop_front() {
-                    return Some((item, (stream, buf, pending, parse_event)));
+                if let Some(event) = pending.pop_front() {
+                    let terminal = event.terminal;
+                    if terminal {
+                        stream = None;
+                    }
+                    return Some((
+                        event.item,
+                        (stream, buf, pending, parse_event, expected_id, terminal),
+                    ));
                 }
-                match stream.next().await {
+                match stream.as_mut().expect("non-terminal stream").next().await {
                     Some(Ok(chunk)) => {
                         // Keep the buffer as raw bytes; defer UTF-8 decoding to event boundaries.
                         buf.extend_from_slice(&chunk);
@@ -317,9 +375,9 @@ where
                             let event_text = match std::str::from_utf8(&event_bytes[..start]) {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    pending.push_back(Err(A2AError::internal(format!(
-                                        "SSE UTF-8 decode error: {e}"
-                                    ))));
+                                    pending.push_back(ParsedEvent::deliver(Err(
+                                        A2AError::internal(format!("SSE UTF-8 decode error: {e}")),
+                                    )));
                                     continue;
                                 }
                             };
@@ -335,15 +393,25 @@ where
                         }
                     }
                     Some(Err(e)) => {
-                        pending
-                            .push_back(Err(A2AError::internal(format!("SSE stream error: {e}"))));
+                        pending.push_back(ParsedEvent::deliver(Err(A2AError::internal(format!(
+                            "SSE stream error: {e}"
+                        )))));
                     }
                     None => {
                         // End of stream: interpret the residual buffer
                         // rather than dropping it (#197).
                         let tail = std::mem::take(&mut buf);
-                        return parse_stream_tail(&tail, &parse_event)
-                            .map(|item| (item, (stream, buf, pending, parse_event)));
+                        return parse_stream_tail(
+                            &tail,
+                            &|text| parse_event(text).map(|event| event.item),
+                            expected_id.as_ref(),
+                        )
+                        .map(|item| {
+                            (
+                                item,
+                                (stream, buf, pending, parse_event, expected_id, false),
+                            )
+                        });
                     }
                 }
             }
@@ -354,53 +422,86 @@ where
 }
 
 /// Parse an SSE byte stream into StreamResponse events (JSON-RPC envelope).
+#[cfg(test)]
 fn parse_sse_stream(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-    parse_sse_bytes(stream, |event_text| {
-        // Extract `data:` lines from the SSE event
-        let mut data = String::new();
-        for line in event_text.lines() {
-            if let Some(d) = line.strip_prefix("data: ") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(d);
-            } else if let Some(d) = line.strip_prefix("data:") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(d);
-            }
-        }
-        if data.is_empty() {
-            return None;
-        }
+    parse_sse_stream_with_id(stream, None)
+}
 
-        // Try JSON-RPC envelope first
-        match serde_json::from_str::<JsonRpcResponse>(&data) {
-            Ok(rpc_resp) => {
-                if let Some(err) = rpc_resp.error {
-                    return Some(Err(parse_jsonrpc_error(err)));
-                }
-                if let Some(result) = rpc_resp.result {
-                    match protojson_conv::from_value::<StreamResponse>(result) {
-                        Ok(sr) => Some(Ok(sr)),
-                        Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
+fn parse_sse_stream_with_id(
+    stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    expected_id: Option<JsonRpcId>,
+) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    let event_id = expected_id.clone();
+    parse_sse_bytes(
+        stream,
+        move |event_text| {
+            // Extract `data:` lines from the SSE event
+            let mut data = String::new();
+            for line in event_text.lines() {
+                if let Some(d) = line.strip_prefix("data: ") {
+                    if !data.is_empty() {
+                        data.push('\n');
                     }
-                } else {
-                    None
+                    data.push_str(d);
+                } else if let Some(d) = line.strip_prefix("data:") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(d);
                 }
             }
-            Err(_) => {
-                // Fallback: parse directly as StreamResponse
-                match protojson_conv::from_str::<StreamResponse>(&data) {
-                    Ok(sr) => Some(Ok(sr)),
-                    Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
+            if data.is_empty() {
+                return None;
+            }
+
+            // Try JSON-RPC envelope first
+            match serde_json::from_str::<JsonRpcResponse>(&data) {
+                Ok(rpc_resp) => {
+                    if let Some(expected_id) = &event_id {
+                        if let Err(error) = validate_response_id(&rpc_resp, expected_id) {
+                            return Some(ParsedEvent::terminal(error));
+                        }
+                    }
+                    if let Some(err) = rpc_resp.error {
+                        return Some(ParsedEvent::deliver(Err(parse_jsonrpc_error(err))));
+                    }
+                    if let Some(result) = rpc_resp.result {
+                        match protojson_conv::from_value::<StreamResponse>(result) {
+                            Ok(sr) => Some(ParsedEvent::deliver(Ok(sr))),
+                            Err(e) => Some(ParsedEvent::deliver(Err(A2AError::internal(format!(
+                                "SSE parse error: {e}"
+                            ))))),
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => {
+                    if event_id.is_some()
+                        && let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&data)
+                        && ["jsonrpc", "id", "result", "error"]
+                            .iter()
+                            .any(|key| object.contains_key(*key))
+                    {
+                        return Some(ParsedEvent::terminal(A2AError::new(
+                            error_code::INVALID_AGENT_RESPONSE,
+                            "malformed JSON-RPC response envelope",
+                        )));
+                    }
+                    // Fallback: parse directly as StreamResponse
+                    match protojson_conv::from_str::<StreamResponse>(&data) {
+                        Ok(sr) => Some(ParsedEvent::deliver(Ok(sr))),
+                        Err(e) => Some(ParsedEvent::deliver(Err(A2AError::internal(format!(
+                            "SSE parse error: {e}"
+                        ))))),
+                    }
                 }
             }
-        }
-    })
+        },
+        expected_id,
+    )
 }
 
 /// Parse an SSE byte stream into StreamResponse events (REST binding).
@@ -409,33 +510,39 @@ fn parse_sse_stream(
 pub(crate) fn parse_sse_stream_rest(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-    parse_sse_bytes(stream, |event_text| {
-        let mut data = String::new();
-        for line in event_text.lines() {
-            if let Some(d) = line.strip_prefix("data: ") {
-                if !data.is_empty() {
-                    data.push('\n');
+    parse_sse_bytes(
+        stream,
+        |event_text| {
+            let mut data = String::new();
+            for line in event_text.lines() {
+                if let Some(d) = line.strip_prefix("data: ") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(d);
+                } else if let Some(d) = line.strip_prefix("data:") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(d);
                 }
-                data.push_str(d);
-            } else if let Some(d) = line.strip_prefix("data:") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(d);
             }
-        }
-        if data.is_empty() {
-            return None;
-        }
-        if let Some(error) = crate::rest::rest_error(&data) {
-            return Some(Err(error));
-        }
+            if data.is_empty() {
+                return None;
+            }
+            if let Some(error) = crate::rest::rest_error(&data) {
+                return Some(ParsedEvent::deliver(Err(error)));
+            }
 
-        match protojson_conv::from_str::<StreamResponse>(&data) {
-            Ok(sr) => Some(Ok(sr)),
-            Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
-        }
-    })
+            match protojson_conv::from_str::<StreamResponse>(&data) {
+                Ok(sr) => Some(ParsedEvent::deliver(Ok(sr))),
+                Err(e) => Some(ParsedEvent::deliver(Err(A2AError::internal(format!(
+                    "SSE parse error: {e}"
+                ))))),
+            }
+        },
+        None,
+    )
 }
 
 #[async_trait]
@@ -533,8 +640,11 @@ impl Transport for JsonRpcTransport {
         let request_params = protojson_conv::to_value(req).map_err(|e| {
             A2AError::internal(format!("failed to serialize request as ProtoJSON: {e}"))
         })?;
-        let rpc_request =
-            JsonRpcRequest::new(id, methods::DELETE_PUSH_CONFIG, Some(request_params));
+        let rpc_request = JsonRpcRequest::new(
+            id.clone(),
+            methods::DELETE_PUSH_CONFIG,
+            Some(request_params),
+        );
 
         let mut builder = self.client.post(&self.endpoint);
         for (key, values) in params {
@@ -549,7 +659,7 @@ impl Transport for JsonRpcTransport {
         let body = wire::response_text(response)
             .await
             .map_err(|e| A2AError::internal(format!("failed to parse JSON-RPC response: {e}")))?;
-        let rpc_response = parse_jsonrpc_response(status, &body)?;
+        let rpc_response = parse_jsonrpc_response(status, &body, &id)?;
 
         if let Some(err) = rpc_response.error {
             return Err(parse_jsonrpc_error(err));
@@ -637,7 +747,16 @@ mod tests {
         )
     }
 
-    async fn spawn_jsonrpc_server(response_body: String) -> (String, oneshot::Receiver<String>) {
+    #[derive(Clone, Copy)]
+    enum ResponseId {
+        EchoRequest,
+        AsProvided,
+    }
+
+    async fn spawn_jsonrpc_server(
+        response_body: String,
+        response_id: ResponseId,
+    ) -> (String, oneshot::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (request_tx, request_rx) = oneshot::channel();
@@ -645,6 +764,16 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let request = read_http_request(&mut socket).await;
+            let request_body = request.split_once("\r\n\r\n").unwrap().1;
+            let request_id = serde_json::from_str::<Value>(request_body).unwrap()["id"].clone();
+            let response_body = match response_id {
+                ResponseId::EchoRequest => {
+                    let mut value: Value = serde_json::from_str(&response_body).unwrap();
+                    value["id"] = request_id;
+                    value.to_string()
+                }
+                ResponseId::AsProvided => response_body,
+            };
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 response_body.len(),
@@ -658,13 +787,33 @@ mod tests {
         (format!("http://{addr}"), request_rx)
     }
 
-    async fn spawn_jsonrpc_sse_server(sse_body: String) -> String {
+    async fn spawn_jsonrpc_sse_server(sse_body: String, response_id: ResponseId) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let _request = read_http_request(&mut socket).await;
+            let request = read_http_request(&mut socket).await;
+            let request_body = request.split_once("\r\n\r\n").unwrap().1;
+            let request_id = serde_json::from_str::<Value>(request_body).unwrap()["id"].clone();
+            let sse_body = sse_body
+                .lines()
+                .map(|line| {
+                    if matches!(response_id, ResponseId::EchoRequest)
+                        && let Some(data) = line.strip_prefix("data: ")
+                    {
+                        if let Ok(mut value) = serde_json::from_str::<Value>(data) {
+                            if value.get("id").is_some() {
+                                value["id"] = request_id.clone();
+                                return format!("data: {value}");
+                            }
+                        }
+                    }
+                    line.to_owned()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n{}",
                 sse_body.len(),
@@ -800,6 +949,57 @@ mod tests {
         let mut parsed = parse_sse_stream(stream);
         let item = parsed.next().await.unwrap();
         assert!(item.is_err());
+    }
+
+    #[tokio::test]
+    async fn multiline_sse_jsonrpc_error_validates_response_id() {
+        for (response_id, expected_code) in [
+            ("expected", -32600),
+            ("another-request", error_code::INVALID_AGENT_RESPONSE),
+        ] {
+            let event = format!(
+                "data: {{\"jsonrpc\":\"2.0\",\ndata:\"id\":\"{response_id}\",\ndata: \"error\":{{\"code\":-32600,\"message\":\"bad request\"}}}}\n\n"
+            );
+            let stream = byte_stream(vec![event]);
+            let mut parsed =
+                parse_sse_stream_with_id(stream, Some(JsonRpcId::String("expected".into())));
+            assert_eq!(
+                parsed.next().await.unwrap().unwrap_err().code,
+                expected_code
+            );
+            assert!(parsed.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn multiline_rest_sse_event_preserves_status_update() {
+        let event = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "task-1".into(),
+            context_id: "context-1".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        let data =
+            serde_json::to_string_pretty(&protojson_conv::to_value(&event).unwrap()).unwrap();
+        let sse = data
+            .lines()
+            .enumerate()
+            .map(|(i, line)| format!("{}{}\n", if i % 2 == 0 { "data: " } else { "data:" }, line))
+            .collect::<String>()
+            + "\n";
+        let mut parsed = parse_sse_stream_rest(byte_stream(vec![sse]));
+        match parsed.next().await.unwrap().unwrap() {
+            StreamResponse::StatusUpdate(update) => {
+                assert_eq!(update.task_id, "task-1");
+                assert_eq!(update.status.state, TaskState::Working);
+            }
+            other => panic!("expected status update, got {other:?}"),
+        }
+        assert!(parsed.next().await.is_none());
     }
 
     #[tokio::test]
@@ -1361,7 +1561,7 @@ mod tests {
             }
         })
         .to_string();
-        let (endpoint, request_rx) = spawn_jsonrpc_server(response).await;
+        let (endpoint, request_rx) = spawn_jsonrpc_server(response, ResponseId::EchoRequest).await;
         let transport =
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
         let mut params = ServiceParams::new();
@@ -1411,7 +1611,7 @@ mod tests {
             }
         })
         .to_string();
-        let (endpoint, _request_rx) = spawn_jsonrpc_server(response).await;
+        let (endpoint, _request_rx) = spawn_jsonrpc_server(response, ResponseId::EchoRequest).await;
         let transport =
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
@@ -1444,7 +1644,7 @@ mod tests {
             protojson_conv::to_value(&status_update).unwrap(),
         );
         let sse_body = format!("data: {}\n\n", serde_json::to_string(&rpc_resp).unwrap());
-        let endpoint = spawn_jsonrpc_sse_server(sse_body).await;
+        let endpoint = spawn_jsonrpc_sse_server(sse_body, ResponseId::EchoRequest).await;
         let transport =
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
@@ -1477,7 +1677,7 @@ mod tests {
             }
         })
         .to_string();
-        let (endpoint, _request_rx) = spawn_jsonrpc_server(response).await;
+        let (endpoint, _request_rx) = spawn_jsonrpc_server(response, ResponseId::EchoRequest).await;
         let transport =
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
@@ -1510,7 +1710,7 @@ mod tests {
             "result": {}
         })
         .to_string();
-        let (endpoint, _request_rx) = spawn_jsonrpc_server(response).await;
+        let (endpoint, _request_rx) = spawn_jsonrpc_server(response, ResponseId::EchoRequest).await;
         let transport =
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
@@ -1538,7 +1738,8 @@ mod tests {
     async fn test_subscribe_to_task_surfaces_unparseable_non_streaming_body() {
         // A non-SSE body that isn't valid JSON-RPC either (e.g. a raw error
         // page from a proxy) should surface as an error, not an empty stream.
-        let (endpoint, _request_rx) = spawn_jsonrpc_server("not json".into()).await;
+        let (endpoint, _request_rx) =
+            spawn_jsonrpc_server("not json".into(), ResponseId::AsProvided).await;
         let transport =
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
@@ -1608,7 +1809,7 @@ mod tests {
             "id": "1"
         })
         .to_string();
-        let (endpoint, _request_rx) = spawn_jsonrpc_server(response).await;
+        let (endpoint, _request_rx) = spawn_jsonrpc_server(response, ResponseId::EchoRequest).await;
         let transport =
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
@@ -1635,7 +1836,7 @@ mod tests {
             }
         })
         .to_string();
-        let (endpoint, request_rx) = spawn_jsonrpc_server(response).await;
+        let (endpoint, request_rx) = spawn_jsonrpc_server(response, ResponseId::EchoRequest).await;
         let transport =
             JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
 
@@ -2063,6 +2264,234 @@ mod tests {
         assert_eq!(items.len(), 1, "expected one item, got {items:?}");
         let error = items.into_iter().next().unwrap().unwrap_err();
         assert!(error.message.contains("end of stream"), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn test_transport_rejects_mismatched_response_id() {
+        let response =
+            json!({"jsonrpc":"2.0", "id":"another-request", "result": {"ok":true}}).to_string();
+        let (endpoint, request_rx) = spawn_jsonrpc_server(response, ResponseId::AsProvided).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+        let result = transport
+            .call_value_with_payload(&ServiceParams::new(), "GetTask", json!({}))
+            .await;
+        let request = request_rx.await.unwrap();
+        assert!(request.contains("GetTask"));
+        assert_eq!(result.unwrap_err().code, error_code::INVALID_AGENT_RESPONSE);
+    }
+
+    #[tokio::test]
+    async fn test_transport_rejects_wrong_id_errors_and_null_id_results() {
+        for response in [
+            json!({"jsonrpc":"2.0", "id":"another-request", "error":{"code":-32001,"message":"not found"}}),
+            json!({"jsonrpc":"2.0", "id":null, "result": {"ok":true}}),
+        ] {
+            let (endpoint, _request_rx) =
+                spawn_jsonrpc_server(response.to_string(), ResponseId::AsProvided).await;
+            let transport =
+                JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+            let error = transport
+                .call_value_with_payload(&ServiceParams::new(), "GetTask", json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transport_accepts_null_id_error() {
+        let response =
+            json!({"jsonrpc":"2.0", "id":null, "error":{"code":-32001,"message":"not found"}});
+        let (endpoint, _request_rx) =
+            spawn_jsonrpc_server(response.to_string(), ResponseId::AsProvided).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+        let error = transport
+            .call_value_with_payload(&ServiceParams::new(), "GetTask", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, -32001);
+    }
+
+    #[tokio::test]
+    async fn test_stream_preflight_and_delete_reject_wrong_ids() {
+        let response = json!({"jsonrpc":"2.0", "id":"another-request", "error":{"code":-32001,"message":"not found"}}).to_string();
+        let (endpoint, _request_rx) =
+            spawn_jsonrpc_server(response.clone(), ResponseId::AsProvided).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+        let request = SubscribeToTaskRequest {
+            id: "t".into(),
+            tenant: None,
+        };
+        let error = match transport
+            .subscribe_to_task(&ServiceParams::new(), &request)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("unexpected stream"),
+        };
+        assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+
+        let (endpoint, _request_rx) = spawn_jsonrpc_server(response, ResponseId::AsProvided).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+        let request = DeleteTaskPushNotificationConfigRequest {
+            task_id: "t".into(),
+            id: "cfg".into(),
+            tenant: None,
+        };
+        let error = transport
+            .delete_push_config(&ServiceParams::new(), &request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+    }
+
+    #[tokio::test]
+    async fn test_transport_stream_rejects_mismatched_event_id() {
+        let event = json!({"jsonrpc":"2.0", "id":"another-request", "error":{"code":-32001,"message":"not found"}});
+        let endpoint =
+            spawn_jsonrpc_sse_server(format!("data: {event}\n\n"), ResponseId::AsProvided).await;
+        let transport =
+            JsonRpcTransport::new(crate::default_reqwest_client(None).unwrap(), endpoint);
+        let request = SubscribeToTaskRequest {
+            id: "t".into(),
+            tenant: None,
+        };
+        let mut stream = transport
+            .subscribe_to_task(&ServiceParams::new(), &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap_err().code,
+            error_code::INVALID_AGENT_RESPONSE
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_rejects_mismatched_id_in_event_and_plain_tail() {
+        for prefix in ["data: ", ""] {
+            let body = format!(
+                "{prefix}{{\"jsonrpc\":\"2.0\",\"id\":\"another-request\",\"error\":{{\"code\":-32001,\"message\":\"not found\"}}}}{}",
+                if prefix.is_empty() { "" } else { "\n\n" }
+            );
+            let mut stream = parse_sse_stream_with_id(
+                byte_stream(vec![body]),
+                Some(JsonRpcId::String("expected".into())),
+            );
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_rejects_missing_id_jsonrpc_envelope() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"result\":{}}\n\n".to_owned();
+        let mut stream = parse_sse_stream_with_id(
+            byte_stream(vec![body]),
+            Some(JsonRpcId::String("expected".into())),
+        );
+        assert!(stream.next().await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stream_rejects_malformed_envelope_with_direct_event_fields() {
+        for id in [None, Some(json!({"invalid":"id"}))] {
+            let mut body = json!({"jsonrpc":"2.0", "task":{"id":"t","contextId":"c","status":{"state":"TASK_STATE_WORKING"}}});
+            if let Some(id) = id {
+                body["id"] = id;
+            }
+            let framed = format!("data: {body}\n\n");
+            let mut stream = parse_sse_stream_with_id(
+                byte_stream(vec![framed]),
+                Some(JsonRpcId::String("expected".into())),
+            );
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_stops_after_id_mismatch() {
+        let wrong =
+            json!({"jsonrpc":"2.0", "id":"wrong", "error":{"code":-32001,"message":"not found"}});
+        let valid = json!({"jsonrpc":"2.0", "id":"expected", "result":{"task":{"id":"t","contextId":"c","status":{"state":"TASK_STATE_WORKING"}}}});
+        let mut stream = parse_sse_stream_with_id(
+            byte_stream(vec![format!("data: {wrong}\n\ndata: {valid}\n\n")]),
+            Some(JsonRpcId::String("expected".into())),
+        );
+        assert_eq!(
+            stream.next().await.unwrap().unwrap_err().code,
+            error_code::INVALID_AGENT_RESPONSE
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn server_invalid_agent_response_does_not_masquerade_as_id_mismatch() {
+        let server_error = json!({"jsonrpc":"2.0", "id":"expected", "error":{"code":error_code::INVALID_AGENT_RESPONSE,"message":"executor error"}});
+        let valid = json!({"jsonrpc":"2.0", "id":"expected", "result":{"task":{"id":"t","contextId":"c","status":{"state":"TASK_STATE_WORKING"}}}});
+        let mut stream = parse_sse_stream_with_id(
+            byte_stream(vec![format!("data: {server_error}\n\ndata: {valid}\n\n")]),
+            Some(JsonRpcId::String("expected".into())),
+        );
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+        assert_eq!(error.message, "executor error");
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamResponse::Task(_)))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_drops_source_immediately_after_id_mismatch() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct DropStream {
+            dropped: Arc<AtomicBool>,
+            sent: bool,
+        }
+        impl futures::Stream for DropStream {
+            type Item = Result<bytes::Bytes, reqwest::Error>;
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                if self.sent {
+                    return std::task::Poll::Pending;
+                }
+                self.sent = true;
+                std::task::Poll::Ready(Some(Ok(bytes::Bytes::from_static(b"data: {\"jsonrpc\":\"2.0\",\"id\":\"wrong\",\"error\":{\"code\":-32001,\"message\":\"not found\"}}\n\n"))))
+            }
+        }
+        impl Drop for DropStream {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut stream = parse_sse_stream_with_id(
+            DropStream {
+                dropped: dropped.clone(),
+                sent: false,
+            },
+            Some(JsonRpcId::String("expected".into())),
+        );
+        assert_eq!(
+            stream.next().await.unwrap().unwrap_err().code,
+            error_code::INVALID_AGENT_RESPONSE
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "source was retained after returning the error"
+        );
     }
 
     /// An envelope with neither result nor error is not a usable event, so
