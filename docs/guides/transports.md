@@ -12,7 +12,7 @@ mount more than one on the same handler.
 | JSON-RPC | `a2a-server-lf`, `a2a-client-lf` | JSON over HTTP POST | Default. Widest client support and the simplest to debug. |
 | REST | `a2a-server-lf`, `a2a-client-lf` | JSON over HTTP verbs | You want resource-oriented URLs and plain HTTP tooling. |
 | gRPC | `a2a-grpc`, `a2a-pb` | Protocol Buffers | You already use gRPC, or want generated clients in many languages. |
-| SLIMRPC | `a2a-slimrpc` | SLIM peer transport | You are inside a SLIM deployment and want its identity model. |
+| SLIMRPC | `a2a-slimrpc` | Protocol Buffers | When you need e2e encrypted, collaborative (multi-party) communication between distributed Agents. |
 
 An agent advertises the bindings it serves in `supportedInterfaces`, one
 `AgentInterface` per binding, so a client can pick one. Advertise only what you
@@ -58,7 +58,9 @@ yet, so this page cannot include one from a compiled file. Its `README.md`
 documents the caller-identity keys it sets on `ServiceParams` and the target
 format in detail; `a2a-slimrpc/tests/e2e.rs` is the working reference.
 
-## Serving several bindings from one handler
+## Additional Considerations
+
+### Serving several bindings from one handler
 
 Every binding takes the same `RequestHandler`, so one executor can be reached
 over JSON-RPC, REST and gRPC at once — which is what the hello world example
@@ -69,7 +71,7 @@ binding a request arrived on.
 List each binding in the card's `supportedInterfaces` with the URL a client
 should use, and keep those URLs in step with where you actually listen.
 
-## TLS
+### TLS
 
 `a2a_server::tls` re-exports the pieces needed to terminate TLS in-process. The
 `rustls-tls` feature is on by default and uses `rustls`; `native-tls` switches
