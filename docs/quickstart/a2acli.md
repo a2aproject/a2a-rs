@@ -4,6 +4,19 @@
 
 The commands run the CLI from a checkout of the repository. With an installed binary, run `a2acli` in place of `cargo run -q --bin a2acli --`. The [command reference](../reference/a2acli.md) covers everything else.
 
+!!! note "If the build asks for CMake"
+
+    Run from the root of the checkout, `cargo run --bin a2acli` builds with the dependencies of every crate in the workspace, including `a2a-slimrpc`. Its dependencies build a C library with [CMake](https://cmake.org/download/), so the build stops with `Missing dependency: cmake` when CMake is missing. The CLI itself does not need CMake. You have two ways around it:
+
+    - Install CMake.
+    - Name the package, so that only the CLI's own dependencies are built:
+
+        ```bash
+        cargo run -q -p a2a-cli --bin a2acli --
+        ```
+
+    Use that in place of `cargo run -q --bin a2acli --` in the commands below. An installed binary does not need CMake. The [install page](../install.md) lists the requirements.
+
 ## Name the agent
 
 `a2acli` targets `http://localhost:3000` unless told otherwise, which is the port of the hello world example. The greeter listens on port 9999. Set it once in the environment:
