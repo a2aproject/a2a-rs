@@ -7,12 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Validate JSON-RPC response IDs, including streamed events. A success response
-  with a null or mismatched ID is now rejected as an invalid agent response;
-  null-ID error responses remain supported.
-
 ## [0.2.9](https://github.com/a2aproject/a2a-rs/compare/a2a-client-lf-v0.2.8...a2a-client-lf-v0.2.9) - 2026-10-16
 
 ### Other
