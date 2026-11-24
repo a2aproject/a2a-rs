@@ -482,8 +482,12 @@ fn subscription_stream(
                         match &event.result {
                             Ok(item) if is_terminal_event(item) => state.done = true,
                             // §3.1.2: a Message answer is "exactly one Message
-                            // object and then close immediately"; a pending
-                            // cancellation's later items do not follow it.
+                            // object and then close immediately". Nothing may
+                            // follow an answering Message on that execution, so
+                            // attached and waiting subscriptions (§3.1.6), which
+                            // follow the same execution, end at the Message too,
+                            // and a pending cancellation's later items do not
+                            // follow it.
                             Ok(StreamResponse::Message(_)) | Err(_) => state.done = true,
                             _ => {}
                         }
