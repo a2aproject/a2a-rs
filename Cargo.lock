@@ -122,6 +122,7 @@ dependencies = [
  "futures",
  "http-body-util",
  "hyper",
+ "percent-encoding",
  "reqwest",
  "rustls",
  "serde",
