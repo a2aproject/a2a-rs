@@ -76,6 +76,10 @@ docs: docs-install
 docs-build: docs-install
     .venv-docs/bin/mkdocs build --strict
 
+# Export the docs as plain Markdown for the A2A site to mount
+docs-export out='docs-export': docs-install
+    .venv-docs/bin/python scripts/export_docs.py {{out}}
+
 # Clean build artifacts
 clean:
     cargo clean
