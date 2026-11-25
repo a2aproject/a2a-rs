@@ -33,5 +33,7 @@ tracing = { workspace = true }
 fuzzing = []
 
 [dev-dependencies]
+base64 = { workspace = true }
+rcgen = { workspace = true }
 slim_config = { workspace = true }
 tracing-subscriber = { workspace = true }

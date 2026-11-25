@@ -281,6 +281,7 @@ async fn run_with_config(endpoint: &str, config: PluginConfig) -> Result<(), Plu
     let app_name = parse_proto_name(&config.app.name)?;
     let (slim_app, _notifications) = service
         .create_app(&app_name, provider, verifier)
+        .await
         .map_err(|e| PluginError::Slim(format!("create_app failed: {e}")))?;
     let slim_app = Arc::new(slim_app);
 

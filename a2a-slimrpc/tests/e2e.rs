@@ -1,7 +1,8 @@
 // Copyright AGNTCY Contributors (https://github.com/agntcy)
 // Copyright A2A Contributors (https://github.com/a2aproject)
 // SPDX-License-Identifier: Apache-2.0
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use a2a::event::{StreamResponse, TaskStatusUpdateEvent};
@@ -15,11 +16,12 @@ use a2a_slimrpc::{
     SlimRpcHandler, SlimRpcTransport, SlimRpcTransportFactory,
 };
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use prost::Message as _;
-use slim_auth::auth_provider::{AuthProvider, AuthVerifier};
-use slim_auth::shared_secret::SharedSecret;
+use rcgen::{KeyPair, PKCS_ED25519};
 use slim_config::component::id::{ID, Kind};
 use slim_datapath::api::ProtoName as Name;
 use slim_rpc::{Channel, RpcCode, RpcError, Server};
@@ -33,7 +35,6 @@ const COLLABORATE_SERVICE_NAME: &str =
     "experimental.slimrpc.collaborative_channel.v1.CollaborativeChannelService";
 const COLLABORATE_METHOD: &str = "Collaborate";
 const NO_PART_CONTENT: &str = "must have one of: text, raw, url, data";
-const SHARED_SECRET: &str = "test-secret-with-sufficient-length-for-hmac-key";
 
 fn sample_message(role: Role, text: &str, task_id: &str) -> Message {
     Message {
@@ -121,13 +122,55 @@ fn send_message_request(task_id: &str) -> SendMessageRequest {
     }
 }
 
-/// Build a shared-secret auth provider/verifier pair for the given identity id.
-fn auth(id: &str) -> (AuthProvider, AuthVerifier) {
-    let secret = SharedSecret::new(id, SHARED_SECRET).unwrap();
-    (
-        AuthProvider::shared_secret(secret.clone()),
-        AuthVerifier::shared_secret(secret),
-    )
+/// How many identities the tests can hand out: one per app, and an app takes the next one.
+const IDENTITIES: usize = 256;
+
+/// The Ed25519 private keys (PKCS#8 PEM) of the test apps, and the JWKS that lists all of their
+/// public keys. Every app trusts that JWKS, so the apps accept each other.
+fn identities() -> &'static (Vec<String>, String) {
+    static IDENTITIES_AND_TRUST_ANCHOR: OnceLock<(Vec<String>, String)> = OnceLock::new();
+    IDENTITIES_AND_TRUST_ANCHOR.get_or_init(|| {
+        let key_pairs: Vec<KeyPair> = (0..IDENTITIES)
+            .map(|_| KeyPair::generate_for(&PKCS_ED25519).unwrap())
+            .collect();
+        let jwks: Vec<String> = key_pairs
+            .iter()
+            .map(|key_pair| {
+                let x = URL_SAFE_NO_PAD.encode(key_pair.public_key_raw());
+                format!(r#"{{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","use":"sig","x":"{x}"}}"#)
+            })
+            .collect();
+        (
+            key_pairs.iter().map(KeyPair::serialize_pem).collect(),
+            format!(r#"{{"keys":[{}]}}"#, jwks.join(",")),
+        )
+    })
+}
+
+/// The private key of a new identity, and the trust anchor.
+fn next_identity() -> (&'static str, &'static str) {
+    // The JWT verifier of the identity builds an HTTP client, which needs a TLS provider.
+    slim_config::tls::provider::initialize_crypto_provider();
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let (private_keys, trust_anchor) = identities();
+    let i = NEXT.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        i < IDENTITIES,
+        "the tests need more than {IDENTITIES} identities"
+    );
+    (&private_keys[i], trust_anchor)
+}
+
+/// Creates the app `name` on `service`, with a `did:key` identity that every other test app
+/// trusts. Gives back the app and its notifications.
+macro_rules! new_app {
+    ($service:expr, $name:expr) => {{
+        let (private_key, trust_anchor) = next_identity();
+        $service
+            .create_app_with_did_key($name, private_key, trust_anchor)
+            .await
+            .unwrap()
+    }};
 }
 
 struct TestEnv {
@@ -144,10 +187,7 @@ impl TestEnv {
         let service = Arc::new(Service::new(id));
 
         let server_name = Name::from_strings(["org", "test", test_name]);
-        let (provider, verifier) = auth("test-provider");
-        let (server_app, server_notifications) = service
-            .create_app(&server_name, provider, verifier)
-            .unwrap();
+        let (server_app, server_notifications) = new_app!(service, &server_name);
         let server_app = Arc::new(server_app);
         let server = Arc::new(Server::new(
             server_app.clone(),
@@ -183,8 +223,7 @@ impl TestEnv {
             "test".to_string(),
             format!("{}-{suffix}", self.test_name),
         ]);
-        let (provider, verifier) = auth("test-provider-client");
-        let (app, _) = self.service.create_app(&name, provider, verifier).unwrap();
+        let (app, _) = new_app!(self.service, &name);
         Arc::new(app)
     }
 
@@ -238,17 +277,18 @@ impl RequestHandler for TestHandler {
 
         if req.message.task_id.as_deref() == Some("identity-required") {
             // The caller's identity comes from the session: its SLIM name and
-            // the verified subject of its shared-secret token (id plus a
-            // per-instance suffix), never the spoofed values it sent.
+            // the verified subject and issuer of its token (both its own
+            // `did:key`), never the spoofed values it sent.
             let single = |key: &str| match params.get(key).map(Vec::as_slice) {
                 Some([value]) => Some(value.clone()),
                 _ => None,
             };
             let slim_src = single(SLIM_SRC_METADATA_KEY).unwrap_or_default();
             let subject = single(SLIM_PEER_SUBJECT_METADATA_KEY).unwrap_or_default();
+            let issuer = single(SLIM_PEER_ISSUER_METADATA_KEY).unwrap_or_default();
             if !slim_src.starts_with(&format!("{}-direct/", self.target))
-                || !subject.starts_with("test-provider-client")
-                || params.contains_key(SLIM_PEER_ISSUER_METADATA_KEY)
+                || !subject.starts_with("did:key:")
+                || issuer != subject
             {
                 return Err(A2AError::invalid_params(format!(
                     "unexpected caller identity: {params:?}"
@@ -1037,8 +1077,7 @@ async fn slimrpc_collaborate_broadcasts_to_every_other_member() {
             "test",
             &format!("collab-{suffix}"),
         ]));
-        let (provider, verifier) = auth(&format!("collab-provider-{suffix}"));
-        let (app, notifications) = service.create_app(&name, provider, verifier).unwrap();
+        let (app, notifications) = new_app!(service, &name);
         let app = Arc::new(app);
 
         let server = Arc::new(Server::new(
@@ -1127,8 +1166,7 @@ async fn slimrpc_collaborate_replies_are_attributed_to_their_sender() {
             "test",
             &format!("collab-{suffix}"),
         ]));
-        let (provider, verifier) = auth(&format!("collab-provider-{suffix}"));
-        let (app, notifications) = service.create_app(&name, provider, verifier).unwrap();
+        let (app, notifications) = new_app!(service, &name);
         apps.push((name, Arc::new(app), notifications));
     }
     let (echo_name, echo_app, notifications) = apps.remove(0);
@@ -1224,8 +1262,7 @@ async fn slimrpc_collaborate_drops_a_message_it_cannot_deliver() {
             "test",
             &format!("collab-invalid-{suffix}"),
         ]));
-        let (provider, verifier) = auth(&format!("collab-invalid-provider-{suffix}"));
-        let (app, notifications) = service.create_app(&name, provider, verifier).unwrap();
+        let (app, notifications) = new_app!(service, &name);
         apps.push((name, Arc::new(app), notifications));
     }
     let (listener_name, listener_app, notifications) = apps.remove(0);
