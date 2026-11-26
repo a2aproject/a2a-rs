@@ -281,6 +281,7 @@ async fn run_with_config(endpoint: &str, config: PluginConfig) -> Result<(), Plu
     let app_name = parse_proto_name(&config.app.name)?;
     let (slim_app, _notifications) = service
         .create_app(&app_name, provider, verifier)
+        .await
         .map_err(|e| PluginError::Slim(format!("create_app failed: {e}")))?;
     let slim_app = Arc::new(slim_app);
 
@@ -957,5 +958,85 @@ app:
         let (mut writer, reader) = tokio::io::duplex(64);
         writer.write_all(&[0]).await.unwrap();
         wait_for_close(reader).await;
+    }
+
+    // ── run_with_config ──────────────────────────────────────────────────────
+
+    /// Connects to a SLIM gateway, creates the app and subscribes it, which is the
+    /// part of `run_with_config` that needs a live gateway. It gets as far as
+    /// serving, so it either keeps running until the timeout or, when stdin is
+    /// already closed, returns `Ok`. Any error before that is a failure.
+    ///
+    /// The config sets a fast-failing `backoff`: without it a failed connect retries
+    /// past the timeout, which would be indistinguishable from serving.
+    ///
+    /// It runs on its own runtime: `run_with_config` reads stdin on a blocking
+    /// thread that never ends under `cargo test`, and dropping a runtime waits for
+    /// such a thread, so the runtime is shut down in the background.
+    #[test]
+    fn test_run_with_config_connects_creates_the_app_and_serves() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(run_with_config_against_a_gateway());
+        runtime.shutdown_background();
+    }
+
+    async fn run_with_config_against_a_gateway() {
+        slim_config::tls::provider::initialize_crypto_provider();
+
+        // A free port for the gateway.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let gateway = Service::new(
+            slim_config::component::id::ID::new_with_name(ServiceBuilder::kind(), "test-gateway")
+                .unwrap(),
+        );
+        gateway
+            .run_server(
+                &slim_config::grpc::server::ServerConfig::with_endpoint(&format!(
+                    "127.0.0.1:{port}"
+                ))
+                .with_tls_settings(
+                    slim_config::tls::server::TlsServerConfig::new().with_insecure(true),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let config: PluginConfig = yaml_serde::from_str(&format!(
+            r#"
+client:
+  endpoint: "http://127.0.0.1:{port}"
+  tls:
+    insecure: true
+  backoff:
+    type: fixed_interval
+    interval: 1ms
+    max_attempts: 0
+app:
+  name: "org/namespace/run-with-config"
+  identity_provider:
+    type: shared_secret
+    id: "run-with-config"
+    data: "test-secret-with-sufficient-length-for-hmac-key"
+  identity_verifier:
+    type: shared_secret
+    id: "run-with-config"
+    data: "test-secret-with-sufficient-length-for-hmac-key"
+"#
+        ))
+        .unwrap();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_with_config("slimrpc://org/namespace/remote", config),
+        )
+        .await;
+        if let Ok(result) = outcome {
+            result.unwrap();
+        }
+        gateway.shutdown().await.unwrap();
     }
 }

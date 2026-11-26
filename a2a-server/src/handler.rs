@@ -75,14 +75,22 @@ impl ActiveExecution {
         result: Result<&StreamResponse, &A2AError>,
         snapshot_task: Option<Task>,
     ) {
-        let sequence = {
-            let mut state = self.state.write().await;
-            if let Some(task) = snapshot_task {
-                state.snapshot_task = Some(task);
-            }
-            state.sequence += 1;
-            state.sequence
-        };
+        let mut state = self.state.write().await;
+        // An event can be persisted before cancellation, but held up while
+        // its push notification is sent. It must not restore the old snapshot
+        // or reach subscribers after the cancellation has been published.
+        if state
+            .snapshot_task
+            .as_ref()
+            .is_some_and(|task| task.status.state.is_terminal())
+        {
+            return;
+        }
+        if let Some(task) = snapshot_task {
+            state.snapshot_task = Some(task);
+        }
+        state.sequence += 1;
+        let sequence = state.sequence;
 
         // Task state remains available for a later subscription, but transient
         // events do not need to be allocated when no subscriber is listening.
@@ -94,6 +102,7 @@ impl ActiveExecution {
             sequence,
             result: result.cloned().map_err(Clone::clone),
         };
+        // Keep sequence assignment and broadcast ordered with the snapshot.
         let _ = self.sender.send(event);
     }
 
@@ -203,6 +212,62 @@ struct ReleaseOnDrop<'a> {
 impl Drop for ReleaseOnDrop<'_> {
     fn drop(&mut self) {
         self.manager.release(&self.task);
+    }
+}
+
+/// Complete an attached execution when cancellation exits after `begin_cancel`
+/// returned the committed final state, including when its future is dropped.
+struct FinishCancelOnDrop {
+    manager: Arc<ExecutionManager>,
+    active: Option<Arc<ActiveExecution>>,
+    task: Task,
+    armed: bool,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl FinishCancelOnDrop {
+    async fn finish(&mut self, publish_canceled: bool) {
+        if self.armed {
+            if let Some(active) = &self.active {
+                if publish_canceled {
+                    active
+                        .publish(Ok(&status_update(&self.task)), Some(self.task.clone()))
+                        .await;
+                }
+                self.manager.finish(&self.task.id, active).await;
+            }
+            self.armed = false;
+        }
+    }
+}
+
+async fn finish_cancel(
+    manager: Arc<ExecutionManager>,
+    active: Option<Arc<ActiveExecution>>,
+    task: Task,
+) {
+    let active = match active {
+        Some(active) => Some(active),
+        None => manager.get(&task.id).await,
+    };
+    if let Some(active) = active {
+        active
+            .publish(Ok(&status_update(&task)), Some(task.clone()))
+            .await;
+        manager.finish(&task.id, &active).await;
+    }
+}
+
+impl Drop for FinishCancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let manager = self.manager.clone();
+            let active = self.active.take();
+            let task = self.task.clone();
+            if let Some(runtime) = &self.runtime {
+                runtime.spawn(finish_cancel(manager, active, task));
+            }
+        }
     }
 }
 
@@ -489,7 +554,14 @@ fn subscription_stream(
                         state.min_sequence = event.sequence;
                         match &event.result {
                             Ok(item) if is_terminal_event(item) => state.done = true,
-                            Err(_) => state.done = true,
+                            // §3.1.2: a Message answer is "exactly one Message
+                            // object and then close immediately". Nothing may
+                            // follow an answering Message on that execution, so
+                            // attached and waiting subscriptions (§3.1.6), which
+                            // follow the same execution, end at the Message too,
+                            // and a pending cancellation's later items do not
+                            // follow it.
+                            Ok(StreamResponse::Message(_)) | Err(_) => state.done = true,
                             _ => {}
                         }
                         return Some((event.result.clone(), state));
@@ -1254,7 +1326,15 @@ impl RequestHandler for DefaultRequestHandler {
             task: task.clone(),
         };
 
+        let mut finish_cancel_guard = FinishCancelOnDrop {
+            manager: Arc::clone(&self.execution_manager),
+            active: None,
+            task: task.clone(),
+            armed: true,
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        };
         let active_execution = self.execution_manager.get(&req.id).await;
+        finish_cancel_guard.active = active_execution.clone();
 
         let exec_ctx = crate::ExecutorContext {
             message: None,
@@ -1275,18 +1355,34 @@ impl RequestHandler for DefaultRequestHandler {
             match event {
                 Ok(mut event) => {
                     backfill_status_timestamp(&mut event);
-                    let updated_task =
-                        apply_event_to_task(self.task_store.as_ref(), current_task.clone(), &event)
-                            .await?;
+                    let updated_task = match apply_event_to_task(
+                        self.task_store.as_ref(),
+                        current_task.clone(),
+                        &event,
+                    )
+                    .await
+                    {
+                        Ok(task) => task,
+                        Err(error) => {
+                            finish_cancel_guard.finish(true).await;
+                            return Err(error);
+                        }
+                    };
                     current_task = updated_task.clone();
 
-                    send_push_notifications(
+                    if let Err(error) = send_push_notifications(
                         &req.id,
                         self.push_config_store.as_deref(),
                         self.push_sender.as_deref(),
                         &event,
                     )
-                    .await?;
+                    .await
+                    {
+                        // The push error belongs to this caller. Subscribers
+                        // instead receive the already-committed cancellation.
+                        finish_cancel_guard.finish(true).await;
+                        return Err(error);
+                    }
 
                     if let Some(active) = &active_execution {
                         active.publish(Ok(&event), updated_task).await;
@@ -1317,18 +1413,7 @@ impl RequestHandler for DefaultRequestHandler {
             }
         }
 
-        if let Some(active) = active_execution {
-            if !terminal_pushed {
-                // begin_cancel persisted CANCELED even if the executor emitted
-                // no terminal event. Attached subscribers need that final state.
-                if let Some(task) = &current_task {
-                    active
-                        .publish(Ok(&status_update(task)), Some(task.clone()))
-                        .await;
-                }
-            }
-            self.execution_manager.finish(&req.id, &active).await;
-        }
+        finish_cancel_guard.finish(!terminal_pushed).await;
 
         // A subscription to a task between turns has no execution to follow
         // into the cancel; the final snapshot ends it. Subscriptions register
@@ -3196,9 +3281,11 @@ mod tests {
         assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
     }
 
-    /// Nothing may follow a Message that answered the request.
+    /// Nothing may follow a Message that answered the request: the response
+    /// stream ends at the Message (§3.1.2), and the later event fails the
+    /// task in the store.
     #[tokio::test]
-    async fn test_event_after_an_answering_message_is_an_invalid_agent_response() {
+    async fn test_event_after_an_answering_message_fails_the_task_behind_the_closed_stream() {
         let handler = DefaultRequestHandler::new(
             ScriptedExecutor(|ctx: &ExecutorContext| {
                 vec![
@@ -3214,16 +3301,302 @@ mod tests {
             }),
             InMemoryTaskStore::new(),
         );
-        let events: Vec<_> = handler
+        let stream = handler
             .send_streaming_message(&ServiceParams::new(), send_request())
             .await
-            .unwrap()
-            .collect()
-            .await;
-        assert!(matches!(events[0], Ok(StreamResponse::Message(_))));
+            .unwrap();
+        let events = within(stream.collect::<Vec<_>>()).await;
         assert!(
-            matches!(&events[1], Err(error) if error.code == error_code::INVALID_AGENT_RESPONSE)
+            matches!(&events[..], [Ok(StreamResponse::Message(_))]),
+            "{events:?}"
         );
+
+        let task_id = only_task_id(&handler).await;
+        timeout(Duration::from_secs(5), async {
+            while handler.execution_manager.get(&task_id).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let task = handler
+            .get_task(
+                &ServiceParams::new(),
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.status.state, TaskState::Failed);
+    }
+
+    /// The id of the one task the handler stores.
+    async fn only_task_id(handler: &DefaultRequestHandler) -> TaskId {
+        let listed = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.tasks.len(), 1);
+        listed.tasks[0].id.clone()
+    }
+
+    /// An event after an answering Message is classified at the execution
+    /// layer as an invalid agent response, before any response stream.
+    #[tokio::test]
+    async fn test_event_after_an_answering_message_is_published_as_an_invalid_agent_response() {
+        let late = Arc::new(Notify::new());
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor({
+                let late = late.clone();
+                move |ctx: &ExecutorContext| {
+                    let message = Message::new(Role::Agent, vec![Part::text("answer")]);
+                    vec![
+                        (None, Ok(StreamResponse::Message(message))),
+                        (
+                            Some(late.clone()),
+                            Ok(status_event(ctx, TaskState::Completed, None)),
+                        ),
+                    ]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let _stream = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap();
+        let task_id = only_task_id(&handler).await;
+        // The execution waits for `late`, so it is still registered.
+        let mut events = handler
+            .execution_manager
+            .get(&task_id)
+            .await
+            .expect("the execution waits for its late event")
+            .subscribe();
+        late.notify_one();
+        let result = within(async {
+            loop {
+                match events.recv().await.unwrap().result {
+                    Ok(StreamResponse::Message(_)) => continue,
+                    other => break other,
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(&result, Err(error) if error.code == error_code::INVALID_AGENT_RESPONSE),
+            "{result:?}"
+        );
+    }
+
+    /// Bounds a wait of a test, so a stream that stays open fails it.
+    async fn within<T>(future: impl Future<Output = T>) -> T {
+        timeout(Duration::from_secs(5), future)
+            .await
+            .expect("timed out")
+    }
+
+    /// The gates of `cancel_race_handler`'s executor.
+    #[derive(Default)]
+    struct CancelRace {
+        /// Releases the Message that answers any message but "ask".
+        answer: Arc<Notify>,
+        /// Notified when the cancel calls the executor: CANCELED is then
+        /// committed and the cancel holds the execution.
+        canceling: Arc<Notify>,
+        /// Releases the cancel's CANCELED status.
+        cancel_ends: Arc<Notify>,
+    }
+
+    /// An executor that leaves the task awaiting input on "ask", answers any
+    /// other message with a Message, and is canceled with CANCELED, each
+    /// step behind the gates of the returned `CancelRace`.
+    fn cancel_race_handler() -> (Arc<DefaultRequestHandler>, CancelRace) {
+        let race = CancelRace::default();
+        let (answer, canceling, cancel_ends) = (
+            race.answer.clone(),
+            race.canceling.clone(),
+            race.cancel_ends.clone(),
+        );
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(move |ctx: &ExecutorContext| match &ctx.message {
+                Some(message) if message.text() == Some("ask") => {
+                    vec![(None, Ok(status_event(ctx, TaskState::InputRequired, None)))]
+                }
+                Some(_) => {
+                    let message = Message::new(Role::Agent, vec![Part::text("answer")]);
+                    vec![(Some(answer.clone()), Ok(StreamResponse::Message(message)))]
+                }
+                None => {
+                    canceling.notify_one();
+                    vec![(
+                        Some(cancel_ends.clone()),
+                        Ok(status_event(ctx, TaskState::Canceled, None)),
+                    )]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        );
+        (Arc::new(handler), race)
+    }
+
+    fn start_cancel(
+        handler: &Arc<DefaultRequestHandler>,
+        task_id: &str,
+    ) -> tokio::task::JoinHandle<Result<Task, A2AError>> {
+        let handler = Arc::clone(handler);
+        let request = CancelTaskRequest {
+            id: task_id.into(),
+            metadata: None,
+            tenant: None,
+        };
+        tokio::spawn(async move { handler.cancel_task(&ServiceParams::new(), request).await })
+    }
+
+    /// Releases a cancel `start_cancel` started and checks its own answer.
+    async fn finish_cancel(
+        race: &CancelRace,
+        cancel: tokio::task::JoinHandle<Result<Task, A2AError>>,
+    ) {
+        race.cancel_ends.notify_one();
+        let canceled = within(cancel).await.unwrap().unwrap();
+        assert_eq!(canceled.status.state, TaskState::Canceled);
+    }
+
+    /// §3.1.2: a Message answer is "exactly one Message object and then close
+    /// immediately", also while a cancel of the request's task waits for the
+    /// executor: the stream closes before the cancel ends, its CANCELED
+    /// status never follows the Message, and the cancel itself succeeds.
+    #[tokio::test]
+    async fn test_message_answer_ends_the_stream_before_a_pending_cancel() {
+        let (handler, race) = cancel_race_handler();
+        let mut stream = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap();
+        let task_id = only_task_id(&handler).await;
+        let cancel = start_cancel(&handler, &task_id);
+        within(race.canceling.notified()).await;
+        race.answer.notify_one();
+
+        assert!(matches!(
+            within(stream.next()).await,
+            Some(Ok(StreamResponse::Message(_)))
+        ));
+        assert!(within(stream.next()).await.is_none());
+        assert!(!cancel.is_finished(), "the cancel is still pending");
+        finish_cancel(&race, cancel).await;
+    }
+
+    /// A subscription attached to the running execution ends at its Message
+    /// too, while the cancel is pending.
+    #[tokio::test]
+    async fn test_message_answer_ends_an_attached_subscription_before_a_pending_cancel() {
+        let (handler, race) = cancel_race_handler();
+        let _stream = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap();
+        let task_id = only_task_id(&handler).await;
+        let subscription = handler
+            .subscribe_to_task(
+                &ServiceParams::new(),
+                SubscribeToTaskRequest {
+                    id: task_id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        let cancel = start_cancel(&handler, &task_id);
+        within(race.canceling.notified()).await;
+        race.answer.notify_one();
+
+        let items = within(subscription.collect::<Vec<_>>()).await;
+        assert!(
+            matches!(
+                &items[..],
+                [Ok(StreamResponse::Task(task)), Ok(StreamResponse::Message(_))]
+                    if task.status.state == TaskState::Submitted
+            ),
+            "{items:?}"
+        );
+        assert!(!cancel.is_finished(), "the cancel is still pending");
+        finish_cancel(&race, cancel).await;
+    }
+
+    /// A subscription waiting for a task's next turn follows that turn to its
+    /// Message and ends there, while the cancel is pending.
+    #[tokio::test]
+    async fn test_message_answer_ends_a_waiting_subscription_before_a_pending_cancel() {
+        let (handler, race) = cancel_race_handler();
+        let params = ServiceParams::new();
+        let ask = SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("ask")]),
+            ..send_request()
+        };
+        let SendMessageResponse::Task(task) = handler.send_message(&params, ask).await.unwrap()
+        else {
+            panic!("expected a task awaiting input");
+        };
+        assert_eq!(task.status.state, TaskState::InputRequired);
+        let subscription = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: task.id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let follow_up = SendMessageRequest {
+            message: Message {
+                task_id: Some(task.id.clone()),
+                ..Message::new(Role::User, vec![Part::text("go")])
+            },
+            ..send_request()
+        };
+        let _stream = handler
+            .send_streaming_message(&params, follow_up)
+            .await
+            .unwrap();
+        let cancel = start_cancel(&handler, &task.id);
+        within(race.canceling.notified()).await;
+        race.answer.notify_one();
+
+        // The stored task, the task as the turn found it, then the answer.
+        let items = within(subscription.collect::<Vec<_>>()).await;
+        assert!(
+            matches!(
+                &items[..],
+                [
+                    Ok(StreamResponse::Task(stored)),
+                    Ok(StreamResponse::Task(found)),
+                    Ok(StreamResponse::Message(_)),
+                ] if stored.status.state == TaskState::InputRequired
+                    && found.status.state == TaskState::InputRequired
+            ),
+            "{items:?}"
+        );
+        assert!(!cancel.is_finished(), "the cancel is still pending");
+        finish_cancel(&race, cancel).await;
     }
 
     /// The items of a streaming send's response, none of them an error,
@@ -5449,6 +5822,331 @@ mod tests {
         server.await.unwrap();
     }
 
+    struct PausedPushStore {
+        inner: InMemoryPushConfigStore,
+        calls: AtomicI32,
+        started: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl PushConfigStore for PausedPushStore {
+        async fn save(
+            &self,
+            config: TaskPushNotificationConfig,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.inner.save(config).await
+        }
+
+        async fn get(
+            &self,
+            task_id: &str,
+            config_id: &str,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.inner.get(task_id, config_id).await
+        }
+
+        async fn list(&self, _task_id: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.notify_one();
+                self.resume.notified().await;
+                Ok(Vec::new())
+            } else {
+                Err(A2AError::internal("push store unavailable"))
+            }
+        }
+
+        async fn delete(&self, task_id: &str, config_id: &str) -> Result<(), A2AError> {
+            self.inner.delete(task_id, config_id).await
+        }
+
+        async fn delete_all(&self, task_id: &str) -> Result<(), A2AError> {
+            self.inner.delete_all(task_id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_push_failure_rejects_in_flight_older_event() {
+        install_crypto_provider();
+        let started = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                if ctx.message.is_some() {
+                    vec![(None, Ok(status_event(ctx, TaskState::Working, None)))]
+                } else {
+                    vec![(None, Ok(status_event(ctx, TaskState::Canceled, None)))]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        )
+        .with_push_notifications(
+            PausedPushStore {
+                inner: InMemoryPushConfigStore::new(),
+                calls: AtomicI32::new(0),
+                started: started.clone(),
+                resume: resume.clone(),
+            },
+            crate::HttpPushSender::new(None),
+        );
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-push-race", "c-push-race").await;
+        // A delivery failure must not prevent the owner from inspecting and
+        // removing the task's push configurations.
+        for id in ["cfg-1", "cfg-2"] {
+            handler
+                .create_push_config(
+                    &params,
+                    TaskPushNotificationConfig {
+                        id: Some(id.into()),
+                        ..push_config("t-push-race")
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let mut request = send_request();
+        request.message.task_id = Some("t-push-race".into());
+        let _stream = handler
+            .send_streaming_message(&params, request)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        let active = handler.execution_manager.get("t-push-race").await.unwrap();
+        let mut subscriber = active.subscribe();
+
+        assert!(
+            handler
+                .cancel_task(
+                    &params,
+                    CancelTaskRequest {
+                        id: "t-push-race".into(),
+                        metadata: None,
+                        tenant: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            subscriber.recv().await.unwrap().result,
+            Ok(StreamResponse::StatusUpdate(ref update)) if update.status.state == TaskState::Canceled
+        ));
+        let get_config = |id: &str| GetTaskPushNotificationConfigRequest {
+            task_id: "t-push-race".into(),
+            id: id.into(),
+            tenant: None,
+        };
+        assert_eq!(
+            handler
+                .get_push_config(&params, get_config("cfg-1"))
+                .await
+                .unwrap()
+                .id
+                .as_deref(),
+            Some("cfg-1")
+        );
+        handler
+            .delete_push_config(
+                &params,
+                DeleteTaskPushNotificationConfigRequest {
+                    task_id: "t-push-race".into(),
+                    id: "cfg-1".into(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            handler
+                .get_push_config(&params, get_config("cfg-1"))
+                .await
+                .is_err()
+        );
+        handler
+            .push_config_store_checked()
+            .unwrap()
+            .delete_all("t-push-race")
+            .await
+            .unwrap();
+        assert!(
+            handler
+                .get_push_config(&params, get_config("cfg-2"))
+                .await
+                .is_err()
+        );
+        resume.notify_one();
+        timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&active) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("execution did not finish");
+
+        assert!(active.snapshot_is_terminal().await);
+        assert!(matches!(
+            subscriber.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            handler.load_task("t-push-race").await.unwrap().status.state,
+            TaskState::Canceled
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_push_failure_notifies_and_releases_active_execution() {
+        install_crypto_provider();
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                vec![(None, Ok(status_event(ctx, TaskState::Canceled, None)))]
+            }),
+            InMemoryTaskStore::new(),
+        )
+        .with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(None),
+        );
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-cancel-push-error", "c-cancel-push-error").await;
+        let task = handler.load_task("t-cancel-push-error").await.unwrap();
+        let active = handler.execution_manager.start(task).await.unwrap();
+        let mut subscriber = active.subscribe();
+        handler
+            .create_push_config(
+                &params,
+                TaskPushNotificationConfig {
+                    url: "http://127.0.0.1:9/callback".into(),
+                    ..push_config("t-cancel-push-error")
+                },
+            )
+            .await
+            .unwrap();
+
+        handler
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: "t-cancel-push-error".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        let event = timeout(Duration::from_secs(1), subscriber.recv())
+            .await
+            .expect("the active subscriber must not remain blocked")
+            .unwrap();
+        assert!(matches!(
+            event.result,
+            Ok(StreamResponse::StatusUpdate(ref update)) if update.status.state == TaskState::Canceled
+        ));
+        assert!(active.snapshot_is_terminal().await);
+        assert!(
+            handler
+                .execution_manager
+                .get("t-cancel-push-error")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            handler
+                .load_task("t-cancel-push-error")
+                .await
+                .unwrap()
+                .status
+                .state,
+            TaskState::Canceled
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_push_failure_ends_running_stream() {
+        install_crypto_provider();
+        let gate = Arc::new(Notify::new());
+        let resume = gate.clone();
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(move |ctx: &ExecutorContext| {
+                if ctx.message.is_some() {
+                    vec![
+                        (None, Ok(status_event(ctx, TaskState::Working, None))),
+                        (
+                            Some(gate.clone()),
+                            Ok(status_event(ctx, TaskState::Completed, None)),
+                        ),
+                    ]
+                } else {
+                    vec![(None, Ok(status_event(ctx, TaskState::Canceled, None)))]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        )
+        .with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(None),
+        );
+        let params = ServiceParams::new();
+        let mut stream = handler
+            .send_streaming_message(&params, send_request())
+            .await
+            .unwrap();
+        let working = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let task_id = match working {
+            StreamResponse::StatusUpdate(event) => {
+                assert_eq!(event.status.state, TaskState::Working);
+                event.task_id
+            }
+            event => panic!("expected working status, got {event:?}"),
+        };
+        handler
+            .create_push_config(
+                &params,
+                TaskPushNotificationConfig {
+                    url: "http://127.0.0.1:9/callback".into(),
+                    ..push_config(&task_id)
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            handler
+                .cancel_task(
+                    &params,
+                    CancelTaskRequest {
+                        id: task_id.clone(),
+                        metadata: None,
+                        tenant: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap(),
+            Ok(StreamResponse::StatusUpdate(ref update)) if update.status.state == TaskState::Canceled
+        ));
+        assert!(stream.next().await.is_none());
+        resume.notify_one();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            handler.load_task(&task_id).await.unwrap().status.state,
+            TaskState::Canceled
+        );
+    }
+
     #[tokio::test]
     async fn test_empty_cancel_unblocks_running_stream() {
         let gate = Arc::new(Notify::new());
@@ -5526,6 +6224,300 @@ mod tests {
         );
         assert!(stream.next().await.is_none());
         release.notify_one();
+    }
+
+    #[tokio::test]
+    async fn cancel_event_application_error_finishes_attached_execution() {
+        let handler = DefaultRequestHandler::new(
+            InputRequiredExecutor {
+                cancel: Cancel::SendsAnInapplicableEvent,
+            },
+            InMemoryTaskStore::new(),
+        );
+        seed_task(&handler, "t-apply-error", "c-apply-error").await;
+        let task = handler.load_task("t-apply-error").await.unwrap();
+        let active = handler.execution_manager.start(task).await.unwrap();
+        let mut subscriber = active.subscribe();
+
+        let error = handler
+            .cancel_task(
+                &ServiceParams::new(),
+                CancelTaskRequest {
+                    id: "t-apply-error".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
+        let delivered = timeout(Duration::from_secs(5), subscriber.recv())
+            .await
+            .expect("subscriber did not receive cancellation")
+            .unwrap();
+        assert!(matches!(
+            delivered.result,
+            Ok(StreamResponse::StatusUpdate(ref update)) if update.status.state == TaskState::Canceled
+        ));
+        timeout(Duration::from_secs(5), async {
+            while handler
+                .execution_manager
+                .get("t-apply-error")
+                .await
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("active execution was not removed");
+    }
+
+    struct CancelUpdateFailsStore(InMemoryTaskStore);
+
+    #[async_trait]
+    impl TaskStore for CancelUpdateFailsStore {
+        async fn create(&self, task: Task) -> Result<TaskVersion, A2AError> {
+            self.0.create(task).await
+        }
+
+        async fn update(&self, _task: Task) -> Result<TaskVersion, A2AError> {
+            Err(A2AError::internal("cancel event persistence failed"))
+        }
+
+        async fn get(&self, id: &str) -> Result<Option<Task>, A2AError> {
+            self.0.get(id).await
+        }
+
+        async fn list(&self, req: &ListTasksRequest) -> Result<ListTasksResponse, A2AError> {
+            self.0.list(req).await
+        }
+
+        async fn begin_cancel(&self, id: &str) -> Result<Task, A2AError> {
+            self.0.begin_cancel(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_event_store_failure_returns_error_and_ends_subscriber() {
+        let handler = DefaultRequestHandler::new(
+            InputRequiredExecutor {
+                cancel: Cancel::Cancels,
+            },
+            CancelUpdateFailsStore(InMemoryTaskStore::new()),
+        );
+        seed_task(&handler, "t-store-error", "c-store-error").await;
+        let task = handler.load_task("t-store-error").await.unwrap();
+        let active = handler.execution_manager.start(task).await.unwrap();
+        let mut subscriber = active.subscribe();
+
+        let error = handler
+            .cancel_task(
+                &ServiceParams::new(),
+                CancelTaskRequest {
+                    id: "t-store-error".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "cancel event persistence failed");
+        let delivered = timeout(Duration::from_secs(5), subscriber.recv())
+            .await
+            .expect("subscriber did not receive cancellation")
+            .unwrap();
+        assert!(matches!(
+            delivered.result,
+            Ok(StreamResponse::StatusUpdate(ref update)) if update.status.state == TaskState::Canceled
+        ));
+        assert!(
+            handler
+                .execution_manager
+                .get("t-store-error")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_cancel_request_finishes_attached_execution() {
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
+        let handler = Arc::new(DefaultRequestHandler::new(
+            ScriptedExecutor({
+                let started = started.clone();
+                move |ctx: &ExecutorContext| {
+                    started.notify_one();
+                    vec![(
+                        Some(gate.clone()),
+                        Ok(status_event(ctx, TaskState::Canceled, None)),
+                    )]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        ));
+        seed_task(&handler, "t-aborted-cancel", "c-aborted-cancel").await;
+        let task = handler.load_task("t-aborted-cancel").await.unwrap();
+        let active = handler.execution_manager.start(task).await.unwrap();
+        let mut subscriber = active.subscribe();
+        let call = tokio::spawn({
+            let handler = handler.clone();
+            async move {
+                handler
+                    .cancel_task(
+                        &ServiceParams::new(),
+                        CancelTaskRequest {
+                            id: "t-aborted-cancel".into(),
+                            metadata: None,
+                            tenant: None,
+                        },
+                    )
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("cancel did not start");
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+
+        let delivered = timeout(Duration::from_secs(5), subscriber.recv())
+            .await
+            .expect("subscriber did not receive cancellation")
+            .unwrap();
+        assert!(matches!(
+            delivered.result,
+            Ok(StreamResponse::StatusUpdate(ref update)) if update.status.state == TaskState::Canceled
+        ));
+        timeout(Duration::from_secs(5), async {
+            while handler
+                .execution_manager
+                .get("t-aborted-cancel")
+                .await
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("active execution was not removed");
+    }
+
+    #[tokio::test]
+    async fn dropped_cancel_while_waiting_for_execution_registry_finishes_subscriber() {
+        let handler = Arc::new(DefaultRequestHandler::new(
+            InputRequiredExecutor {
+                cancel: Cancel::Cancels,
+            },
+            InMemoryTaskStore::new(),
+        ));
+        seed_task(&handler, "t-blocked-registry", "c-blocked-registry").await;
+        let task = handler.load_task("t-blocked-registry").await.unwrap();
+        let active = handler.execution_manager.start(task).await.unwrap();
+        let mut subscriber = active.subscribe();
+        let registry_lock = handler.execution_manager.executions.write().await;
+        let call = tokio::spawn({
+            let handler = handler.clone();
+            async move {
+                handler
+                    .cancel_task(
+                        &ServiceParams::new(),
+                        CancelTaskRequest {
+                            id: "t-blocked-registry".into(),
+                            metadata: None,
+                            tenant: None,
+                        },
+                    )
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), async {
+            while handler
+                .load_task("t-blocked-registry")
+                .await
+                .unwrap()
+                .status
+                .state
+                != TaskState::Canceled
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation was not committed");
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        drop(registry_lock);
+
+        let delivered = timeout(Duration::from_secs(5), subscriber.recv())
+            .await
+            .expect("subscriber did not receive cancellation")
+            .unwrap();
+        assert!(matches!(
+            delivered.result,
+            Ok(StreamResponse::StatusUpdate(ref update)) if update.status.state == TaskState::Canceled
+        ));
+        timeout(Duration::from_secs(5), async {
+            while handler
+                .execution_manager
+                .get("t-blocked-registry")
+                .await
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("active execution was not removed");
+    }
+
+    #[tokio::test]
+    async fn cancellation_guard_dropped_off_runtime_still_finishes_execution() {
+        let handler = DefaultRequestHandler::new(
+            InputRequiredExecutor {
+                cancel: Cancel::Cancels,
+            },
+            InMemoryTaskStore::new(),
+        );
+        seed_task(&handler, "t-drop-thread", "c-drop-thread").await;
+        let task = handler.load_task("t-drop-thread").await.unwrap();
+        let active = handler.execution_manager.start(task).await.unwrap();
+        let mut subscriber = active.subscribe();
+        let task = handler
+            .task_store
+            .begin_cancel("t-drop-thread")
+            .await
+            .unwrap();
+        let guard = FinishCancelOnDrop {
+            manager: handler.execution_manager.clone(),
+            active: Some(active),
+            task,
+            armed: true,
+            runtime: Some(tokio::runtime::Handle::current()),
+        };
+        std::thread::spawn(move || drop(guard)).join().unwrap();
+
+        let delivered = timeout(Duration::from_secs(5), subscriber.recv())
+            .await
+            .expect("subscriber did not receive cancellation")
+            .unwrap();
+        assert!(matches!(
+            delivered.result,
+            Ok(StreamResponse::StatusUpdate(ref update)) if update.status.state == TaskState::Canceled
+        ));
+        timeout(Duration::from_secs(5), async {
+            while handler
+                .execution_manager
+                .get("t-drop-thread")
+                .await
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("active execution was not removed");
     }
 
     /// The CANCELED state `begin_cancel` commits is pushed even when the
