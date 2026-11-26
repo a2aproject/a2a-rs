@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - *(a2a-pb)* [**breaking**] reject a part with no content and a request with no message ([#510](https://github.com/a2aproject/a2a-rs/pull/510))
 
+### Breaking changes
+
+- *(slimrpc)* **breaking:** the SLIM crates moved to 3.5 (`agntcy-slim-rpc` 3.5, `agntcy-slim-auth` 0.19, `agntcy-slim-config` 0.18). `SlimApp` and the `slim_rpc` types are public API, so a caller still on SLIM 3.4 ends up with two copies of `slim_auth` and must move to the same versions ([#594](https://github.com/a2aproject/a2a-rs/pull/594))
+
 ### Other
 
 - *(slimrpc)* upgrade slim to 3.5 and test with did:key identities ([#594](https://github.com/a2aproject/a2a-rs/pull/594))

@@ -218,17 +218,39 @@ impl TestEnv {
     }
 
     async fn new_client_app(&self, suffix: &str) -> Arc<SlimApp> {
+        let (private_key, trust_anchor) = next_identity();
+        self.new_client_app_with_identity(suffix, private_key, trust_anchor)
+            .await
+    }
+
+    async fn new_client_app_with_identity(
+        &self,
+        suffix: &str,
+        private_key: &str,
+        trust_anchor: &str,
+    ) -> Arc<SlimApp> {
         let name = Name::from_strings([
             "org".to_string(),
             "test".to_string(),
             format!("{}-{suffix}", self.test_name),
         ]);
-        let (app, _) = new_app!(self.service, &name);
+        let (app, _) = self
+            .service
+            .create_app_with_did_key(&name, private_key, trust_anchor)
+            .await
+            .unwrap();
         Arc::new(app)
     }
 
-    async fn transport(&self, suffix: &str) -> SlimRpcTransport {
-        let client_app = self.new_client_app(suffix).await;
+    async fn transport_with_identity(
+        &self,
+        suffix: &str,
+        private_key: &str,
+        trust_anchor: &str,
+    ) -> SlimRpcTransport {
+        let client_app = self
+            .new_client_app_with_identity(suffix, private_key, trust_anchor)
+            .await;
         SlimRpcTransport::new(client_app, self.server_name.clone())
     }
 
@@ -260,6 +282,9 @@ impl TestEnv {
 
 struct TestHandler {
     target: String,
+    /// The `did:key` of the client that sends `identity-required`: its token's subject and
+    /// issuer must both be this value.
+    caller_did_key: Option<String>,
 }
 
 #[async_trait]
@@ -278,7 +303,11 @@ impl RequestHandler for TestHandler {
         if req.message.task_id.as_deref() == Some("identity-required") {
             // The caller's identity comes from the session: its SLIM name and
             // the verified subject and issuer of its token (both its own
-            // `did:key`), never the spoofed values it sent.
+            // `did:key`, not the server's or anyone else's), never the spoofed values it sent.
+            let expected = self
+                .caller_did_key
+                .as_deref()
+                .expect("the identity-required test names the caller");
             let single = |key: &str| match params.get(key).map(Vec::as_slice) {
                 Some([value]) => Some(value.clone()),
                 _ => None,
@@ -287,8 +316,8 @@ impl RequestHandler for TestHandler {
             let subject = single(SLIM_PEER_SUBJECT_METADATA_KEY).unwrap_or_default();
             let issuer = single(SLIM_PEER_ISSUER_METADATA_KEY).unwrap_or_default();
             if !slim_src.starts_with(&format!("{}-direct/", self.target))
-                || !subject.starts_with("did:key:")
-                || issuer != subject
+                || subject != expected
+                || issuer != expected
             {
                 return Err(A2AError::invalid_params(format!(
                     "unexpected caller identity: {params:?}"
@@ -479,13 +508,19 @@ impl RequestHandler for TestHandler {
 #[tokio::test]
 async fn slimrpc_transport_end_to_end() {
     let env = TestEnv::new("transport-success").await;
+    // The client's `did:key` is known up front, so the handler can pin the caller to it.
+    let (client_key, trust_anchor) = next_identity();
+    let client_did_key = slim_auth::did_key::ed25519_did_key_from_pkcs8_pem(client_key).unwrap();
     let handler = Arc::new(TestHandler {
         target: env.target(),
+        caller_did_key: Some(client_did_key),
     });
     SlimRpcHandler::new(handler).register(&env.server);
     env.start().await;
 
-    let transport = env.transport("direct").await;
+    let transport = env
+        .transport_with_identity("direct", client_key, trust_anchor)
+        .await;
     let mut params = ServiceParams::new();
     params.insert(
         "x-trace".to_string(),
@@ -634,6 +669,7 @@ async fn slimrpc_transport_streaming_and_factory_paths() {
     let env = TestEnv::new("transport-streams").await;
     let handler = Arc::new(TestHandler {
         target: env.target(),
+        caller_did_key: None,
     });
     SlimRpcHandler::new(handler).register(&env.server);
     env.start().await;
@@ -863,6 +899,7 @@ async fn slimrpc_server_rejects_a_missing_message_and_a_part_without_content() {
     let env = TestEnv::new("server-invalid-request").await;
     let handler = Arc::new(TestHandler {
         target: env.target(),
+        caller_did_key: None,
     });
     SlimRpcHandler::new(handler).register(&env.server);
     env.start().await;

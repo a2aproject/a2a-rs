@@ -967,6 +967,9 @@ app:
     /// serving, so it either keeps running until the timeout or, when stdin is
     /// already closed, returns `Ok`. Any error before that is a failure.
     ///
+    /// The config sets a fast-failing `backoff`: without it a failed connect retries
+    /// past the timeout, which would be indistinguishable from serving.
+    ///
     /// It runs on its own runtime: `run_with_config` reads stdin on a blocking
     /// thread that never ends under `cargo test`, and dropping a runtime waits for
     /// such a thread, so the runtime is shut down in the background.
@@ -1008,6 +1011,10 @@ client:
   endpoint: "http://127.0.0.1:{port}"
   tls:
     insecure: true
+  backoff:
+    type: fixed_interval
+    interval: 1ms
+    max_attempts: 0
 app:
   name: "org/namespace/run-with-config"
   identity_provider:
