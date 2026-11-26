@@ -3599,6 +3599,16 @@ mod tests {
         finish_cancel(&race, cancel).await;
     }
 
+    /// The payload of a stream item of the given variant; any other variant fails the test.
+    macro_rules! item {
+        ($item:expr, $variant:ident) => {
+            match $item {
+                StreamResponse::$variant(payload) => payload,
+                other => panic!("expected {}, got {other:?}", stringify!($variant)),
+            }
+        };
+    }
+
     /// The items of a streaming send's response, none of them an error,
     /// collected within a bound so a stream that never closes fails.
     async fn streamed(
@@ -3667,14 +3677,20 @@ mod tests {
     async fn test_status_first_stream_begins_with_the_task() {
         let handler = status_first_handler();
         let events = streamed(&handler, send_request()).await;
-        let [
-            StreamResponse::Task(task),
-            StreamResponse::StatusUpdate(working),
-            StreamResponse::StatusUpdate(completed),
-        ] = &events[..]
-        else {
-            panic!("expected Task, Working, Completed: {events:?}");
-        };
+        assert!(
+            matches!(
+                &events[..],
+                [
+                    StreamResponse::Task(_),
+                    StreamResponse::StatusUpdate(_),
+                    StreamResponse::StatusUpdate(_)
+                ]
+            ),
+            "expected Task, Working, Completed: {events:?}"
+        );
+        let task = item!(&events[0], Task);
+        let working = item!(&events[1], StatusUpdate);
+        let completed = item!(&events[2], StatusUpdate);
         assert_eq!(task.status.state, TaskState::Submitted);
         assert_eq!(task.id, working.task_id);
         assert_eq!(task.context_id, working.context_id);
@@ -3730,15 +3746,22 @@ mod tests {
             InMemoryTaskStore::new(),
         );
         let events = streamed(&handler, send_request()).await;
-        let [
-            StreamResponse::Task(task),
-            StreamResponse::ArtifactUpdate(first),
-            StreamResponse::ArtifactUpdate(delta),
-            StreamResponse::StatusUpdate(completed),
-        ] = &events[..]
-        else {
-            panic!("expected Task, artifact, append, Completed: {events:?}");
-        };
+        assert!(
+            matches!(
+                &events[..],
+                [
+                    StreamResponse::Task(_),
+                    StreamResponse::ArtifactUpdate(_),
+                    StreamResponse::ArtifactUpdate(_),
+                    StreamResponse::StatusUpdate(_)
+                ]
+            ),
+            "expected Task, artifact, append, Completed: {events:?}"
+        );
+        let task = item!(&events[0], Task);
+        let first = item!(&events[1], ArtifactUpdate);
+        let delta = item!(&events[2], ArtifactUpdate);
+        let completed = item!(&events[3], StatusUpdate);
         assert_eq!(task.status.state, TaskState::Submitted);
         assert!(
             task.artifacts.is_none(),
@@ -3822,13 +3845,15 @@ mod tests {
     async fn test_continuation_stream_begins_with_the_task() {
         let handler = DefaultRequestHandler::new(MultiTurnExecutor, InMemoryTaskStore::new());
         let first = streamed(&handler, send_request()).await;
-        let [
-            StreamResponse::Task(task),
-            StreamResponse::StatusUpdate(asked),
-        ] = &first[..]
-        else {
-            panic!("expected Task, InputRequired: {first:?}");
-        };
+        assert!(
+            matches!(
+                &first[..],
+                [StreamResponse::Task(_), StreamResponse::StatusUpdate(_)]
+            ),
+            "expected Task, InputRequired: {first:?}"
+        );
+        let task = item!(&first[0], Task);
+        let asked = item!(&first[1], StatusUpdate);
         assert_eq!(asked.status.state, TaskState::InputRequired);
 
         let answer = SendMessageRequest {
@@ -3839,13 +3864,15 @@ mod tests {
             ..send_request()
         };
         let second = streamed(&handler, answer).await;
-        let [
-            StreamResponse::Task(found),
-            StreamResponse::StatusUpdate(done),
-        ] = &second[..]
-        else {
-            panic!("expected Task, Completed: {second:?}");
-        };
+        assert!(
+            matches!(
+                &second[..],
+                [StreamResponse::Task(_), StreamResponse::StatusUpdate(_)]
+            ),
+            "expected Task, Completed: {second:?}"
+        );
+        let found = item!(&second[0], Task);
+        let done = item!(&second[1], StatusUpdate);
         assert_eq!(found.id, task.id);
         assert_eq!(found.status.state, TaskState::InputRequired);
         let said: Vec<_> = found
@@ -6100,13 +6127,13 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        let task_id = match first {
-            StreamResponse::Task(task) => {
-                assert_eq!(task.status.state, TaskState::Submitted);
-                task.id
-            }
-            event => panic!("expected the task first, got {event:?}"),
-        };
+        assert!(
+            matches!(first, StreamResponse::Task(_)),
+            "expected the task first, got {first:?}"
+        );
+        let task = item!(&first, Task);
+        assert_eq!(task.status.state, TaskState::Submitted);
+        let task_id = task.id.clone();
         let working = timeout(Duration::from_secs(5), stream.next())
             .await
             .unwrap()
