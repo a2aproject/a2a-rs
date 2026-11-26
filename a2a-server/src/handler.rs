@@ -6095,18 +6095,30 @@ mod tests {
             .send_streaming_message(&params, send_request())
             .await
             .unwrap();
+        let first = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let task_id = match first {
+            StreamResponse::Task(task) => {
+                assert_eq!(task.status.state, TaskState::Submitted);
+                task.id
+            }
+            event => panic!("expected the task first, got {event:?}"),
+        };
         let working = timeout(Duration::from_secs(5), stream.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        let task_id = match working {
+        match working {
             StreamResponse::StatusUpdate(event) => {
                 assert_eq!(event.status.state, TaskState::Working);
-                event.task_id
+                assert_eq!(event.task_id, task_id);
             }
             event => panic!("expected working status, got {event:?}"),
-        };
+        }
         handler
             .create_push_config(
                 &params,
