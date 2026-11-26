@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::types::*;
+use crate::{EXTENSION_URI_SHARED_TASK, types::*};
 
 // ---------------------------------------------------------------------------
 // StreamResponse (field-presence union — 4 variants)
@@ -100,6 +100,21 @@ pub struct TaskArtifactUpdateEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "fuzzing", arbitrary(default))]
     pub metadata: Option<HashMap<String, Value>>,
+}
+
+// ---------------------------------------------------------------------------
+// Attribution helper
+// ---------------------------------------------------------------------------
+
+/// Build the shared-task attribution block for `Message.metadata`.
+///
+/// Returns `{ EXTENSION_URI_SHARED_TASK: { "message-sender": sender } }` per spec §4.1.
+pub fn shared_task_attribution(sender: impl Into<String>) -> HashMap<String, Value> {
+    let mut inner = serde_json::Map::new();
+    inner.insert("message-sender".to_string(), Value::String(sender.into()));
+    let mut outer = HashMap::new();
+    outer.insert(EXTENSION_URI_SHARED_TASK.to_string(), Value::Object(inner));
+    outer
 }
 
 #[cfg(test)]
@@ -208,6 +223,20 @@ mod tests {
         let back: TaskStatusUpdateEvent = serde_json::from_str(&json).unwrap();
         assert!(back.metadata.is_some());
         assert_eq!(back.status.state, TaskState::Working);
+    }
+
+    #[test]
+    fn test_shared_task_attribution() {
+        let attr = shared_task_attribution("agent-orders");
+        let inner = attr
+            .get(crate::EXTENSION_URI_SHARED_TASK)
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            inner["message-sender"],
+            Value::String("agent-orders".into())
+        );
     }
 
     #[test]
