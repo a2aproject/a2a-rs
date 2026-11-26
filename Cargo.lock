@@ -7,6 +7,7 @@ name = "a2a-cli"
 version = "0.4.5"
 dependencies = [
  "a2a-client-lf",
+ "a2a-collab",
  "a2a-lf",
  "a2a-server-lf",
  "assert_cmd",

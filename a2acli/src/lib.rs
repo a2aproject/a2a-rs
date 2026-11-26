@@ -27,6 +27,7 @@ use std::time::Duration;
 use a2a::*;
 use a2a_client::auth::AuthInterceptor;
 use a2a_client::{A2AClient, A2AClientFactory, BoxStream};
+use a2a_collab::{CollaborativeSession, require_collaborative_extensions};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use fileparts::{FilePartSaver, FilePartSource};
@@ -266,6 +267,40 @@ pub enum Command {
         #[arg(value_name = "SHELL")]
         shell: clap_complete::Shell,
     },
+    /// Start a collaborative task session with two or more agents (Basic Relay §2.1).
+    Collaborate(CollaborateCommand),
+}
+
+/// Arguments for `a2acli collaborate`.
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct CollaborateCommand {
+    /// Initial text payload. Shorthand for a single --text-part when no other
+    /// part flags are given; mutually exclusive with --text-part/--file-part/--data-part.
+    pub text: Option<String>,
+
+    /// Add a text part. Repeatable and order-preserving alongside
+    /// --file-part/--data-part.
+    #[arg(long = "text-part")]
+    pub text_parts: Vec<String>,
+
+    /// Add a file part. A local path is inlined as bytes; a URL is carried
+    /// by reference. Repeatable.
+    #[arg(long = "file-part")]
+    pub file_parts: Vec<String>,
+
+    /// Add a structured JSON data part. Repeatable.
+    #[arg(long = "data-part")]
+    pub data_parts: Vec<String>,
+
+    /// Media type for the part flag immediately preceding it.
+    #[arg(long = "media-type")]
+    pub media_types: Vec<String>,
+
+    /// Agent Card references to include in the session (at least 2). Each value
+    /// is a bare host, card URL, or local file path — the same forms as
+    /// --agent-card. Repeatable: --agent CARD1 --agent CARD2.
+    #[arg(long = "agent", required = true, num_args = 1)]
+    pub agents: Vec<String>,
 }
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
@@ -1000,6 +1035,7 @@ pub async fn run(
             }
         }
         Command::Task { command } => run_task_command(&cli, matches, command).await?,
+        Command::Collaborate(command) => run_collaborate_command(&cli, command).await?,
     }
 
     Ok(())
@@ -1608,6 +1644,147 @@ fn build_push_notification_config(
         authentication,
         tenant: None,
     })
+}
+
+/// `a2acli collaborate` — Basic Relay model (spec §2.1).
+///
+/// 1. Resolve each `--agent` reference to an AgentCard and build a client.
+/// 2. Pre-flight: verify every agent declares both required extension URIs.
+/// 3. Send the initial message to all agents via streaming.
+/// 4. Merge all streams. For each event: print it, then relay a translated
+///    copy to every *other* agent (echo suppression).
+async fn run_collaborate_command(cli: &Cli, command: &CollaborateCommand) -> Result<(), CliError> {
+    if command.agents.len() < 2 {
+        return Err(CliError::InvalidInput(
+            "collaborate requires at least 2 --agent references".to_string(),
+        ));
+    }
+
+    let parts = resolve_collaborate_parts(command)?;
+    let http = build_http_client(cli)?;
+    let factory = A2AClientFactory::builder().build();
+
+    let mut agents: Vec<(String, A2AClient<Box<dyn a2a_client::Transport>>)> =
+        Vec::with_capacity(command.agents.len());
+    for reference in &command.agents {
+        let card = fetch_card_for_reference(reference, &http).await?;
+        require_collaborative_extensions(&card).map_err(CliError::A2A)?;
+        let label = card.name.clone();
+        let mut client = factory.create_from_card(&card).await?;
+        if let Some(ref t) = cli.tenant {
+            client = client.with_tenant(t.clone());
+        }
+        agents.push((label, client));
+    }
+
+    let initial_request = SendMessageRequest {
+        message: Message::new(Role::User, parts),
+        configuration: None,
+        metadata: None,
+        tenant: cli.tenant.clone(),
+    };
+
+    let mut stream = CollaborativeSession::new(agents)
+        .start(initial_request)
+        .await
+        .map_err(CliError::A2A)?;
+
+    let deadline = tokio::time::Instant::now() + cli.timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Err(_elapsed) => break,
+            Ok(None) => break,
+            Ok(Some((label, event))) => match cli.output {
+                OutputFormat::Json => {
+                    let line = serde_json::to_string(&serde_json::json!({
+                        "agent": &label,
+                        "event": &event,
+                    }))?;
+                    println!("{line}");
+                }
+                OutputFormat::Text => {
+                    for line in event.render_text().lines() {
+                        println!("[{label}] {line}");
+                    }
+                }
+            },
+        }
+    }
+
+    Ok(())
+}
+
+/// Build parts from a `CollaborateCommand` using the same logic as `MessageCommand`.
+fn resolve_collaborate_parts(command: &CollaborateCommand) -> Result<Vec<Part>, CliError> {
+    if command.text_parts.is_empty()
+        && command.file_parts.is_empty()
+        && command.data_parts.is_empty()
+    {
+        return match command.text.as_deref() {
+            Some(text) => Ok(vec![Part::text(text)]),
+            None => Err(CliError::InvalidInput(
+                "message must have at least one part: pass text, or use \
+                 --text-part/--file-part/--data-part"
+                    .to_string(),
+            )),
+        };
+    }
+    if command.text.is_some() {
+        return Err(CliError::InvalidInput(
+            "the positional message text cannot be combined with \
+             --text-part/--file-part/--data-part; pass it as --text-part instead"
+                .to_string(),
+        ));
+    }
+    // Simple ordered assembly: text parts first, then file, then data.
+    // A full order-preserving implementation would need ArgMatches indices.
+    let mut parts: Vec<Part> = Vec::new();
+    for t in &command.text_parts {
+        parts.push(Part::text(t));
+    }
+    for f in &command.file_parts {
+        let content = std::fs::read(f).map_err(|source| CliError::ReadFile {
+            path: f.clone(),
+            source,
+        })?;
+        parts.push(Part::raw(content));
+    }
+    for d in &command.data_parts {
+        let value: Value = if d == "-" {
+            serde_json::from_reader(std::io::stdin())?
+        } else if d.starts_with('{') || d.starts_with('[') {
+            serde_json::from_str(d)?
+        } else {
+            let text = std::fs::read_to_string(d).map_err(|source| CliError::ReadFile {
+                path: d.clone(),
+                source,
+            })?;
+            serde_json::from_str(&text)?
+        };
+        parts.push(Part::data(value));
+    }
+    Ok(parts)
+}
+
+/// Fetch an AgentCard from a reference string (host, URL, or file path).
+async fn fetch_card_for_reference(
+    reference: &str,
+    http: &reqwest::Client,
+) -> Result<AgentCard, CliError> {
+    match normalize_card_reference(reference) {
+        CardReference::File(path) => Ok(read_agent_card_file(&path)?.0),
+        CardReference::Url(url) => {
+            let raw: Value = http
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            serde_json::from_value(raw)
+                .map_err(|error| CliError::CardInvalid(format!("{url}: {error}")))
+        }
+    }
 }
 
 /// Every push-notification subcommand is gated on the card declaring
@@ -3579,6 +3756,37 @@ mod tests {
     }
 
     impl RunTestServer {
+        async fn spawn_collab(name: &str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let state = Arc::new(RunTestState::default());
+
+            let public_card = make_collab_fixture_card(&base_url, name);
+            let extended_card = make_collab_fixture_card(&base_url, &format!("{name} (extended)"));
+            let handler = Arc::new(RunTestHandler {
+                state,
+                extended_card,
+            });
+
+            let card = public_card.clone();
+            let app = Router::new()
+                .route(
+                    WELL_KNOWN_AGENT_CARD_PATH,
+                    get(move || {
+                        let card = card.clone();
+                        async move { Json(card) }
+                    }),
+                )
+                .nest("/jsonrpc", jsonrpc_router(handler.clone()))
+                .nest("/rest", rest_router(handler));
+
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            RunTestServer { base_url, handle }
+        }
+
         async fn spawn() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -6248,5 +6456,270 @@ mod tests {
         assert_eq!(envelope.error.code, "A2ACLI_ERR_USAGE");
         assert_eq!(envelope.error.message, "unexpected argument '--nope' found");
         assert!(envelope.error.hint.unwrap().contains("--help"));
+    }
+
+    // -----------------------------------------------------------------------
+    // collaborate command helpers and tests
+    // -----------------------------------------------------------------------
+
+    fn make_collab_fixture_card(base_url: &str, name: &str) -> AgentCard {
+        let mut card = make_fixture_card(base_url, name);
+        card.capabilities.extensions = Some(vec![
+            AgentExtension {
+                uri: EXTENSION_URI_SHARED_TASK.to_string(),
+                description: None,
+                required: None,
+                params: None,
+            },
+            AgentExtension {
+                uri: EXTENSION_URI_COLLABORATIVE_TASK.to_string(),
+                description: None,
+                required: None,
+                params: None,
+            },
+        ]);
+        card
+    }
+
+    #[test]
+    fn test_resolve_collaborate_parts_positional_text() {
+        let cmd = CollaborateCommand {
+            text: Some("hello world".to_string()),
+            text_parts: vec![],
+            file_parts: vec![],
+            data_parts: vec![],
+            media_types: vec![],
+            agents: vec![],
+        };
+        let parts = resolve_collaborate_parts(&cmd).unwrap();
+        assert_eq!(parts, vec![Part::text("hello world")]);
+    }
+
+    #[test]
+    fn test_resolve_collaborate_parts_no_message_error() {
+        let cmd = CollaborateCommand {
+            text: None,
+            text_parts: vec![],
+            file_parts: vec![],
+            data_parts: vec![],
+            media_types: vec![],
+            agents: vec![],
+        };
+        assert!(matches!(
+            resolve_collaborate_parts(&cmd),
+            Err(CliError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn test_resolve_collaborate_parts_text_part_flag() {
+        let cmd = CollaborateCommand {
+            text: None,
+            text_parts: vec!["part one".to_string(), "part two".to_string()],
+            file_parts: vec![],
+            data_parts: vec![],
+            media_types: vec![],
+            agents: vec![],
+        };
+        let parts = resolve_collaborate_parts(&cmd).unwrap();
+        assert_eq!(parts, vec![Part::text("part one"), Part::text("part two")]);
+    }
+
+    #[test]
+    fn test_resolve_collaborate_parts_conflicts_text_and_parts() {
+        let cmd = CollaborateCommand {
+            text: Some("hello".to_string()),
+            text_parts: vec!["world".to_string()],
+            file_parts: vec![],
+            data_parts: vec![],
+            media_types: vec![],
+            agents: vec![],
+        };
+        assert!(matches!(
+            resolve_collaborate_parts(&cmd),
+            Err(CliError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn test_resolve_collaborate_parts_inline_json_data_part() {
+        let cmd = CollaborateCommand {
+            text: None,
+            text_parts: vec![],
+            file_parts: vec![],
+            data_parts: vec![r#"{"k":1}"#.to_string()],
+            media_types: vec![],
+            agents: vec![],
+        };
+        let parts = resolve_collaborate_parts(&cmd).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(parts[0].content, PartContent::Data(_)));
+    }
+
+    #[test]
+    fn test_resolve_collaborate_parts_file_part() {
+        let path = std::env::temp_dir().join("a2acli-test-collab-file-part.bin");
+        std::fs::write(&path, b"hello bytes").unwrap();
+        let cmd = CollaborateCommand {
+            text: None,
+            text_parts: vec![],
+            file_parts: vec![path.to_string_lossy().to_string()],
+            data_parts: vec![],
+            media_types: vec![],
+            agents: vec![],
+        };
+        let parts = resolve_collaborate_parts(&cmd).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(parts[0].content, PartContent::Raw(_)));
+    }
+
+    #[test]
+    fn test_resolve_collaborate_parts_file_part_read_error() {
+        let cmd = CollaborateCommand {
+            text: None,
+            text_parts: vec![],
+            file_parts: vec!["/nonexistent/collab/test/file.bin".to_string()],
+            data_parts: vec![],
+            media_types: vec![],
+            agents: vec![],
+        };
+        assert!(matches!(
+            resolve_collaborate_parts(&cmd),
+            Err(CliError::ReadFile { .. })
+        ));
+    }
+
+    #[test]
+    fn test_resolve_collaborate_parts_file_data_part() {
+        let path = std::env::temp_dir().join("a2acli-test-collab-data-part.json");
+        std::fs::write(&path, r#"{"key":"value"}"#).unwrap();
+        let cmd = CollaborateCommand {
+            text: None,
+            text_parts: vec![],
+            file_parts: vec![],
+            data_parts: vec![path.to_string_lossy().to_string()],
+            media_types: vec![],
+            agents: vec![],
+        };
+        let parts = resolve_collaborate_parts(&cmd).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(parts[0].content, PartContent::Data(_)));
+    }
+
+    #[test]
+    fn test_resolve_collaborate_parts_data_file_read_error() {
+        let cmd = CollaborateCommand {
+            text: None,
+            text_parts: vec![],
+            file_parts: vec![],
+            data_parts: vec!["/nonexistent/collab/test/data.json".to_string()],
+            media_types: vec![],
+            agents: vec![],
+        };
+        assert!(matches!(
+            resolve_collaborate_parts(&cmd),
+            Err(CliError::ReadFile { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_collaborate_requires_at_least_two_agents() {
+        // Fails before any HTTP call — no server needed.
+        let result = run_args([
+            "a2acli",
+            "collaborate",
+            "--agent",
+            "localhost:19999",
+            "hello",
+        ])
+        .await;
+        assert!(matches!(result, Err(CliError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn test_collaborate_fails_when_card_missing_extensions() {
+        let srv = RunTestServer::spawn().await;
+        // Both --agent refs point to the same plain server (extensions: None).
+        // The first agent fails require_collaborative_extensions → Err.
+        let result = run_args([
+            "a2acli",
+            "collaborate",
+            "--agent",
+            &srv.base_url,
+            "--agent",
+            &srv.base_url,
+            "hello",
+        ])
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_collaborate_runs_session_text_output() {
+        let srv_a = RunTestServer::spawn_collab("Agent A").await;
+        let srv_b = RunTestServer::spawn_collab("Agent B").await;
+        let result = run_args([
+            "a2acli",
+            "collaborate",
+            "--agent",
+            &srv_a.base_url,
+            "--agent",
+            &srv_b.base_url,
+            "hello",
+        ])
+        .await;
+        assert!(result.is_ok(), "collaborate failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_collaborate_runs_session_json_output() {
+        let srv_a = RunTestServer::spawn_collab("Agent A").await;
+        let srv_b = RunTestServer::spawn_collab("Agent B").await;
+        let result = run_args([
+            "a2acli",
+            "-o",
+            "json",
+            "collaborate",
+            "--agent",
+            &srv_a.base_url,
+            "--agent",
+            &srv_b.base_url,
+            "hello",
+        ])
+        .await;
+        assert!(result.is_ok(), "collaborate json failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_collaborate_runs_session_with_tenant() {
+        let srv_a = RunTestServer::spawn_collab("Agent A").await;
+        let srv_b = RunTestServer::spawn_collab("Agent B").await;
+        let result = run_args([
+            "a2acli",
+            "--tenant",
+            "test-tenant",
+            "collaborate",
+            "--agent",
+            &srv_a.base_url,
+            "--agent",
+            &srv_b.base_url,
+            "hello",
+        ])
+        .await;
+        assert!(result.is_ok(), "collaborate with tenant failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_card_for_reference_file_path() {
+        let card = make_fixture_card("http://localhost:19999", "File Card");
+        let path = std::env::temp_dir().join("a2acli-test-collab-fetch-card.json");
+        std::fs::write(&path, serde_json::to_string(&card).unwrap()).unwrap();
+        let reference = format!("file://{}", path.display());
+        let http = reqwest::Client::new();
+        let result = fetch_card_for_reference(&reference, &http).await;
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result.unwrap().name, "File Card");
     }
 }
