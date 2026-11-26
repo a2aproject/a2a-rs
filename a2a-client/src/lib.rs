@@ -52,7 +52,7 @@ pub mod fuzz_support {
         buf: &[u8],
         parse_event: &dyn Fn(&str) -> Option<Result<StreamResponse, A2AError>>,
     ) -> Option<Result<StreamResponse, A2AError>> {
-        crate::jsonrpc::parse_stream_tail(buf, parse_event)
+        crate::jsonrpc::parse_stream_tail(buf, parse_event, None)
     }
 }
 

@@ -21,6 +21,7 @@ copyright: Copyright A2A Contributors. Licensed under the Apache License, Versio
 # Navigation
 nav:
   - Home: index.md
+  - Install: install.md
   - Quickstart:
       - Agent:
           - quickstart/agent/index.md

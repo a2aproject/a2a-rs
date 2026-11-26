@@ -56,8 +56,8 @@ cargo add a2a-lf --rename a2a
 cargo add a2a-slimrpc
 ```
 
-Built on the SLIM 3.4 release line (`agntcy-slim-rpc` 3.4, `agntcy-slim-auth` and
-`agntcy-slim-config` 0.17). `SlimApp` and the `slim_rpc` types in the public API
+Built on the SLIM 3.5 release line (`agntcy-slim-rpc` 3.5, `agntcy-slim-auth` 0.19 and
+`agntcy-slim-config` 0.18). `SlimApp` and the `slim_rpc` types in the public API
 come from those crates, so depend on the same versions.
 
 ## Workspace

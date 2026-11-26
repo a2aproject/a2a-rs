@@ -36,12 +36,12 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Internal crates
-a2a = { package = "a2a-lf", path = "a2a", version = "0.4.2" }
-a2a-client = { package = "a2a-client-lf", path = "a2a-client", version = "0.2.9", default-features = false }
-a2a-server = { package = "a2a-server-lf", path = "a2a-server", version = "0.5.3", default-features = false }
-a2a-pb = { package = "a2a-pb", path = "a2a-pb", version = "0.3.2" }
-a2a-grpc = { package = "a2a-grpc", path = "a2a-grpc", version = "0.3.11", default-features = false }
-a2a-slimrpc = { package = "a2a-slimrpc", path = "a2a-slimrpc", version = "0.3.5" }
+a2a = { package = "a2a-lf", path = "a2a", version = "0.4.3" }
+a2a-client = { package = "a2a-client-lf", path = "a2a-client", version = "0.3.0", default-features = false }
+a2a-server = { package = "a2a-server-lf", path = "a2a-server", version = "0.6.0", default-features = false }
+a2a-pb = { package = "a2a-pb", path = "a2a-pb", version = "0.4.0" }
+a2a-grpc = { package = "a2a-grpc", path = "a2a-grpc", version = "0.4.0", default-features = false }
+a2a-slimrpc = { package = "a2a-slimrpc", path = "a2a-slimrpc", version = "0.4.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -76,13 +76,13 @@ prost = "0.14"
 prost-types = "0.14"
 pbjson-build = "0.9"
 protoc-bin-vendored = "3"
-slim_rpc = { package = "agntcy-slim-rpc", version = "3.4.5" }
-slim_config = { package = "agntcy-slim-config", version = "0.17.9" }
-slim_service = { package = "agntcy-slim-service", version = "0.13.14", features = [
+slim_rpc = { package = "agntcy-slim-rpc", version = "3.5.1" }
+slim_config = { package = "agntcy-slim-config", version = "0.18.0" }
+slim_service = { package = "agntcy-slim-service", version = "0.15.0", features = [
     "session",
 ] }
-slim_datapath = { package = "agntcy-slim-datapath", version = "0.19.14" }
-slim_auth = { package = "agntcy-slim-auth", version = "0.17.9" }
+slim_datapath = { package = "agntcy-slim-datapath", version = "0.20.0" }
+slim_auth = { package = "agntcy-slim-auth", version = "0.19.0" }
 
 # Utilities
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
