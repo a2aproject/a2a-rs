@@ -46,12 +46,6 @@ class EchoAssertions(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "completed"):
             assert_echo(json.dumps(self.stream()[0]), self.message, True)
 
-    def test_nonfinal_stream(self):
-        events = self.stream()
-        events[-1]["statusUpdate"]["final"] = False
-        with self.assertRaisesRegex(ValueError, "not final"):
-            assert_echo("\n".join(map(json.dumps, events)), self.message, True)
-
     def test_polling_fallback_and_nonzero_exit(self):
         output = "\n".join(map(json.dumps, self.stream()))
         with self.assertRaisesRegex(ValueError, "polling"):

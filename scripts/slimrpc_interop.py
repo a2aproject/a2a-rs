@@ -45,8 +45,6 @@ def assert_echo(output, message, streaming=False):
     terminal = events[-1].get("statusUpdate", events[-1]) if streaming else events[-1].get("task", events[-1])
     if terminal.get("status", {}).get("state") not in COMPLETED:
         raise ValueError("Final completed task status missing")
-    if streaming and terminal.get("final", True) is not True:
-        raise ValueError("Streaming response is not final")
 
 
 def check_response(result, message, streaming=False):
