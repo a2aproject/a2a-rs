@@ -209,6 +209,13 @@ SLIM gateway image `2.3.0`, the released
 [`slim-a2a-go` v0.3.0 echo agent](https://github.com/agntcy/slim-a2a-go/tree/v0.3.0/examples/echo_agent),
 and this workspace's locked Rust dependencies.
 
+To run the same round trip unattended, as CI does, put `a2a`,
+`a2a-transport-slimrpc` and the built echo agent (as `slimrpc-echo-agent`) on
+`PATH`, then run
+[`scripts/slimrpc_live_interop.sh`](../scripts/slimrpc_live_interop.sh) with
+`SLIM_GATEWAY_IMAGE` set to a gateway image. It starts the gateway and agent,
+checks a unary and a streaming send, and leaves logs in `interop-logs/`.
+
 ### 1. Start The Gateway
 
 The checked-in [gateway configuration](examples/slim-gateway.yaml) starts a

@@ -17,6 +17,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/slimrpc_interop.py'
+      - 'scripts/slimrpc_live_interop.sh'
       - 'scripts/test_slimrpc_interop.py'
       - '.github/workflows/cli-plugin-interop.yml'
   push:
@@ -33,12 +34,18 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/slimrpc_interop.py'
+      - 'scripts/slimrpc_live_interop.sh'
       - 'scripts/test_slimrpc_interop.py'
       - '.github/workflows/cli-plugin-interop.yml'
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  # Live interop pins. Renovate manages only cargo and github-actions here, so
+  # nothing bumps these: update them together, by hand.
+  A2A_CLI_VERSION: v0.4.0
+  SLIM_GATEWAY_IMAGE: ghcr.io/agntcy/slim:3.4.6@sha256:54fde7ce0ef8efa6a61fee47996e941e87acb4e62284e5d9c00eb761295619b7
+  SLIM_A2A_GO_REF: 7744bf6f2c78f00f7c87e96894346b0762adeb4f # v0.5.2
 
 # Least privilege by default; nothing is published from this job.
 permissions:
@@ -74,7 +81,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/a2a-cli"
-          gh release download v0.4.0 --repo a2aproject/a2a-cli \
+          gh release download "$A2A_CLI_VERSION" --repo a2aproject/a2a-cli \
             --pattern '*_linux_amd64.tar.gz' \
             --dir "$RUNNER_TEMP/a2a-cli" \
             --clobber
@@ -121,7 +128,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: agntcy/slim-a2a-go
-          ref: 7744bf6f2c78f00f7c87e96894346b0762adeb4f # v0.5.2
+          ref: ${{ env.SLIM_A2A_GO_REF }}
           path: .interop/slim-a2a-go
           persist-credentials: false
 
@@ -141,60 +148,7 @@ jobs:
       - name: Test unary and streaming sends through a live gateway
         env:
           A2A_SLIMRPC_PLUGIN_CONFIG: ${{ github.workspace }}/a2acli-transport-slimrpc/examples/plugin.yaml
-        run: |
-          mkdir -p interop-logs
-          gateway="a2a-slimrpc-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          agent_pid=""
-          cleanup() {
-            if [ -n "$agent_pid" ]; then
-              kill "$agent_pid" 2>/dev/null || true
-              wait "$agent_pid" 2>/dev/null || true
-            fi
-            docker logs "$gateway" > interop-logs/gateway.log 2>&1 || true
-            docker rm -f "$gateway" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-          docker run -d --name "$gateway" \
-            -p 127.0.0.1:46357:46357 \
-            -v "$PWD/a2acli-transport-slimrpc/examples/slim-gateway.yaml:/config.yaml:ro" \
-            ghcr.io/agntcy/slim:3.4.6@sha256:54fde7ce0ef8efa6a61fee47996e941e87acb4e62284e5d9c00eb761295619b7 /slim --config /config.yaml
-          # Bound startup separately from the actual test; sends are not retried.
-          python3 - <<'PYREADY'
-          import socket
-          import time
-          for attempt in range(60):
-              try:
-                  with socket.create_connection(("127.0.0.1", 46357), timeout=1):
-                      break
-              except OSError:
-                  time.sleep(1)
-          else:
-              raise SystemExit("SLIM gateway did not become ready")
-          PYREADY
-          # Docker's host port can accept TCP before SLIM accepts gRPC.
-          # Retry only agent startup, retaining every failed attempt's output.
-          agent_log=""
-          for attempt in $(seq 1 60); do
-            if [ -z "$agent_pid" ] || ! kill -0 "$agent_pid" 2>/dev/null; then
-              if [ -n "$agent_pid" ]; then
-                wait "$agent_pid" 2>/dev/null || true
-              fi
-              # Keep each attempt's logs, but only inspect the current one.
-              agent_log="interop-logs/agent-attempt-${attempt}.log"
-              echo "Starting echo agent (readiness attempt $attempt)" > "$agent_log"
-              GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn \
-                slimrpc-echo-agent --a2a-version v1 --slim-endpoint http://127.0.0.1:46357 \
-                >> "$agent_log" 2>&1 &
-              agent_pid=$!
-            fi
-            if grep -q 'echo agent ready' "$agent_log"; then
-              break
-            fi
-            sleep 1
-          done
-          kill -0 "$agent_pid"
-          grep -q 'echo agent ready' "$agent_log"
-          python3 scripts/slimrpc_interop.py --output-dir interop-logs
+        run: scripts/slimrpc_live_interop.sh
 
       - name: Upload interop logs
         if: always()
