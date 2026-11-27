@@ -23,6 +23,7 @@ fuzz/target/
 # Derived from the root Cargo.lock; see `just fuzz-lock`.
 fuzz/Cargo.lock
 
-# Docs site: `just docs-build` output and its Python environment
+# Docs site: `just docs-build` and `just docs-export` output, and the Python environment
 /site/
+/docs-export/
 /.venv-docs/

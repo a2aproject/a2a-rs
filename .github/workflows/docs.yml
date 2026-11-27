@@ -17,6 +17,8 @@ on:
       - 'mkdocs.yml'
       - 'requirements-docs.in'
       - 'requirements-docs.txt'
+      - 'scripts/export_docs.py'
+      - 'scripts/publish_docs_export.sh'
   push:
     branches:
       - main
@@ -31,6 +33,8 @@ on:
       - 'mkdocs.yml'
       - 'requirements-docs.in'
       - 'requirements-docs.txt'
+      - 'scripts/export_docs.py'
+      - 'scripts/publish_docs_export.sh'
 
 # Least privilege: every job is read-only except `deploy`, which can publish to
 # GitHub Pages and nothing else.
@@ -68,6 +72,11 @@ jobs:
       # path, a nav entry with no page, a dead link or anchor between pages.
       - name: Build the site
         run: just docs-build
+
+      # What the `export` job publishes after a merge, checked before it.
+      - name: Export the docs
+        if: github.event_name == 'pull_request'
+        run: just docs-export
 
       - name: Upload the site
         if: github.event_name == 'pull_request'
@@ -134,3 +143,37 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  # Publishes the docs as plain Markdown on the `docs-export` branch, which the
+  # A2A site (a2a-protocol.org) mounts. The only job that can write to the repo.
+  export:
+    name: Export docs for a2a-protocol.org
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.15'
+
+      - name: Install just
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
+        with:
+          tool: just
+
+      - name: Export the docs
+        run: just docs-export
+
+      - name: Publish the export
+        run: bash scripts/publish_docs_export.sh docs-export
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
