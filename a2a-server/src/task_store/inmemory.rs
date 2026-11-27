@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 
 use super::apply_history_length;
 use super::store::{TaskStore, TaskVersion};
-use crate::pagination::resolve_page_size;
+use crate::pagination::{resolve_page_offset, resolve_page_size};
 
 struct StoredEntry {
     task: Task,
@@ -187,14 +187,8 @@ impl TaskStore for InMemoryTaskStore {
         // store, but a store reached by another route must still bound its
         // own page.
         let page_size = resolve_page_size(req.page_size);
-        let start = if let Some(ref token) = req.page_token {
-            // Simple offset-based pagination
-            token
-                .parse::<usize>()
-                .map_err(|_| A2AError::invalid_params("invalid page token"))?
-        } else {
-            0
-        };
+        // Simple offset-based pagination
+        let start = resolve_page_offset(req.page_token.as_deref())?;
 
         let total_size = tasks.len();
         // Make sure start is within bounds
@@ -709,6 +703,36 @@ mod tests {
         let result = store.list(&req).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, error_code::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn test_list_empty_page_token_is_the_first_page() {
+        let store = InMemoryTaskStore::new();
+        for i in 0..3 {
+            store
+                .create(make_task(&format!("t{i}"), "c1", TaskState::Submitted))
+                .await
+                .unwrap();
+        }
+        let request = |page_token: Option<String>| ListTasksRequest {
+            context_id: None,
+            status: None,
+            page_size: Some(2),
+            page_token,
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: None,
+            tenant: None,
+        };
+
+        let first = store.list(&request(None)).await.unwrap();
+        let empty = store.list(&request(Some(String::new()))).await.unwrap();
+
+        let ids =
+            |resp: &ListTasksResponse| resp.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&empty), ids(&first));
+        assert_eq!(empty.next_page_token, first.next_page_token);
+        assert!(!empty.next_page_token.is_empty());
     }
 
     #[tokio::test]
