@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.4.0...a2a-slimrpc-v0.4.1) - 2026-11-27
+
+### Other
+
+- *(slimrpc)* pin the e2e caller identity to the client's did:key ([#603](https://github.com/a2aproject/a2a-rs/pull/603))
+- *(slimrpc)* name the SLIM 3.5 line in the README ([#600](https://github.com/a2aproject/a2a-rs/pull/600))
+- *(slimrpc)* mark the SLIM 3.5 move as breaking in the 0.4.0 notes ([#601](https://github.com/a2aproject/a2a-rs/pull/601))
+
 ## [0.4.0](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.3.5...a2a-slimrpc-v0.4.0) - 2026-11-26
 
 ### Fixed

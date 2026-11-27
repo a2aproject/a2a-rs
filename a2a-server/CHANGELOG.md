@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.6.0...a2a-server-lf-v0.6.1) - 2026-11-27
+
+### Fixed
+
+- *(a2a-server)* begin a task stream with the task object ([#587](https://github.com/a2aproject/a2a-rs/pull/587))
+
 ## [0.6.0](https://github.com/a2aproject/a2a-rs/compare/a2a-server-lf-v0.5.3...a2a-server-lf-v0.6.0) - 2026-11-26
 
 ### Added
