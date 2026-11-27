@@ -27,14 +27,15 @@ curl -sN http://localhost:9999/jsonrpc \
 The events arrive one after another, over about a second and a half, as the executor produces them:
 
 ```json
-{"statusUpdate":{"contextId":"01a1d1be-4be6-704d-aa17-3a070b5ec48c","status":{"state":"TASK_STATE_WORKING","timestamp":"2026-11-12T21:51:12.148744Z"},"taskId":"01a1d1be-4be6-704d-aa17-3a06bfbbb553"}}
-{"artifactUpdate":{"artifact":{"artifactId":"greeting","parts":[{"text":"Hello, "}]},"contextId":"01a1d1be-4be6-704d-aa17-3a070b5ec48c","taskId":"01a1d1be-4be6-704d-aa17-3a06bfbbb553"}}
-{"artifactUpdate":{"append":true,"artifact":{"artifactId":"greeting","parts":[{"text":"Ada"}]},"contextId":"01a1d1be-4be6-704d-aa17-3a070b5ec48c","taskId":"01a1d1be-4be6-704d-aa17-3a06bfbbb553"}}
-{"artifactUpdate":{"append":true,"artifact":{"artifactId":"greeting","parts":[{"text":"!"}]},"contextId":"01a1d1be-4be6-704d-aa17-3a070b5ec48c","lastChunk":true,"taskId":"01a1d1be-4be6-704d-aa17-3a06bfbbb553"}}
-{"statusUpdate":{"contextId":"01a1d1be-4be6-704d-aa17-3a070b5ec48c","status":{"state":"TASK_STATE_COMPLETED","timestamp":"2026-11-12T21:51:13.357120Z"},"taskId":"01a1d1be-4be6-704d-aa17-3a06bfbbb553"}}
+{"task":{"contextId":"01a20f90-a441-74ed-b8e5-e99ab81db97c","history":[{"messageId":"m4","parts":[{"text":"Ada"}],"role":"ROLE_USER"}],"id":"01a20f90-a441-74ed-b8e5-e999bde968a2","status":{"state":"TASK_STATE_SUBMITTED","timestamp":"2026-11-24T21:57:47.201368547Z"}}}
+{"statusUpdate":{"contextId":"01a20f90-a441-74ed-b8e5-e99ab81db97c","status":{"state":"TASK_STATE_WORKING","timestamp":"2026-11-24T21:57:47.502167154Z"},"taskId":"01a20f90-a441-74ed-b8e5-e999bde968a2"}}
+{"artifactUpdate":{"artifact":{"artifactId":"greeting","parts":[{"text":"Hello, "}]},"contextId":"01a20f90-a441-74ed-b8e5-e99ab81db97c","taskId":"01a20f90-a441-74ed-b8e5-e999bde968a2"}}
+{"artifactUpdate":{"append":true,"artifact":{"artifactId":"greeting","parts":[{"text":"Ada"}]},"contextId":"01a20f90-a441-74ed-b8e5-e99ab81db97c","taskId":"01a20f90-a441-74ed-b8e5-e999bde968a2"}}
+{"artifactUpdate":{"append":true,"artifact":{"artifactId":"greeting","parts":[{"text":"!"}]},"contextId":"01a20f90-a441-74ed-b8e5-e99ab81db97c","lastChunk":true,"taskId":"01a20f90-a441-74ed-b8e5-e999bde968a2"}}
+{"statusUpdate":{"contextId":"01a20f90-a441-74ed-b8e5-e99ab81db97c","status":{"state":"TASK_STATE_COMPLETED","timestamp":"2026-11-24T21:57:48.706063693Z"},"taskId":"01a20f90-a441-74ed-b8e5-e999bde968a2"}}
 ```
 
-There are five events: a `statusUpdate` to `TASK_STATE_WORKING`, three `artifactUpdate` events that carry `Hello, `, `Ada` and `!`, and a `statusUpdate` to `TASK_STATE_COMPLETED`. The first piece creates the artifact, the next two have `"append": true`, and the last has `"lastChunk": true`. The first piece has no `append` because `false` is the default, and the JSON leaves defaults out.
+There are six events: the `task` itself in `TASK_STATE_SUBMITTED`, with your message in its history, a `statusUpdate` to `TASK_STATE_WORKING`, three `artifactUpdate` events that carry `Hello, `, `Ada` and `!`, and a `statusUpdate` to `TASK_STATE_COMPLETED`. The first piece creates the artifact, the next two have `"append": true`, and the last has `"lastChunk": true`. The first piece has no `append` because `false` is the default, and the JSON leaves defaults out.
 
 ## A conversation over two messages
 

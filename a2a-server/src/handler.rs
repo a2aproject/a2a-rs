@@ -23,6 +23,14 @@ const EXECUTION_BUFFER_CAPACITY: usize = 32;
 /// last event already published, and that event's sequence.
 type Resubscription = (broadcast::Receiver<ExecutionEvent>, Option<Task>, u64);
 
+/// A started execution: the task's id, the task as the execution starts
+/// from it, and the execution's events.
+type StartedExecution = (
+    TaskId,
+    Task,
+    BoxStream<'static, Result<StreamResponse, A2AError>>,
+);
+
 #[derive(Clone)]
 struct ExecutionEvent {
     sequence: u64,
@@ -546,7 +554,14 @@ fn subscription_stream(
                         state.min_sequence = event.sequence;
                         match &event.result {
                             Ok(item) if is_terminal_event(item) => state.done = true,
-                            Err(_) => state.done = true,
+                            // §3.1.2: a Message answer is "exactly one Message
+                            // object and then close immediately". Nothing may
+                            // follow an answering Message on that execution, so
+                            // attached and waiting subscriptions (§3.1.6), which
+                            // follow the same execution, end at the Message too,
+                            // and a pending cancellation's later items do not
+                            // follow it.
+                            Ok(StreamResponse::Message(_)) | Err(_) => state.done = true,
                             _ => {}
                         }
                         return Some((event.result.clone(), state));
@@ -565,6 +580,32 @@ fn subscription_stream(
             }
         },
     ))
+}
+
+/// §3.1.2: a task lifecycle stream "MUST begin with the Task object". An
+/// executor may open its turn with a status or artifact update instead; the
+/// response stream then begins with `task`, the task as the execution
+/// started from it, before that update applies, so the update is not
+/// delivered twice. A first Task or Message, or an error, passes untouched.
+fn open_with_task(
+    events: BoxStream<'static, Result<StreamResponse, A2AError>>,
+    task: Task,
+) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    let mut task = Some(task);
+    events
+        .flat_map(move |item| {
+            let opens_task = matches!(
+                item,
+                Ok(StreamResponse::StatusUpdate(_) | StreamResponse::ArtifactUpdate(_))
+            );
+            let lead = task.take().filter(|_| opens_task);
+            stream::iter(
+                lead.map(|task| Ok(StreamResponse::Task(task)))
+                    .into_iter()
+                    .chain([item]),
+            )
+        })
+        .boxed()
 }
 
 async fn drive_execution(
@@ -1058,7 +1099,7 @@ impl DefaultRequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
         include_task_snapshot_in_context: bool,
-    ) -> Result<(TaskId, BoxStream<'static, Result<StreamResponse, A2AError>>), A2AError> {
+    ) -> Result<StartedExecution, A2AError> {
         if req.message.role != Role::User {
             let received = match req.message.role {
                 Role::Agent => "ROLE_AGENT",
@@ -1105,7 +1146,7 @@ impl DefaultRequestHandler {
             drive_execution(runtime, execution_task_id, active_execution, exec_ctx).await;
         });
 
-        Ok((task_id, subscription_stream(receiver, None, 0)))
+        Ok((task_id, task, subscription_stream(receiver, None, 0)))
     }
 }
 
@@ -1124,7 +1165,7 @@ impl RequestHandler for DefaultRequestHandler {
             .configuration
             .as_ref()
             .and_then(|configuration| configuration.history_length);
-        let (task_id, mut stream) = self.start_execution(params, req.clone(), true).await?;
+        let (task_id, _, mut stream) = self.start_execution(params, req.clone(), true).await?;
         let mut last_event = None;
 
         while let Some(item) = stream.next().await {
@@ -1180,7 +1221,8 @@ impl RequestHandler for DefaultRequestHandler {
             .configuration
             .as_ref()
             .and_then(|configuration| configuration.history_length);
-        let (_, stream) = self.start_execution(params, req, false).await?;
+        let (_, initial_task, stream) = self.start_execution(params, req, false).await?;
+        let stream = open_with_task(stream, initial_task);
         Ok(Box::pin(stream.map(move |item| {
             item.map(|mut event| {
                 if let StreamResponse::Task(task) = &mut event {
@@ -3239,9 +3281,11 @@ mod tests {
         assert_eq!(error.code, error_code::INVALID_AGENT_RESPONSE);
     }
 
-    /// Nothing may follow a Message that answered the request.
+    /// Nothing may follow a Message that answered the request: the response
+    /// stream ends at the Message (§3.1.2), and the later event fails the
+    /// task in the store.
     #[tokio::test]
-    async fn test_event_after_an_answering_message_is_an_invalid_agent_response() {
+    async fn test_event_after_an_answering_message_fails_the_task_behind_the_closed_stream() {
         let handler = DefaultRequestHandler::new(
             ScriptedExecutor(|ctx: &ExecutorContext| {
                 vec![
@@ -3257,15 +3301,591 @@ mod tests {
             }),
             InMemoryTaskStore::new(),
         );
-        let events: Vec<_> = handler
+        let stream = handler
             .send_streaming_message(&ServiceParams::new(), send_request())
             .await
-            .unwrap()
-            .collect()
-            .await;
-        assert!(matches!(events[0], Ok(StreamResponse::Message(_))));
+            .unwrap();
+        let events = within(stream.collect::<Vec<_>>()).await;
         assert!(
-            matches!(&events[1], Err(error) if error.code == error_code::INVALID_AGENT_RESPONSE)
+            matches!(&events[..], [Ok(StreamResponse::Message(_))]),
+            "{events:?}"
+        );
+
+        let task_id = only_task_id(&handler).await;
+        timeout(Duration::from_secs(5), async {
+            while handler.execution_manager.get(&task_id).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let task = handler
+            .get_task(
+                &ServiceParams::new(),
+                GetTaskRequest {
+                    id: task_id,
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.status.state, TaskState::Failed);
+    }
+
+    /// The id of the one task the handler stores.
+    async fn only_task_id(handler: &DefaultRequestHandler) -> TaskId {
+        let listed = handler
+            .list_tasks(
+                &ServiceParams::new(),
+                ListTasksRequest {
+                    context_id: None,
+                    status: None,
+                    page_size: None,
+                    page_token: None,
+                    history_length: None,
+                    status_timestamp_after: None,
+                    include_artifacts: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.tasks.len(), 1);
+        listed.tasks[0].id.clone()
+    }
+
+    /// An event after an answering Message is classified at the execution
+    /// layer as an invalid agent response, before any response stream.
+    #[tokio::test]
+    async fn test_event_after_an_answering_message_is_published_as_an_invalid_agent_response() {
+        let late = Arc::new(Notify::new());
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor({
+                let late = late.clone();
+                move |ctx: &ExecutorContext| {
+                    let message = Message::new(Role::Agent, vec![Part::text("answer")]);
+                    vec![
+                        (None, Ok(StreamResponse::Message(message))),
+                        (
+                            Some(late.clone()),
+                            Ok(status_event(ctx, TaskState::Completed, None)),
+                        ),
+                    ]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let _stream = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap();
+        let task_id = only_task_id(&handler).await;
+        // The execution waits for `late`, so it is still registered.
+        let mut events = handler
+            .execution_manager
+            .get(&task_id)
+            .await
+            .expect("the execution waits for its late event")
+            .subscribe();
+        late.notify_one();
+        let result = within(async {
+            loop {
+                match events.recv().await.unwrap().result {
+                    Ok(StreamResponse::Message(_)) => continue,
+                    other => break other,
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(&result, Err(error) if error.code == error_code::INVALID_AGENT_RESPONSE),
+            "{result:?}"
+        );
+    }
+
+    /// Bounds a wait of a test, so a stream that stays open fails it.
+    async fn within<T>(future: impl Future<Output = T>) -> T {
+        timeout(Duration::from_secs(5), future)
+            .await
+            .expect("timed out")
+    }
+
+    /// The gates of `cancel_race_handler`'s executor.
+    #[derive(Default)]
+    struct CancelRace {
+        /// Releases the Message that answers any message but "ask".
+        answer: Arc<Notify>,
+        /// Notified when the cancel calls the executor: CANCELED is then
+        /// committed and the cancel holds the execution.
+        canceling: Arc<Notify>,
+        /// Releases the cancel's CANCELED status.
+        cancel_ends: Arc<Notify>,
+    }
+
+    /// An executor that leaves the task awaiting input on "ask", answers any
+    /// other message with a Message, and is canceled with CANCELED, each
+    /// step behind the gates of the returned `CancelRace`.
+    fn cancel_race_handler() -> (Arc<DefaultRequestHandler>, CancelRace) {
+        let race = CancelRace::default();
+        let (answer, canceling, cancel_ends) = (
+            race.answer.clone(),
+            race.canceling.clone(),
+            race.cancel_ends.clone(),
+        );
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(move |ctx: &ExecutorContext| match &ctx.message {
+                Some(message) if message.text() == Some("ask") => {
+                    vec![(None, Ok(status_event(ctx, TaskState::InputRequired, None)))]
+                }
+                Some(_) => {
+                    let message = Message::new(Role::Agent, vec![Part::text("answer")]);
+                    vec![(Some(answer.clone()), Ok(StreamResponse::Message(message)))]
+                }
+                None => {
+                    canceling.notify_one();
+                    vec![(
+                        Some(cancel_ends.clone()),
+                        Ok(status_event(ctx, TaskState::Canceled, None)),
+                    )]
+                }
+            }),
+            InMemoryTaskStore::new(),
+        );
+        (Arc::new(handler), race)
+    }
+
+    fn start_cancel(
+        handler: &Arc<DefaultRequestHandler>,
+        task_id: &str,
+    ) -> tokio::task::JoinHandle<Result<Task, A2AError>> {
+        let handler = Arc::clone(handler);
+        let request = CancelTaskRequest {
+            id: task_id.into(),
+            metadata: None,
+            tenant: None,
+        };
+        tokio::spawn(async move { handler.cancel_task(&ServiceParams::new(), request).await })
+    }
+
+    /// Releases a cancel `start_cancel` started and checks its own answer.
+    async fn finish_cancel(
+        race: &CancelRace,
+        cancel: tokio::task::JoinHandle<Result<Task, A2AError>>,
+    ) {
+        race.cancel_ends.notify_one();
+        let canceled = within(cancel).await.unwrap().unwrap();
+        assert_eq!(canceled.status.state, TaskState::Canceled);
+    }
+
+    /// §3.1.2: a Message answer is "exactly one Message object and then close
+    /// immediately", also while a cancel of the request's task waits for the
+    /// executor: the stream closes before the cancel ends, its CANCELED
+    /// status never follows the Message, and the cancel itself succeeds.
+    #[tokio::test]
+    async fn test_message_answer_ends_the_stream_before_a_pending_cancel() {
+        let (handler, race) = cancel_race_handler();
+        let mut stream = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap();
+        let task_id = only_task_id(&handler).await;
+        let cancel = start_cancel(&handler, &task_id);
+        within(race.canceling.notified()).await;
+        race.answer.notify_one();
+
+        assert!(matches!(
+            within(stream.next()).await,
+            Some(Ok(StreamResponse::Message(_)))
+        ));
+        assert!(within(stream.next()).await.is_none());
+        assert!(!cancel.is_finished(), "the cancel is still pending");
+        finish_cancel(&race, cancel).await;
+    }
+
+    /// A subscription attached to the running execution ends at its Message
+    /// too, while the cancel is pending.
+    #[tokio::test]
+    async fn test_message_answer_ends_an_attached_subscription_before_a_pending_cancel() {
+        let (handler, race) = cancel_race_handler();
+        let _stream = handler
+            .send_streaming_message(&ServiceParams::new(), send_request())
+            .await
+            .unwrap();
+        let task_id = only_task_id(&handler).await;
+        let subscription = handler
+            .subscribe_to_task(
+                &ServiceParams::new(),
+                SubscribeToTaskRequest {
+                    id: task_id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        let cancel = start_cancel(&handler, &task_id);
+        within(race.canceling.notified()).await;
+        race.answer.notify_one();
+
+        let items = within(subscription.collect::<Vec<_>>()).await;
+        assert!(
+            matches!(
+                &items[..],
+                [Ok(StreamResponse::Task(task)), Ok(StreamResponse::Message(_))]
+                    if task.status.state == TaskState::Submitted
+            ),
+            "{items:?}"
+        );
+        assert!(!cancel.is_finished(), "the cancel is still pending");
+        finish_cancel(&race, cancel).await;
+    }
+
+    /// A subscription waiting for a task's next turn follows that turn to its
+    /// Message and ends there, while the cancel is pending.
+    #[tokio::test]
+    async fn test_message_answer_ends_a_waiting_subscription_before_a_pending_cancel() {
+        let (handler, race) = cancel_race_handler();
+        let params = ServiceParams::new();
+        let ask = SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("ask")]),
+            ..send_request()
+        };
+        let SendMessageResponse::Task(task) = handler.send_message(&params, ask).await.unwrap()
+        else {
+            panic!("expected a task awaiting input");
+        };
+        assert_eq!(task.status.state, TaskState::InputRequired);
+        let subscription = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: task.id.clone(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let follow_up = SendMessageRequest {
+            message: Message {
+                task_id: Some(task.id.clone()),
+                ..Message::new(Role::User, vec![Part::text("go")])
+            },
+            ..send_request()
+        };
+        let _stream = handler
+            .send_streaming_message(&params, follow_up)
+            .await
+            .unwrap();
+        let cancel = start_cancel(&handler, &task.id);
+        within(race.canceling.notified()).await;
+        race.answer.notify_one();
+
+        // The stored task, the task as the turn found it, then the answer.
+        let items = within(subscription.collect::<Vec<_>>()).await;
+        assert!(
+            matches!(
+                &items[..],
+                [
+                    Ok(StreamResponse::Task(stored)),
+                    Ok(StreamResponse::Task(found)),
+                    Ok(StreamResponse::Message(_)),
+                ] if stored.status.state == TaskState::InputRequired
+                    && found.status.state == TaskState::InputRequired
+            ),
+            "{items:?}"
+        );
+        assert!(!cancel.is_finished(), "the cancel is still pending");
+        finish_cancel(&race, cancel).await;
+    }
+
+    /// The payload of a stream item of the given variant; any other variant fails the test.
+    macro_rules! item {
+        ($item:expr, $variant:ident) => {
+            match $item {
+                StreamResponse::$variant(payload) => payload,
+                other => panic!("expected {}, got {other:?}", stringify!($variant)),
+            }
+        };
+    }
+
+    /// The items of a streaming send's response, none of them an error,
+    /// collected within a bound so a stream that never closes fails.
+    async fn streamed(
+        handler: &DefaultRequestHandler,
+        request: SendMessageRequest,
+    ) -> Vec<StreamResponse> {
+        let stream = handler
+            .send_streaming_message(&ServiceParams::new(), request)
+            .await
+            .unwrap();
+        timeout(
+            Duration::from_secs(5),
+            stream.map(Result::unwrap).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the response stream must close")
+    }
+
+    async fn stored_task(handler: &DefaultRequestHandler, id: &str) -> Task {
+        handler
+            .get_task(
+                &ServiceParams::new(),
+                GetTaskRequest {
+                    id: id.into(),
+                    history_length: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    fn artifact_event(ctx: &ExecutorContext, text: &str, append: Option<bool>) -> StreamResponse {
+        StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            task_id: ctx.task_id.clone(),
+            context_id: ctx.context_id.clone(),
+            artifact: Artifact {
+                artifact_id: "a-1".into(),
+                name: None,
+                description: None,
+                parts: vec![Part::text(text)],
+                metadata: None,
+                extensions: None,
+            },
+            append,
+            last_chunk: None,
+            metadata: None,
+        })
+    }
+
+    fn status_first_handler() -> DefaultRequestHandler {
+        DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                vec![
+                    (None, Ok(status_event(ctx, TaskState::Working, None))),
+                    (None, Ok(status_event(ctx, TaskState::Completed, None))),
+                ]
+            }),
+            InMemoryTaskStore::new(),
+        )
+    }
+
+    /// §3.1.2: the stream "MUST begin with the Task object", also when the
+    /// executor opens the task with a status update.
+    #[tokio::test]
+    async fn test_status_first_stream_begins_with_the_task() {
+        let handler = status_first_handler();
+        let events = streamed(&handler, send_request()).await;
+        assert!(
+            matches!(
+                &events[..],
+                [
+                    StreamResponse::Task(_),
+                    StreamResponse::StatusUpdate(_),
+                    StreamResponse::StatusUpdate(_)
+                ]
+            ),
+            "expected Task, Working, Completed: {events:?}"
+        );
+        let task = item!(&events[0], Task);
+        let working = item!(&events[1], StatusUpdate);
+        let completed = item!(&events[2], StatusUpdate);
+        assert_eq!(task.status.state, TaskState::Submitted);
+        assert_eq!(task.id, working.task_id);
+        assert_eq!(task.context_id, working.context_id);
+        assert_eq!(
+            task.history.as_ref().and_then(|history| history[0].text()),
+            Some("hi")
+        );
+        assert_eq!(working.status.state, TaskState::Working);
+        assert_eq!(completed.status.state, TaskState::Completed);
+
+        // The Task item is a stream item only: the store holds the turn's end.
+        let stored = stored_task(&handler, &task.id).await;
+        assert_eq!(stored.status.state, TaskState::Completed);
+        assert_eq!(stored.history.as_ref().map(Vec::len), Some(1));
+    }
+
+    /// The Task item the server inserts obeys `configuration.historyLength`
+    /// like any other Task of the stream.
+    #[tokio::test]
+    async fn test_inserted_task_respects_history_length() {
+        let request = SendMessageRequest {
+            configuration: Some(SendMessageConfiguration {
+                accepted_output_modes: None,
+                task_push_notification_config: None,
+                history_length: Some(0),
+                return_immediately: None,
+            }),
+            ..send_request()
+        };
+        let events = streamed(&status_first_handler(), request).await;
+        assert!(
+            matches!(
+                &events[..],
+                [StreamResponse::Task(task), _, _]
+                    if task.history.as_ref().is_none_or(Vec::is_empty)
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// An artifact and its append delta follow the Task object, which does
+    /// not hold the artifact yet: the client applies each part once.
+    #[tokio::test]
+    async fn test_artifact_first_stream_begins_with_the_task_without_the_artifact() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                vec![
+                    (None, Ok(artifact_event(ctx, "one", None))),
+                    (None, Ok(artifact_event(ctx, "two", Some(true)))),
+                    (None, Ok(status_event(ctx, TaskState::Completed, None))),
+                ]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let events = streamed(&handler, send_request()).await;
+        assert!(
+            matches!(
+                &events[..],
+                [
+                    StreamResponse::Task(_),
+                    StreamResponse::ArtifactUpdate(_),
+                    StreamResponse::ArtifactUpdate(_),
+                    StreamResponse::StatusUpdate(_)
+                ]
+            ),
+            "expected Task, artifact, append, Completed: {events:?}"
+        );
+        let task = item!(&events[0], Task);
+        let first = item!(&events[1], ArtifactUpdate);
+        let delta = item!(&events[2], ArtifactUpdate);
+        let completed = item!(&events[3], StatusUpdate);
+        assert_eq!(task.status.state, TaskState::Submitted);
+        assert!(
+            task.artifacts.is_none(),
+            "the artifact must not arrive twice"
+        );
+        assert_eq!(first.append, None);
+        assert_eq!(delta.append, Some(true));
+        assert_eq!(completed.status.state, TaskState::Completed);
+
+        let stored = stored_task(&handler, &task.id).await;
+        let artifacts = stored.artifacts.unwrap();
+        let texts: Vec<_> = artifacts[0]
+            .parts
+            .iter()
+            .filter_map(Part::as_text)
+            .collect();
+        assert_eq!((artifacts.len(), texts), (1, vec!["one", "two"]));
+    }
+
+    /// A Task the executor emits first opens the stream itself; none is added.
+    #[tokio::test]
+    async fn test_task_first_stream_is_unchanged() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|ctx: &ExecutorContext| {
+                let working = StreamResponse::Task(Task {
+                    id: ctx.task_id.clone(),
+                    context_id: ctx.context_id.clone(),
+                    status: TaskStatus {
+                        state: TaskState::Working,
+                        message: None,
+                        timestamp: None,
+                    },
+                    artifacts: None,
+                    history: None,
+                    metadata: None,
+                });
+                vec![
+                    (None, Ok(working)),
+                    (None, Ok(status_event(ctx, TaskState::Completed, None))),
+                ]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let events = streamed(&handler, send_request()).await;
+        assert!(
+            matches!(
+                &events[..],
+                [StreamResponse::Task(task), StreamResponse::StatusUpdate(_)]
+                    if task.status.state == TaskState::Working
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// §3.1.2: a Message answer is the whole stream; no Task precedes it.
+    #[tokio::test]
+    async fn test_message_first_stream_is_unchanged() {
+        let handler = DefaultRequestHandler::new(
+            ScriptedExecutor(|_ctx: &ExecutorContext| {
+                vec![(
+                    None,
+                    Ok(StreamResponse::Message(Message::new(
+                        Role::Agent,
+                        vec![Part::text("answer")],
+                    ))),
+                )]
+            }),
+            InMemoryTaskStore::new(),
+        );
+        let events = streamed(&handler, send_request()).await;
+        assert!(
+            matches!(&events[..], [StreamResponse::Message(_)]),
+            "{events:?}"
+        );
+    }
+
+    /// A continuation's stream begins with the Task as well: S:187 binds
+    /// the stream of every request. The Task is the one the turn started
+    /// from, with the new message in its history, before the turn's update.
+    #[tokio::test]
+    async fn test_continuation_stream_begins_with_the_task() {
+        let handler = DefaultRequestHandler::new(MultiTurnExecutor, InMemoryTaskStore::new());
+        let first = streamed(&handler, send_request()).await;
+        assert!(
+            matches!(
+                &first[..],
+                [StreamResponse::Task(_), StreamResponse::StatusUpdate(_)]
+            ),
+            "expected Task, InputRequired: {first:?}"
+        );
+        let task = item!(&first[0], Task);
+        let asked = item!(&first[1], StatusUpdate);
+        assert_eq!(asked.status.state, TaskState::InputRequired);
+
+        let answer = SendMessageRequest {
+            message: Message {
+                task_id: Some(task.id.clone()),
+                ..Message::new(Role::User, vec![Part::text("done")])
+            },
+            ..send_request()
+        };
+        let second = streamed(&handler, answer).await;
+        assert!(
+            matches!(
+                &second[..],
+                [StreamResponse::Task(_), StreamResponse::StatusUpdate(_)]
+            ),
+            "expected Task, Completed: {second:?}"
+        );
+        let found = item!(&second[0], Task);
+        let done = item!(&second[1], StatusUpdate);
+        assert_eq!(found.id, task.id);
+        assert_eq!(found.status.state, TaskState::InputRequired);
+        let said: Vec<_> = found
+            .history
+            .iter()
+            .flatten()
+            .filter_map(Message::text)
+            .collect();
+        assert_eq!(said, ["hi", "done"]);
+        assert_eq!(done.status.state, TaskState::Completed);
+        assert_eq!(
+            stored_task(&handler, &task.id).await.status.state,
+            TaskState::Completed
         );
     }
 
@@ -5502,18 +6122,30 @@ mod tests {
             .send_streaming_message(&params, send_request())
             .await
             .unwrap();
+        let first = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(first, StreamResponse::Task(_)),
+            "expected the task first, got {first:?}"
+        );
+        let task = item!(&first, Task);
+        assert_eq!(task.status.state, TaskState::Submitted);
+        let task_id = task.id.clone();
         let working = timeout(Duration::from_secs(5), stream.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        let task_id = match working {
+        match working {
             StreamResponse::StatusUpdate(event) => {
                 assert_eq!(event.status.state, TaskState::Working);
-                event.task_id
+                assert_eq!(event.task_id, task_id);
             }
             event => panic!("expected working status, got {event:?}"),
-        };
+        }
         handler
             .create_push_config(
                 &params,
@@ -5579,6 +6211,19 @@ mod tests {
             .send_streaming_message(&params, send_request())
             .await
             .unwrap();
+        // §3.1.2: the stream begins with the task, then the executor's update.
+        let first = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                &first,
+                StreamResponse::Task(task) if task.status.state == TaskState::Submitted
+            ),
+            "expected the task first, got {first:?}"
+        );
         let working = timeout(Duration::from_secs(2), stream.next())
             .await
             .unwrap()

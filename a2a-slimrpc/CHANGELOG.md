@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.3.5...a2a-slimrpc-v0.4.0) - 2026-11-26
+
+### Fixed
+
+- *(a2a-pb)* [**breaking**] reject a part with no content and a request with no message ([#510](https://github.com/a2aproject/a2a-rs/pull/510))
+
+### Breaking changes
+
+- *(slimrpc)* **breaking:** the SLIM crates moved to 3.5 (`agntcy-slim-rpc` 3.5, `agntcy-slim-auth` 0.19, `agntcy-slim-config` 0.18). `SlimApp` and the `slim_rpc` types are public API, so a caller still on SLIM 3.4 ends up with two copies of `slim_auth` and must move to the same versions ([#594](https://github.com/a2aproject/a2a-rs/pull/594))
+
+### Other
+
+- *(slimrpc)* upgrade slim to 3.5 and test with did:key identities ([#594](https://github.com/a2aproject/a2a-rs/pull/594))
+- document the crates at crate level and fix the rustdoc errors ([#541](https://github.com/a2aproject/a2a-rs/pull/541))
+- *(readme)* install the crates with cargo add ([#408](https://github.com/a2aproject/a2a-rs/pull/408))
+
 ## [0.3.5](https://github.com/a2aproject/a2a-rs/compare/a2a-slimrpc-v0.3.4...a2a-slimrpc-v0.3.5) - 2026-10-18
 
 ### Other
