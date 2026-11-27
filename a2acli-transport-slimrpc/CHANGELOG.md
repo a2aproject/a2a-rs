@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/a2aproject/a2a-rs/compare/a2acli-transport-slimrpc-v0.1.9...a2acli-transport-slimrpc-v0.1.10) - 2026-11-27
+
+### Other
+
+- *(slimrpc)* fail the serve test when the gateway connect fails ([#602](https://github.com/a2aproject/a2a-rs/pull/602))
+
 ## [0.1.9](https://github.com/a2aproject/a2a-rs/compare/a2acli-transport-slimrpc-v0.1.8...a2acli-transport-slimrpc-v0.1.9) - 2026-11-26
 
 ### Other

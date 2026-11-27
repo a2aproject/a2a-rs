@@ -14,6 +14,18 @@ library also keeps its own: [a2a](a2a/CHANGELOG.md),
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.5.0...a2a-cli-v0.5.1) - 2026-11-27
+
+### Fixed
+
+- *(a2a-server)* begin a task stream with the task object ([#587](https://github.com/a2aproject/a2a-rs/pull/587))
+
+### Other
+
+- *(slimrpc)* pin the e2e caller identity to the client's did:key ([#603](https://github.com/a2aproject/a2a-rs/pull/603))
+- *(slimrpc)* name the SLIM 3.5 line in the README ([#600](https://github.com/a2aproject/a2a-rs/pull/600))
+- *(slimrpc)* mark the SLIM 3.5 move as breaking in the 0.4.0 notes ([#601](https://github.com/a2aproject/a2a-rs/pull/601))
+
 ## [0.5.0](https://github.com/a2aproject/a2a-rs/compare/a2a-cli-v0.4.5...a2a-cli-v0.5.0) - 2026-11-26
 
 ### Added
