@@ -8,17 +8,44 @@ on:
   pull_request:
     paths:
       - 'a2acli-transport-slimrpc/**'
+      - 'a2a-slimrpc/**'
+      - 'a2a-grpc/**'
+      - 'a2a-pb/**'
+      - 'a2a/**'
+      - 'a2a-client/**'
+      - 'a2a-server/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/slimrpc_interop.py'
+      - 'scripts/slimrpc_live_interop.sh'
+      - 'scripts/test_slimrpc_interop.py'
       - '.github/workflows/cli-plugin-interop.yml'
   push:
     branches:
       - main
     paths:
       - 'a2acli-transport-slimrpc/**'
+      - 'a2a-slimrpc/**'
+      - 'a2a-grpc/**'
+      - 'a2a-pb/**'
+      - 'a2a/**'
+      - 'a2a-client/**'
+      - 'a2a-server/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/slimrpc_interop.py'
+      - 'scripts/slimrpc_live_interop.sh'
+      - 'scripts/test_slimrpc_interop.py'
       - '.github/workflows/cli-plugin-interop.yml'
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  # Live interop pins. Renovate manages only cargo and github-actions here, so
+  # nothing bumps these: update them together, by hand.
+  A2A_CLI_VERSION: v0.4.0
+  SLIM_GATEWAY_IMAGE: ghcr.io/agntcy/slim:3.4.6@sha256:54fde7ce0ef8efa6a61fee47996e941e87acb4e62284e5d9c00eb761295619b7
+  SLIM_A2A_GO_REF: 7744bf6f2c78f00f7c87e96894346b0762adeb4f # v0.5.2
 
 # Least privilege by default; nothing is published from this job.
 permissions:
@@ -31,8 +58,9 @@ concurrency:
 
 jobs:
   cli-plugin-interop:
-    name: a2a-cli plugin discovery
+    name: a2a-cli plugin discovery and live round trip
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -42,6 +70,9 @@ jobs:
         with:
           cache-save-if: false
 
+      - name: Check response assertions
+        run: python3 -m unittest discover -s scripts -p test_slimrpc_interop.py -v
+
       - name: Build the slimrpc transport plugin
         run: cargo build -p a2acli-transport-slimrpc --locked
 
@@ -50,7 +81,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/a2a-cli"
-          gh release download --repo a2aproject/a2a-cli \
+          gh release download "$A2A_CLI_VERSION" --repo a2aproject/a2a-cli \
             --pattern '*_linux_amd64.tar.gz' \
             --dir "$RUNNER_TEMP/a2a-cli" \
             --clobber
@@ -92,3 +123,38 @@ jobs:
           echo "$output"
           [ "$exit_code" -ne 0 ]
           echo "$output" | grep -q 'A2A_SLIMRPC_PLUGIN_CONFIG'
+
+      - name: Checkout the Go echo agent
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: agntcy/slim-a2a-go
+          ref: ${{ env.SLIM_A2A_GO_REF }}
+          path: .interop/slim-a2a-go
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: .interop/slim-a2a-go/go.mod
+          cache: false
+
+      - name: Build the Go echo agent
+        working-directory: .interop/slim-a2a-go
+        run: |
+          # Resolve the native setup tool from this checkout's go.mod.
+          go run github.com/agntcy/slim-bindings-go/v3/cmd/slim-bindings-setup
+          CGO_ENABLED=1 go build -o "$RUNNER_TEMP/bin/slimrpc-echo-agent" ./examples/echo_agent/cmd/server
+
+      - name: Test unary and streaming sends through a live gateway
+        env:
+          A2A_SLIMRPC_PLUGIN_CONFIG: ${{ github.workspace }}/a2acli-transport-slimrpc/examples/plugin.yaml
+        run: scripts/slimrpc_live_interop.sh
+
+      - name: Upload interop logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: slimrpc-interop-logs
+          path: interop-logs/
+          if-no-files-found: ignore
+          retention-days: 7

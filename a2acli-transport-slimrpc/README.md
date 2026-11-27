@@ -209,6 +209,13 @@ SLIM gateway image `2.3.0`, the released
 [`slim-a2a-go` v0.3.0 echo agent](https://github.com/agntcy/slim-a2a-go/tree/v0.3.0/examples/echo_agent),
 and this workspace's locked Rust dependencies.
 
+To run the same round trip unattended, as CI does, put `a2a`,
+`a2a-transport-slimrpc` and the built echo agent (as `slimrpc-echo-agent`) on
+`PATH`, then run
+[`scripts/slimrpc_live_interop.sh`](../scripts/slimrpc_live_interop.sh) with
+`SLIM_GATEWAY_IMAGE` set to a gateway image. It starts the gateway and agent,
+checks a unary and a streaming send, and leaves logs in `interop-logs/`.
+
 ### 1. Start The Gateway
 
 The checked-in [gateway configuration](examples/slim-gateway.yaml) starts a
@@ -306,8 +313,12 @@ cargo test -p a2acli-transport-slimrpc --release --locked
 
 The [CLI plugin interop workflow](../.github/workflows/cli-plugin-interop.yml)
 checks discovery with the real Go CLI and verifies the missing-configuration
-startup error. Run the local example above to check unary and streaming
-responses manually; the workflow does not start a gateway or echo agent.
+startup error. It also starts a SLIM gateway and the Go echo agent, then checks
+unary and streaming sends for the exact response artifact and a completed task.
+Streaming must finish without falling back to polling. The workflow pins its
+CLI, gateway and agent versions independently of the local example above, and
+uploads gateway, agent and CLI logs for diagnosis. This Linux CI check uses the
+public demo credentials and does not validate production authentication.
 
 ## Workspace
 
