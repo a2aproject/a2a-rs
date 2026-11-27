@@ -81,6 +81,9 @@ cargo run -q --bin a2acli -- send "Grace" --stream
 ```text
 Task ID: 01a1d1d2-981d-7375-98a9-728b516995c5
 Context ID: 01a1d1d2-981d-7375-98a9-728cc9a6fad1
+State: SUBMITTED
+Task ID: 01a1d1d2-981d-7375-98a9-728b516995c5
+Context ID: 01a1d1d2-981d-7375-98a9-728cc9a6fad1
 State: WORKING
 Task ID: 01a1d1d2-981d-7375-98a9-728b516995c5
 Context ID: 01a1d1d2-981d-7375-98a9-728cc9a6fad1
