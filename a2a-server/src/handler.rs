@@ -14,7 +14,7 @@ use std::{
 use tokio::sync::{RwLock, broadcast, oneshot};
 
 use crate::middleware::ServiceParams;
-use crate::pagination::resolve_page_size;
+use crate::pagination::{resolve_page_offset, resolve_page_size};
 use crate::task_store::apply_history_length;
 
 const EXECUTION_BUFFER_CAPACITY: usize = 32;
@@ -1510,13 +1510,7 @@ impl RequestHandler for DefaultRequestHandler {
         // that. PushConfigStore is public, so this clamp is what bounds the
         // response for an implementation with no per-task limit of its own.
         let page_size = resolve_page_size(req.page_size);
-        let start = if let Some(ref token) = req.page_token {
-            token
-                .parse::<usize>()
-                .map_err(|_| A2AError::invalid_params("invalid page token"))?
-        } else {
-            0
-        };
+        let start = resolve_page_offset(req.page_token.as_deref())?;
         let start = start.min(configs.len());
         let end = (start + page_size).min(configs.len());
         let next_page_token = (end < configs.len()).then(|| end.to_string());
@@ -5134,6 +5128,54 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_push_configs_empty_page_token_is_the_first_page() {
+        install_crypto_provider();
+        let handler = make_handler_with_push_configs();
+        let params = ServiceParams::new();
+        for id in ["cfg-1", "cfg-2"] {
+            handler
+                .create_push_config(
+                    &params,
+                    TaskPushNotificationConfig {
+                        task_id: "t1".into(),
+                        url: "https://example.com/callback".into(),
+                        id: Some(id.into()),
+                        token: None,
+                        authentication: None,
+                        tenant: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let list = |page_token: Option<String>| {
+            handler.list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "t1".into(),
+                    page_size: Some(1),
+                    page_token,
+                    tenant: None,
+                },
+            )
+        };
+
+        let first = list(None).await.unwrap();
+        let empty = list(Some(String::new())).await.unwrap();
+
+        let ids = |resp: &ListTaskPushNotificationConfigsResponse| {
+            resp.configs
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&empty), ids(&first));
+        assert_eq!(ids(&first), vec![Some("cfg-1".to_string())]);
+        assert_eq!(empty.next_page_token, first.next_page_token);
+        assert!(first.next_page_token.is_some());
     }
 
     #[tokio::test]
