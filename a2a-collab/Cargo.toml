@@ -1,0 +1,19 @@
+[package]
+name = "a2a-collab"
+version = "0.1.0"
+description = "Transport-agnostic relay logic for the A2A collaborative task extension"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+a2a = { workspace = true }
+a2a-client = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
